@@ -687,6 +687,128 @@ def test_langserve_matcher_rests_on_runnable_routes_not_on_fastapi_shape():
     )
 
 
+# --------------------------------------------------------------------------
+# L'index des flux de Flowise est un tableau d'objets nommés, datés et marqués
+# déployés : la forme même que sert n'importe quel constructeur de flux. La
+# signature doit donc tenir aux colonnes de l'entité ChatFlow, et aux plus
+# anciennes d'entre elles — exiger "chatbotConfig", "analytic" ou "category",
+# ajoutées au fil des versions, raterait les instances anciennes. Et parce que
+# le voisinage de cet endpoint est dangereux, le template ne doit toucher ni la
+# route de prédiction ni celle des identifiants.
+
+FLOWISE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "flowise-unauthenticated-api.yaml")
+
+# Réponse d'une version récente : le graphe est réencodé en chaîne JSON dans
+# flowData, et l'enregistrement porte les colonnes ajoutées après coup.
+FLOWISE_CHATFLOWS_BODY = (
+    '[{"id":"6f1a9c40-3b7e-4d21-9a0c-1f8e5b2d7c33","name":"Support RAG",'
+    '"flowData":"{\\"nodes\\":[{\\"id\\":\\"chatOpenAI_0\\",\\"data\\":'
+    '{\\"inputs\\":{\\"credential\\":\\"b2c4e1a8-77d9-4f13-8e60-9a3c5d0b6e21\\",'
+    '\\"modelName\\":\\"gpt-4o-mini\\"}}}],\\"edges\\":[]}",'
+    '"deployed":true,"isPublic":true,"apikeyid":null,'
+    '"chatbotConfig":"{\\"welcomeMessage\\":\\"Bonjour\\"}","apiConfig":null,'
+    '"analytic":null,"speechToText":null,"followUpPrompts":null,'
+    '"category":"support","type":"CHATFLOW",'
+    '"createdDate":"2026-05-12T09:14:22.000Z",'
+    '"updatedDate":"2026-07-02T16:41:08.000Z"}]'
+)
+
+# Même endpoint sur une version antérieure : ni chatbotConfig, ni analytic, ni
+# speechToText, ni category, ni type. Le template doit toujours la reconnaître.
+FLOWISE_OLD_CHATFLOWS_BODY = (
+    '[{"id":"9b1c7e52-0a44-4c8b-b3d6-2e7f1a904d15","name":"demo",'
+    '"flowData":"{\\"nodes\\":[],\\"edges\\":[]}",'
+    '"deployed":false,"isPublic":false,"apikeyid":null,'
+    '"createdDate":"2024-02-03T11:02:44.000Z",'
+    '"updatedDate":"2024-02-03T11:09:12.000Z"}]'
+)
+
+# Une plateforme d'automatisation quelconque énumère elle aussi des flux nommés,
+# datés, déployés et publics ou non : ce vocabulaire n'appartient à personne.
+OTHER_FLOW_PLATFORM_BODY = (
+    '[{"id":42,"name":"Nightly sync","description":"ETL nocturne",'
+    '"deployed":true,"isPublic":false,'
+    '"nodes":[{"id":"http_1","type":"http"}],"edges":[],'
+    '"createdDate":"2026-01-08T10:00:00.000Z",'
+    '"updatedDate":"2026-03-19T08:30:00.000Z"}]'
+)
+
+# Un éditeur de graphes bâti sur la même bibliothèque de rendu enregistre sa
+# scène sous flowData : cette clé seule ne prouve donc rien.
+OTHER_GRAPH_EDITOR_BODY = (
+    '[{"id":7,"name":"parcours-client",'
+    '"flowData":"{\\"nodes\\":[],\\"edges\\":[],'
+    '\\"viewport\\":{\\"x\\":0,\\"y\\":0,\\"zoom\\":1}}",'
+    '"owner":"marketing","createdAt":"2026-04-01T12:00:00.000Z"}]'
+)
+
+
+def flowise_chatflows_block():
+    doc = load(FLOWISE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/v1/chatflows" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /api/v1/chatflows"
+    return blocks[0]
+
+
+def test_flowise_probe_only_reads_the_chatflow_index():
+    doc = load(FLOWISE_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "GET", (
+            "l'index des flux se lit en GET : le template ne doit rien envoyer "
+            "à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "/prediction" not in path, (
+                "le template appelle la route de prédiction : le flux "
+                "tournerait vraiment, donc le template consommerait le quota du "
+                "fournisseur de modèle sur le compte de l'exploitant — c'est "
+                "l'abus qu'il est censé signaler"
+            )
+            assert "/credentials" not in path, (
+                "le template lit la route des identifiants, qui les renvoie "
+                "déchiffrés : il exfiltrerait le secret qu'il est censé "
+                "signaler"
+            )
+
+
+def test_flowise_matcher_rests_on_chatflow_columns_not_on_flow_list_shape():
+    block = flowise_chatflows_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, FLOWISE_CHATFLOWS_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /api/v1/chatflows de Flowise"
+    )
+    assert all(word_matcher_hits(m, FLOWISE_OLD_CHATFLOWS_BODY)
+               for m in body_matchers), (
+        "le template exige des colonnes absentes des versions plus anciennes de "
+        "Flowise — chatbotConfig, analytic ou category — il raterait les "
+        "instances qui traînent exposées"
+    )
+    assert not all(word_matcher_hits(m, OTHER_FLOW_PLATFORM_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une plateforme d'automatisation qui n'est "
+        "pas Flowise : nom, date et drapeau de déploiement sont la forme "
+        "commune de toute liste de flux"
+    )
+    assert not all(word_matcher_hits(m, OTHER_GRAPH_EDITOR_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur un éditeur de graphes qui n'est pas "
+        "Flowise : flowData seul ne désigne aucun produit"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

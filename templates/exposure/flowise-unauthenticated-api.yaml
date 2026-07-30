@@ -1,0 +1,115 @@
+id: flowise-unauthenticated-api
+
+info:
+  name: Flowise - Unauthenticated Chatflow Management API
+  author: popy21
+  severity: critical
+  description: |
+    Flowise ne monte aucune authentification tant qu'on ne lui en configure pas :
+    FLOWISE_USERNAME et FLOWISE_PASSWORD sont des variables d'environnement
+    facultatives, et ni l'image Docker ni un simple démarrage du paquet ne les
+    exigent. Sans elles, rien ne garde /api/v1 — c'est l'interface elle-même qui
+    appelle GET /api/v1/chatflows pour dessiner la liste des flux, et cet appel
+    n'emporte aucun jeton. Le même GET répond donc à quiconque atteint le port.
+    Les clés d'API que Flowise sait poser sur un flux n'y changent rien : elles
+    sont vérifiées à l'exécution du flux, sur la route de prédiction, pas sur les
+    routes de gestion qui le décrivent.
+  impact: |
+    La réponse porte flowData, le graphe sérialisé de chaque flux : tous les
+    nœuds et toutes leurs entrées. Ce qui n'est pas modélisé comme identifiant y
+    est écrit en clair — chaînes de connexion et hôtes de bases, URL et noms
+    d'index des bases vectorielles, points d'entrée d'API internes, prompts
+    système. Ce qui l'est n'apparaît que comme une référence, mais la même
+    surface non authentifiée sert /api/v1/credentials, et Flowise déchiffre le
+    secret côté serveur avant de le renvoyer, pour que le formulaire de
+    l'interface puisse l'afficher : la référence lue dans flowData est l'index
+    d'une lecture qui rend la clé. apikeyid vaut null tant qu'aucune clé n'a été
+    posée sur le flux, et cela se lit dans la même réponse : la route de
+    prédiction correspondante répond alors sans jeton, donc l'anonyme fait
+    tourner le flux sur le compte du fournisseur de modèle de l'exploitant.
+    L'absence d'authentification vaut enfin pour les verbes d'écriture de ces
+    mêmes routes : un flux peut être réécrit, pas seulement lu.
+  remediation: |
+    Poser FLOWISE_USERNAME et FLOWISE_PASSWORD, ou l'authentification applicative
+    de la version déployée, avant d'exposer le port ; lier le service à 127.0.0.1
+    et le publier derrière un proxy qui authentifie. Ne pas compter sur la clé
+    d'API d'un flux : elle ne protège que son exécution, jamais l'API de gestion
+    qui le décrit. Une authentification applicative reste un secret unique
+    partagé, pas une autorisation par utilisateur. Après une exposition,
+    considérer comme divulgué tout identifiant enregistré dans l'instance et le
+    renouveler : la lecture ne laisse aucune trace côté Flowise.
+  reference:
+    - https://github.com/FlowiseAI/Flowise
+    - https://github.com/FlowiseAI/Flowise/blob/main/packages/server/src/database/entities/ChatFlow.ts
+    - https://github.com/FlowiseAI/Flowise/blob/main/packages/server/src/services/credentials/index.ts
+    - https://docs.flowiseai.com/configuration/authorization/app-level
+  metadata:
+    max-request: 1
+    vendor: flowiseai
+    product: flowise
+    shodan-query: title:"Flowise"
+  tags: ai,llm,flowise,exposure,unauth,misconfig
+
+http:
+  # L'index des flux, en lecture seule. Aucune autre route n'est interrogée, et
+  # c'est délibéré : /api/v1/prediction ferait tourner le flux, donc consommerait
+  # le quota du fournisseur de modèle aux frais de l'exploitant, et
+  # /api/v1/credentials renverrait le secret déchiffré — un template qui le lit
+  # exfiltre l'identifiant qu'il est censé signaler.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/chatflows"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Une liste d'objets nommés et datés ne désigne aucun produit : n'importe
+      # quel constructeur de flux sert la sienne, avec des noms, des dates et un
+      # drapeau de déploiement. Ces trois clés-là, ensemble, désignent Flowise :
+      #
+      # - "flowData" porte le graphe entier réencodé en chaîne JSON, colonne
+      #   propre à l'entité ChatFlow ; c'est aussi ce qui fait la valeur de la
+      #   réponse.
+      # - "apikeyid", dans cette graphie tout en minuscules, est le nom de colonne
+      #   de Flowise et de personne d'autre. Il porte en plus le renseignement qui
+      #   compte : à null, le flux s'exécute sans jeton.
+      # - "deployed" seul serait banal, mais il rattache l'objet à un flux servi,
+      #   pas à un simple document enregistré.
+      #
+      # Ce sont trois colonnes présentes de longue date. Les plus parlantes ne
+      # sont pas retenues justement parce qu'elles sont récentes :
+      # "chatbotConfig", "analytic", "speechToText", "category" ou "type" ont été
+      # ajoutées au fil des versions, et les exiger raterait les instances
+      # anciennes — précisément celles qui traînent exposées.
+      - type: word
+        part: body
+        words:
+          - '"flowData"'
+          - '"apikeyid"'
+          - '"deployed"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le nom de chaque flux servi : c'est ce qu'il faut remonter à
+      # l'exploitant, pas seulement le fait que le port réponde.
+      - type: json
+        part: body
+        name: chatflow
+        json:
+          - '.[].name'
+
+      # Les flux sur lesquels aucune clé n'a été posée : leur route de prédiction
+      # répond à l'anonyme.
+      - type: json
+        part: body
+        name: keyless_chatflow
+        json:
+          - '.[] | select(.apikeyid == null) | .id'
