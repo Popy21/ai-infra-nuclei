@@ -1,0 +1,68 @@
+id: vllm-unauthenticated-api
+
+info:
+  name: vLLM - Unauthenticated OpenAI-Compatible API Exposure
+  author: popy21
+  severity: high
+  description: |
+    vLLM sert une API compatible OpenAI sur le port 8000 et n'active aucune
+    authentification par défaut : le middleware d'authentification n'est monté
+    que si --api-key ou VLLM_API_KEY est fourni, et les deux sont optionnels.
+    Sans cette clé, /v1/models et les routes d'inférence servies par le même
+    processus répondent à quiconque atteint le port.
+  impact: |
+    N'importe qui peut lancer de l'inférence sur le GPU de l'hôte, ce qui occupe
+    la mémoire vidéo et prive le service légitime de sa capacité, et énumérer les
+    modèles servis avec leur fenêtre de contexte. Aucune limite de débit, aucune
+    trace d'audit, aucune notion d'utilisateur.
+  remediation: |
+    Lancer le serveur avec --host 127.0.0.1 et le publier derrière un proxy qui
+    authentifie. La clé --api-key / VLLM_API_KEY est un jeton statique partagé :
+    elle ferme l'accès anonyme mais ne remplace pas une authentification par
+    utilisateur. Ne jamais publier le port 8000 sur un réseau non maîtrisé.
+  reference:
+    - https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
+    - https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/api_server.py
+    - https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/protocol.py
+  metadata:
+    max-request: 1
+    vendor: vllm-project
+    product: vllm
+  tags: ai,llm,vllm,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # /v1/models est partagé par tous les serveurs compatibles OpenAI : la
+      # forme {"object":"list","data":[...]} ne prouve rien à elle seule.
+      # owned_by="vllm" et max_model_len viennent de la ModelCard de vLLM et
+      # n'existent pas dans la spécification OpenAI — c'est ce couple qui
+      # sépare vLLM de LocalAI, LiteLLM ou LM Studio.
+      - type: word
+        part: body
+        words:
+          - '"data"'
+          - '"owned_by"'
+          - '"vllm"'
+          - '"max_model_len"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'

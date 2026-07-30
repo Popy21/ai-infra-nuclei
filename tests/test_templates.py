@@ -129,6 +129,63 @@ def test_description_impact_remediation_are_substantive(path):
         )
 
 
+# --------------------------------------------------------------------------
+# Endpoint partagé : plusieurs runtimes parlent le protocole OpenAI et servent
+# tous GET /v1/models. Un matcher qui se contente de la forme générique
+# {"object":"list","data":[...]} déclenche sur tous à la fois. Ces deux corps
+# gardent le discriminant produit du template vLLM.
+
+VLLM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "vllm-unauthenticated-api.yaml")
+
+# Réponse de vLLM, telle que FastAPI sérialise ModelList/ModelCard.
+VLLM_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"meta-llama/Llama-3.1-8B-Instruct",'
+    '"object":"model","created":1753900000,"owned_by":"vllm",'
+    '"root":"meta-llama/Llama-3.1-8B-Instruct","parent":null,'
+    '"max_model_len":131072,"permission":[{"id":"modelperm-4f1c",'
+    '"object":"model_permission","created":1753900000,'
+    '"allow_sampling":true}]}]}'
+)
+
+# Même endpoint, même forme, autre produit : le template ne doit pas déclencher.
+OTHER_OPENAI_API_BODY = (
+    '{"object":"list","data":[{"id":"gpt-4o","object":"model",'
+    '"created":1753900000,"owned_by":"openai"}]}'
+)
+
+
+def word_matcher_hits(matcher, body):
+    """Sémantique nuclei d'un matcher `word` : condition `or` par défaut."""
+    words = matcher.get("words") or []
+    if matcher.get("condition") == "and":
+        return all(w in body for w in words)
+    return any(w in body for w in words)
+
+
+def test_vllm_matcher_distinguishes_vllm_from_other_openai_apis():
+    doc = load(VLLM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v1/models" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /v1/models"
+
+    block = blocks[0]
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, VLLM_MODELS_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /v1/models de vLLM"
+    )
+    assert not all(word_matcher_hits(m, OTHER_OPENAI_API_BODY) for m in body_matchers), (
+        "le template déclenche sur une API compatible OpenAI qui n'est pas vLLM"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
