@@ -6,6 +6,7 @@ jamais être commité. C'est cette contrainte qui rend un commit automatique
 significatif : sans elle, un commit ne prouve rien.
 """
 
+import json
 import os
 import re
 import shutil
@@ -366,6 +367,105 @@ def test_sglang_matcher_holds_across_versions_without_becoming_generic():
     # servi, et les deux templates ne doivent pas revendiquer la même instance.
     assert not all(word_matcher_hits(m, TGI_INFO_BODY) for m in body_matchers), (
         "le template déclenche sur TGI, déjà couvert par son propre template"
+    )
+
+
+# --------------------------------------------------------------------------
+# Au-delà de la lecture. /api/tags prouve qu'Ollama répond, pas que les routes
+# mutantes sont ouvertes : un proxy placé devant peut ne laisser passer que la
+# lecture. Le template doit donc interroger /api/pull lui-même — et le faire sans
+# provoquer le téléchargement qu'il signale, sinon il devient l'abus qu'il
+# détecte.
+
+OLLAMA_PULL_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                    "ollama-model-pull-abuse.yaml")
+
+# Refus de validation d'une version récente : le nom passe par model.ParseName.
+OLLAMA_PULL_INVALID_NAME_BODY = '{"error":"invalid model name"}'
+
+# Même refus sur une version antérieure à ce passage, avec l'ancien message.
+OLLAMA_PULL_OLD_REQUIRED_BODY = '{"error":"model is required"}'
+
+# Premier événement du flux de progression quand un pull démarre réellement.
+# Reconnaître ce corps voudrait dire rapporter un téléchargement déclenché par le
+# template lui-même.
+OLLAMA_PULL_PROGRESS_BODY = '{"status":"pulling manifest"}'
+
+# 400 générique — proxy, passerelle ou service quelconque servant le même chemin.
+GENERIC_BAD_REQUEST_BODY = '{"error":"Bad Request"}'
+
+
+def ollama_pull_block():
+    doc = load(OLLAMA_PULL_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/pull" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas /api/pull — /api/tags est déjà couvert par "
+        "ollama-unauthenticated-api.yaml et ne prouve rien des routes mutantes"
+    )
+    return blocks[0]
+
+
+def test_ollama_pull_probe_cannot_trigger_a_download():
+    block = ollama_pull_block()
+
+    assert block.get("method") == "POST", (
+        "/api/pull n'est servi qu'en POST : autre chose ne prouve pas que la "
+        "route est atteignable"
+    )
+
+    sent = json.loads(block.get("body") or "null")
+    assert isinstance(sent, dict), "le corps envoyé n'est pas un objet JSON"
+    name = str(sent.get("model") or sent.get("name") or "")
+    assert not name.strip(), (
+        f"le corps envoie un nom de modèle exploitable ({name!r}) : Ollama "
+        "sortirait vers le registre et commencerait à télécharger des poids"
+    )
+
+    statuses = [s for m in (block.get("matchers") or [])
+                if m.get("type") == "status"
+                for s in (m.get("status") or [])]
+    assert 400 in statuses, (
+        "le refus de validation est un 400 : sans lui le template ne prouve "
+        "pas que le handler a désérialisé la requête"
+    )
+    assert 200 not in statuses, (
+        "un 200 sur /api/pull signifie que le téléchargement a commencé — "
+        "l'accepter serait rapporter une consommation causée par le template"
+    )
+
+
+def test_ollama_pull_matcher_holds_across_versions_without_becoming_generic():
+    block = ollama_pull_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la preuve du refus "
+        "peut être court-circuitée par le seul code de statut"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, OLLAMA_PULL_INVALID_NAME_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas le refus de validation d'/api/pull"
+    )
+    assert all(word_matcher_hits(m, OLLAMA_PULL_OLD_REQUIRED_BODY)
+               for m in body_matchers), (
+        "le template n'accepte que la formulation récente du refus — il "
+        "raterait les instances anciennes, précisément celles qui traînent "
+        "exposées"
+    )
+    assert not all(word_matcher_hits(m, OLLAMA_PULL_PROGRESS_BODY)
+                   for m in body_matchers), (
+        "le template reconnaît le flux de progression d'un pull en cours : il "
+        "rapporterait un téléchargement qu'il a lui-même déclenché"
+    )
+    assert not all(word_matcher_hits(m, GENERIC_BAD_REQUEST_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur un 400 générique : n'importe quel proxy "
+        "servant ce chemin suffirait à le faire remonter"
     )
 
 

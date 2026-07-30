@@ -1,0 +1,95 @@
+id: ollama-model-pull-abuse
+
+info:
+  name: Ollama - Unauthenticated Model Pull Endpoint Reachable
+  author: popy21
+  severity: high
+  description: |
+    Ollama n'implémente aucune authentification et son API ne sépare pas la
+    lecture de l'écriture : le même port sert /api/tags, qui énumère les modèles
+    locaux, et /api/pull, qui en télécharge de nouveaux. Constater qu'une
+    instance répond en lecture ne dit donc rien des routes mutantes — un proxy
+    placé devant peut parfaitement ne laisser passer que /api/tags. Ce template
+    interroge /api/pull lui-même, avec un nom de modèle vide : PullHandler
+    valide le nom avant tout accès au registre, donc la requête s'arrête sur un
+    refus de validation. La route est prouvée atteignable et sans clé, sans
+    qu'un octet de modèle soit téléchargé ni qu'un état local change.
+  impact: |
+    Un /api/pull ouvert donne à l'anonyme le contrôle de ce que l'hôte télécharge
+    et stocke. Un modèle pèse plusieurs gigaoctets : la répétition remplit le
+    disque et fait tomber le service. Le nom de modèle porte son registre
+    d'origine, et le champ insecure autorise explicitement une connexion non
+    chiffrée : l'hôte peut donc être forcé à récupérer des poids depuis un
+    registre contrôlé par l'attaquant, ce qui transforme l'exposition en canal
+    d'introduction de code et de sortie réseau depuis l'intérieur du réseau.
+    Les routes /api/create, /api/copy, /api/push et /api/delete sont servies par
+    le même processus, sans authentification elles non plus.
+  remediation: |
+    Laisser OLLAMA_HOST sur 127.0.0.1 et publier le service derrière un proxy qui
+    authentifie. Ollama n'a aucune notion d'accès en lecture seule : si un accès
+    distant est nécessaire, le proxy doit lister explicitement les routes permises
+    et refuser /api/pull, /api/create, /api/copy, /api/push et /api/delete.
+    Filtrer la seule route de génération ne suffit pas. Ne jamais publier le port
+    11434 sur un réseau non maîtrisé.
+  reference:
+    - https://github.com/ollama/ollama/blob/main/docs/api.md#pull-a-model
+    - https://github.com/ollama/ollama/blob/main/server/routes.go
+    - https://github.com/ollama/ollama/blob/main/docs/faq.md#how-can-i-expose-ollama-on-my-network
+    - https://blogs.cisco.com/security/detecting-exposed-llm-servers-shodan-case-study-on-ollama
+  metadata:
+    max-request: 1
+    vendor: ollama
+    product: ollama
+    shodan-query: "Ollama is running"
+  tags: ai,llm,ollama,exposure,unauth,misconfig
+
+http:
+  - method: POST
+    path:
+      - "{{BaseURL}}/api/pull"
+
+    headers:
+      Content-Type: application/json
+
+    # Nom de modèle vide, délibérément. PullHandler valide le nom avant de
+    # contacter le registre : la requête est refusée sur place, aucun
+    # téléchargement ne démarre et aucun état local n'est touché. Un nom
+    # syntaxiquement valide, même inexistant, ferait au contraire sortir l'hôte
+    # vers le registre — ce n'est pas au template de provoquer ce qu'il signale.
+    body: '{"model":"","stream":false}'
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le refus de validation est la preuve recherchée : il ne peut être émis
+      # qu'après que le handler ait accepté la requête et désérialisé son corps,
+      # donc la route est bien servie et n'a réclamé aucune clé.
+      #
+      # Deux formulations, et c'est délibéré : le message a changé quand la
+      # validation est passée à model.ParseName. Les versions récentes répondent
+      # "invalid model name", les antérieures "model is required" — or ce sont
+      # les instances anciennes qui traînent exposées, les exclure viderait le
+      # template de son intérêt.
+      - type: word
+        part: body
+        words:
+          - "invalid model name"
+          - "model is required"
+
+      # 400 et surtout pas 200 : sur /api/pull, un 200 signifie que le
+      # téléchargement a commencé. Un template qui l'accepterait rapporterait
+      # une consommation de bande passante et de disque qu'il a lui-même causée.
+      - type: status
+        status:
+          - 400
+
+    extractors:
+      - type: json
+        part: body
+        name: pull_refusal
+        json:
+          - '.error'
