@@ -1,0 +1,60 @@
+id: ollama-unauthenticated-api
+
+info:
+  name: Ollama - Unauthenticated API Exposure
+  author: popy21
+  severity: high
+  description: |
+    Ollama ships with no authentication and binds to 127.0.0.1 by default, but is
+    commonly re-bound to 0.0.0.0 via OLLAMA_HOST to serve other machines. When that
+    happens the entire management API is reachable by anyone: listing, pulling,
+    running and deleting models are all unauthenticated operations.
+  impact: |
+    Anyone can run inference on the host GPU, enumerate locally stored models,
+    pull arbitrary models to fill the disk, and delete existing ones. There is no
+    rate limit and no audit trail.
+  remediation: |
+    Keep OLLAMA_HOST bound to 127.0.0.1, or place Ollama behind a reverse proxy
+    that enforces authentication. Never expose port 11434 to an untrusted network.
+  reference:
+    - https://github.com/ollama/ollama/blob/main/docs/faq.md#how-can-i-expose-ollama-on-my-network
+    - https://blogs.cisco.com/security/detecting-exposed-llm-servers-shodan-case-study-on-ollama
+    - https://www.indusface.com/blog/exposed-ollama-servers-llm-security-risks/
+  metadata:
+    verified: true
+    max-request: 1
+    vendor: ollama
+    product: ollama
+    shodan-query: "Ollama is running"
+  tags: ai,llm,ollama,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/tags"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # /api/tags renvoie la liste des modèles locaux. Sa présence prouve que
+      # l'API de gestion répond sans authentification — pas seulement qu'un
+      # service tourne.
+      - type: word
+        part: body
+        words:
+          - '"models"'
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.models[].name'

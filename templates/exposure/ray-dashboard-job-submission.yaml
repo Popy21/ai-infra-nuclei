@@ -1,0 +1,58 @@
+id: ray-dashboard-job-submission
+
+info:
+  name: Ray Dashboard - Unauthenticated Job Submission API
+  author: popy21
+  severity: critical
+  description: |
+    The Ray cluster dashboard (default port 8265) exposes a Jobs API that accepts
+    arbitrary entrypoint commands. Ray has no built-in authentication: the project
+    documents that the dashboard must never be exposed outside a trusted network.
+    Reaching /api/version unauthenticated means the job submission endpoint on the
+    same service is reachable too.
+  impact: |
+    Submitting a job runs an arbitrary command on every node of the cluster. On an
+    exposed dashboard this is unauthenticated remote code execution against
+    GPU-bearing infrastructure, with access to any credentials mounted in the
+    cluster.
+  remediation: |
+    Bind the dashboard to localhost, or put it behind an authenticating proxy and
+    a network policy. Ray's own documentation treats the dashboard port as
+    trusted-network-only; there is no supported authentication mode.
+  reference:
+    - https://docs.ray.io/en/latest/ray-security/index.html
+    - https://docs.ray.io/en/latest/cluster/running-applications/job-submission/index.html
+  metadata:
+    verified: true
+    max-request: 1
+    vendor: ray-project
+    product: ray
+    shodan-query: title:"Ray Dashboard"
+  tags: ai,ml,ray,exposure,unauth,rce,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/version"
+
+    matchers-condition: and
+    matchers:
+      # ray_version + ray_commit identifient le service sans ambiguïté ; un
+      # simple titre de page serait trop faible.
+      - type: word
+        part: body
+        words:
+          - '"ray_version"'
+          - '"ray_commit"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: ray_version
+        json:
+          - '.ray_version'
