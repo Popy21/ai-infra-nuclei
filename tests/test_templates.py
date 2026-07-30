@@ -302,6 +302,73 @@ def test_lmstudio_matcher_targets_the_product_api_not_openai_compat():
     )
 
 
+# --------------------------------------------------------------------------
+# SGLang décrit son modèle sous /get_model_info. Le corps a gagné des clés au fil
+# des versions : s'appuyer sur les plus récentes raterait les instances
+# anciennes, or ce sont elles qui traînent exposées. La signature doit donc tenir
+# aux seules clés que toutes les versions sérialisent, sans pour autant se
+# réduire à "model_path", qui ne désigne aucun produit.
+
+SGLANG_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "sglang-server-exposed.yaml")
+
+# Réponse d'une version récente : le dict complet.
+SGLANG_MODEL_INFO_BODY = (
+    '{"model_path":"meta-llama/Llama-3.1-8B-Instruct",'
+    '"tokenizer_path":"meta-llama/Llama-3.1-8B-Instruct",'
+    '"is_generation":true,"preferred_sampling_params":null,'
+    '"weight_version":"default"}'
+)
+
+# Même endpoint sur une version plus ancienne : seules model_path et
+# is_generation sont sérialisées. Le template doit toujours reconnaître celle-ci.
+SGLANG_OLD_MODEL_INFO_BODY = (
+    '{"model_path":"meta-llama/Llama-3.1-8B-Instruct","is_generation":true}'
+)
+
+# Une autre pile de service nomme aussi ses poids model_path et son tokenizer
+# tokenizer_path : ces deux clés seules ne prouvent donc rien.
+OTHER_MODEL_INFO_BODY = (
+    '{"model_path":"/models/llama-3.1-8b","tokenizer_path":"/models/llama-3.1-8b",'
+    '"backend":"triton","version":"1.2.0","max_batch_size":8}'
+)
+
+
+def test_sglang_matcher_holds_across_versions_without_becoming_generic():
+    doc = load(SGLANG_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/get_model_info" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /get_model_info"
+
+    block = blocks[0]
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, SGLANG_MODEL_INFO_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /get_model_info de SGLang"
+    )
+    assert all(word_matcher_hits(m, SGLANG_OLD_MODEL_INFO_BODY)
+               for m in body_matchers), (
+        "le template exige des clés absentes des versions plus anciennes de "
+        "SGLang — il raterait les instances qui traînent exposées"
+    )
+    assert not all(word_matcher_hits(m, OTHER_MODEL_INFO_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une pile de service qui n'est pas SGLang : "
+        "model_path et tokenizer_path sont des clés banales"
+    )
+    # Collision interne au pack : /info du routeur TGI décrit lui aussi le modèle
+    # servi, et les deux templates ne doivent pas revendiquer la même instance.
+    assert not all(word_matcher_hits(m, TGI_INFO_BODY) for m in body_matchers), (
+        "le template déclenche sur TGI, déjà couvert par son propre template"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

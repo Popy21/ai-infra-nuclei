@@ -1,0 +1,79 @@
+id: sglang-server-exposed
+
+info:
+  name: SGLang - Exposed Inference Server
+  author: popy21
+  severity: high
+  description: |
+    SGLang n'impose aucune authentification : le middleware de contrôle n'est
+    monté que si --api-key est passé au lancement du serveur, et cette option est
+    facultative. Le serveur écoute sur le port 30000 et se retrouve publié dès
+    qu'on le lance avec --host 0.0.0.0 ou qu'on mappe le port du conteneur — le
+    geste habituel pour servir une autre machine du réseau. Sans clé,
+    /get_model_info répond à quiconque atteint le port, et les routes de
+    génération du même processus aussi.
+  impact: |
+    /get_model_info révèle le modèle servi et son tokenizer par leur chemin :
+    identifiant HuggingFace pour un modèle public, mais chemin du système de
+    fichiers pour des poids privés ou affinés, ce qui renseigne sur
+    l'arborescence de l'hôte. Les routes d'inférence — /generate comme les routes
+    compatibles OpenAI sous /v1 — sont servies par le même processus sans
+    authentification : n'importe qui occupe le GPU de l'hôte et prive le service
+    légitime de sa capacité, sans limite de débit ni trace d'audit.
+  remediation: |
+    Lier le serveur à 127.0.0.1 et le publier derrière un proxy qui authentifie ;
+    ne pas mapper le port 30000 du conteneur sur une interface publique. La clé
+    --api-key est un jeton statique partagé : elle ferme l'accès anonyme mais ne
+    remplace pas une authentification par utilisateur.
+  reference:
+    - https://docs.sglang.ai/
+    - https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
+    - https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
+  metadata:
+    max-request: 1
+    vendor: sgl-project
+    product: sglang
+  tags: ai,llm,sglang,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/get_model_info"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # /get_model_info est le bon témoin plutôt que /health : quand --api-key
+      # est fourni, le middleware laisse passer les routes de santé mais rejette
+      # celle-ci en 401. Un 200 ici prouve donc l'absence d'authentification, pas
+      # seulement qu'un service tourne.
+      #
+      # Deux clés seulement, et c'est délibéré : "preferred_sampling_params" et
+      # "weight_version" ne sont apparus que dans les versions récentes, les
+      # exiger raterait les instances plus anciennes — précisément celles qui
+      # traînent exposées. "model_path" et "is_generation" sont sérialisés par
+      # toutes les versions, et "is_generation" — le drapeau interne qui sépare
+      # un modèle de génération d'un modèle d'embedding — n'appartient à aucune
+      # spécification publique : couplé à un endpoint aussi peu banal, il ne peut
+      # pas venir d'une autre passerelle d'inférence.
+      - type: word
+        part: body
+        words:
+          - '"model_path"'
+          - '"is_generation"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: model_path
+        json:
+          - '.model_path'
