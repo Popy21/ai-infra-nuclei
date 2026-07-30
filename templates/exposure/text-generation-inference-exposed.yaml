@@ -1,0 +1,70 @@
+id: text-generation-inference-exposed
+
+info:
+  name: HuggingFace Text Generation Inference - Exposed Router
+  author: popy21
+  severity: high
+  description: |
+    Le routeur de Text Generation Inference écoute sur 0.0.0.0 par défaut et
+    n'impose aucune authentification : le contrôle n'est monté que si une clé
+    d'API est fournie au lancement, et cette option est facultative. Sans elle,
+    GET /info répond à quiconque atteint le port et décrit le modèle servi ainsi
+    que le dimensionnement du routeur.
+  impact: |
+    /info révèle le modèle chargé (model_id, révision), le type de tâche et les
+    limites du service — max_concurrent_requests, max_total_tokens, taille de
+    lot. Les routes de génération sont servies par le même processus, sans
+    authentification : n'importe qui consomme le GPU de l'hôte, sans limite de
+    débit ni trace d'audit.
+  remediation: |
+    Lier le routeur à 127.0.0.1 et le publier derrière un proxy qui authentifie ;
+    ne pas mapper le port du conteneur sur une interface publique. La clé d'API
+    du routeur est un jeton statique partagé : elle ferme l'accès anonyme mais ne
+    remplace pas une authentification par utilisateur.
+  reference:
+    - https://huggingface.co/docs/text-generation-inference/index
+    - https://huggingface.co/docs/text-generation-inference/reference/launcher
+    - https://github.com/huggingface/text-generation-inference/blob/main/router/src/lib.rs
+    - https://github.com/huggingface/text-generation-inference/blob/main/router/src/server.rs
+  metadata:
+    max-request: 1
+    vendor: huggingface
+    product: text-generation-inference
+  tags: ai,llm,tgi,huggingface,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/info"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # /info est un nom d'endpoint banal (Spring Boot Actuator, passerelles
+      # d'inférence maison) et "model_id" seul ne désigne aucun produit. Ces
+      # quatre clés viennent de la struct Info du routeur TGI : ce sont les
+      # paramètres du routeur lui-même (max_best_of, validation_workers), pas
+      # des champs de la spécification OpenAI, et ils sont toujours sérialisés.
+      - type: word
+        part: body
+        words:
+          - '"model_id"'
+          - '"max_concurrent_requests"'
+          - '"max_best_of"'
+          - '"validation_workers"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: model_id
+        json:
+          - '.model_id'

@@ -186,6 +186,67 @@ def test_vllm_matcher_distinguishes_vllm_from_other_openai_apis():
     )
 
 
+# --------------------------------------------------------------------------
+# Endpoint générique : /info est un nom banal et "model_id" une clé banale. La
+# signature du template TGI doit tenir aux paramètres du routeur, pas au seul
+# nom du modèle — sinon toute passerelle d'inférence servant /info déclenche.
+
+TGI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "text-generation-inference-exposed.yaml")
+
+# Réponse du routeur TGI, telle qu'axum sérialise la struct Info.
+TGI_INFO_BODY = (
+    '{"model_id":"meta-llama/Llama-3.1-8B-Instruct",'
+    '"model_sha":"0e9e39f249a16976918f6564b8830bc894c89659",'
+    '"model_pipeline_tag":"text-generation","max_concurrent_requests":128,'
+    '"max_best_of":2,"max_stop_sequences":4,"max_input_tokens":4095,'
+    '"max_total_tokens":4096,"max_batch_total_tokens":16000,'
+    '"max_waiting_tokens":20,"max_batch_size":null,"validation_workers":2,'
+    '"max_client_batch_size":4,"version":"3.3.4","sha":null,'
+    '"docker_label":null}'
+)
+
+# Une autre passerelle d'inférence sert /info et nomme aussi son modèle
+# model_id : même endpoint, même clé, autre produit.
+OTHER_INFO_BODY = (
+    '{"model_id":"meta-llama/Llama-3.1-8B-Instruct","backend":"triton",'
+    '"version":"1.2.0","max_batch_size":8}'
+)
+
+# /info d'un service qui n'a rien à voir avec l'inférence.
+ACTUATOR_INFO_BODY = (
+    '{"app":{"name":"billing-api","version":"4.1.0"},'
+    '"git":{"branch":"main","commit":{"id":"9f3c1ab"}}}'
+)
+
+
+def test_tgi_matcher_needs_router_parameters_not_just_model_id():
+    doc = load(TGI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/info" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /info"
+
+    block = blocks[0]
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, TGI_INFO_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /info du routeur TGI"
+    )
+    assert not all(word_matcher_hits(m, OTHER_INFO_BODY) for m in body_matchers), (
+        "le template déclenche sur une passerelle d'inférence qui n'est pas TGI"
+    )
+    assert not all(word_matcher_hits(m, ACTUATOR_INFO_BODY) for m in body_matchers), (
+        "le template déclenche sur un /info sans rapport avec l'inférence"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
