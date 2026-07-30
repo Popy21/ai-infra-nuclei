@@ -1,0 +1,121 @@
+id: xinference-exposed
+
+info:
+  name: Xorbits Inference - Exposed Model Management API
+  author: popy21
+  severity: high
+  description: |
+    Jusqu'aux versions 2.x, Xinference ne monte aucune authentification tant
+    qu'on ne la lui demande pas : les deux mécanismes sont facultatifs — un
+    fichier d'identifiants passé par --auth-config, ou le système à comptes
+    activé par XINFERENCE_AUTH_ADVANCED — et rien ne les exige au démarrage.
+    Le serveur écoute sur 127.0.0.1:9997 par défaut, mais le compose officiel du
+    projet lance xinference-local -H 0.0.0.0 et publie 9997:9997 ; c'est le
+    geste habituel pour piloter la machine à GPU depuis un autre poste, et il
+    suffit à publier l'API de gestion des modèles en l'état. La version 3.0 a
+    inversé ce défaut et active le système à comptes, ce qui ne referme aucune
+    des instances déjà déployées.
+  impact: |
+    /v1/model_registrations/LLM énumère le catalogue de l'instance, familles
+    intégrées et modèles enregistrés par l'exploitant confondus : les seconds
+    portent ses noms internes. Mais la lecture n'est que le témoin — la même
+    surface non authentifiée sert les verbes d'écriture de la même API de
+    gestion. POST /v1/models lance un modèle et occupe le GPU : les poids sont
+    tirés de HuggingFace ou de ModelScope, ou lus depuis un model_path de l'hôte
+    fourni dans la requête. DELETE /v1/models/{uid} arrête ceux que l'exploitant
+    sert. POST /v1/model_registrations/{type} enregistre un modèle
+    personnalisé. Les routes d'inférence du même processus, compatibles OpenAI
+    sous /v1, répondent elles aussi à l'anonyme, sans limite de débit, et
+    /v1/cluster/info décrit les GPU de la machine. Sans authentification, aucune
+    de ces requêtes n'est journalisée : la piste d'audit de Xinference n'est
+    alimentée que pour un porteur de clé.
+  remediation: |
+    Laisser l'écoute sur 127.0.0.1 et publier le service derrière un proxy qui
+    authentifie ; ne pas passer -H 0.0.0.0 et ne pas mapper le port 9997 sur un
+    réseau non maîtrisé. Sur une version 2.x, activer l'un des deux mécanismes
+    — --auth-config ou XINFERENCE_AUTH_ADVANCED — et créer les utilisateurs
+    avant d'exposer le port ; sur une version 3.x, vérifier qu'il n'a pas été
+    désactivé par XINFERENCE_AUTH_ADVANCED=0. Après une exposition, considérer
+    les modèles enregistrés comme connus de l'attaquant et contrôler ce qui
+    tourne réellement sur l'instance : les routes de lancement et d'arrêt
+    étaient ouvertes au même titre que celles de lecture.
+  reference:
+    - https://inference.readthedocs.io/en/latest/user_guide/auth_system.html
+    - https://github.com/xorbitsai/inference/blob/main/xinference/api/routers/models.py
+    - https://github.com/xorbitsai/inference/blob/main/xinference/constants.py
+    - https://github.com/xorbitsai/inference/blob/main/xinference/deploy/docker/docker-compose.yml
+  metadata:
+    max-request: 1
+    vendor: xorbitsai
+    product: xinference
+  tags: ai,llm,xinference,exposure,unauth,misconfig
+
+http:
+  # Le témoin est le registre de modèles, pas /v1/models :
+  #
+  # - /v1/models ne liste que les modèles *chargés*. Sur une instance au repos —
+  #   le cas d'une machine oubliée — la réponse est une liste vide, et le
+  #   template raterait l'exposition. Sa forme est en plus celle du protocole
+  #   OpenAI, partagée par vLLM, SGLang et LM Studio, chacun déjà couvert par
+  #   son propre template.
+  # - /v1/model_registrations/LLM énumère les familles livrées avec le paquet :
+  #   il répond peuplé qu'un modèle tourne ou non.
+  #
+  # Et quand l'authentification est active, cette route porte le scope
+  # models:list. Un 200 prouve donc l'absence d'authentification, pas seulement
+  # qu'un service tourne.
+  #
+  # En lecture seule, et c'est délibéré : le même chemin en POST enregistre un
+  # modèle, et POST /v1/models en lance un — un template qui les appelle
+  # déclenche le téléchargement de poids et occupe le GPU qu'il est censé
+  # signaler.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/model_registrations/LLM"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Deux clés, et ce sont les seules que la réponse sérialise depuis la
+      # version 0.11 : le détail des familles n'est rendu qu'avec
+      # ?detailed=true, que le template ne demande pas — il ferait contrôler
+      # l'état du cache de chaque famille intégrée, donc parcourir le disque de
+      # l'hôte aux frais de l'exploitant.
+      #
+      # "model_name" seul est banal : n'importe quelle passerelle d'inférence
+      # nomme ainsi son modèle. "is_builtin" fait la différence — il sépare les
+      # familles livrées avec le paquet de celles que l'exploitant a
+      # enregistrées, une distinction propre au registre de Xinference, et il
+      # n'appartient à aucune spécification publique. Couplé à un chemin que
+      # personne d'autre ne sert, il désigne le produit.
+      - type: word
+        part: body
+        words:
+          - '"model_name"'
+          - '"is_builtin"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Les modèles que l'exploitant a enregistrés lui-même : c'est ce qui lui
+      # appartient dans la réponse, et souvent le nom d'un modèle affiné maison.
+      - type: json
+        part: body
+        name: custom_model
+        json:
+          - '.[] | select(.is_builtin == false) | .model_name'
+
+      # La taille du catalogue suit les versions du paquet : elle situe
+      # l'ancienneté de l'instance sans exiger de clé de version au matcher.
+      - type: json
+        part: body
+        name: catalog_size
+        json:
+          - 'length'

@@ -809,6 +809,131 @@ def test_flowise_matcher_rests_on_chatflow_columns_not_on_flow_list_shape():
     )
 
 
+# --------------------------------------------------------------------------
+# Xinference expose deux façons de parler de ses modèles, et une seule tient :
+# /v1/models ne liste que les modèles chargés — vide sur une instance au repos,
+# et de la forme OpenAI que trois autres templates du pack revendiquent déjà —
+# tandis que le registre énumère les familles livrées avec le paquet, donc
+# répond peuplé même à vide. Sa réponse non détaillée ne porte que deux clés :
+# la signature doit tenir à celles-là, sans exiger le détail qui coûterait un
+# parcours de disque à l'exploitant, et sans jamais toucher les verbes qui
+# lancent un modèle.
+
+XINFERENCE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "xinference-exposed.yaml")
+
+# Réponse du registre : catalogue intégré, plus un modèle enregistré par
+# l'exploitant. Forme inchangée depuis la version 0.11.
+XINFERENCE_REGISTRATIONS_BODY = (
+    '[{"model_name":"deepseek-v3","is_builtin":true},'
+    '{"model_name":"llama-3.1-instruct","is_builtin":true},'
+    '{"model_name":"support-rag-ft","is_builtin":false},'
+    '{"model_name":"qwen2.5-instruct","is_builtin":true}]'
+)
+
+# Même endpoint avec ?detailed=true : les familles sont rendues entières. Le
+# template ne demande pas ce détail, mais reconnaître cette forme-là ne coûte
+# rien et couvre une instance derrière un proxy qui ajoute le paramètre.
+XINFERENCE_DETAILED_REGISTRATIONS_BODY = (
+    '[{"version":2,"model_name":"qwen2.5-instruct",'
+    '"model_lang":["en","zh"],"model_ability":["generate","chat"],'
+    '"model_description":"Qwen2.5 is the latest series of Qwen large language models.",'
+    '"model_family":"qwen2.5-instruct","is_builtin":true,'
+    '"model_specs":[{"model_format":"pytorch","model_size_in_billions":7,'
+    '"quantizations":["none"],"model_hub":"huggingface",'
+    '"cache_status":false}],"model_version_count":6,'
+    '"model_instance_count":0}]'
+)
+
+# Une autre passerelle d'inférence énumère elle aussi son catalogue et nomme son
+# modèle model_name : cette clé seule ne désigne aucun produit.
+OTHER_MODEL_CATALOG_BODY = (
+    '[{"model_name":"llama-3.1-8b-instruct","backend":"triton",'
+    '"state":"READY","version":"1"},'
+    '{"model_name":"bge-m3","backend":"onnxruntime","state":"READY",'
+    '"version":"2"}]'
+)
+
+# Un registre d'extensions quelconque distingue lui aussi ce qu'il livre de ce
+# que l'exploitant a ajouté : is_builtin seul ne prouve rien non plus.
+OTHER_BUILTIN_REGISTRY_BODY = (
+    '[{"name":"http-request","is_builtin":true,"enabled":true},'
+    '{"name":"crm-connector","is_builtin":false,"enabled":true}]'
+)
+
+
+def xinference_registrations_block():
+    doc = load(XINFERENCE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any("/v1/model_registrations" in p for p in (b.get("path") or []))]
+    assert blocks, (
+        "le template ne vise pas le registre de modèles — /v1/models ne liste "
+        "que les modèles chargés, donc renvoie une liste vide sur une instance "
+        "au repos, et sa forme OpenAI est déjà revendiquée par les templates "
+        "vLLM, SGLang et LM Studio"
+    )
+    return blocks[0]
+
+
+def test_xinference_probe_never_launches_nor_registers_a_model():
+    doc = load(XINFERENCE_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "GET", (
+            "le registre se lit en GET : le même chemin en POST enregistre un "
+            "modèle, et POST /v1/models en lance un — le template déclencherait "
+            "le téléchargement de poids et occuperait le GPU qu'il est censé "
+            "signaler"
+        )
+        for path in (block.get("path") or []):
+            assert "detailed=true" not in path, (
+                "le template demande le catalogue détaillé : Xinference "
+                "contrôlerait l'état du cache de chaque famille intégrée, donc "
+                "parcourrait le disque de l'hôte aux frais de l'exploitant"
+            )
+
+
+def test_xinference_matcher_rests_on_the_registry_flag_not_on_model_name():
+    block = xinference_registrations_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, XINFERENCE_REGISTRATIONS_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /v1/model_registrations de "
+        "Xinference"
+    )
+    assert all(word_matcher_hits(m, XINFERENCE_DETAILED_REGISTRATIONS_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas le registre rendu en détail — il raterait "
+        "une instance dont le paramètre detailed est ajouté en amont"
+    )
+    assert not all(word_matcher_hits(m, OTHER_MODEL_CATALOG_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une passerelle d'inférence qui n'est pas "
+        "Xinference : model_name est le nom que tout le monde donne à son modèle"
+    )
+    assert not all(word_matcher_hits(m, OTHER_BUILTIN_REGISTRY_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur un registre d'extensions : is_builtin seul "
+        "ne désigne aucun produit"
+    )
+    # Collisions internes au pack : ces runtimes décrivent eux aussi le modèle
+    # servi, et deux templates ne doivent pas revendiquer la même instance.
+    for other_body in (VLLM_MODELS_BODY, LMSTUDIO_MODELS_BODY,
+                       SGLANG_MODEL_INFO_BODY, TGI_INFO_BODY):
+        assert not all(word_matcher_hits(m, other_body) for m in body_matchers), (
+            "le template déclenche sur un runtime déjà couvert par son propre "
+            "template"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

@@ -17,7 +17,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [ ] `templates/exposure/localai-unauthenticated-api.yaml` — LocalAI, API compatible OpenAI sans authentification par défaut. Sévérité high.
 - [x] `templates/exposure/lmstudio-server-exposed.yaml` — serveur local LM Studio, endpoint compatible OpenAI. Sévérité medium.
 - [x] `templates/exposure/sglang-server-exposed.yaml` — serveur SGLang, `GET /get_model_info`. Sévérité high.
-- [ ] `templates/exposure/xinference-exposed.yaml` — Xorbits Inference, API de gestion de modèles. Sévérité high.
+- [x] `templates/exposure/xinference-exposed.yaml` — Xorbits Inference, API de gestion de modèles. Sévérité high.
 - [x] `templates/exposure/ollama-model-pull-abuse.yaml` — au-delà de la lecture : prouver que `/api/pull` est atteignable (sans déclencher de téléchargement). Sévérité high.
 
 ## Interfaces & plateformes d'agents
