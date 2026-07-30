@@ -1,0 +1,76 @@
+id: lmstudio-server-exposed
+
+info:
+  name: LM Studio - Exposed Local Inference Server
+  author: popy21
+  severity: medium
+  description: |
+    LM Studio est une application de bureau : son serveur local n'offre aucun
+    mécanisme d'authentification — il n'y a ni clé d'API ni jeton à configurer,
+    l'option n'existe pas dans le produit. Il écoute sur 127.0.0.1:1234 par
+    défaut, mais l'onglet Developer propose un réglage de diffusion sur le réseau
+    local qui le rebascule sur 0.0.0.0. Le même processus sert alors l'API REST
+    de LM Studio sous /api/v0 et les routes compatibles OpenAI sous /v1 à
+    quiconque atteint le port.
+  impact: |
+    GET /api/v0/models énumère les modèles présents sur le poste avec leur
+    éditeur, leur architecture, leur quantification et leur fenêtre de contexte,
+    et indique lesquels sont déjà chargés en mémoire. Les routes de génération du
+    même serveur — /api/v0/chat/completions comme /v1/chat/completions — répondent
+    sans authentification : n'importe qui consomme le CPU ou le GPU du poste, sans
+    limite de débit ni trace d'audit. La sévérité reste medium parce qu'il s'agit
+    d'un poste de travail : pas de multi-tenant à compromettre, et les modèles
+    exposés sont des poids publics.
+  remediation: |
+    Laisser le serveur sur 127.0.0.1 en désactivant la diffusion sur le réseau
+    local dans l'onglet Developer. LM Studio n'implémentant aucune
+    authentification, un accès distant légitime doit passer par un tunnel ou par
+    un proxy qui authentifie à sa place. Ne jamais publier le port 1234 sur un
+    réseau non maîtrisé.
+  reference:
+    - https://lmstudio.ai/docs/app/api/endpoints/rest
+    - https://lmstudio.ai/docs/app/api/endpoints/openai
+  metadata:
+    max-request: 1
+    vendor: lmstudio
+    product: lm-studio
+  tags: ai,llm,lmstudio,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v0/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # /v1/models ne suffirait pas : tous les serveurs compatibles OpenAI le
+      # servent et LM Studio n'y ajoute presque rien. /api/v0/models est l'API
+      # propre au produit, et ces quatre clés décrivent la bibliothèque locale de
+      # LM Studio — éditeur, architecture des poids, format de compatibilité
+      # (gguf ou mlx), état de chargement. Aucune n'appartient à la spécification
+      # OpenAI, donc aucune ne peut venir de vLLM, LocalAI ou LiteLLM.
+      - type: word
+        part: body
+        words:
+          - '"data"'
+          - '"publisher"'
+          - '"arch"'
+          - '"compatibility_type"'
+          - '"state"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'

@@ -247,6 +247,61 @@ def test_tgi_matcher_needs_router_parameters_not_just_model_id():
     )
 
 
+# --------------------------------------------------------------------------
+# LM Studio parle aussi le protocole OpenAI, donc /v1/models ne le distingue de
+# rien. Le template doit se poser sur /api/v0/models, l'API propre au produit, et
+# sa signature doit tenir aux clés de la bibliothèque locale — sinon il déclenche
+# sur les autres runtimes déjà couverts par le pack.
+
+LMSTUDIO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "lmstudio-server-exposed.yaml")
+
+# Réponse de l'API REST de LM Studio : un modèle chargé, un modèle présent mais
+# non chargé.
+LMSTUDIO_MODELS_BODY = (
+    '{"data":[{"id":"qwen2.5-7b-instruct","object":"model","type":"llm",'
+    '"publisher":"lmstudio-community","arch":"qwen2",'
+    '"compatibility_type":"gguf","quantization":"Q4_K_M","state":"loaded",'
+    '"max_context_length":32768,"loaded_context_length":4096},'
+    '{"id":"text-embedding-nomic-embed-text-v1.5","object":"model",'
+    '"type":"embeddings","publisher":"nomic-ai","arch":"nomic-bert",'
+    '"compatibility_type":"gguf","quantization":"Q4_0","state":"not-loaded",'
+    '"max_context_length":2048}],"object":"list"}'
+)
+
+
+def test_lmstudio_matcher_targets_the_product_api_not_openai_compat():
+    doc = load(LMSTUDIO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/v0/models" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/v0/models — /v1/models est partagé "
+        "par tous les serveurs compatibles OpenAI et ne désigne pas LM Studio"
+    )
+
+    block = blocks[0]
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, LMSTUDIO_MODELS_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /api/v0/models de LM Studio"
+    )
+    assert not all(word_matcher_hits(m, OTHER_OPENAI_API_BODY) for m in body_matchers), (
+        "le template déclenche sur une API compatible OpenAI qui n'est pas LM Studio"
+    )
+    # Collision interne au pack : deux templates ne doivent pas revendiquer la
+    # même instance.
+    assert not all(word_matcher_hits(m, VLLM_MODELS_BODY) for m in body_matchers), (
+        "le template déclenche sur vLLM, déjà couvert par son propre template"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
