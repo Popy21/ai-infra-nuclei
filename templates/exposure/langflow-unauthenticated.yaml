@@ -1,0 +1,138 @@
+id: langflow-unauthenticated
+
+info:
+  name: Langflow - Unauthenticated Management API
+  author: popy21
+  severity: critical
+  description: |
+    LANGFLOW_AUTO_LOGIN vaut True par défaut dans l'application : tant qu'on ne
+    le désactive pas, Langflow signe chaque requête au nom du superutilisateur —
+    le compte langflow, créé au premier démarrage. Les images Docker officielles
+    posent false, mais le démarrage documenté (pip install langflow, puis
+    langflow run) garde le défaut, et --host 0.0.0.0 est à un drapeau de là.
+    Avant la version 1.5, ce seul réglage ouvrait toute l'API. Depuis, une clé
+    reste exigée sur les routes de gestion sauf si LANGFLOW_SKIP_AUTH_AUTO_LOGIN
+    est posé à true — un réglage que la documentation présente comme le moyen de
+    piloter l'instance par API sans clé, donc appliqué exprès. Le témoin est
+    GET /api/v1/users/whoami : la route ne fait que renvoyer l'utilisateur
+    courant, elle est gardée par CurrentActiveUser comme le reste de l'API, et
+    un 200 sans le moindre en-tête d'autorisation signifie que le serveur a
+    identifié l'anonyme — la réponse dit à quel compte, et avec quel privilège.
+  impact: |
+    Cette dépendance-là garde toute l'API de gestion : lecture et écriture des
+    flux, variables globales — où sont rangées les clés des fournisseurs de
+    modèles —, création de clés d'API, dépôt de fichiers. Construire ou exécuter
+    un flux fait tourner le code Python de ses composants personnalisés sur
+    l'hôte, avec les privilèges du processus. Et /api/v1/validate/code compile
+    puis exec() le code qu'on lui poste : c'est la faille CVE-2025-3248,
+    inscrite au catalogue KEV de la CISA et exploitée dans la nature pour
+    déployer le botnet Flodrix. La version 1.3.0 l'a refermée en posant
+    get_current_active_user sur la route — exactement la dépendance qui vient de
+    laisser passer l'anonyme ici. Sur une instance qui répond à ce template, le
+    correctif de version ne tient plus : la charge du KEV repasse, quelle que
+    soit la version installée. Un is_superuser à true dans la réponse dit que
+    l'anonyme dispose en plus des routes réservées à l'administrateur, dont
+    l'énumération des comptes.
+  remediation: |
+    Poser LANGFLOW_AUTO_LOGIN=false, créer le superutilisateur
+    (LANGFLOW_SUPERUSER / LANGFLOW_SUPERUSER_PASSWORD) et une LANGFLOW_SECRET_KEY
+    qui ne soit pas celle par défaut — elle chiffre les variables globales —
+    avant d'exposer le port ; ne jamais laisser LANGFLOW_SKIP_AUTH_AUTO_LOGIN à
+    true sur un service atteignable. Lier le serveur à 127.0.0.1 et le publier
+    derrière un proxy qui authentifie. Un refus sur cette route ne blanchit pas
+    l'instance : à partir de la version 1.5, une instance dont AUTO_LOGIN est
+    resté à true répond 403 ici mais sert toujours GET /api/v1/auto_login, qui
+    délivre une session de superutilisateur à qui la demande. Après une
+    exposition, considérer comme divulguées les variables globales et toute clé
+    inscrite dans un flux, les renouveler, et contrôler les clés d'API de
+    l'instance : l'anonyme pouvait s'en créer une, qui survit à la fermeture
+    d'AUTO_LOGIN.
+  reference:
+    - https://docs.langflow.org/api-keys-and-authentication
+    - https://github.com/langflow-ai/langflow/blob/main/src/backend/base/langflow/api/v1/users.py
+    - https://github.com/langflow-ai/langflow/blob/main/src/backend/base/langflow/services/database/models/user/model.py
+    - https://github.com/langflow-ai/langflow/blob/main/src/backend/base/langflow/api/v1/login.py
+    - https://nvd.nist.gov/vuln/detail/CVE-2025-3248
+  metadata:
+    max-request: 1
+    vendor: langflow-ai
+    product: langflow
+    shodan-query: title:"Langflow"
+  tags: ai,llm,langflow,exposure,unauth,rce,misconfig
+
+http:
+  # /api/v1/users/whoami, et rien d'autre. Les trois voisins qui viennent à
+  # l'esprit sont écartés, chacun pour une raison propre :
+  #
+  # - /api/v1/auto_login délivre une session de superutilisateur à qui la
+  #   demande. Ce serait la preuve la plus large — elle vaudrait aussi pour les
+  #   instances récentes qui exigent encore une clé sur les routes de gestion —
+  #   mais le template repartirait avec le jeton qu'il est censé signaler, et la
+  #   route écrit en base au passage (last_login). Un scanner ne se connecte pas.
+  # - /api/v1/flows/ rend le graphe entier de chaque flux, projets de démarrage
+  #   compris tant que remove_example_flows n'est pas demandé : plusieurs
+  #   mégaoctets par cible. Et sur une instance encore vide, la réponse est une
+  #   liste sans clé — le template raterait l'exposition.
+  # - /api/v1/version répond sans authentification par construction, y compris
+  #   sur une instance correctement fermée : il nomme le produit, il ne prouve
+  #   rien.
+  #
+  # whoami tient en quelques centaines d'octets, ne modifie rien, et sa réponse
+  # est la preuve elle-même : le serveur nomme le compte qu'il vient d'attribuer
+  # à une requête sans identifiant.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/users/whoami"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Trois clés du modèle UserRead, et les trois sont sérialisées depuis la
+      # 1.0 — celles ajoutées depuis, "store_api_key" et "optins", sont écartées
+      # pour ne pas rater les instances anciennes, précisément celles qui
+      # traînent exposées.
+      #
+      # - "create_at" est la faute de frappe de Langflow pour created_at : c'est
+      #   le nom de colonne de son modèle User, et de personne d'autre. C'est le
+      #   discriminant.
+      # - "is_superuser" porte le renseignement qui compte — le privilège
+      #   accordé à l'anonyme — mais seul il ne désigne rien : c'est aussi un
+      #   champ du modèle utilisateur de Django, servi tel quel par quantité
+      #   d'API.
+      # - "last_login_at" achève de séparer les deux : Django écrit last_login.
+      #
+      # La valeur de "is_superuser" n'est pas exigée au matcher, seulement
+      # extraite : un compte non privilégié rendu à un anonyme reste une API de
+      # gestion ouverte, et l'exiger à true raterait ce cas-là.
+      - type: word
+        part: body
+        words:
+          - '"create_at"'
+          - '"is_superuser"'
+          - '"last_login_at"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le compte auquel le serveur a rattaché la requête anonyme — langflow
+      # tant que LANGFLOW_SUPERUSER n'a pas été changé.
+      - type: json
+        part: body
+        name: account
+        json:
+          - '.username'
+
+      # Le privilège accordé avec : à true, les routes réservées à
+      # l'administrateur répondent elles aussi.
+      - type: json
+        part: body
+        name: superuser
+        json:
+          - '.is_superuser'

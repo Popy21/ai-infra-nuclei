@@ -934,6 +934,136 @@ def test_xinference_matcher_rests_on_the_registry_flag_not_on_model_name():
         )
 
 
+# --------------------------------------------------------------------------
+# Langflow a un endpoint qui prouverait l'exposition bien plus largement,
+# /api/v1/auto_login : il délivre une session de superutilisateur à qui la
+# demande. Le template ne doit pas l'appeler — il repartirait avec le jeton
+# qu'il signale — ni toucher /api/v1/validate/code, qui exec() ce qu'on lui
+# poste. Reste /api/v1/users/whoami, dont la réponse est le dossier
+# utilisateur : forme banale, un compte a un nom, un drapeau d'activité et une
+# date. La signature doit donc tenir aux colonnes propres au modèle de Langflow,
+# et aux plus anciennes d'entre elles.
+
+LANGFLOW_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "langflow-unauthenticated.yaml")
+
+# Réponse d'une version récente : le superutilisateur créé au premier démarrage,
+# avec les champs ajoutés après coup (store_api_key, optins).
+LANGFLOW_WHOAMI_BODY = (
+    '{"id":"4c9d1e77-2a05-4b8f-9c31-7e6a0d4b2f18","username":"langflow",'
+    '"profile_image":null,"store_api_key":null,"is_active":true,'
+    '"is_superuser":true,"create_at":"2026-04-11T08:22:41.113402",'
+    '"updated_at":"2026-07-19T14:05:02.887130",'
+    '"last_login_at":"2026-07-19T14:05:02.886901",'
+    '"optins":{"github_starred":false,"dialog_dismissed":true,'
+    '"discord_clicked":false}}'
+)
+
+# Même route sur une instance 1.0 : ni store_api_key, ni optins, et le compte
+# n'a jamais servi. Le template doit toujours la reconnaître.
+LANGFLOW_OLD_WHOAMI_BODY = (
+    '{"id":"b8f0c2d4-6e11-4a73-95bc-0d3f8e7a1c42","username":"langflow",'
+    '"profile_image":null,"is_active":true,"is_superuser":true,'
+    '"create_at":"2024-06-03T09:12:55.401238",'
+    '"updated_at":"2024-06-03T09:12:55.401244","last_login_at":null}'
+)
+
+# Le modèle utilisateur de Django, servi tel quel par quantité d'API : mêmes
+# username, is_active et is_superuser. Ces clés seules ne désignent donc rien.
+DJANGO_CURRENT_USER_BODY = (
+    '{"id":1,"username":"admin","email":"admin@corp.internal",'
+    '"first_name":"","last_name":"","is_staff":true,"is_active":true,'
+    '"is_superuser":true,"last_login":"2026-07-19T14:05:02.886901Z",'
+    '"date_joined":"2024-06-03T09:12:55.401238Z"}'
+)
+
+# Un profil applicatif quelconque : il a lui aussi un nom, une image et des
+# dates de création et de connexion.
+OTHER_PROFILE_BODY = (
+    '{"id":"9c2a","username":"adele","profile_image":"/avatars/9c2a.png",'
+    '"is_active":true,"role":"owner","created_at":"2026-01-08T10:00:00Z",'
+    '"last_login_at":"2026-07-28T18:41:09Z"}'
+)
+
+
+def langflow_whoami_block():
+    doc = load(LANGFLOW_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/v1/users/whoami" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/v1/users/whoami — /api/v1/version "
+        "répond sans authentification même sur une instance fermée et ne prouve "
+        "donc rien, et /api/v1/flows/ rend une liste sans clé sur une instance "
+        "encore vide"
+    )
+    return blocks[0]
+
+
+def test_langflow_probe_never_opens_a_session_nor_runs_code():
+    doc = load(LANGFLOW_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "GET", (
+            "le dossier utilisateur se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "auto_login" not in path, (
+                "le template appelle /api/v1/auto_login : la route délivre une "
+                "session de superutilisateur à qui la demande, donc le template "
+                "repartirait avec le jeton qu'il est censé signaler — et elle "
+                "écrit en base au passage"
+            )
+            assert "/validate/code" not in path, (
+                "le template appelle /api/v1/validate/code, qui compile et "
+                "exec() le code posté : c'est l'exécution qu'il est censé "
+                "signaler, pas provoquer"
+            )
+
+
+def test_langflow_matcher_rests_on_the_user_model_not_on_a_generic_profile():
+    block = langflow_whoami_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, LANGFLOW_WHOAMI_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /api/v1/users/whoami de Langflow"
+    )
+    assert all(word_matcher_hits(m, LANGFLOW_OLD_WHOAMI_BODY)
+               for m in body_matchers), (
+        "le template exige des colonnes absentes des versions plus anciennes de "
+        "Langflow — store_api_key ou optins — il raterait les instances qui "
+        "traînent exposées"
+    )
+    assert not all(word_matcher_hits(m, DJANGO_CURRENT_USER_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur le modèle utilisateur de Django : "
+        "is_superuser et is_active sont les champs que sert n'importe quelle "
+        "API bâtie dessus"
+    )
+    assert not all(word_matcher_hits(m, OTHER_PROFILE_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur un profil applicatif quelconque : un compte "
+        "a partout un nom, une image et des dates"
+    )
+
+    # Le privilège est la conséquence, pas la preuve : une instance qui rend un
+    # compte non privilégié à un anonyme a tout autant son API de gestion
+    # ouverte.
+    assert all(word_matcher_hits(m, LANGFLOW_WHOAMI_BODY.replace(
+        '"is_superuser":true', '"is_superuser":false')) for m in body_matchers), (
+        "le template exige is_superuser à true : il raterait une instance dont "
+        "le compte auto-connecté n'est pas superutilisateur, alors que son API "
+        "de gestion répond tout autant sans authentification"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
