@@ -1,0 +1,117 @@
+id: langserve-exposed-playground
+
+info:
+  name: LangServe - Unauthenticated Runnable Routes Exposed
+  author: popy21
+  severity: high
+  description: |
+    LangServe n'apporte aucune authentification : add_routes se contente de
+    greffer les routes d'un Runnable LangChain sur une application FastAPI, et
+    rien n'y monte de contrôle d'accès tant que le développeur ne passe pas
+    lui-même une dépendance de sécurité. Les projets générés par langchain-cli
+    laissent donc l'application nue, documentation interactive comprise : /docs
+    et son document source /openapi.json répondent à quiconque atteint le port,
+    et le second énumère les routes greffées — /invoke, /batch, /stream,
+    /stream_log et les trois schémas. Un seul GET prouve ainsi que la chaîne est
+    servie et que personne ne réclame de jeton.
+  impact: |
+    Le document de la documentation donne la carte d'attaque complète : chemin de
+    montage de chaque chaîne, et surtout le schéma d'entrée de /invoke, soit la
+    forme exacte du corps à envoyer pour faire tourner la chaîne. Or
+    /invoke exécute le Runnable côté serveur, avec les clés d'API du déploiement :
+    l'anonyme consomme le quota du fournisseur de modèle sur le compte de
+    l'exploitant, sans limite de débit ni trace d'audit. Le schéma de
+    configuration va plus loin : quand la chaîne déclare des champs
+    configurables, l'appelant choisit le modèle et les paramètres de génération,
+    et réécrit le prompt système si celui-ci a été rendu configurable. Les mêmes
+    entrées sont servies en /stream et /stream_log, et stream_log restitue les
+    étapes intermédiaires — donc les prompts assemblés et les documents récupérés
+    par un pipeline RAG, y compris ce que l'index contient de privé.
+  remediation: |
+    LangServe ne prévoit pas d'authentification : la protection se pose au niveau
+    de FastAPI. Passer une dépendance de sécurité à add_routes
+    (dependencies=[Depends(...)]) ou monter le contrôle sur l'application
+    entière, et désactiver la documentation en production
+    (FastAPI(docs_url=None, openapi_url=None)) — elle n'apporte rien à un client
+    légitime et donne la carte des routes à tous les autres. Lier le serveur à
+    127.0.0.1 et le publier derrière un proxy qui authentifie. Une dépendance
+    globale ferme l'accès anonyme mais n'empêche pas un compte authentifié
+    d'appeler une chaîne à laquelle il n'a pas droit : l'autorisation par
+    utilisateur reste à écrire.
+  reference:
+    - https://github.com/langchain-ai/langserve
+    - https://github.com/langchain-ai/langserve/blob/main/README.md
+    - https://github.com/langchain-ai/langserve/blob/main/langserve/server.py
+    - https://fastapi.tiangolo.com/tutorial/security/
+  metadata:
+    max-request: 1
+    vendor: langchain-ai
+    product: langserve
+  tags: ai,llm,langchain,langserve,exposure,unauth,misconfig
+
+http:
+  # /openapi.json plutôt que /docs, et c'est le cœur du template : /docs ne
+  # renvoie qu'une coquille HTML de Swagger UI, identique pour toute application
+  # FastAPI de la Terre — s'y accrocher reviendrait à signaler un titre de page.
+  # /openapi.json est le document que cette page charge et affiche : même preuve
+  # d'exposition, mais avec le contenu qui identifie le produit. Un GET, aucun
+  # effet de bord, et surtout aucune exécution de la chaîne — un POST sur
+  # /invoke prouverait la même chose en faisant tourner le modèle aux frais de
+  # l'exploitant, ce qui est précisément l'abus que le template signale.
+  - method: GET
+    path:
+      - "{{BaseURL}}/openapi.json"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Les noms de routes que add_routes greffe sur l'application sont la
+      # signature : ce sont les méthodes de l'interface Runnable de LangChain
+      # transposées en HTTP, et aucune autre pile n'a de raison de servir ce
+      # trio. "/invoke" seul ne prouverait rien — le mot est banal pour toute
+      # passerelle de fonctions — mais "/stream_log", la route qui rejoue les
+      # étapes intermédiaires d'une chaîne, et "/config_schema", celle qui décrit
+      # ses champs configurables, ne portent aucun sens hors de LangChain.
+      #
+      # Ces trois routes-là et pas d'autres : /astream_events n'est apparue que
+      # dans les versions récentes et /feedback ne se monte que sur option, les
+      # exiger raterait les instances anciennes ou minimales — précisément celles
+      # qui traînent exposées.
+      #
+      # Le guillemet fermant est porté par le mot, l'ouvrant non : add_routes
+      # accepte un préfixe de montage, la clé du document vaut "/invoke" à la
+      # racine mais "/ma_chaine/invoke" dès qu'une chaîne est nommée. Ancrer les
+      # deux côtés ne reconnaîtrait que le montage à la racine.
+      - type: word
+        part: body
+        words:
+          - '/invoke"'
+          - '/stream_log"'
+          - '/config_schema"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le titre de l'application nomme le déploiement — les projets langchain-cli
+      # laissent "LangChain Server", les autres portent le nom du service.
+      - type: json
+        part: body
+        name: server_title
+        json:
+          - '.info.title'
+
+      # Le chemin de montage de chaque chaîne servie : c'est ce qu'il faut
+      # remonter à l'exploitant, pas seulement le fait que le port réponde.
+      - type: regex
+        part: body
+        name: invoke_route
+        group: 1
+        regex:
+          - '"(/[^"]*invoke)"'

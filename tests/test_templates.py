@@ -559,6 +559,134 @@ def test_comfyui_matcher_rests_on_product_keys_not_generic_gpu_stats():
         )
 
 
+# --------------------------------------------------------------------------
+# LangServe n'est qu'une greffe de routes sur FastAPI : sa documentation est
+# celle de FastAPI, donc /docs ne renvoie que la coquille Swagger UI commune à
+# toutes les applications du framework. La preuve doit se lire dans le document
+# que cette page charge, et tenir aux routes que add_routes greffe — sans jamais
+# appeler /invoke, qui ferait tourner la chaîne aux frais de l'exploitant.
+
+LANGSERVE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "langserve-exposed-playground.yaml")
+
+# Document d'une application langchain-cli : la chaîne est montée sous un
+# préfixe, cas de loin le plus courant.
+LANGSERVE_OPENAPI_BODY = (
+    '{"openapi":"3.1.0","info":{"title":"LangChain Server","version":"1.0",'
+    '"description":"Spin up a simple api server using LangChain Runnable '
+    'interfaces"},"paths":{'
+    '"/ma-chaine/invoke":{"post":{"summary":"Invoke",'
+    '"operationId":"invoke_ma_chaine_invoke_post"}},'
+    '"/ma-chaine/batch":{"post":{"summary":"Batch"}},'
+    '"/ma-chaine/stream":{"post":{"summary":"Stream"}},'
+    '"/ma-chaine/stream_log":{"post":{"summary":"Stream Log"}},'
+    '"/ma-chaine/input_schema":{"get":{"summary":"Input Schema"}},'
+    '"/ma-chaine/output_schema":{"get":{"summary":"Output Schema"}},'
+    '"/ma-chaine/config_schema":{"get":{"summary":"Config Schema"}}},'
+    '"components":{"schemas":{"MaChaineInvokeRequest":{"type":"object"}}}}'
+)
+
+# Même produit, montage à la racine : les routes n'ont plus de préfixe. Une
+# instance plus ancienne, sans /astream_events ni /feedback.
+LANGSERVE_ROOT_OPENAPI_BODY = (
+    '{"openapi":"3.0.2","info":{"title":"FastAPI","version":"0.1.0"},"paths":{'
+    '"/invoke":{"post":{"summary":"Invoke"}},'
+    '"/batch":{"post":{"summary":"Batch"}},'
+    '"/stream":{"post":{"summary":"Stream"}},'
+    '"/stream_log":{"post":{"summary":"Stream Log"}},'
+    '"/input_schema":{"get":{"summary":"Input Schema"}},'
+    '"/output_schema":{"get":{"summary":"Output Schema"}},'
+    '"/config_schema":{"get":{"summary":"Config Schema"}}}}'
+)
+
+# Une passerelle de fonctions quelconque : elle sert /docs, elle sert
+# /openapi.json, et elle a bien une route /invoke. "invoke" est un mot banal, il
+# ne désigne aucun produit à lui seul.
+OTHER_FASTAPI_OPENAPI_BODY = (
+    '{"openapi":"3.1.0","info":{"title":"functions-runner","version":"2.3.0"},'
+    '"paths":{"/invoke":{"post":{"summary":"Invoke Function",'
+    '"operationId":"invoke_invoke_post"}},'
+    '"/healthz":{"get":{"summary":"Healthz"}},'
+    '"/config":{"get":{"summary":"Config"}}}}'
+)
+
+# Collision interne au pack : les runtimes déjà couverts sont eux aussi des
+# applications FastAPI et servent donc le même /openapi.json.
+VLLM_OPENAPI_BODY = (
+    '{"openapi":"3.1.0","info":{"title":"FastAPI","version":"0.1.0"},"paths":{'
+    '"/health":{"get":{"summary":"Health"}},'
+    '"/v1/models":{"get":{"summary":"Show Available Models"}},'
+    '"/v1/completions":{"post":{"summary":"Create Completion"}},'
+    '"/v1/chat/completions":{"post":{"summary":"Create Chat Completion"}},'
+    '"/tokenize":{"post":{"summary":"Tokenize"}}}}'
+)
+
+
+def langserve_openapi_block():
+    doc = load(LANGSERVE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/openapi.json" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /openapi.json — /docs ne renvoie que la "
+        "coquille Swagger UI, identique pour toute application FastAPI, et ne "
+        "désigne donc pas LangServe"
+    )
+    return blocks[0]
+
+
+def test_langserve_probe_never_runs_the_chain():
+    doc = load(LANGSERVE_TEMPLATE)
+
+    assert langserve_openapi_block().get("method") == "GET", (
+        "le document de documentation se lit en GET : le template ne doit rien "
+        "envoyer à une instance qu'il découvre"
+    )
+
+    for block in (doc.get("http") or []):
+        paths = block.get("path") or []
+        assert not (block.get("method") == "POST"
+                    and any("/invoke" in p for p in paths)), (
+            "le template appelle /invoke : la chaîne tournerait vraiment, donc "
+            "le template consommerait le quota du fournisseur de modèle sur le "
+            "compte de l'exploitant — c'est l'abus qu'il est censé signaler"
+        )
+
+
+def test_langserve_matcher_rests_on_runnable_routes_not_on_fastapi_shape():
+    block = langserve_openapi_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, LANGSERVE_OPENAPI_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas le document d'une application LangServe"
+    )
+    assert all(word_matcher_hits(m, LANGSERVE_ROOT_OPENAPI_BODY)
+               for m in body_matchers), (
+        "le template n'accepte que les chaînes montées sous un préfixe, ou "
+        "exige des routes absentes des versions plus anciennes — il raterait "
+        "les instances qui traînent exposées"
+    )
+    assert not all(word_matcher_hits(m, OTHER_FASTAPI_OPENAPI_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une passerelle de fonctions qui n'est pas "
+        "LangServe : /invoke est un nom de route banal"
+    )
+    assert not all(word_matcher_hits(m, VLLM_OPENAPI_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur vLLM, déjà couvert par son propre template : "
+        "tous ces runtimes sont des applications FastAPI et servent le même "
+        "/openapi.json"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

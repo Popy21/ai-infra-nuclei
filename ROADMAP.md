@@ -23,7 +23,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 ## Interfaces & plateformes d'agents
 
 - [x] `templates/exposure/comfyui-unauthenticated.yaml` — ComfyUI, `GET /system_stats` renvoie les informations GPU et la version. Sévérité high.
-- [ ] `templates/exposure/langserve-exposed-playground.yaml` — LangServe expose `/docs` et les routes `/invoke` sans authentification. Sévérité high.
+- [x] `templates/exposure/langserve-exposed-playground.yaml` — LangServe expose `/docs` et les routes `/invoke` sans authentification. Sévérité high.
 - [ ] `templates/exposure/flowise-unauthenticated-api.yaml` — Flowise, `GET /api/v1/chatflows` sans authentification. Sévérité critical (les identifiants sont lisibles).
 - [ ] `templates/exposure/langflow-unauthenticated.yaml` — Langflow, API sans authentification. Sévérité critical.
 - [ ] `templates/exposure/open-webui-signup-enabled.yaml` — Open WebUI avec inscription ouverte : n'importe qui crée un compte. Sévérité medium.
