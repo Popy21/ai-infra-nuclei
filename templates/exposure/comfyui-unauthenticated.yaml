@@ -1,0 +1,97 @@
+id: comfyui-unauthenticated
+
+info:
+  name: ComfyUI - Unauthenticated Server
+  author: popy21
+  severity: high
+  description: |
+    ComfyUI n'a aucune notion d'authentification : ni écran de connexion, ni clé
+    d'API, ni middleware de contrôle à monter. Le serveur écoute sur 127.0.0.1 par
+    défaut, mais --listen le bascule sur 0.0.0.0 et mapper le port 8188 d'un
+    conteneur produit le même résultat — le geste habituel pour piloter la machine
+    à GPU depuis un autre poste. Dès lors, /system_stats répond à quiconque atteint
+    le port : c'est l'endpoint que l'interface interroge pour afficher l'état de la
+    machine, et il n'existe aucun réglage qui le ferme sans fermer le serveur.
+  impact: |
+    /system_stats décrit la machine : modèle de chaque GPU, VRAM totale et libre,
+    système, versions de ComfyUI, de Python et de PyTorch, et sur les versions
+    récentes la ligne de commande complète du processus — donc les chemins de
+    l'hôte passés en argument. Surtout, l'absence d'authentification vaut pour tout
+    le processus, pas pour ce seul endpoint : /prompt accepte un graphe de travail
+    de l'anonyme et le fait exécuter sur le GPU, sans limite de débit ni trace
+    d'audit, tandis que les routes de fichiers servent et reçoivent des chemins.
+    Les nœuds installés déterminent jusqu'où cela porte : une instance chargée de
+    nœuds tiers offre à l'anonyme leur propre surface, lecture et écriture de
+    fichiers comprises.
+  remediation: |
+    Laisser l'adresse d'écoute sur 127.0.0.1 et publier le service derrière un
+    proxy qui authentifie ; ne pas passer --listen et ne pas mapper le port 8188
+    sur un réseau non maîtrisé. Les identifiants d'utilisateur que l'API accepte ne
+    servent qu'à séparer les espaces de travail : aucun n'est vérifié, ils ne
+    constituent pas une authentification et ne restreignent aucune route.
+  reference:
+    - https://docs.comfy.org/
+    - https://github.com/comfyanonymous/ComfyUI/blob/master/server.py
+    - https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/cli_args.py
+    - https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/model_management.py
+  metadata:
+    max-request: 1
+    vendor: comfyanonymous
+    product: comfyui
+    shodan-query: title:"ComfyUI"
+  tags: ai,comfyui,stable-diffusion,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/system_stats"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le vocabulaire de cet endpoint est banal : "system", "devices", "os",
+      # "vram_total" ou "python_version" se retrouvent dans n'importe quelle sonde
+      # de supervision GPU maison. Ces trois mots-là, non :
+      #
+      # - "embedded_python" est un comfyuisme, le drapeau qui teste si
+      #   l'interpréteur vit dans un répertoire python_embeded, c'est-à-dire la
+      #   distribution portable Windows du projet ; aucune autre pile n'a de raison
+      #   de sérialiser cette clé.
+      # - "torch_vram_total" vient de model_management, qui distingue la VRAM de la
+      #   carte de celle que torch s'est réservée — une distinction propre à la
+      #   gestion mémoire de ComfyUI.
+      # - "devices" porte l'inventaire des GPU lui-même.
+      #
+      # Ce sont aussi trois clés que toutes les versions sérialisent, et c'est
+      # délibéré : "comfyui_version" identifierait le produit de façon encore plus
+      # nette mais n'existe que depuis les versions récentes, l'exiger raterait les
+      # instances anciennes — précisément celles qui traînent exposées. La version
+      # est donc rapportée par un extracteur, pas exigée par le matcher.
+      - type: word
+        part: body
+        words:
+          - '"embedded_python"'
+          - '"torch_vram_total"'
+          - '"devices"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: comfyui_version
+        json:
+          - '.system.comfyui_version'
+
+      - type: json
+        part: body
+        name: gpu
+        json:
+          - '.devices[0].name'

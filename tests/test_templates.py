@@ -469,6 +469,96 @@ def test_ollama_pull_matcher_holds_across_versions_without_becoming_generic():
     )
 
 
+# --------------------------------------------------------------------------
+# /system_stats décrit une machine à GPU, et ce vocabulaire n'appartient à
+# personne : "system", "devices", "os", "vram_total", "python_version" sont ce
+# qu'écrirait n'importe quelle sonde de supervision maison. La signature du
+# template ComfyUI doit donc tenir à des clés que le produit seul sérialise, tout
+# en restant sur celles que toutes les versions émettent — exiger
+# "comfyui_version" raterait les instances anciennes.
+
+COMFYUI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "comfyui-unauthenticated.yaml")
+
+# Réponse d'une version récente : le dict complet, argv compris.
+COMFYUI_SYSTEM_STATS_BODY = (
+    '{"system":{"os":"posix","ram_total":67260375040,"ram_free":31234567890,'
+    '"comfyui_version":"0.3.44","required_frontend_version":"1.23.4",'
+    '"python_version":"3.12.4 (main, Jun  7 2024, 06:33:07) [GCC 12.2.0]",'
+    '"pytorch_version":"2.7.1+cu126","embedded_python":false,'
+    '"argv":["main.py","--listen","0.0.0.0","--output-directory","/srv/out"]},'
+    '"devices":[{"name":"cuda:0 NVIDIA GeForce RTX 4090 : cudaMallocAsync",'
+    '"type":"cuda","index":0,"vram_total":25757220864,"vram_free":24696061952,'
+    '"torch_vram_total":1073741824,"torch_vram_free":58720256}]}'
+)
+
+# Même endpoint sur une version antérieure : ni comfyui_version, ni les versions
+# de PyTorch et du frontend, ni la mémoire de l'hôte, ni argv. Le template doit
+# toujours reconnaître celle-ci.
+COMFYUI_OLD_SYSTEM_STATS_BODY = (
+    '{"system":{"os":"posix",'
+    '"python_version":"3.10.12 (main, Nov 20 2023, 15:14:05) [GCC 11.4.0]",'
+    '"embedded_python":false},'
+    '"devices":[{"name":"cuda:0 NVIDIA GeForce RTX 3090 : cudaMallocAsync",'
+    '"type":"cuda","index":0,"vram_total":25438126080,"vram_free":24216764416,'
+    '"torch_vram_total":1073741824,"torch_vram_free":50331648}]}'
+)
+
+# Une sonde de supervision GPU quelconque : elle emploie tout le vocabulaire
+# générique de /system_stats — system, devices, os, python_version, vram_total,
+# vram_free, jusqu'à une version — sans être ComfyUI. Ces clés seules ne prouvent
+# donc rien.
+OTHER_GPU_STATS_BODY = (
+    '{"system":{"os":"posix","python_version":"3.11.9","hostname":"gpu-node-04"},'
+    '"devices":[{"name":"NVIDIA A100-SXM4-40GB","type":"cuda","index":0,'
+    '"vram_total":42949672960,"vram_free":41003286528}],"version":"2.4.1"}'
+)
+
+
+def test_comfyui_matcher_rests_on_product_keys_not_generic_gpu_stats():
+    doc = load(COMFYUI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/system_stats" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /system_stats"
+
+    block = blocks[0]
+    assert block.get("method") == "GET", (
+        "/system_stats se lit en GET : le template ne doit rien envoyer à une "
+        "instance qu'il découvre"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, COMFYUI_SYSTEM_STATS_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /system_stats de ComfyUI"
+    )
+    assert all(word_matcher_hits(m, COMFYUI_OLD_SYSTEM_STATS_BODY)
+               for m in body_matchers), (
+        "le template exige des clés absentes des versions plus anciennes de "
+        "ComfyUI — comfyui_version notamment — il raterait les instances qui "
+        "traînent exposées"
+    )
+    assert not all(word_matcher_hits(m, OTHER_GPU_STATS_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une sonde de supervision GPU qui n'est pas "
+        "ComfyUI : system, devices et vram_total sont des clés banales"
+    )
+    # Collisions internes au pack : ces corps décrivent eux aussi la machine ou le
+    # modèle servi, et deux templates ne doivent pas revendiquer la même instance.
+    for other_body in (TGI_INFO_BODY, SGLANG_MODEL_INFO_BODY):
+        assert not all(word_matcher_hits(m, other_body) for m in body_matchers), (
+            "le template déclenche sur un runtime déjà couvert par son propre "
+            "template"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
