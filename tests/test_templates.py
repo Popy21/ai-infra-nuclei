@@ -1635,6 +1635,199 @@ def test_dify_matcher_proves_the_console_is_unclaimed_not_merely_that_it_is_dify
     )
 
 
+# --------------------------------------------------------------------------
+# LiteLLM ne garde ses routes qu'avec un master_key, et rien ne l'impose au
+# démarrage : user_api_key_auth rend un jeton valable dès que master_key vaut
+# None, et n'exige une clé que dans le cas contraire. Un 200 anonyme sur une
+# route portant cette dépendance est donc le constat entier. Mais /v1/models,
+# la route que l'énoncé désigne, est bâtie avec provider="openai" en dur : son
+# corps est la forme OpenAI nue, celle-là même que ce fichier tient pour la
+# contre-épreuve depuis le template vLLM. La preuve doit donc se lire sur
+# /model/info, qui porte la même dépendance et sert les clés du schéma de
+# config.yaml — et le template ne doit toucher ni la route de complétion, qui
+# dépenserait le budget du fournisseur, ni celle qui émet des clés virtuelles.
+
+LITELLM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "litellm-proxy-no-master-key.yaml")
+
+# Réponse de /model/info sur une instance sans master_key (LiteLLM courant),
+# tronquée : model_info porte en réalité plus de cent clés de tarification.
+# api_key a été retiré de litellm_params par
+# remove_sensitive_info_from_deployment().
+LITELLM_MODEL_INFO_BODY = (
+    '{"data":[{"model_name":"fake-openai-endpoint","litellm_params":'
+    '{"api_base":"https://exampleopenaiendpoint-production.up.railway.app/",'
+    '"use_in_pass_through":false,"use_litellm_proxy":false,'
+    '"merge_reasoning_content_in_choices":false,"model":"openai/fake"},'
+    '"model_info":{"id":"46577d4b09b8d111c341a16bc55d5771bb3972ec28e80e48dc21'
+    'bbc6261f4ca1","db_model":false,"key":"openai/fake","max_tokens":null,'
+    '"input_cost_per_token":0,"output_cost_per_token":0,'
+    '"litellm_provider":"openai","mode":null,"tpm":null,"rpm":null}}]}'
+)
+
+# Même route sur une instance nettement plus ancienne : litellm_params n'a que
+# les deux clés venues du config.yaml, et model_info aucune des clés ajoutées
+# depuis. Le template doit toujours la reconnaître.
+LITELLM_OLD_MODEL_INFO_BODY = (
+    '{"data":[{"model_name":"fake-openai-endpoint","litellm_params":'
+    '{"api_base":"https://exampleopenaiendpoint-production.up.railway.app/",'
+    '"model":"openai/fake"},"model_info":{"id":"46577d4b09b8d111c341a16bc55d'
+    '5771bb3972ec28e80e48dc21bbc6261f4ca1","max_tokens":null,'
+    '"input_cost_per_token":0,"output_cost_per_token":0}}]}'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. La même table de routage, réindentée.
+LITELLM_REFORMATTED_MODEL_INFO_BODY = (
+    '{\n  "data": [\n    {\n      "model_name": "fake-openai-endpoint",\n'
+    '      "litellm_params": {"model": "openai/fake"},\n'
+    '      "model_info": {"id": "46577d4b", "db_model": false}\n    }\n  ]\n}'
+)
+
+# /v1/models de LiteLLM : create_model_info_response() est appelée avec
+# provider="openai" en dur, donc owned_by ne nomme même pas le produit. Ce corps
+# est indiscernable d'OTHER_OPENAI_API_BODY — la preuve qu'aucune signature ne
+# peut s'y poser.
+LITELLM_OPENAI_MODELS_BODY = (
+    '{"data":[{"id":"fake-openai-endpoint","object":"model",'
+    '"created":1677610602,"owned_by":"openai"}],"object":"list"}'
+)
+
+# Même instance, master_key posé : user_api_key_auth atteint la branche
+# « elif api_key is None » et refuse. C'est l'instance correctement fermée, le
+# template ne doit pas déclencher.
+LITELLM_MASTER_KEY_SET_BODY = (
+    '{"error":{"message":"Authentication Error, No api key passed in.",'
+    '"type":"auth_error","param":"None","code":"401"}}'
+)
+
+# Un registre de modèles quelconque énumère lui aussi des entrées nommées et
+# décrites : "model_name" et "model_info" ne désignent aucun produit.
+OTHER_MODEL_REGISTRY_BODY = (
+    '{"data":[{"model_name":"llama-3.1-8b-instruct",'
+    '"model_info":{"id":"7f3c","version":"3","framework":"onnxruntime"},'
+    '"params":{"model":"/models/llama-3.1-8b","batch_size":8}},'
+    '{"model_name":"bge-m3","model_info":{"id":"1a90","version":"1"},'
+    '"params":{"model":"/models/bge-m3"}}]}'
+)
+
+
+def litellm_model_info_block():
+    doc = load(LITELLM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/model/info" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /model/info — /v1/models porte bien la "
+        "même dépendance user_api_key_auth, mais LiteLLM l'assemble avec "
+        "provider=\"openai\" en dur, donc son corps est la forme OpenAI nue que "
+        "les templates vLLM, LM Studio et LocalAI revendiquent déjà"
+    )
+    return blocks[0]
+
+
+def test_litellm_probe_neither_infers_nor_mints_a_key():
+    doc = load(LITELLM_TEMPLATE)
+
+    paths = [p for b in (doc.get("http") or []) for p in (b.get("path") or [])]
+    assert "{{BaseURL}}/v1/models" not in paths, (
+        "le template vise /v1/models, dont le corps est indiscernable de celui "
+        "de n'importe quelle API compatible OpenAI : owned_by y vaut \"openai\" "
+        "en dur, et les en-têtes x-litellm-* ne sont écrites que par le chemin "
+        "des complétions"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la table de routage se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "/chat/completions" not in path, (
+                "le template appelle la route de complétion : le proxy sortirait "
+                "vers le fournisseur avec la clé de l'exploitant, donc le "
+                "template dépenserait le budget qu'il est censé protéger"
+            )
+            assert "/key/generate" not in path, (
+                "le template appelle /key/generate : sur un déploiement adossé "
+                "à une base, la route émet une clé virtuelle qui resterait "
+                "valide après la pose du master_key — le template survivrait à "
+                "sa propre remédiation"
+            )
+            assert "/model/new" not in path, (
+                "le template appelle /model/new : il inscrirait une entrée de "
+                "routage dans l'instance qu'il audite"
+            )
+
+
+def test_litellm_matcher_rests_on_the_config_schema_not_on_a_model_inventory():
+    block = litellm_model_info_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(body_matcher_hits(m, LITELLM_MODEL_INFO_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /model/info d'un proxy "
+        "LiteLLM démarré sans master_key"
+    )
+    assert all(body_matcher_hits(m, LITELLM_OLD_MODEL_INFO_BODY)
+               for m in body_matchers), (
+        "le template exige des clés absentes des versions plus anciennes — "
+        "db_model ou litellm_provider, ajoutées à model_info après coup — il "
+        "raterait les instances qui traînent exposées"
+    )
+    assert all(body_matcher_hits(m, LITELLM_REFORMATTED_MODEL_INFO_BODY)
+               for m in body_matchers), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not all(body_matcher_hits(m, LITELLM_MASTER_KEY_SET_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur le refus d'une instance dont le master_key "
+        "est posé, c'est-à-dire sur l'instance correctement fermée"
+    )
+    assert not all(body_matcher_hits(m, LITELLM_OPENAI_MODELS_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur la forme OpenAI générique, que LiteLLM "
+        "partage avec tous les runtimes du pack"
+    )
+    assert not all(body_matcher_hits(m, OTHER_MODEL_REGISTRY_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur un registre de modèles quelconque : "
+        "model_name et model_info sont le vocabulaire de tout inventaire, seul "
+        "litellm_params nomme le produit"
+    )
+
+    # Le refus doit tenir au corps, pas au seul code de statut : les instances
+    # fermées répondent 401, mais une signature qui ne prouverait rien serait
+    # rattrapée par n'importe quel intermédiaire renvoyant 200.
+    statuses = [s for m in (block.get("matchers") or [])
+                if m.get("type") == "status"
+                for s in (m.get("status") or [])]
+    assert statuses == [200], (
+        f"le template accepte des statuts autres que 200 ({statuses}) — or "
+        "c'est le 200 anonyme, et lui seul, qui prouve que master_key n'est pas "
+        "posé : la même route rend 401 dès qu'il l'est"
+    )
+
+    # Collisions internes au pack : ces runtimes décrivent eux aussi les modèles
+    # servis, et deux templates ne doivent pas revendiquer la même instance.
+    for other_body in (VLLM_MODELS_BODY, LMSTUDIO_MODELS_BODY, TGI_INFO_BODY,
+                       SGLANG_MODEL_INFO_BODY, XINFERENCE_REGISTRATIONS_BODY,
+                       LOCALAI_SYSTEM_BODY):
+        assert not all(body_matcher_hits(m, other_body) for m in body_matchers), (
+            "le template déclenche sur un runtime déjà couvert par son propre "
+            "template"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

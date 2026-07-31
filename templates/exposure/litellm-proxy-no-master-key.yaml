@@ -1,0 +1,154 @@
+id: litellm-proxy-no-master-key
+
+info:
+  name: LiteLLM Proxy - Unauthenticated API (No Master Key Set)
+  author: popy21
+  severity: high
+  description: |
+    Le proxy LiteLLM n'exige une clé que si un master_key est posé, et rien ne
+    l'impose au démarrage : la documentation ne présente general_settings.
+    master_key / LITELLM_MASTER_KEY que dans le chapitre des clés virtuelles,
+    jamais comme un prérequis, et litellm --config config.yaml démarre sans.
+    Le garde est une seule dépendance FastAPI, user_api_key_auth, montée sur
+    toutes les routes du produit, et sa première décision est justement celle-ci
+    — « if master_key is None: return UserAPIKeyAuth(user_role=INTERNAL_USER) »,
+    la branche « elif api_key is None: raise "No api key passed in." » n'étant
+    atteinte que si un master_key existe. Le commentaire du code ne dit pas
+    autre chose : « only require api key if master key is set ». Et l'absence de
+    clé ne fait pas que laisser entrer : le contrôle d'autorisation qui suit
+    rend immédiatement dans ce cas — « No-auth dev mode: master_key unset […]
+    the proxy is unauthenticated by configuration » —, donc aucune restriction
+    de route ne s'applique derrière. Un 200 anonyme sur une route gardée par
+    cette dépendance est ainsi le constat entier : le même chemin répond 401
+    dès qu'un master_key est posé.
+  impact: |
+    Un proxy LiteLLM existe pour détenir les clés des fournisseurs de modèles à
+    la place de ses clients : OpenAI, Anthropic, Azure, Bedrock, Vertex. Sans
+    master_key, POST /v1/chat/completions — même dépendance, même verdict —
+    répond à l'anonyme, qui dépense donc le budget du fournisseur sur le compte
+    de l'exploitant, sans limite de débit ni notion d'utilisateur, et adresse
+    au passage tout ce que le proxy sait joindre, y compris un runtime interne
+    posé derrière un api_base privé. La lecture n'est que le témoin : /model/info
+    rend la table de routage, c'est-à-dire les fournisseurs souscrits et les
+    adresses amont vers lesquelles le proxy sort. Sur les déploiements adossés
+    à une base — celui du docker-compose officiel — les routes de gestion
+    passent sous la même absence de garde : POST /key/generate frappe alors une
+    base connectée et émet une clé virtuelle, donc un accès qui survit à la
+    pose tardive d'un master_key, et POST /model/new inscrit une entrée de
+    routage neuve. Sans base, ces deux routes échouent en 500 faute de
+    DATABASE_URL, mais l'inférence anonyme, elle, ne dépend d'aucune base.
+  remediation: |
+    Poser general_settings.master_key dans config.yaml ou LITELLM_MASTER_KEY
+    dans l'environnement avant d'ouvrir le port, puis vérifier que /model/info
+    répond bien 401 sans en-tête Authorization. Le master_key n'est toutefois
+    qu'un jeton d'administration partagé : il ferme l'accès anonyme sans
+    identifier personne, et servir les clients avec lui revient à donner les
+    droits d'administration du proxy — émettre des clés virtuelles par
+    consommateur, avec budget et limite de débit, est ce qui rend la trace
+    exploitable. Après une exposition, considérer les clés des fournisseurs
+    inscrites dans la configuration comme dépensables par un tiers : contrôler
+    la facturation et les journaux de chaque fournisseur souscrit sur la
+    période, et renouveler ces clés. Sur un déploiement adossé à une base,
+    passer en revue la liste des clés virtuelles avant de refermer — une clé
+    émise pendant l'exposition reste valide après la pose du master_key — ainsi
+    que les entrées de routage, l'anonyme pouvant en avoir ajouté.
+  reference:
+    - https://docs.litellm.ai/docs/proxy/virtual_keys
+    - https://docs.litellm.ai/docs/proxy/configs
+    - https://github.com/BerriAI/litellm/blob/main/litellm/proxy/auth/user_api_key_auth.py
+    - https://github.com/BerriAI/litellm/blob/main/litellm/proxy/proxy_server.py
+    - https://github.com/BerriAI/litellm/blob/main/litellm/proxy/common_utils/openai_endpoint_utils.py
+    - https://github.com/BerriAI/litellm/blob/main/litellm/proxy/_types.py
+  metadata:
+    max-request: 1
+    vendor: berriai
+    product: litellm
+  tags: ai,llm,litellm,exposure,unauth,misconfig
+
+http:
+  # /model/info, et surtout pas /v1/models :
+  #
+  # - LiteLLM construit /v1/models avec create_model_info_response(), appelée
+  #   avec provider="openai" en dur. Le corps est donc, littéralement,
+  #   {"data":[{"id":"…","object":"model","created":1677610602,
+  #   "owned_by":"openai"}],"object":"list"} — la forme OpenAI nue, avec un
+  #   owned_by constant qui ne nomme même pas le produit. C'est mot pour mot le
+  #   corps que ce pack tient déjà pour la contre-épreuve d'une API compatible
+  #   OpenAI quelconque : aucun matcher posé là ne peut désigner LiteLLM plutôt
+  #   que vLLM, LM Studio ou LocalAI, déjà couverts par leurs propres templates.
+  #   Et rien ne rattrape la signature en en-tête : les x-litellm-* sont écrits
+  #   par le chemin des complétions, pas par celui-ci.
+  # - /model/info sert la table de routage telle qu'elle est configurée, donc
+  #   les clés du schéma de config.yaml — litellm_params porte le nom du produit
+  #   dans le nom du champ.
+  #
+  # Les deux routes portent la même dépendance user_api_key_auth : le 200 y
+  # prouve exactement la même chose, mais celle-ci nomme le produit. Un
+  # master_key posé les ferme toutes les deux — 401 {"error":{"message":
+  # "Authentication Error, No api key passed in.","type":"auth_error", …}}.
+  #
+  # Angle mort assumé : un proxy dont model_list est vide rend {"data":[]}, sans
+  # aucune des clés attendues, et n'est donc pas signalé. Se rabattre alors sur
+  # la seule forme {"data":[…]} ferait déclencher le template sur à peu près
+  # tout — et un proxy qui ne route aucun modèle ne détient aucune clé de
+  # fournisseur, donc rien de ce que ce template est censé signaler.
+  #
+  # En lecture seule, et c'est délibéré : la même surface non authentifiée sert
+  # POST /v1/chat/completions, dont l'appel dépenserait le budget du fournisseur
+  # que le template est censé protéger, et POST /key/generate, qui émettrait une
+  # clé virtuelle survivant à la remédiation.
+  - method: GET
+    path:
+      - "{{BaseURL}}/model/info"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # "model_name" et "model_info" sont le vocabulaire de n'importe quel
+      # inventaire de modèles — c'est "litellm_params" qui nomme le produit, et
+      # les trois ensemble qui décrivent une entrée de model_list.
+      #
+      # Ces trois clés-là et pas d'autres : elles sont celles que le handler
+      # sérialise depuis la v1.30, la plus ancienne où /model/info porte déjà
+      # user_api_key_auth. Le contenu de model_info, lui, a beaucoup bougé —
+      # exiger "db_model" ou "litellm_provider", apparus après coup, raterait
+      # les instances anciennes, précisément celles qui traînent exposées.
+      - type: word
+        part: body
+        words:
+          - '"model_name"'
+          - '"litellm_params"'
+          - '"model_info"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Les noms publics de la table de routage : ce que l'anonyme peut appeler.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].model_name'
+
+      # Le fournisseur derrière chaque nom, sous la forme fournisseur/modèle :
+      # il dit quelle facture l'anonyme peut faire grossir. La clé du
+      # fournisseur, elle, n'est pas là — remove_sensitive_info_from_deployment()
+      # retire api_key, client_secret, vertex_credentials et les identifiants
+      # AWS avant de rendre litellm_params.
+      - type: json
+        part: body
+        name: upstreams
+        json:
+          - '.data[].litellm_params.model'
+
+      # api_base est rendu par cette route et n'est pas extrait : l'adresse
+      # amont est l'infrastructure interne de l'exploitant, elle ne prouve rien
+      # de plus que les deux extracteurs ci-dessus et n'a pas à finir dans un
+      # rapport de scan.
