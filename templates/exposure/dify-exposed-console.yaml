@@ -1,0 +1,149 @@
+id: dify-exposed-console
+
+info:
+  name: Dify - Exposed Console Awaiting Setup
+  author: popy21
+  severity: high
+  description: |
+    EDITION vaut SELF_HOSTED par défaut : toute installation qui n'est pas
+    l'offre hébergée passe par une phase d'appropriation, où l'exploitant crée
+    depuis /install le compte qui possédera la plateforme. GET
+    /console/api/setup est la route que cette page interroge, et le code la
+    déclare non authentifiée par dessein — il faut bien pouvoir demander l'état
+    de l'installation avant qu'un compte existe pour l'autoriser. Un 200 sur
+    cette route ne prouve donc rien : c'est la valeur qui fait le constat.
+    "step":"finished" désigne une console déjà appropriée, dont l'écran de
+    connexion garde le reste, et c'est aussi ce que rend l'édition cloud quelle
+    que soit sa configuration. "step":"not_started" signifie qu'aucune ligne
+    DifySetup n'existe en base : la console est atteignable et sans
+    propriétaire. POST sur cette même route crée alors le compte, et
+    RegisterService.setup lui monte un espace de travail neuf dont il est
+    owner. Deux garde-fous seulement peuvent encore refuser ce POST, et aucun
+    n'est acquis : INIT_PASSWORD, que le docker/.env.example officiel laisse
+    vide — get_init_validate_status() rend alors True sans rien demander —, et
+    la présence d'un tenant en base, qui ne concerne que les installations à
+    moitié faites. La forme de la réponse ne bouge pas : {"step":"not_started"}
+    est sérialisé à l'identique depuis les versions 0.x, les versions récentes
+    ajoutant seulement setup_at à null.
+  impact: |
+    Le compte que l'anonyme crée n'est pas un compte parmi d'autres : c'est le
+    owner de l'espace de travail, donc la plateforme entière. Il lit et écrit
+    les identifiants des fournisseurs de modèles inscrits dans les réglages, et
+    consomme ces modèles sans limite aux frais de l'exploitant — quota du
+    fournisseur si une clé y est posée, GPU de la machine si un runtime local y
+    est branché. Il verse et lit les bases de connaissance, c'est-à-dire les
+    documents privés pour lesquels l'instance a été montée. Il construit et
+    publie des applications et des workflows, dont le nœud Code fait tourner du
+    code dans le service bac à sable de l'installation, et installe des
+    plugins, servis par le démon de l'hôte. Et il ferme la porte derrière lui :
+    une fois DifySetup écrit, la route répond "finished" et l'exploitant
+    légitime ne peut plus s'approprier sa propre instance sans intervention en
+    base. Le nginx du compose officiel route /console/api vers api:5001 sans
+    filtre, donc publier le port publie la console : rien ne sépare l'écran
+    d'installation du réseau.
+  remediation: |
+    Terminer l'installation depuis la machine elle-même avant de publier le
+    port, puis vérifier que /console/api/setup répond bien "finished". Poser
+    INIT_PASSWORD avant toute exposition : c'est le seul garde-fou qui survit à
+    une instance neuve atteignable, et le docker/.env.example le laisse vide.
+    Mieux vaut ne pas exposer /console/api du tout — le service applicatif et
+    les applications publiées vivent sous /v1 et /explore — ou le placer
+    derrière un proxy qui authentifie. Après l'exposition d'une instance qui
+    répondait not_started, considérer que l'appropriation a pu avoir lieu :
+    contrôler la liste des comptes et des espaces de travail, car un owner
+    qu'on n'a pas créé signifie que l'instance est prise, renouveler les clés
+    des fournisseurs de modèles, et passer en revue les applications, les
+    workflows et les plugins installés — le code qu'ils embarquent tourne sur
+    l'hôte.
+  reference:
+    - https://github.com/langgenius/dify/blob/main/api/controllers/console/setup.py
+    - https://github.com/langgenius/dify/blob/main/api/controllers/console/init_validate.py
+    - https://github.com/langgenius/dify/blob/main/api/services/account_service.py
+    - https://github.com/langgenius/dify/blob/main/docker/.env.example
+    - https://github.com/langgenius/dify/blob/main/docker/nginx/conf.d/default.conf.template
+  metadata:
+    max-request: 1
+    vendor: langgenius
+    product: dify
+    shodan-query: http.title:"Dify"
+  tags: ai,llm,dify,exposure,unauth,setup,misconfig
+
+http:
+  # GET /console/api/setup, et rien d'autre. Les voisins qui viennent à l'esprit
+  # sont écartés, chacun pour une raison propre :
+  #
+  # - POST sur cette même route serait la preuve définitive — on repart owner de
+  #   l'instance ou non — mais le template créerait le compte administrateur
+  #   qu'il est censé signaler, et écrirait au passage la ligne DifySetup qui
+  #   verrouille l'appropriation. Le scanner prendrait la main sur ce qu'il
+  #   audite, et en priverait l'exploitant.
+  # - POST /console/api/init poste un mot de passe à comparer à INIT_PASSWORD :
+  #   c'est une tentative d'authentification, et elle écrit is_init_validated
+  #   dans la session.
+  # - GET /console/api/init ne lève pas l'ambiguïté qu'on lui prête : il rend
+  #   "finished" aussi bien quand INIT_PASSWORD n'est pas posé que quand
+  #   l'instance est déjà installée. Seul, il ne dit rien de l'exposition.
+  # - GET /console/api/system-features porte la signature produit la plus riche
+  #   de la console — deployment_edition, sso_enforced_for_signin_protocol,
+  #   plugin_installation_permission — mais c'est justement un instantané publié
+  #   avant toute authentification, sur toute instance vivante : s'y poser
+  #   ferait remonter chaque console Dify, y compris correctement fermée.
+  # - GET /console/api/version n'est pas une lecture locale : le handler sort
+  #   vers CHECK_UPDATE_URL depuis l'hôte. Interroger une instance la ferait
+  #   appeler un tiers.
+  - method: GET
+    path:
+      - "{{BaseURL}}/console/api/setup"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le constat, et il tient à la paire entière. "step" seul est le mot que
+      # tout assistant d'installation emploie, et "not_started" une valeur
+      # d'état tout aussi banale : c'est leur association, sur cette route, qui
+      # est le vocabulaire de Dify — SetupStatusResponse ne sait dire que
+      # not_started ou finished, et la sérialise à l'identique depuis les
+      # versions 0.x.
+      #
+      # "finished" est écarté par construction : il désigne une console déjà
+      # appropriée, donc une instance dont le compte owner existe et dont
+      # l'écran de connexion garde tout le reste, et c'est aussi la réponse de
+      # l'édition cloud quelle que soit sa configuration. Le reconnaître
+      # reviendrait à signaler toute installation Dify vivante.
+      #
+      # Une expression plutôt que deux mots : pour ne pas dépendre de la
+      # sérialisation compacte du serveur, qu'un intermédiaire peut reformater,
+      # et pour exiger la paire — deux mots séparés s'appariraient au premier
+      # assistant venu qui numérote ses étapes et nomme un état non démarré.
+      - type: regex
+        part: body
+        regex:
+          - '"step"\s*:\s*"not_started"'
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # La version de l'instance, quand elle la publie. Le hook after_request la
+      # posait sur chaque réponse jusqu'aux versions 1.x et ne le fait plus
+      # aujourd'hui : c'est un renseignement, pas une preuve, d'où un extracteur
+      # et non un matcher — l'exiger raterait les instances récentes.
+      - type: regex
+        part: header
+        name: version
+        group: 1
+        regex:
+          - '(?i)X-Version:\s*([\w.\-]+)'
+
+      # Même hook, même réserve : PRODUCTION ou DEVELOPMENT.
+      - type: regex
+        part: header
+        name: env
+        group: 1
+        regex:
+          - '(?i)X-Env:\s*([\w.\-]+)'

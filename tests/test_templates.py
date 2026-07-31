@@ -1504,6 +1504,137 @@ def test_anythingllm_matcher_transcribes_the_middleware_not_a_single_flag():
     )
 
 
+# --------------------------------------------------------------------------
+# Dify traverse une phase d'appropriation : sur une installation auto-hébergée,
+# le premier venu qui poste /console/api/setup devient owner de la plateforme.
+# GET sur cette même route est non authentifié par dessein — la page
+# d'installation doit pouvoir demander l'état avant qu'un compte existe — donc
+# reconnaître Dify n'y prouve rien : "finished" est ce que rend toute console
+# déjà appropriée, et l'édition cloud avec. Le constat tient à la seule valeur
+# "not_started", et à la paire entière : "step" et "not_started" pris séparément
+# sont le vocabulaire de n'importe quel assistant d'installation. Le template ne
+# doit par ailleurs jamais poster sur cette route, sous peine de créer le compte
+# administrateur qu'il signale.
+
+DIFY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "dify-exposed-console.yaml")
+
+# Console atteignable et sans propriétaire : aucune ligne DifySetup en base.
+# Corps sérialisé à l'identique depuis les versions 0.x.
+DIFY_SETUP_NOT_STARTED_BODY = '{"step":"not_started"}'
+
+# Même état sur une version récente : le modèle de réponse porte désormais
+# setup_at, laissé à null tant que l'installation n'a pas eu lieu.
+DIFY_SETUP_NOT_STARTED_MODERN_BODY = '{"step":"not_started","setup_at":null}'
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. La même console libre, réindentée.
+DIFY_SETUP_REFORMATTED_NOT_STARTED_BODY = '{\n  "step": "not_started"\n}'
+
+# Installation auto-hébergée déjà appropriée : le compte owner existe, et
+# l'écran de connexion garde tout le reste. Le template ne doit pas déclencher,
+# sinon il remonte toute instance Dify vivante.
+DIFY_SETUP_FINISHED_BODY = (
+    '{"step":"finished","setup_at":"2026-03-04T11:22:31.482913"}'
+)
+
+# Édition cloud : la route rend "finished" sans même regarder la base. Le
+# reconnaître ferait remonter l'offre hébergée elle-même.
+DIFY_SETUP_CLOUD_FINISHED_BODY = '{"step":"finished"}'
+
+# Un assistant d'installation quelconque : il numérote ses étapes et nomme un
+# état non démarré. Les deux mots sont là, la paire n'y est pas.
+OTHER_INSTALL_WIZARD_BODY = (
+    '{"step":3,"total_steps":5,"status":"not_started",'
+    '"wizard":"onboarding","product":"helpdesk"}'
+)
+
+
+def dify_setup_block():
+    doc = load(DIFY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/console/api/setup" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /console/api/setup — "
+        "/console/api/system-features est un instantané publié avant toute "
+        "authentification sur toute instance vivante, et /console/api/version "
+        "fait sortir l'hôte vers CHECK_UPDATE_URL"
+    )
+    return blocks[0]
+
+
+def test_dify_probe_never_claims_the_instance_nor_authenticates():
+    doc = load(DIFY_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'état de l'installation se lit en GET : la même route en POST "
+            "crée le compte owner de la plateforme et écrit la ligne DifySetup "
+            "qui verrouille l'appropriation — le template prendrait la main sur "
+            "ce qu'il audite, et en priverait l'exploitant"
+        )
+        for path in (block.get("path") or []):
+            assert "/init" not in path, (
+                "le template touche /console/api/init : en POST il soumet un "
+                "mot de passe à INIT_PASSWORD, donc tente de s'authentifier, et "
+                "en GET il rend \"finished\" aussi bien quand INIT_PASSWORD "
+                "n'est pas posé que quand l'instance est déjà installée — il ne "
+                "prouve rien"
+            )
+            assert "/version" not in path, (
+                "le template appelle /console/api/version, qui n'est pas une "
+                "lecture locale : le handler sort vers CHECK_UPDATE_URL depuis "
+                "l'hôte, donc le template ferait appeler un tiers à l'instance "
+                "qu'il découvre"
+            )
+
+
+def test_dify_matcher_proves_the_console_is_unclaimed_not_merely_that_it_is_dify():
+    block = dify_setup_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la reconnaissance du "
+        "produit suffirait à faire remonter une console déjà appropriée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(body_matcher_hits(m, DIFY_SETUP_NOT_STARTED_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /console/api/setup de Dify "
+        "dont l'installation n'a pas eu lieu"
+    )
+    assert all(body_matcher_hits(m, DIFY_SETUP_NOT_STARTED_MODERN_BODY)
+               for m in body_matchers), (
+        "le template rate la sérialisation des versions récentes, qui ajoutent "
+        "setup_at à null au même état"
+    )
+    assert all(body_matcher_hits(m, DIFY_SETUP_REFORMATTED_NOT_STARTED_BODY)
+               for m in body_matchers), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not all(body_matcher_hits(m, DIFY_SETUP_FINISHED_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une console déjà appropriée : la route est "
+        "non authentifiée par dessein, reconnaître Dify ne prouve rien"
+    )
+    assert not all(body_matcher_hits(m, DIFY_SETUP_CLOUD_FINISHED_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur l'édition cloud, qui rend \"finished\" sans "
+        "même regarder la base"
+    )
+    assert not all(body_matcher_hits(m, OTHER_INSTALL_WIZARD_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur un assistant d'installation quelconque : il "
+        "cherche \"step\" et \"not_started\" séparément au lieu d'exiger la "
+        "paire, or numéroter une étape et nommer un état non démarré n'est le "
+        "vocabulaire de personne"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
