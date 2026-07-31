@@ -1064,6 +1064,99 @@ def test_langflow_matcher_rests_on_the_user_model_not_on_a_generic_profile():
     )
 
 
+# --------------------------------------------------------------------------
+# LocalAI parle le protocole OpenAI, mais son /v1/models est le plus pauvre du
+# lot : OpenAIModel n'a que "id" et "object". Un matcher posé là ne pourrait que
+# décrire la forme OpenAI générique — donc déclencher sur vLLM et LM Studio, déjà
+# couverts. Le template doit viser /system, l'endpoint propre au produit, et sa
+# signature doit tenir sur une instance au repos : c'est celle qu'on trouve
+# oubliée sur un port ouvert.
+
+LOCALAI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "localai-unauthenticated-api.yaml")
+
+# Réponse de /system, telle que LocalAI sérialise SystemInformationResponse.
+LOCALAI_SYSTEM_BODY = (
+    '{"backends":["llama-cpp","whisper","stablediffusion-ggml"],'
+    '"loaded_models":[{"id":"qwen3-4b"},{"id":"granite-embedding-107m-multilingual"}]}'
+)
+
+# Même endpoint sur une instance au repos : aucun modèle chargé, aucun backend
+# externe déclaré. Les deux tranches étant initialisées à [] dans le handler, les
+# deux clés restent sérialisées — le template doit toujours déclencher.
+LOCALAI_IDLE_SYSTEM_BODY = '{"backends":[],"loaded_models":[]}'
+
+# /v1/models de LocalAI : OpenAIModel ne porte que "id" et "object". Ce corps est
+# un sous-ensemble strict de celui de vLLM — la preuve qu'aucune signature ne
+# peut y séparer les deux produits.
+LOCALAI_OPENAI_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"qwen3-4b","object":"model"},'
+    '{"id":"stablediffusion","object":"model"}]}'
+)
+
+# Une sonde d'inventaire maison sous /system : elle énumère elle aussi des
+# moteurs et des modèles, sans être LocalAI.
+OTHER_SYSTEM_BODY = (
+    '{"hostname":"gpu-01","backends":["triton","onnxruntime"],'
+    '"models":["resnet50"],"uptime_seconds":83122}'
+)
+
+
+def test_localai_matcher_targets_system_and_holds_on_an_idle_instance():
+    doc = load(LOCALAI_TEMPLATE)
+
+    paths = [p for b in (doc.get("http") or []) for p in (b.get("path") or [])]
+    assert "{{BaseURL}}/v1/models" not in paths, (
+        "le template vise /v1/models — LocalAI n'y sérialise que \"id\" et "
+        "\"object\", donc rien qui le distingue de vLLM ou LM Studio"
+    )
+
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/system" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /system"
+
+    block = blocks[0]
+    assert block.get("method", "GET") == "GET", (
+        "/system se lit : la même surface non authentifiée sert POST "
+        "/models/apply, qui téléchargerait des poids"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, LOCALAI_SYSTEM_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /system de LocalAI"
+    )
+    assert all(word_matcher_hits(m, LOCALAI_IDLE_SYSTEM_BODY)
+               for m in body_matchers), (
+        "le template exige un modèle chargé ou un backend déclaré : il raterait "
+        "une instance au repos, précisément celle qui traîne exposée"
+    )
+    assert not all(word_matcher_hits(m, OTHER_SYSTEM_BODY) for m in body_matchers), (
+        "le template déclenche sur une sonde d'inventaire quelconque servant "
+        "/system : énumérer des moteurs ne désigne aucun produit"
+    )
+    assert not all(word_matcher_hits(m, LOCALAI_OPENAI_MODELS_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur la forme OpenAI générique, que LocalAI "
+        "partage avec tous les runtimes du pack"
+    )
+    # Collisions internes au pack : deux templates ne doivent pas revendiquer la
+    # même instance.
+    assert not all(word_matcher_hits(m, VLLM_MODELS_BODY) for m in body_matchers), (
+        "le template déclenche sur vLLM, déjà couvert par son propre template"
+    )
+    assert not all(word_matcher_hits(m, LMSTUDIO_MODELS_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur LM Studio, déjà couvert par son propre template"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

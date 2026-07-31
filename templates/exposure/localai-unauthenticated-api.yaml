@@ -1,0 +1,132 @@
+id: localai-unauthenticated-api
+
+info:
+  name: LocalAI - Unauthenticated OpenAI-Compatible API Exposure
+  author: popy21
+  severity: high
+  description: |
+    LocalAI n'active aucune authentification par défaut : la liste APIKeys reste
+    vide tant que --api-keys, LOCALAI_API_KEY ou API_KEY n'est pas fourni, et le
+    validateur retourne alors vrai sans rien examiner — « If no keys are setup,
+    accept everything ». Le défaut d'écoute aggrave le cas. Là où vLLM, Ollama
+    ou Xinference se lient à 127.0.0.1 et demandent un geste pour s'ouvrir,
+    LocalAI écoute sur :8080, un joker sur toutes les interfaces, et le
+    démarrage documenté est docker run -p 8080:8080 localai/localai:latest.
+    Depuis la version 4.2, le serveur refuse de démarrer sur une adresse
+    publique sans authentification, mais le garde-fou tient loopback, RFC 1918,
+    ULA, lien-local et CGNAT pour de confiance, et il ne rejette un joker que si
+    une interface de l'hôte est publique. Dans un conteneur, toutes les
+    interfaces sont privées : le contrôle passe, et c'est la publication du port
+    par l'hôte — que le processus ne voit pas — qui expose l'instance.
+  impact: |
+    Le même middleware garde toute l'API : la lecture n'est que le témoin.
+    POST /models/apply installe un modèle depuis la galerie ou depuis une URL
+    quelconque, aux frais du disque et de la bande passante de l'hôte, et
+    POST /models/delete/{name} supprime ceux de l'exploitant. POST
+    /backends/apply et POST /backends/delete/{name} en font autant des backends
+    d'inférence, et POST /backend/shutdown arrête un modèle en service. Les
+    routes compatibles OpenAI du même processus répondent à l'anonyme, sans
+    limite de débit ni notion d'utilisateur : n'importe qui occupe le GPU.
+    POST /stores/set et POST /stores/find écrivent et interrogent la base
+    vectorielle de l'instance — donc son contenu indexé. Sur une instance en
+    mode P2P, GET /api/p2p/token rend le jeton du réseau, réservé à
+    l'administrateur dès que l'authentification est active et servi à l'anonyme
+    quand elle ne l'est pas : il fait entrer dans la fédération.
+  remediation: |
+    Poser une clé (--api-keys / LOCALAI_API_KEY) ou activer le système de
+    comptes (LOCALAI_AUTH=true) avant d'ouvrir le port, et lier l'écoute à une
+    adresse précise plutôt qu'au joker :8080. En conteneur, ne pas publier 8080
+    sur une interface publique : le garde-fou de démarrage n'inspecte que les
+    interfaces vues par le processus, et --allow-insecure-public-bind le désarme
+    entièrement — ne l'employer que derrière un proxy qui authentifie
+    réellement. La clé statique reste un jeton partagé : elle ferme l'accès
+    anonyme sans identifier personne. Après une exposition, considérer le disque
+    et le GPU de l'hôte comme atteints : contrôler les modèles et les backends
+    installés, l'anonyme pouvait en ajouter par URL, ainsi que le contenu de la
+    base vectorielle.
+  reference:
+    - https://localai.io/basics/getting_started/
+    - https://github.com/mudler/LocalAI/blob/master/core/http/endpoints/localai/system.go
+    - https://github.com/mudler/LocalAI/blob/master/core/schema/localai.go
+    - https://github.com/mudler/LocalAI/blob/master/core/http/auth/middleware.go
+    - https://github.com/mudler/LocalAI/blob/master/core/cli/run_safety.go
+    - https://github.com/mudler/LocalAI/blob/master/core/cli/run.go
+  metadata:
+    max-request: 1
+    vendor: mudler
+    product: localai
+  tags: ai,llm,localai,exposure,unauth,misconfig
+
+http:
+  # /system, et surtout pas /v1/models :
+  #
+  # - LocalAI sérialise /v1/models depuis OpenAIModel, une structure à deux
+  #   champs — {"object":"list","data":[{"id":"…","object":"model"}]}. C'est la
+  #   forme OpenAI nue, strictement un sous-ensemble de ce que rendent vLLM et
+  #   LM Studio, déjà couverts par leurs propres templates : aucun matcher posé
+  #   là ne peut désigner LocalAI plutôt qu'eux. Et sur une instance dont aucun
+  #   modèle n'est installé, "data" est vide.
+  # - /system est propre au produit et répond peuplé qu'un modèle tourne ou non.
+  #   Les deux tranches du handler sont initialisées à [] avant d'être remplies,
+  #   donc les deux clés sont sérialisées même sur une instance au repos —
+  #   précisément le cas de la machine oubliée que ce pack cherche.
+  #
+  # Et un 200 y prouve l'absence d'authentification, pas seulement qu'un service
+  # tourne. Sur les versions 2.x, la route est enregistrée après le middleware
+  # keyauth global, dont la seule échappatoire — l'exemption des GET — est
+  # désactivée par défaut et ne vise de toute façon que /, /browse, /static et
+  # /swagger. Sur les 4.x, isAPIPath liste /system explicitement et la route
+  # porte en plus adminMiddleware : authentification active, l'anonyme reçoit
+  # 401.
+  #
+  # En lecture seule, et c'est délibéré : la même surface non authentifiée sert
+  # POST /models/apply, dont l'appel déclencherait le téléchargement de poids
+  # que le template est censé signaler.
+  - method: GET
+    path:
+      - "{{BaseURL}}/system"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # "backends" seul est banal — n'importe quelle sonde d'inventaire écrirait
+      # ce mot. "loaded_models" est le nom que LocalAI donne au champ Models de
+      # SystemInformationResponse, et c'est le couple des deux, sous ce chemin,
+      # qui désigne le produit.
+      #
+      # Le couple date de la 2.22 : la 2.21, qui a introduit /system, ne
+      # sérialisait que "backends" — loaded_models a été ajouté le lendemain de
+      # sa sortie. Cette version-là n'est pas couverte, et se rabattre sur la
+      # seule clé "backends" pour la rattraper ferait déclencher le template sur
+      # tout ce qui énumère des moteurs.
+      - type: word
+        part: body
+        words:
+          - '"backends"'
+          - '"loaded_models"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Ce qui occupe la mémoire de l'hôte au moment du scan. Vide sur une
+      # instance au repos, ce qui ne retire rien au constat d'exposition.
+      - type: json
+        part: body
+        name: loaded_models
+        json:
+          - '.loaded_models[].id'
+
+      # Les moteurs d'inférence disponibles : ils disent ce que l'instance sait
+      # faire, donc ce que l'anonyme peut lui demander.
+      - type: json
+        part: body
+        name: backends
+        json:
+          - '.backends[]'

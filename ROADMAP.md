@@ -14,7 +14,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 
 - [x] `templates/exposure/vllm-unauthenticated-api.yaml` — vLLM sert une API compatible OpenAI sans clé par défaut ; `GET /v1/models` renvoie `{"object":"list","data":[...]}`. Sévérité high.
 - [x] `templates/exposure/text-generation-inference-exposed.yaml` — HuggingFace TGI expose `GET /info` avec `model_id` et `max_concurrent_requests`. Sévérité high.
-- [ ] `templates/exposure/localai-unauthenticated-api.yaml` — LocalAI, API compatible OpenAI sans authentification par défaut. Sévérité high.
+- [x] `templates/exposure/localai-unauthenticated-api.yaml` — LocalAI, API compatible OpenAI sans authentification par défaut. Sévérité high.
 - [x] `templates/exposure/lmstudio-server-exposed.yaml` — serveur local LM Studio, endpoint compatible OpenAI. Sévérité medium.
 - [x] `templates/exposure/sglang-server-exposed.yaml` — serveur SGLang, `GET /get_model_info`. Sévérité high.
 - [x] `templates/exposure/xinference-exposed.yaml` — Xorbits Inference, API de gestion de modèles. Sévérité high.
