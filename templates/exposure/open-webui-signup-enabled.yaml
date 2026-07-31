@@ -1,0 +1,141 @@
+id: open-webui-signup-enabled
+
+info:
+  name: Open WebUI - Open User Registration
+  author: popy21
+  severity: medium
+  description: |
+    Open WebUI est l'interface web que l'on pose devant Ollama, vLLM ou n'importe
+    quelle API compatible OpenAI — la couche qu'on ajoute justement pour ouvrir un
+    runtime local à d'autres postes. ENABLE_SIGNUP y vaut True par défaut : le
+    formulaire d'inscription est servi tant qu'on ne le ferme pas. GET /api/config
+    est public par construction, parce que la page de connexion doit savoir avant
+    toute authentification s'il faut afficher le bouton d'inscription, et c'est là
+    que le serveur publie features.enable_signup. Un 200 sur cette route ne prouve
+    donc rien : c'est la valeur qui fait le constat. enable_signup à true sur une
+    instance atteignable de l'extérieur signifie que quiconque trouve l'URL poste
+    /api/v1/auths/signup et repart avec un compte et un jeton de session. Le
+    réglage est de surcroît persistant : il est recopié en base au premier
+    démarrage et la variable d'environnement est ensuite ignorée — c'est la raison
+    pour laquelle tant d'instances restent ouvertes après qu'on a cru les fermer.
+  impact: |
+    Le compte créé reçoit le rôle DEFAULT_USER_ROLE, pending par défaut : il attend
+    la validation d'un administrateur, et c'est ce qui maintient la sévérité à
+    medium. Mais poser DEFAULT_USER_ROLE=user est le réglage documenté pour éviter
+    cette validation manuelle, et il est courant : le compte parle alors
+    immédiatement aux modèles branchés, sans limite de débit et aux frais de
+    l'exploitant — quota du fournisseur si une clé est configurée, GPU de la
+    machine sinon — dépose des documents dans la base RAG et déclenche la recherche
+    web et les outils câblés. Le cas extrême se lit dans la même réponse :
+    "onboarding":true signifie que la base ne contient aucun utilisateur, et le
+    gestionnaire d'inscription accorde le rôle admin au premier compte créé.
+    L'instance n'est alors pas ouverte à l'inscription, elle est à prendre — un
+    administrateur Open WebUI lit toutes les conversations, ajoute les connexions
+    compatibles OpenAI de son choix, donc détourne le trafic et capte les invites,
+    et gère les clés d'API de l'instance.
+  remediation: |
+    Fermer l'inscription avant de publier le port. Poser ENABLE_SIGNUP=false suffit
+    sur une instance neuve, mais pas sur une instance déjà démarrée : la valeur a
+    été recopiée en base et c'est elle qui l'emporte, il faut alors la changer dans
+    le panneau d'administration ou forcer ENABLE_PERSISTENT_CONFIG=false pour que
+    les variables d'environnement redeviennent la source de vérité. Sur une
+    instance qui répond "onboarding":true, créer le compte administrateur depuis la
+    machine elle-même avant toute exposition. WEBUI_AUTH=false force bien
+    enable_signup à false, mais ce n'est pas un correctif : l'authentification
+    disparaît entièrement et tout visiteur devient le même utilisateur. Après une
+    exposition, passer la liste des comptes en revue, supprimer ceux qu'on n'a pas
+    créés et révoquer leurs clés d'API — elles survivent à la fermeture de
+    l'inscription.
+  reference:
+    - https://docs.openwebui.com/reference/env-configuration/#enable_signup
+    - https://docs.openwebui.com/reference/env-configuration/#default_user_role
+    - https://docs.openwebui.com/reference/env-configuration/#enable_persistent_config
+    - https://github.com/open-webui/open-webui/blob/main/backend/open_webui/main.py
+    - https://github.com/open-webui/open-webui/blob/main/backend/open_webui/routers/auths.py
+  metadata:
+    max-request: 1
+    vendor: open-webui
+    product: open-webui
+    shodan-query: title:"Open WebUI"
+  tags: ai,llm,open-webui,exposure,signup,misconfig
+
+http:
+  # /api/config, et rien d'autre. Les trois voisins qui viennent à l'esprit sont
+  # écartés, chacun pour une raison propre :
+  #
+  # - POST /api/v1/auths/signup serait la preuve définitive — on tient le compte
+  #   ou on ne le tient pas — mais le template créerait le compte qu'il est censé
+  #   signaler. Et sur une instance dont la base est vide, ce compte-là serait
+  #   administrateur : le scanner prendrait la main sur ce qu'il audite.
+  # - La page d'accueil ne dit rien. Le bouton d'inscription est rendu côté
+  #   client à partir de cette même réponse : la coquille HTML est identique que
+  #   l'inscription soit ouverte ou fermée.
+  # - GET /api/v1/auths/ décrit la session courante et répond 401 sans jeton :
+  #   il prouve qu'Open WebUI est là, jamais que l'inscription est ouverte.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/config"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # La signature produit. Ces trois clés sont sérialisées par toutes les
+      # versions depuis la 0.3, et c'est leur voisinage qui désigne Open WebUI :
+      # une application qui publie à la fois sa locale par défaut, l'état de son
+      # en-tête d'authentification de confiance et celui de son formulaire de
+      # connexion n'est pas une application quelconque.
+      #
+      # Les clés voisines du même bloc sont écartées parce qu'aucune ne traverse
+      # les versions : "enable_ldap" n'apparaît qu'en 0.4, "enable_websocket" en
+      # 0.5, et "enable_api_key" — public de la 0.4 à la 0.6 — a depuis été
+      # renommé et déplacé derrière l'authentification. Les exiger raterait
+      # précisément les instances anciennes, celles qui traînent exposées.
+      - type: word
+        part: body
+        words:
+          - '"default_locale"'
+          - '"auth_trusted_header"'
+          - '"enable_login_form"'
+        condition: and
+
+      # Le constat lui-même, séparé de la signature. La route est publique par
+      # dessein : sans cette condition le template déclencherait sur toute
+      # instance Open WebUI vivante, y compris celles dont l'inscription est
+      # correctement fermée. Une expression plutôt qu'un mot pour ne pas dépendre
+      # de la sérialisation compacte du serveur, qu'un intermédiaire peut
+      # reformater.
+      - type: regex
+        part: body
+        regex:
+          - '"enable_signup"\s*:\s*true'
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Présent seulement quand la base ne contient aucun utilisateur : la
+      # prochaine inscription sera administratrice.
+      - type: json
+        part: body
+        name: onboarding
+        json:
+          - '.onboarding // empty'
+
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
+
+      # Le nom affiché de l'instance — WEBUI_NAME, souvent celui de l'équipe ou
+      # du service qui l'exploite.
+      - type: json
+        part: body
+        name: instance
+        json:
+          - '.name'

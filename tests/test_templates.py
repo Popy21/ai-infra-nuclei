@@ -1157,6 +1157,171 @@ def test_localai_matcher_targets_system_and_holds_on_an_idle_instance():
     )
 
 
+# --------------------------------------------------------------------------
+# Cas particulier du pack : /api/config est public par dessein — la page de
+# connexion doit savoir, avant toute authentification, s'il faut afficher le
+# bouton d'inscription. Le template ne peut donc pas se contenter de reconnaître
+# Open WebUI : reconnaître le produit, c'est reconnaître une instance
+# correctement fermée aussi bien qu'une instance ouverte. Le constat tient à la
+# valeur d'un seul drapeau, et la signature produit doit par ailleurs traverser
+# les versions — le bloc public de "features" a gagné et perdu des clés depuis
+# la 0.3.
+
+OPENWEBUI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "open-webui-signup-enabled.yaml")
+
+# Instance récente, des comptes existent déjà, inscription laissée ouverte : le
+# défaut d'ENABLE_SIGNUP n'a pas été touché.
+OPENWEBUI_CONFIG_SIGNUP_OPEN_BODY = (
+    '{"status":true,"name":"Open WebUI","version":"0.6.18","default_locale":"",'
+    '"oauth":{"providers":{}},"features":{"auth":true,'
+    '"auth_trusted_header":false,"enable_ldap":false,"enable_api_key":true,'
+    '"enable_signup":true,"enable_login_form":true,"enable_websocket":true,'
+    '"enable_version_update_check":true}}'
+)
+
+# Même route sur une instance 0.3 : ni enable_ldap, ni enable_api_key, ni
+# enable_websocket. Le template doit toujours la reconnaître.
+OPENWEBUI_OLD_CONFIG_SIGNUP_OPEN_BODY = (
+    '{"status":true,"name":"Open WebUI","version":"0.3.35","default_locale":"",'
+    '"oauth":{"providers":{}},"features":{"auth":true,'
+    '"auth_trusted_header":false,"enable_signup":true,'
+    '"enable_login_form":true}}'
+)
+
+# La base ne contient aucun utilisateur : le gestionnaire d'inscription accorde
+# le rôle admin au premier compte créé. C'est le pire cas, et il doit remonter.
+OPENWEBUI_ONBOARDING_BODY = (
+    '{"onboarding":true,"status":true,"name":"Open WebUI","version":"0.6.18",'
+    '"default_locale":"","oauth":{"providers":{}},"features":{"auth":true,'
+    '"auth_trusted_header":false,"enable_ldap":false,"enable_api_key":true,'
+    '"enable_signup":true,"enable_login_form":true,"enable_websocket":true}}'
+)
+
+# Même produit, même route, inscription fermée comme il se doit. Le template ne
+# doit pas déclencher : sinon il remonte toute instance Open WebUI vivante.
+OPENWEBUI_CONFIG_SIGNUP_CLOSED_BODY = (
+    '{"status":true,"name":"Open WebUI","version":"0.6.18","default_locale":"",'
+    '"oauth":{"providers":{"google":"Google"}},"features":{"auth":true,'
+    '"auth_trusted_header":false,"enable_ldap":false,"enable_api_key":true,'
+    '"enable_signup":false,"enable_login_form":true,"enable_websocket":true,'
+    '"enable_version_update_check":true}}'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. La même instance ouverte, réindentée : le template doit encore
+# la reconnaître.
+OPENWEBUI_REFORMATTED_SIGNUP_OPEN_BODY = (
+    '{\n  "status": true,\n  "name": "Open WebUI",\n  "version": "0.6.18",\n'
+    '  "default_locale": "",\n  "oauth": {"providers": {}},\n'
+    '  "features": {\n    "auth": true,\n    "auth_trusted_header": false,\n'
+    '    "enable_signup": true,\n    "enable_login_form": true\n  }\n}'
+)
+
+# Une application quelconque publie elle aussi son état d'inscription sous
+# /api/config : "enable_signup" et "enable_login_form" ne désignent aucun
+# produit.
+OTHER_APP_CONFIG_BODY = (
+    '{"status":true,"name":"wiki interne","version":"3.4.1",'
+    '"features":{"enable_signup":true,"enable_login_form":true,'
+    '"enable_oauth":false}}'
+)
+
+
+def body_matcher_hits(matcher, body):
+    """
+    Sémantique nuclei d'un matcher de corps, `word` comme `regex` : condition
+    `or` par défaut, `and` quand elle est demandée.
+    """
+    kind = matcher.get("type")
+    if kind == "word":
+        needles = matcher.get("words") or []
+        def hit(n):
+            return n in body
+    elif kind == "regex":
+        needles = matcher.get("regex") or []
+        def hit(n):
+            return re.search(n, body) is not None
+    else:
+        raise AssertionError(f"type de matcher de corps non géré : {kind!r}")
+
+    if matcher.get("condition") == "and":
+        return all(hit(n) for n in needles)
+    return any(hit(n) for n in needles)
+
+
+def openwebui_config_block():
+    doc = load(OPENWEBUI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/config" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /api/config"
+    return blocks[0]
+
+
+def test_openwebui_probe_never_creates_an_account():
+    doc = load(OPENWEBUI_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'état de l'inscription se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "/signup" not in path, (
+                "le template appelle la route d'inscription : il créerait le "
+                "compte qu'il est censé signaler, et sur une instance dont la "
+                "base est vide ce compte serait administrateur — le scanner "
+                "prendrait la main sur ce qu'il audite"
+            )
+
+
+def test_openwebui_matcher_proves_signup_is_open_not_merely_that_it_is_openwebui():
+    block = openwebui_config_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "suffirait à faire remonter une instance correctement fermée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(body_matcher_hits(m, OPENWEBUI_CONFIG_SIGNUP_OPEN_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /api/config d'Open WebUI dont "
+        "l'inscription est ouverte"
+    )
+    assert all(body_matcher_hits(m, OPENWEBUI_OLD_CONFIG_SIGNUP_OPEN_BODY)
+               for m in body_matchers), (
+        "le template exige des clés absentes du bloc public des versions plus "
+        "anciennes — enable_ldap, enable_websocket ou enable_api_key — il "
+        "raterait les instances qui traînent exposées"
+    )
+    assert all(body_matcher_hits(m, OPENWEBUI_ONBOARDING_BODY)
+               for m in body_matchers), (
+        "le template rate l'instance sans aucun utilisateur, celle dont la "
+        "prochaine inscription sera administratrice"
+    )
+    assert all(body_matcher_hits(m, OPENWEBUI_REFORMATTED_SIGNUP_OPEN_BODY)
+               for m in body_matchers), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not all(body_matcher_hits(m, OPENWEBUI_CONFIG_SIGNUP_CLOSED_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une instance dont l'inscription est fermée : "
+        "/api/config est public par dessein, reconnaître Open WebUI ne prouve "
+        "rien"
+    )
+    assert not all(body_matcher_hits(m, OTHER_APP_CONFIG_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une application quelconque servant "
+        "/api/config : enable_signup et enable_login_form sont des clés banales"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

@@ -26,7 +26,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/langserve-exposed-playground.yaml` — LangServe expose `/docs` et les routes `/invoke` sans authentification. Sévérité high.
 - [x] `templates/exposure/flowise-unauthenticated-api.yaml` — Flowise, `GET /api/v1/chatflows` sans authentification. Sévérité critical (les identifiants sont lisibles).
 - [x] `templates/exposure/langflow-unauthenticated.yaml` — Langflow, API sans authentification. Sévérité critical.
-- [ ] `templates/exposure/open-webui-signup-enabled.yaml` — Open WebUI avec inscription ouverte : n'importe qui crée un compte. Sévérité medium.
+- [x] `templates/exposure/open-webui-signup-enabled.yaml` — Open WebUI avec inscription ouverte : n'importe qui crée un compte. Sévérité medium.
 - [ ] `templates/exposure/anythingllm-exposed.yaml` — AnythingLLM sans authentification. Sévérité high.
 - [ ] `templates/exposure/dify-exposed-console.yaml` — console Dify accessible. Sévérité high.
 - [ ] `templates/exposure/litellm-proxy-no-master-key.yaml` — proxy LiteLLM sans `master_key` : `/v1/models` répond sans clé. Sévérité high.
