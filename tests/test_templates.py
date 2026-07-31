@@ -1828,6 +1828,218 @@ def test_litellm_matcher_rests_on_the_config_schema_not_on_a_model_inventory():
         )
 
 
+# --------------------------------------------------------------------------
+# Gradio sert la définition de son interface aux deux bouts : la racine l'injecte
+# dans la page, /config la rend en JSON. Mais seule la seconde porte
+# Depends(login_check) — la racine répond 200 et sa coquille HTML que l'instance
+# soit protégée ou non, en y glissant un config réduit à "auth_required":true.
+# Le template doit donc viser /config, et sa signature doit tenir aux clés que
+# get_config_file() sérialise depuis les versions 3.x jusqu'à la 6.x courante,
+# sans se rabattre sur le vocabulaire commun à tout fichier de configuration.
+
+GRADIO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "gradio-app-exposed.yaml")
+
+# Réponse de /config sur une instance courante (6.x), tronquée : components
+# énumère en réalité chaque composant de l'interface avec toutes ses props.
+GRADIO_CONFIG_BODY = (
+    '{"version":"6.22.0","api_prefix":"/gradio_api","mode":"interface",'
+    '"app_id":15217808355328254446,"dev_mode":false,"vibe_mode":false,'
+    '"analytics_enabled":true,"components":[{"id":4,"type":"row",'
+    '"props":{"variant":"default","visible":true,"name":"row"},'
+    '"skip_api":true,"key":null}],"css":null,"connect_heartbeat":false,'
+    '"js":null,"head":null,"title":"Gradio","space_id":null,'
+    '"enable_queue":true,"show_error":false,"footer_links":[],'
+    '"is_colab":false,"max_file_size":null,"stylesheets":[],'
+    '"theme":"default","protocol":"sse_v3","fill_height":false,'
+    '"fill_width":false,"theme_hash":"8ad6f9b1","pwa":false,"pages":[""],'
+    '"dependencies":[{"id":0,"targets":[[1,"click"]],"inputs":[],'
+    '"outputs":[1],"backend_fn":true,"js":null,"queue":false,'
+    '"api_name":"predict"}],"layout":{"id":2,"children":[{"id":4}]},'
+    '"username":null,"root":"https://demo.interne"}'
+)
+
+# Même route sur une instance nettement plus ancienne (3.x). get_config_file()
+# n'y sérialise ni analytics_enabled, ni space_id, ni protocol, ni api_prefix, et
+# porte encore show_api, retiré depuis. Le template doit toujours la reconnaître :
+# ce sont ces instances-là qui traînent exposées.
+GRADIO_OLD_CONFIG_BODY = (
+    '{"version":"3.12.0","mode":"blocks","dev_mode":false,'
+    '"components":[{"id":1,"type":"textbox",'
+    '"props":{"lines":1,"name":"textbox"}}],"theme":"default","css":null,'
+    '"title":"Gradio","enable_queue":false,"show_error":false,'
+    '"show_api":true,"is_colab":false,'
+    '"layout":{"id":0,"children":[{"id":1}]},'
+    '"dependencies":[{"targets":[2],"trigger":"click","inputs":[1],'
+    '"outputs":[3],"backend_fn":true,"js":null,"queue":null,'
+    '"api_name":"predict"}]}'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. Le même document, réindenté.
+GRADIO_REFORMATTED_CONFIG_BODY = (
+    '{\n  "version": "5.9.1",\n  "mode": "blocks",\n  "dev_mode": false,\n'
+    '  "components": [],\n  "title": "Gradio",\n  "enable_queue": true,\n'
+    '  "is_colab": false,\n  "dependencies": [],\n  "layout": {"id": 0}\n}'
+)
+
+# Même instance, auth posé : login_check atteint le raise et /config répond 401.
+# C'est l'instance correctement fermée, le template ne doit pas déclencher.
+GRADIO_LOGIN_REQUIRED_BODY = (
+    '{"detail":{"error":"Not authenticated","auth_message":null}}'
+)
+
+# Le même refus tel que les versions 3.x et 4.x le sérialisent : detail y est une
+# chaîne, pas un objet.
+GRADIO_OLD_LOGIN_REQUIRED_BODY = '{"detail":"Not authenticated"}'
+
+# Le config réduit que la racine injecte dans sa page quand auth est posé et que
+# le visiteur n'est pas connecté. Il porte components, dependencies, space_id,
+# root et pages — donc tout le vocabulaire structurel de Gradio — mais aucune des
+# clés du trio : viser la racine reviendrait à signaler l'instance protégée.
+GRADIO_AUTH_REQUIRED_STUB_BODY = (
+    '{"auth_required":true,"auth_message":null,"space_id":null,'
+    '"root":"https://demo.interne","page":{"":{"layout":{}}},"pages":[""],'
+    '"components":[],"dependencies":[],"current_page":""}'
+)
+
+# Une application quelconque qui publie sa configuration : elle nomme sa version,
+# son mode, son titre, son thème, ses composants, sa mise en page et ses
+# dépendances. Sept mots que Gradio écrit aussi, et qui ne désignent personne.
+OTHER_APP_CONFIG_BODY = (
+    '{"version":"2.4.1","mode":"production","title":"Tableau de bord",'
+    '"theme":"dark","css":null,"components":[{"id":"chart-1","type":"chart"}],'
+    '"layout":{"rows":[["chart-1"]]},"dependencies":["chart.js","d3"],'
+    '"enable_queue":false}'
+)
+
+
+def gradio_config_block():
+    doc = load(GRADIO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/config" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /config — c'est pourtant la seule route qui "
+        "conditionne le document de l'interface à l'authentification : la racine "
+        "sert la même coquille HTML, protégée ou non"
+    )
+    return blocks[0]
+
+
+def test_gradio_probe_never_runs_the_app_nor_writes_to_it():
+    doc = load(GRADIO_TEMPLATE)
+
+    paths = [p for b in (doc.get("http") or []) for p in (b.get("path") or [])]
+    assert "{{BaseURL}}/" not in paths, (
+        "le template vise la racine, qui répond 200 et la même coquille HTML que "
+        "l'instance soit protégée ou non : il déclencherait sur les applications "
+        "correctement fermées"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "le document de l'interface se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/call/", "le template appelle POST /gradio_api/call/{api_name} : "
+                           "il exécuterait la fonction Python de l'application sur "
+                           "le matériel de l'exploitant, c'est-à-dire l'abus même "
+                           "qu'il est censé signaler"),
+                ("/run/", "le template appelle la route de prédiction des versions "
+                          "3.x : même exécution, même dépense"),
+                ("/upload", "le template appelle POST /upload : il écrirait un "
+                            "fichier dans le répertoire temporaire de l'instance "
+                            "qu'il audite"),
+                ("/component_server", "le template appelle POST /component_server : "
+                                      "il ferait exécuter une méthode de composant "
+                                      "côté serveur"),
+                ("/file=", "le template lit un fichier servi par l'application : "
+                           "signaler une exposition ne demande pas d'en extraire le "
+                           "contenu"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_gradio_matcher_rests_on_the_config_schema_not_on_a_generic_config():
+    block = gradio_config_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(body_matcher_hits(m, GRADIO_CONFIG_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /config d'une application "
+        "Gradio courante"
+    )
+    assert all(body_matcher_hits(m, GRADIO_OLD_CONFIG_BODY)
+               for m in body_matchers), (
+        "le template exige des clés absentes des versions 3.x — analytics_enabled, "
+        "protocol ou api_prefix, toutes ajoutées après coup — il raterait les "
+        "instances qui traînent exposées"
+    )
+    assert all(body_matcher_hits(m, GRADIO_REFORMATTED_CONFIG_BODY)
+               for m in body_matchers), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not all(body_matcher_hits(m, GRADIO_LOGIN_REQUIRED_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur le refus d'une instance dont auth est posé, "
+        "c'est-à-dire sur l'application correctement fermée"
+    )
+    assert not all(body_matcher_hits(m, GRADIO_OLD_LOGIN_REQUIRED_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur le refus tel que les versions 3.x et 4.x le "
+        "sérialisent"
+    )
+    assert not all(body_matcher_hits(m, GRADIO_AUTH_REQUIRED_STUB_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur le config réduit que la racine injecte quand "
+        "auth est posé : il porte components, dependencies et pages, donc toute "
+        "la structure de Gradio, et pourtant l'instance demande bien un mot de "
+        "passe"
+    )
+    assert not all(body_matcher_hits(m, OTHER_APP_CONFIG_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur la configuration d'une application "
+        "quelconque : version, mode, titre, thème, composants, mise en page et "
+        "dépendances sont le vocabulaire de tout fichier de configuration, seul "
+        "le trio dev_mode / enable_queue / is_colab nomme le produit"
+    )
+
+    # Le refus doit tenir au corps ET au statut : c'est le 200 anonyme, et lui
+    # seul, qui prouve que login_check laisse passer — la même route rend 401 dès
+    # qu'un auth ou un auth_dependency est posé.
+    statuses = [s for m in (block.get("matchers") or [])
+                if m.get("type") == "status"
+                for s in (m.get("status") or [])]
+    assert statuses == [200], (
+        f"le template accepte des statuts autres que 200 ({statuses}) — or la "
+        "route /config porte Depends(login_check), et c'est son 200 qui constitue "
+        "le constat d'absence d'authentification"
+    )
+
+    # Collisions internes au pack : ces interfaces publient elles aussi leur
+    # configuration sans authentification, et deux templates ne doivent pas
+    # revendiquer la même instance.
+    for other_body in (OPENWEBUI_CONFIG_SIGNUP_OPEN_BODY,
+                       ANYTHINGLLM_SETUP_COMPLETE_OPEN_BODY,
+                       LANGSERVE_OPENAPI_BODY, COMFYUI_SYSTEM_STATS_BODY,
+                       LOCALAI_SYSTEM_BODY):
+        assert not all(body_matcher_hits(m, other_body) for m in body_matchers), (
+            "le template déclenche sur une interface déjà couverte par son "
+            "propre template"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

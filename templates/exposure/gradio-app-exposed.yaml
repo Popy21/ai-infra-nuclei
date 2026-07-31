@@ -1,0 +1,150 @@
+id: gradio-app-exposed
+
+info:
+  name: Gradio - Unauthenticated Application Config Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Gradio n'a d'authentification que sur demande : launch() prend un paramètre
+    auth qui vaut None par défaut, et rien ne l'exige. L'écoute, elle, est prudente
+    — server_name retombe sur 127.0.0.1 — mais la documentation elle-même donne
+    server_name="0.0.0.0" comme le geste pour joindre l'application depuis une
+    autre machine, GRADIO_SERVER_NAME fait la même chose en variable
+    d'environnement, et c'est ce que pose toute image Docker qui publie un port.
+    La démo montée en une après-midi se retrouve ainsi sur l'Internet, sans écran
+    de connexion, parce que personne n'a rien décidé.
+    GET /config est le point où cela se constate. La route porte
+    Depends(login_check) depuis les versions 3.x : dès qu'un auth ou un
+    auth_dependency est posé, elle rend 401 « Not authenticated » ; sans lui elle
+    rend 200 et le document complet de l'interface. Un 200 anonyme n'est donc pas
+    la découverte d'un service, c'est le constat qu'aucune identité n'est demandée.
+    La racine ne dirait pas cela : elle sert la même coquille HTML dans les deux
+    cas, l'instance protégée y glissant simplement un config réduit à
+    "auth_required":true pour que le front affiche le formulaire de connexion.
+  impact: |
+    Le document rendu est la définition de l'application : composants, mise en
+    page, et surtout dependencies — chaque gestionnaire d'événement avec son
+    api_name, ses inputs, ses outputs et son backend_fn. C'est la carte d'appel
+    exacte de POST /gradio_api/call/{api_name}, qui exécute la fonction Python
+    derrière l'interface sur la machine de l'exploitant : GPU, quota du
+    fournisseur de modèle si l'application en appelle un, sans limite de débit ni
+    notion d'utilisateur. Et c'est le même login_check qui garde le reste :
+    POST /upload écrit dans le répertoire temporaire du serveur, GET /file={path}
+    relit ce que l'application sert — le champ allowed_paths est une liste de
+    répertoires, donc leurs sous-répertoires entiers — et POST /component_server
+    appelle une méthode de composant côté serveur. Le 200 sur /config énonce que
+    toutes ces routes répondent au même anonyme.
+    La sévérité reste medium parce que le constat n'est pas à lui seul une faute :
+    une démo Gradio publique est un déploiement légitime et courant, là où une API
+    Ollama ou vLLM ouverte ne l'est jamais. Ce que le template établit, c'est que
+    l'interface et sa carte d'appel sont lisibles et actionnables sans identifiant
+    — à l'exploitant de dire s'il l'a voulu.
+  remediation: |
+    Poser auth= au lancement (ou auth_dependency= pour brancher un fournisseur
+    existant) avant de publier le port. Le auth intégré n'est qu'une liste de
+    couples identifiant/mot de passe partagée : il ferme l'accès anonyme, il
+    n'autorise personne individuellement. Sinon garder l'écoute sur 127.0.0.1 —
+    c'est le défaut — et placer devant un proxy qui authentifie, plutôt que de
+    poser server_name="0.0.0.0" ou GRADIO_SERVER_NAME. Vérifier au passage que
+    share n'est pas à True : le tunnel FRP vers gradio.live rend l'application
+    publique quel que soit le pare-feu de l'hôte. Borner ensuite ce que
+    l'application accepte et sert : max_file_size, qui n'a aucune limite par
+    défaut, et allowed_paths / blocked_paths, blocked_paths l'emportant sur tout
+    le reste. Après une exposition, considérer que la fonction a pu être appelée
+    autant de fois qu'on voulait et que les fichiers servis ont pu être lus.
+  reference:
+    - https://www.gradio.app/guides/sharing-your-app
+    - https://www.gradio.app/docs/gradio/blocks#blocks-launch
+    - https://github.com/gradio-app/gradio/blob/main/gradio/routes.py
+    - https://github.com/gradio-app/gradio/blob/main/gradio/blocks.py
+  metadata:
+    max-request: 1
+    vendor: gradio-app
+    product: gradio
+  tags: ai,llm,gradio,exposure,unauth,misconfig
+
+http:
+  # /config, et pas la racine. Les deux servent le même document, mais seule la
+  # route /config le conditionne à l'authentification :
+  #
+  # - GET / rend 200 et la coquille HTML que l'instance soit protégée ou non.
+  #   Quand auth est posé, le gabarit reçoit un config réduit —
+  #   {"auth_required":true,"auth_message":…,"components":[],"dependencies":[]} —
+  #   et le front affiche le formulaire. S'accrocher à la racine reviendrait à
+  #   signaler toute application Gradio vivante, protégée comprise.
+  # - GET /config porte Depends(login_check), qui rend 401 dès que app.auth ou
+  #   app.auth_dependency existe. Le 200 est donc le constat entier.
+  #
+  # En lecture seule, et c'est délibéré : le même login_check garde
+  # POST /gradio_api/call/{api_name}, qui exécuterait la fonction Python de
+  # l'application sur le matériel de l'exploitant — précisément l'abus que le
+  # template signale — ainsi que POST /upload et POST /component_server, qui
+  # écriraient dans l'instance auditée.
+  - method: GET
+    path:
+      - "{{BaseURL}}/config"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # La signature produit. Aucune de ces trois clés ne suffit seule — un
+      # « mode développement » et une file d'attente activable sont le vocabulaire
+      # de n'importe quelle application — mais un document qui déclare dans le
+      # même souffle son dev_mode, sa file d'attente et le fait de tourner ou non
+      # dans un carnet Google Colab décrit un cadre de démonstration de modèle, et
+      # c'est le vocabulaire de get_config_file().
+      #
+      # Ce trio-là et pas un autre, parce qu'il traverse les versions : dev_mode
+      # date de la 3.1, enable_queue de la 3.0 et is_colab de la 3.9, et les trois
+      # sont encore sérialisés par la 6.x courante. Les clés voisines ne tiennent
+      # pas la distance — "analytics_enabled" n'apparaît qu'après la 3.12,
+      # "protocol" en 4.x, "api_prefix" en 5.x, et "show_api", présent de la 3.4 à
+      # la 5.x, a disparu depuis. Les exiger raterait soit les instances
+      # anciennes, soit les récentes.
+      #
+      # Les versions antérieures à la 3.9 ne sont donc pas couvertes : leur config
+      # n'a pas encore is_colab, et il ne reste alors que "enable_queue",
+      # "layout" et "dependencies" — trois mots qu'un ordonnanceur ou un moteur de
+      # graphe quelconque écrirait aussi bien.
+      - type: word
+        part: body
+        words:
+          - '"dev_mode"'
+          - '"enable_queue"'
+          - '"is_colab"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # La version de Gradio qui sert l'instance : elle situe le déploiement dans
+      # le temps et se rapporte telle quelle à l'exploitant.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
+
+      # Le titre de l'application — souvent le nom du projet interne. Vaut
+      # "Gradio" quand rien n'a été posé.
+      - type: json
+        part: body
+        name: title
+        json:
+          - '.title'
+
+      # Ce qu'il faut vraiment remonter : le nom d'appel de chaque gestionnaire
+      # d'événement, c'est-à-dire ce que l'anonyme peut déclencher via
+      # POST /gradio_api/call/{api_name}. Nul sur les événements purement front,
+      # écarté ici.
+      - type: json
+        part: body
+        name: api_name
+        json:
+          - '.dependencies[].api_name // empty'

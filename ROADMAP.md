@@ -30,7 +30,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/anythingllm-exposed.yaml` — AnythingLLM sans authentification. Sévérité high.
 - [x] `templates/exposure/dify-exposed-console.yaml` — console Dify accessible. Sévérité high.
 - [x] `templates/exposure/litellm-proxy-no-master-key.yaml` — proxy LiteLLM sans `master_key` : `/v1/models` répond sans clé. Sévérité high.
-- [ ] `templates/exposure/gradio-app-exposed.yaml` — application Gradio exposée, `GET /config` renvoie la définition de l'interface. Sévérité medium.
+- [x] `templates/exposure/gradio-app-exposed.yaml` — application Gradio exposée, `GET /config` renvoie la définition de l'interface. Sévérité medium.
 
 ## Bases vectorielles
 
