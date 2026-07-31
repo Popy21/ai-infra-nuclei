@@ -1322,6 +1322,188 @@ def test_openwebui_matcher_proves_signup_is_open_not_merely_that_it_is_openwebui
     )
 
 
+# --------------------------------------------------------------------------
+# AnythingLLM n'a pas un drapeau d'exposition mais deux, et c'est le middleware
+# validatedRequest qui les combine : il n'exige un jeton qu'en mode
+# multi-utilisateur, ou — en mono-utilisateur — si AUTH_TOKEN *et* JWT_SECRET
+# sont tous deux posés. Il suffit donc qu'un seul des deux manque pour que toute
+# l'API de gestion passe sans authentification. GET /api/setup-complete publie
+# ces trois drapeaux sans middleware, et le template doit transcrire la condition
+# telle quelle : ni la réduire à RequiresAuth, ce qui raterait l'instance
+# démarrée sans JWT_SECRET, ni l'oublier, ce qui ferait remonter toute instance
+# vivante. Sa signature produit doit par ailleurs ne tenir qu'aux clés que
+# JSON.stringify ne peut pas omettre : celles qui valent directement une variable
+# d'environnement disparaissent du corps quand elle n'est pas posée.
+
+ANYTHINGLLM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                    "anythingllm-exposed.yaml")
+
+# Instance récente, mono-utilisateur, aucun mot de passe : le défaut de
+# l'installation Docker documentée. Tout est configuré côté modèles, donc les
+# clés qui valent une variable d'environnement sont bien présentes.
+ANYTHINGLLM_SETUP_COMPLETE_OPEN_BODY = (
+    '{"results":{"RequiresAuth":false,"AuthToken":false,"JWTSecret":false,'
+    '"StorageDir":"/app/server/storage","MultiUserMode":false,'
+    '"MemoryEnabled":true,"DisableTelemetry":"false",'
+    '"EmbeddingEngine":"native","HasExistingEmbeddings":true,'
+    '"HasCachedEmbeddings":true,"EmbeddingModelPref":"Xenova/all-MiniLM-L6-v2",'
+    '"VectorDB":"lancedb","LLMProvider":"openai","LLMModel":"gpt-4o-mini",'
+    '"OpenAiKey":true,"WhisperProvider":"local",'
+    '"TextToSpeechProvider":"native","AgentSerpApiKey":false}}'
+)
+
+# Même route sur une instance qui n'a rien configuré — celle qu'on trouve
+# oubliée sur un port ouvert. STORAGE_DIR, EMBEDDING_ENGINE, VECTOR_DB et
+# LLM_PROVIDER ne sont pas posés : leur valeur vaut undefined, donc
+# JSON.stringify omet purement et simplement les clés. Le template doit toujours
+# reconnaître ce corps-là.
+ANYTHINGLLM_BARE_SETUP_COMPLETE_BODY = (
+    '{"results":{"RequiresAuth":false,"AuthToken":false,"JWTSecret":false,'
+    '"MultiUserMode":false,"DisableTelemetry":"false",'
+    '"HasExistingEmbeddings":false,"HasCachedEmbeddings":false}}'
+)
+
+# Le piège du produit : l'exploitant a bien posé un mot de passe, mais pas
+# JWT_SECRET. validatedRequest tombe dans sa branche de passe-droit et laisse
+# passer chaque requête sans jeton — l'instance est ouverte alors qu'elle affiche
+# un écran de connexion. Le template doit la faire remonter.
+ANYTHINGLLM_PASSWORD_WITHOUT_JWT_SECRET_BODY = (
+    '{"results":{"RequiresAuth":true,"AuthToken":true,"JWTSecret":false,'
+    '"StorageDir":"/app/server/storage","MultiUserMode":false,'
+    '"DisableTelemetry":"false","EmbeddingEngine":"native",'
+    '"HasExistingEmbeddings":true,"HasCachedEmbeddings":true,'
+    '"VectorDB":"lancedb","LLMProvider":"ollama"}}'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. La même instance ouverte, réindentée.
+ANYTHINGLLM_REFORMATTED_OPEN_BODY = (
+    '{\n  "results": {\n    "RequiresAuth": false,\n    "AuthToken": false,\n'
+    '    "JWTSecret": false,\n    "MultiUserMode": false,\n'
+    '    "HasExistingEmbeddings": true,\n    "VectorDB": "lancedb"\n  }\n}'
+)
+
+# Mono-utilisateur, mot de passe posé et JWT_SECRET présent : validatedRequest
+# exige le jeton. L'instance est fermée, le template ne doit pas déclencher.
+ANYTHINGLLM_PASSWORD_PROTECTED_BODY = (
+    '{"results":{"RequiresAuth":true,"AuthToken":true,"JWTSecret":true,'
+    '"StorageDir":"/app/server/storage","MultiUserMode":false,'
+    '"DisableTelemetry":"false","EmbeddingEngine":"native",'
+    '"HasExistingEmbeddings":true,"HasCachedEmbeddings":true,'
+    '"VectorDB":"lancedb","LLMProvider":"openai","OpenAiKey":true}}'
+)
+
+# Mode multi-utilisateur : chaque requête exige un compte nommé, quel que soit
+# l'état d'AUTH_TOKEN — et AUTH_TOKEN n'a justement rien à y faire, donc
+# RequiresAuth y vaut false sur une instance parfaitement fermée. C'est le
+# faux positif le plus coûteux du produit, et le seul RequiresAuth n'en protège
+# pas.
+ANYTHINGLLM_MULTI_USER_BODY = (
+    '{"results":{"RequiresAuth":false,"AuthToken":false,"JWTSecret":true,'
+    '"StorageDir":"/app/server/storage","MultiUserMode":true,'
+    '"DisableTelemetry":"false","EmbeddingEngine":"native",'
+    '"HasExistingEmbeddings":true,"HasCachedEmbeddings":true,'
+    '"VectorDB":"lancedb","LLMProvider":"openai","OpenAiKey":true}}'
+)
+
+# Une application quelconque publie elle aussi son état d'authentification :
+# "RequiresAuth" et "MultiUserMode" à false ne désignent aucun produit.
+OTHER_APP_AUTH_SETTINGS_BODY = (
+    '{"results":{"RequiresAuth":false,"MultiUserMode":false,'
+    '"AuthToken":false,"Version":"2.7.1","StorageDir":"/var/lib/app"}}'
+)
+
+
+def anythingllm_setup_complete_block():
+    doc = load(ANYTHINGLLM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/setup-complete" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/setup-complete — /api/ping ne porte "
+        "aucune signature produit, /api/system/multi-user-mode ne dit pas si un "
+        "mot de passe est posé, et GET /api/workspaces rend {\"workspaces\":[]} "
+        "sur une instance neuve"
+    )
+    return blocks[0]
+
+
+def test_anythingllm_probe_neither_writes_nor_attempts_to_authenticate():
+    doc = load(ANYTHINGLLM_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les réglages se lisent en GET : le template ne doit rien envoyer à "
+            "une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "env-dump" not in path, (
+                "le template appelle /api/env-dump, qui n'est pas une lecture : "
+                "dumpENV() réécrit le fichier .env de l'instance sur le disque "
+                "de l'hôte"
+            )
+            assert "request-token" not in path, (
+                "le template appelle la route de connexion : il tenterait de "
+                "s'authentifier sur ce qu'il audite"
+            )
+
+
+def test_anythingllm_matcher_transcribes_the_middleware_not_a_single_flag():
+    block = anythingllm_setup_complete_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "suffirait à faire remonter une instance correctement fermée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(body_matcher_hits(m, ANYTHINGLLM_SETUP_COMPLETE_OPEN_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /api/setup-complete "
+        "d'AnythingLLM démarré sans authentification"
+    )
+    assert all(body_matcher_hits(m, ANYTHINGLLM_BARE_SETUP_COMPLETE_BODY)
+               for m in body_matchers), (
+        "le template s'appuie sur des clés que JSON.stringify omet quand la "
+        "variable d'environnement correspondante n'est pas posée — StorageDir, "
+        "EmbeddingEngine, VectorDB ou LLMProvider — il raterait l'instance qui "
+        "n'a rien configuré, précisément celle qui traîne exposée"
+    )
+    assert all(body_matcher_hits(m, ANYTHINGLLM_PASSWORD_WITHOUT_JWT_SECRET_BODY)
+               for m in body_matchers), (
+        "le template exige RequiresAuth à false : il raterait l'instance dont "
+        "le mot de passe est posé mais JWT_SECRET absent, alors que "
+        "validatedRequest y laisse passer chaque requête sans jeton"
+    )
+    assert all(body_matcher_hits(m, ANYTHINGLLM_REFORMATTED_OPEN_BODY)
+               for m in body_matchers), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not all(body_matcher_hits(m, ANYTHINGLLM_PASSWORD_PROTECTED_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une instance protégée par mot de passe, dont "
+        "AUTH_TOKEN et JWT_SECRET sont tous deux posés : validatedRequest y "
+        "exige le jeton"
+    )
+    assert not all(body_matcher_hits(m, ANYTHINGLLM_MULTI_USER_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une instance en mode multi-utilisateur : "
+        "AUTH_TOKEN n'y sert à rien, donc RequiresAuth y vaut false alors que "
+        "chaque requête exige un compte nommé — reconnaître ce corps ferait "
+        "remonter toute instance correctement fermée"
+    )
+    assert not all(body_matcher_hits(m, OTHER_APP_AUTH_SETTINGS_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une application quelconque publiant son état "
+        "d'authentification : RequiresAuth et MultiUserMode ne désignent aucun "
+        "produit"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

@@ -1,0 +1,174 @@
+id: anythingllm-exposed
+
+info:
+  name: AnythingLLM - Unauthenticated Instance
+  author: popy21
+  severity: high
+  description: |
+    AnythingLLM démarre sans aucune authentification. Les deux protections
+    existent mais sont l'une et l'autre à activer à la main : « Password Protect
+    Instance » pose AUTH_TOKEN pour le mode mono-utilisateur, « Enable
+    multi-user mode » bascule l'instance sur des comptes nommés. Le
+    docker/.env.example officiel laisse les deux commentés — JWT_SECRET y porte
+    même la mention « Only needed if AUTH_TOKEN is set » — donc l'installation
+    documentée sert une instance ouverte, et il suffit de publier le port 3001
+    pour la donner. Le témoin est GET /api/setup-complete : la route n'a aucun
+    middleware, c'est elle que le frontend interroge avant de savoir s'il doit
+    afficher un écran de connexion, et elle publie les drapeaux qui décident de
+    l'accès. Un 200 ne prouve donc rien à lui seul : ce sont les valeurs qui
+    font le constat. Le middleware validatedRequest, qui garde toute l'API de
+    gestion, n'exige un jeton que dans un cas — mode multi-utilisateur, sinon
+    AUTH_TOKEN *et* JWT_SECRET tous deux posés. Le template reprend cette
+    condition telle quelle : MultiUserMode à false, et RequiresAuth ou JWTSecret
+    à false. Le second cas est le piège du produit : une instance dont
+    l'exploitant a bien posé un mot de passe mais oublié JWT_SECRET tombe dans
+    la branche de passe-droit et reste entièrement ouverte, alors que son écran
+    de connexion laisse croire le contraire.
+  impact: |
+    Le passe-droit de validatedRequest ne concerne pas une route mais toute
+    l'API de gestion, en lecture comme en écriture : énumérer les espaces de
+    travail et lire l'historique complet des conversations, télécharger les
+    documents déjà versés — c'est la base documentaire privée, la raison même
+    pour laquelle l'instance a été montée —, en déposer d'autres, dialoguer avec
+    les modèles branchés sans limite de débit et aux frais de l'exploitant
+    (quota du fournisseur si une clé est configurée, GPU de la machine sinon),
+    et reconfigurer l'instance. La réponse dit dans le même temps ce qui est en
+    jeu : HasExistingEmbeddings à true signifie que des documents sont déjà
+    indexés, et LLMProvider nomme le fournisseur dont la clé sera consommée.
+    L'écriture sur les réglages permet de rediriger LLMProvider vers un point de
+    terminaison compatible OpenAI choisi par l'attaquant, donc de capter les
+    invites et les extraits de documents à mesure qu'ils sont soumis. Les
+    agents, activés par espace de travail, ajoutent l'exécution : recherche web
+    et appels sortants depuis l'hôte. Enfin, l'anonyme peut basculer l'instance
+    en mode multi-utilisateur et se donner le compte administrateur : il ferme
+    alors la porte derrière lui.
+  remediation: |
+    Poser AUTH_TOKEN *et* JWT_SECRET avant de publier le port — l'un sans
+    l'autre laisse validatedRequest en passe-droit et ne protège rien. Le mode
+    multi-utilisateur reste préférable dès que l'instance sert à plus d'une
+    personne, puisqu'il exige un compte nommé sur chaque requête quel que soit
+    l'état d'AUTH_TOKEN. Vérifier aussi que NODE_ENV vaut production : la même
+    branche de passe-droit s'ouvre en développement, quels que soient les
+    secrets configurés. Dans tous les cas, lier le service à 127.0.0.1 et le
+    publier derrière un proxy qui authentifie plutôt que d'exposer 3001. Après
+    une exposition, considérer comme divulgués les documents versés et
+    l'historique des conversations, renouveler les clés des fournisseurs de
+    modèles inscrites dans les réglages, et contrôler la liste des espaces de
+    travail, des comptes et des clés d'API de l'instance — l'anonyme pouvait
+    s'en créer, et elles survivent à la pose du mot de passe.
+  reference:
+    - https://docs.anythingllm.com/features/security-and-access
+    - https://github.com/Mintplex-Labs/anything-llm/blob/master/server/utils/middleware/validatedRequest.js
+    - https://github.com/Mintplex-Labs/anything-llm/blob/master/server/models/systemSettings.js
+    - https://github.com/Mintplex-Labs/anything-llm/blob/master/server/endpoints/system.js
+    - https://github.com/Mintplex-Labs/anything-llm/blob/master/docker/.env.example
+  metadata:
+    max-request: 1
+    vendor: mintplex-labs
+    product: anythingllm
+    shodan-query: http.title:"AnythingLLM"
+  tags: ai,llm,anythingllm,exposure,unauth,misconfig
+
+http:
+  # /api/setup-complete, et rien d'autre. Les voisins qui viennent à l'esprit
+  # sont écartés, chacun pour une raison propre :
+  #
+  # - GET /api/workspaces serait la preuve directe — la route est gardée par
+  #   validatedRequest, donc un 200 sans jeton *est* le passe-droit — mais sur
+  #   une instance neuve elle rend {"workspaces":[]} : aucune signature produit,
+  #   et la même forme que n'importe quelle API qui parle d'espaces de travail.
+  # - GET /api/env-dump n'est pas une lecture : dumpENV() réécrit le fichier
+  #   .env de l'instance sur le disque de l'hôte.
+  # - POST /api/request-token est la route de connexion. La toucher, c'est
+  #   tenter de s'authentifier, et sur une instance en mode multi-utilisateur
+  #   c'est frapper à la porte des comptes.
+  # - GET /api/ping rend {"online":true} : ni signature produit, ni rien sur
+  #   l'authentification.
+  # - GET /api/system/multi-user-mode rend une seule clé générique. Elle dit que
+  #   l'instance est en mono-utilisateur, jamais qu'aucun mot de passe n'y est
+  #   posé — la moitié du constat manque.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/setup-complete"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # La signature produit. Ces quatre clés sont sérialisées à l'identique de
+      # la v1.0.0 à aujourd'hui, et c'est leur voisinage qui désigne
+      # AnythingLLM : un service qui publie sans authentification son vocabulaire
+      # de réglages d'accès *et* l'état de son index documentaire dans le même
+      # objet n'est pas un service quelconque.
+      #
+      # Les clés plus parlantes du même objet sont écartées parce qu'aucune
+      # n'est garantie présente : StorageDir, EmbeddingEngine, VectorDB et
+      # LLMProvider valent directement une variable d'environnement, et
+      # JSON.stringify omet une clé dont la valeur est undefined. Sur une
+      # instance qui n'a rien configuré — précisément celle qui traîne exposée —
+      # elles disparaissent du corps. Les quatre retenues valent toutes un
+      # booléen calculé, jamais undefined.
+      - type: word
+        part: body
+        words:
+          - '"AuthToken"'
+          - '"JWTSecret"'
+          - '"MultiUserMode"'
+          - '"HasExistingEmbeddings"'
+        condition: and
+
+      # Le constat, séparé de la signature, et transcrit du middleware
+      # validatedRequest plutôt que deviné. Le mode multi-utilisateur exige un
+      # jeton sur chaque requête quel que soit l'état d'AUTH_TOKEN : une
+      # instance qui répond MultiUserMode à true est fermée, et la faire
+      # remonter reviendrait à signaler tout AnythingLLM vivant.
+      #
+      # Des expressions plutôt que des mots pour ne pas dépendre de la
+      # sérialisation compacte du serveur, qu'un intermédiaire peut reformater.
+      - type: regex
+        part: body
+        regex:
+          - '"MultiUserMode"\s*:\s*false'
+
+      # La seconde moitié du constat. validatedRequest n'applique
+      # l'authentification en mono-utilisateur que si AUTH_TOKEN et JWT_SECRET
+      # sont tous deux posés : il suffit qu'un seul manque pour que la requête
+      # passe sans jeton. D'où la condition `or` par défaut, et non `and` — se
+      # limiter à RequiresAuth raterait l'instance protégée par mot de passe
+      # mais démarrée sans JWT_SECRET, qui est ouverte tout en affichant un
+      # écran de connexion.
+      - type: regex
+        part: body
+        regex:
+          - '"RequiresAuth"\s*:\s*false'
+          - '"JWTSecret"\s*:\s*false'
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # true signifie que des documents sont déjà indexés : la base documentaire
+      # privée est en place, et lisible.
+      - type: json
+        part: body
+        name: has_embeddings
+        json:
+          - '.results.HasExistingEmbeddings'
+
+      # Le fournisseur dont la clé sera consommée. Absent quand LLM_PROVIDER
+      # n'est pas posé.
+      - type: json
+        part: body
+        name: llm_provider
+        json:
+          - '.results.LLMProvider // empty'
+
+      - type: json
+        part: body
+        name: vector_db
+        json:
+          - '.results.VectorDB // empty'
