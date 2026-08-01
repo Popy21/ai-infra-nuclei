@@ -1,0 +1,158 @@
+id: qdrant-no-api-key
+
+info:
+  name: Qdrant - No API Key Set (Unauthenticated Collection Enumeration)
+  author: popy21
+  severity: high
+  description: |
+    Qdrant ne monte d'authentification que si une clé est posée, et rien ne
+    l'impose : le config.yaml livré avec le serveur laisse api_key et
+    read_only_api_key en commentaire — « Uncomment to enable » — tout en gardant
+    service.host à 0.0.0.0 sur le port 6333. La décision tient en une ligne de
+    AuthKeys::try_create, qui rend None quand api_key, alt_api_key et
+    read_only_api_key sont toutes absentes ; le middleware étant monté par
+    ConditionEx::from_option, une instance sans clé ne tourne pas avec un garde
+    permissif, elle tourne sans garde du tout. La documentation ne dit pas autre
+    chose : « By default, all self-deployed Qdrant instances are not secure.
+    They are open to all network interfaces and do not have any kind of
+    authentication configured. »
+    Reste que la seule route qui nomme le produit — GET /, dont le handler rend
+    VersionInfo::default(), donc le titre « qdrant - vector search engine » et
+    la version du paquet — est justement celle que le middleware laisse passer
+    quand une clé est posée : api_key_whitelist compte quatre entrées, / en
+    exact, /healthz en exact, /readyz et /livez en préfixe, plus /dashboard si
+    le tableau de bord est embarqué. La reconnaître seule ferait remonter les
+    instances correctement fermées. GET /collections ne figure sur aucune de ces
+    entrées : dès qu'une clé existe, le middleware s'arrête avant le handler et
+    rend 401 « Must provide an API key or an Authorization bearer token ». Son
+    200 anonyme est le constat entier.
+  impact: |
+    L'index des collections livre d'abord les noms que l'exploitant a donnés à
+    ses corpus : de quoi nommer les projets internes avant même d'en lire une
+    ligne. Mais l'énumération n'est que le témoin — la même absence de garde
+    couvre tout le plan de données. POST /collections/{nom}/points/scroll pagine
+    les points avec leur payload, et le payload est précisément l'endroit où une
+    chaîne RAG range le texte source à côté du vecteur : le corpus — contrats,
+    tickets, documentation interne, ce qui alimente l'assistant — s'extrait page
+    par page, sans inversion ni recherche. POST /collections/{nom}/points/query
+    le classe par proximité sémantique, donc désigne les passages sensibles sans
+    qu'il faille tout tirer. Les verbes d'écriture du même chemin — PUT
+    /collections/{nom}/points, POST /collections/{nom}/points/delete, DELETE
+    /collections/{nom} — laissent réécrire ou supprimer les documents que le
+    modèle citera ensuite comme sources, c'est-à-dire empoisonner les réponses
+    de l'assistant sans jamais toucher au modèle. POST
+    /collections/{nom}/snapshots puis GET /collections/{nom}/snapshots/{nom}
+    rendent la collection entière en un seul fichier. Et PUT
+    /collections/{nom}/snapshots/recover prend une URL que le serveur va
+    chercher lui-même : enable_snapshot_url_recovery vaut true par défaut, et le
+    config.yaml livré note que le désactiver « can mitigate SSRF risks in
+    environments where the Qdrant node has access to internal resources that
+    should not be reachable by users » — l'instance exposée est donc aussi un
+    relais de requêtes vers le réseau interne. GET /telemetry et GET /cluster
+    passent par la même porte ouverte et nomment les pairs.
+  remediation: |
+    Poser service.api_key — ou QDRANT__SERVICE__API_KEY dans l'environnement —
+    avant d'ouvrir le port, puis vérifier que GET /collections répond bien 401
+    sans en-tête api-key. Contrôler GET / ne prouve rien : cette route est sur
+    la liste blanche et rend 200 dans les deux cas. La clé voyage en clair sur
+    HTTP, ce que le config.yaml signale lui-même — « If you enable this you
+    should also enable TLS » — donc activer service.enable_tls ou terminer le
+    TLS sur un proxy. Une clé unique et partagée n'identifie toutefois
+    personne : read_only_api_key pour les consommateurs qui ne font
+    qu'interroger, et service.jwt_rbac pour des jetons portant des droits par
+    collection, sont ce qui rend la trace exploitable. Indépendamment de la clé,
+    ramener service.host à 127.0.0.1 ou à une interface privée, et ne pas
+    publier 6333 — ni 6334, le port gRPC, qui dépend des mêmes clés — sur un
+    réseau non maîtrisé. Après une exposition, considérer le corpus comme lu :
+    le payload d'un point contient le texte source en clair. Et comme les verbes
+    d'écriture étaient ouverts au même titre que ceux de lecture, en contrôler
+    le contenu plutôt que de le supposer intact. GET
+    /collections/{nom}/snapshots liste les instantanés avec leur date de
+    création et leur taille : un instantané que personne n'a demandé est la
+    trace d'une copie de la collection entière.
+  reference:
+    - https://qdrant.tech/documentation/security/
+    - https://github.com/qdrant/qdrant/blob/master/config/config.yaml
+    - https://github.com/qdrant/qdrant/blob/master/src/common/auth/mod.rs
+    - https://github.com/qdrant/qdrant/blob/master/src/actix/mod.rs
+    - https://github.com/qdrant/qdrant/blob/master/src/actix/auth.rs
+    - https://github.com/qdrant/qdrant/blob/master/lib/api/src/rest/models.rs
+  metadata:
+    max-request: 2
+    vendor: qdrant
+    product: qdrant
+  tags: ai,vectordb,qdrant,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et leur séparation n'est pas un confort de rédaction : c'est
+  # la liste blanche du serveur qui l'impose.
+  #
+  # GET / est la seule route qui nomme le produit — index() rend
+  # VersionInfo::default(), soit le titre « qdrant - vector search engine » et la
+  # version du paquet. C'est aussi la première entrée de api_key_whitelist,
+  # WhitelistItem::exact("/") : le middleware la laisse passer même lorsqu'une
+  # clé est posée. Elle identifie, elle ne prouve rien.
+  #
+  # GET /collections ne figure sur aucune entrée de cette liste. Avec une clé, le
+  # middleware s'arrête avant le handler et rend 401 en texte brut ; sans clé, il
+  # n'est pas monté du tout et le handler répond. C'est donc ce 200 anonyme qui
+  # porte le contrôle d'accès, et lui seul — d'où l'ordre des deux chemins, le
+  # produit d'abord, la preuve ensuite.
+  #
+  # En lecture seule, et strictement : le même préfixe sert
+  # /collections/{nom}/points/scroll et /points/query, qui rendraient et
+  # classeraient les documents que ce template est censé protéger, les verbes
+  # d'écriture /points, /points/delete et DELETE /collections/{nom}, qui
+  # toucheraient au corpus, POST /collections/{nom}/snapshots, qui écrirait un
+  # fichier sur le disque de l'hôte audité, et PUT
+  # /collections/{nom}/snapshots/recover, dont l'appel ferait sortir le serveur
+  # vers une URL. Signaler une exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+      - "{{BaseURL}}/collections"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, la bannière de version conclurait
+    # seule — or c'est exactement la route que la liste blanche épargne.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le titre est écrit en dur dans Default::default() de VersionInfo et
+          # n'a pas bougé depuis que la route existe. C'est une phrase entière,
+          # pas un mot-clé : personne ne la sert par accident.
+          - "contains(body_1, 'qdrant - vector search engine')"
+
+          # Le statut, et non le corps, pour l'index : une instance neuve n'a
+          # aucune collection et rend {"result":{"collections":[]},…}. Exiger un
+          # nom de collection raterait précisément l'instance qu'on trouve
+          # oubliée sur un port ouvert.
+          - "status_code_2 == 200"
+
+          # L'enveloppe ApiResponse et la charge CollectionsResponse, vérifiées
+          # sur leurs clés JSON plutôt que sur la sérialisation compacte du
+          # serveur : un intermédiaire qui réindente ce qu'il relaie laisse
+          # "result" et "collections" intacts, alors qu'il disloquerait
+          # "status":"ok". Ces deux clés écartent le portail captif ou le proxy
+          # qui répondrait 200 et une page HTML à tout ce qu'on lui demande.
+          - 'contains(body_2, "\"result\"") && contains(body_2, "\"collections\"")'
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses corpus : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire. CollectionDescription ne porte que ce champ.
+      # Un seul extracteur, et c'est délibéré : sous req-condition, le moteur
+      # évalue les extracteurs contre chacune des deux réponses et émet un
+      # résultat par extracteur qui rend quelque chose. En ajouter un second sur
+      # la bannière — la version, par exemple — ferait remonter deux fois la
+      # même instance dans le rapport de scan. La version se lit de toute façon
+      # sur GET /, que l'instance soit fermée ou non ; elle ne fait pas partie
+      # du constat.
+      - type: json
+        part: body
+        name: collection
+        json:
+          - '.result.collections[].name'

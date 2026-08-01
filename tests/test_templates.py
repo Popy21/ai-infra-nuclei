@@ -2360,6 +2360,285 @@ def test_chromadb_matcher_needs_the_guarded_route_not_just_the_heartbeat():
     )
 
 
+# --------------------------------------------------------------------------
+# Qdrant a la même fracture que ChromaDB, mais le serveur l'écrit noir sur
+# blanc : api_key_whitelist épargne quatre routes de l'authentification — / en
+# exact, /healthz en exact, /readyz et /livez en préfixe — et la première est
+# justement la seule qui nomme le produit, index() rendant VersionInfo. Une
+# instance dont la clé est posée sert donc toujours sa bannière ; la reconnaître
+# seule ferait remonter les instances correctement fermées. GET /collections ne
+# figure sur aucune de ces entrées et rend 401 dès qu'une clé existe — y compris
+# une simple read_only_api_key, puisque AuthKeys::try_create ne rend None que si
+# les trois clés sont absentes. Le template doit donc lier les deux réponses, et
+# conclure sur une instance neuve, dont l'index est un tableau vide.
+
+QDRANT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "qdrant-no-api-key.yaml")
+
+QDRANT_ROOT = "/"
+QDRANT_COLLECTIONS = "/collections"
+
+# VersionInfo::default() : le titre est écrit en dur dans le serveur, la version
+# vient du paquet, et commit n'est sérialisé que s'il a été passé au build.
+QDRANT_VERSION_BODY = (
+    '{"title":"qdrant - vector search engine","version":"1.18.3",'
+    '"commit":"db8fa43fcb6aedec1e739487e17a99731b74590a"}'
+)
+
+# ApiResponse<CollectionsResponse> : result, status, time — et
+# CollectionDescription ne porte que le champ name.
+QDRANT_COLLECTIONS_BODY = (
+    '{"result":{"collections":[{"name":"support-rag"},'
+    '{"name":"contrats-2026"}]},"status":"ok","time":0.000122}'
+)
+
+# La même route sur une instance qui vient d'être lancée : aucune collection
+# n'a encore été créée.
+QDRANT_EMPTY_COLLECTIONS_BODY = (
+    '{"result":{"collections":[]},"status":"ok","time":0.000018}'
+)
+
+# Avec service.hardware_reporting, l'enveloppe porte un bloc usage de plus.
+QDRANT_COLLECTIONS_USAGE_BODY = (
+    '{"result":{"collections":[{"name":"support-rag"}]},"status":"ok",'
+    '"time":0.000122,"usage":{"hardware":{"cpu":1,"payload_io_read":0,'
+    '"payload_io_write":0,"payload_index_io_read":0,"payload_index_io_write":0,'
+    '"vector_io_read":0,"vector_io_write":0},"inference":null}}'
+)
+
+# Ce que rend le middleware quand une clé est posée et qu'aucune n'est fournie :
+# du texte brut, pas du JSON — HttpResponse::Unauthorized().body(e).
+QDRANT_UNAUTHORIZED_BODY = "Must provide an API key or an Authorization bearer token"
+
+
+def qdrant_scenario(root, collections):
+    return {QDRANT_ROOT: root, QDRANT_COLLECTIONS: collections}
+
+
+QDRANT_UNAUTHORIZED = (401, QDRANT_UNAUTHORIZED_BODY)
+
+# Instance servant un corpus, sans aucune clé posée.
+QDRANT_OPEN = qdrant_scenario(
+    root=(200, QDRANT_VERSION_BODY),
+    collections=(200, QDRANT_COLLECTIONS_BODY),
+)
+
+# La même au lendemain de son démarrage : l'index est vide. C'est celle qu'on
+# trouve oubliée sur un port ouvert, et elle doit remonter.
+QDRANT_OPEN_IDLE = qdrant_scenario(
+    root=(200, QDRANT_VERSION_BODY),
+    collections=(200, QDRANT_EMPTY_COLLECTIONS_BODY),
+)
+
+# service.hardware_reporting activé : une clé de plus dans l'enveloppe.
+QDRANT_OPEN_HARDWARE_REPORTING = qdrant_scenario(
+    root=(200, QDRANT_VERSION_BODY),
+    collections=(200, QDRANT_COLLECTIONS_USAGE_BODY),
+)
+
+# Un intermédiaire réindente ce qu'il relaie : le corps n'est plus compact.
+QDRANT_OPEN_REFORMATTED = qdrant_scenario(
+    root=(200, '{\n  "title": "qdrant - vector search engine",\n'
+               '  "version": "1.18.3"\n}'),
+    collections=(200, '\n{\n  "result": {\n    "collections": [\n'
+                      '      {\n        "name": "support-rag"\n      }\n'
+                      '    ]\n  },\n  "status": "ok",\n  "time": 0.000122\n}\n'),
+)
+
+# service.api_key posé. La bannière reste servie — elle est sur la liste
+# blanche — mais l'index est refusé. C'est l'instance fermée, et c'est le
+# scénario qui sépare ce template d'un simple détecteur de produit.
+QDRANT_API_KEY_SET = qdrant_scenario(
+    root=(200, QDRANT_VERSION_BODY),
+    collections=QDRANT_UNAUTHORIZED,
+)
+
+# Seule read_only_api_key est posée : try_create ne rend None que si les trois
+# clés manquent, donc le middleware est monté et l'anonyme est refusé pareil.
+QDRANT_READ_ONLY_API_KEY_SET = qdrant_scenario(
+    root=(200, QDRANT_VERSION_BODY),
+    collections=QDRANT_UNAUTHORIZED,
+)
+
+# Un proxy réglé pour tout garder, bannière comprise.
+QDRANT_BEHIND_AUTH_PROXY = qdrant_scenario(
+    root=(401, "Unauthorized"),
+    collections=(401, "Unauthorized"),
+)
+
+# Portail captif devant une vraie instance : il laisse filer la bannière et
+# répond 200 à l'index, mais avec sa page de connexion.
+QDRANT_BEHIND_CAPTIVE_PORTAL = qdrant_scenario(
+    root=(200, QDRANT_VERSION_BODY),
+    collections=(200, "<html><body>Connexion requise</body></html>"),
+)
+
+# Un proxy qui sert la racine sur tout ce qu'on lui demande : la bannière est
+# authentique, mais l'index n'a jamais répondu.
+QDRANT_ROOT_MIRRORED = qdrant_scenario(
+    root=(200, QDRANT_VERSION_BODY),
+    collections=(200, QDRANT_VERSION_BODY),
+)
+
+# Un autre service qui sert la même enveloppe partout : il satisfait tout ce
+# qu'on attend de l'index, seule la bannière l'en sépare.
+OTHER_SERVER_SERVES_THE_ENVELOPE = qdrant_scenario(
+    root=(200, QDRANT_COLLECTIONS_BODY),
+    collections=(200, QDRANT_COLLECTIONS_BODY),
+)
+
+# Un serveur quelconque qui répond 200 à tout ce qu'on lui demande.
+OTHER_SERVER_ALWAYS_OK = qdrant_scenario(
+    root=(200, '{"status":"ok"}'),
+    collections=(200, '{"status":"ok"}'),
+)
+
+
+def qdrant_block():
+    doc = load(QDRANT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(QDRANT_COLLECTIONS) for p in (b.get("path") or []))]
+    assert blocks, (
+        "le template n'interroge pas GET /collections — c'est pourtant la seule "
+        "route du constat, la bannière de version étant épargnée par la liste "
+        "blanche du middleware"
+    )
+    return blocks[0]
+
+
+def qdrant_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in qdrant_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que Qdrant ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def qdrant_fires(scenario):
+    block = qdrant_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = qdrant_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_qdrant_probe_only_reads_and_never_touches_the_data_plane():
+    doc = load(QDRANT_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'index des collections se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/points", "le template touche au plan de données : /points/scroll "
+                            "rendrait les payloads, où une chaîne RAG range le texte "
+                            "source en clair, et les verbes d'écriture du même "
+                            "préfixe récriraient le corpus qu'il est censé protéger"),
+                ("/query", "le template appelle /points/query : il ferait classer le "
+                           "corpus par proximité sémantique, c'est-à-dire désigner "
+                           "les passages sensibles"),
+                ("/search", "le template appelle /points/search : même effet, il "
+                            "ferait ressortir les documents qu'il signale"),
+                ("/snapshots", "le template déclenche un instantané, donc écrit un "
+                               "fichier sur le disque de l'hôte audité — ou en "
+                               "télécharge un, c'est-à-dire la collection entière"),
+                ("/recover", "le template appelle snapshots/recover, qui fait sortir "
+                             "le serveur vers une URL et écrase la collection"),
+                ("/facet", "le template agrège les payloads de l'instance qu'il "
+                           "audite"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_qdrant_probe_links_the_banner_to_the_guarded_index():
+    block = qdrant_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+
+    assert QDRANT_ROOT in paths, (
+        "le template n'interroge pas GET / — c'est la seule route qui nomme le "
+        "produit, l'index des collections étant vide sur une instance neuve"
+    )
+    assert QDRANT_COLLECTIONS in paths, (
+        "le template n'interroge pas GET /collections, la seule route dont le "
+        "200 anonyme prouve qu'aucune clé n'est posée"
+    )
+    assert block.get("req-condition") is True, (
+        "sans req-condition, les deux réponses ne peuvent pas être liées : la "
+        "bannière conclurait seule, or la liste blanche du middleware l'épargne"
+    )
+
+    # Sous req-condition, le moteur évalue les extracteurs contre chacune des
+    # deux réponses et émet un résultat par extracteur qui rend quelque chose :
+    # deux extracteurs feraient remonter deux fois la même instance.
+    assert len(block.get("extractors") or []) <= 1, (
+        "le template porte plus d'un extracteur : sous req-condition, chacun "
+        "rendant quelque chose ajoute un résultat, donc la même instance est "
+        "signalée plusieurs fois dans un rapport de scan"
+    )
+
+
+def test_qdrant_matcher_needs_the_guarded_index_not_the_whitelisted_banner():
+    assert qdrant_fires(QDRANT_OPEN), (
+        "le template ne reconnaît pas une instance dont GET /collections répond "
+        "à l'anonyme"
+    )
+    assert qdrant_fires(QDRANT_OPEN_IDLE), (
+        "le template exige une collection dans l'index : il raterait l'instance "
+        "qui vient d'être lancée, précisément celle qu'on trouve oubliée sur un "
+        "port ouvert"
+    )
+    assert qdrant_fires(QDRANT_OPEN_HARDWARE_REPORTING), (
+        "le template dépend de l'absence du bloc usage : service."
+        "hardware_reporting le ferait apparaître et mettrait le matcher en défaut"
+    )
+    assert qdrant_fires(QDRANT_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not qdrant_fires(QDRANT_API_KEY_SET), (
+        "le template déclenche sur une instance dont service.api_key est posé : "
+        "son index rend 401, et seule la bannière répond encore — c'est "
+        "exactement ce que la liste blanche du middleware laisse passer"
+    )
+    assert not qdrant_fires(QDRANT_READ_ONLY_API_KEY_SET), (
+        "le template déclenche alors qu'une read_only_api_key suffit à monter le "
+        "middleware : try_create ne rend None que si les trois clés manquent"
+    )
+    assert not qdrant_fires(QDRANT_BEHIND_AUTH_PROXY), (
+        "le template déclenche sur une instance entièrement gardée"
+    )
+    assert not qdrant_fires(QDRANT_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise d'index : un portail captif "
+        "qui répond 200 suffirait à le faire remonter"
+    )
+    assert not qdrant_fires(QDRANT_ROOT_MIRRORED), (
+        "le template conclut d'une bannière servie sur les deux chemins : "
+        "l'index n'a jamais répondu, rien ne prouve qu'il répondrait"
+    )
+    assert not qdrant_fires(OTHER_SERVER_SERVES_THE_ENVELOPE), (
+        "le template déclenche sur un service qui sert l'enveloppe attendue "
+        "partout : il satisfait tout ce qu'on attend de l'index, seule la "
+        "bannière l'en sépare"
+    )
+    assert not qdrant_fires(OTHER_SERVER_ALWAYS_OK), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

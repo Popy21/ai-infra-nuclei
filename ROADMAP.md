@@ -35,7 +35,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 ## Bases vectorielles
 
 - [x] `templates/exposure/chromadb-open-instance.yaml` — ChromaDB, `GET /api/v1/heartbeat` puis énumération des collections. Sévérité high.
-- [ ] `templates/exposure/qdrant-no-api-key.yaml` — Qdrant sans clé d'API : `GET /collections` répond. Sévérité high.
+- [x] `templates/exposure/qdrant-no-api-key.yaml` — Qdrant sans clé d'API : `GET /collections` répond. Sévérité high.
 - [ ] `templates/exposure/weaviate-anonymous-access.yaml` — Weaviate avec accès anonyme activé, `GET /v1/meta`. Sévérité high.
 - [ ] `templates/exposure/milvus-exposed.yaml` — Milvus atteignable sans authentification. Sévérité high.
 
