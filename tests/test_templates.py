@@ -2040,6 +2040,326 @@ def test_gradio_matcher_rests_on_the_config_schema_not_on_a_generic_config():
         )
 
 
+# --------------------------------------------------------------------------
+# ChromaDB sépare ce qui nomme le produit de ce qui prouve l'exposition, et le
+# template doit épouser cette séparation. Le handler heartbeat n'appelle aucun
+# contrôle d'accès — ni dans le serveur Rust des versions 1.x, ni dans le
+# serveur Python d'avant — donc il répond 200 y compris derrière un proxy qui
+# authentifie : le reconnaître seul ferait remonter les instances gardées.
+# list_collections passe, lui, par authenticate_and_authorize avec l'action
+# ListCollections, et c'est son 200 anonyme qui constitue le constat. Le
+# template doit donc lier les deux réponses, couvrir les deux générations d'API
+# — la 1.0 a déplacé le tout sous /api/v2 et rend 410 sur /api/v1, alors que le
+# parc de 2023 ne connaît que /api/v1 — et conclure sur une instance neuve, dont
+# l'index est un tableau vide.
+
+CHROMADB_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "chromadb-open-instance.yaml")
+
+CHROMA_V2_HEARTBEAT = "/api/v2/heartbeat"
+CHROMA_V2_COLLECTIONS = ("/api/v2/tenants/default_tenant/databases/"
+                         "default_database/collections")
+CHROMA_V1_HEARTBEAT = "/api/v1/heartbeat"
+CHROMA_V1_COLLECTIONS = "/api/v1/collections"
+
+# HeartbeatResponse : le champ Rust nanosecond_heartbeat est explicitement
+# renommé à la sérialisation, et le serveur Python écrivait déjà ce littéral.
+# Une espace au milieu d'une clé JSON, personne ne l'écrit par accident.
+CHROMA_HEARTBEAT_BODY = '{"nanosecond heartbeat":1785309961123456789}'
+
+# Index des collections d'une instance qui sert un corpus. Forme du modèle
+# Collection : id, name, configuration_json, metadata, dimension, tenant,
+# database, log_position, version.
+CHROMA_COLLECTIONS_BODY = (
+    '[{"id":"6f1a9c40-3b7e-4d21-9a0c-1f8e5b2d7c33","name":"support-rag",'
+    '"configuration_json":{"hnsw":{"space":"l2","ef_construction":100}},'
+    '"metadata":null,"dimension":384,"tenant":"default_tenant",'
+    '"database":"default_database","log_position":0,"version":0}]'
+)
+
+# La même route sur une instance qui vient d'être lancée : aucune collection
+# n'a encore été créée.
+CHROMA_EMPTY_COLLECTIONS_BODY = "[]"
+
+# Refus de la route gardée quand un CHROMA_SERVER_AUTHN_PROVIDER est posé.
+CHROMA_UNAUTHORIZED_BODY = '{"error":"Unauthorized"}'
+
+# Ce que rend une instance 1.x sur l'ancienne API, tout chemin confondu.
+CHROMA_V1_GONE_BODY = (
+    '{"error":"Unimplemented",'
+    '"message":"The v1 API is deprecated. Please use /v2 apis"}'
+)
+
+# Ce que rend une instance 0.5.x sur la nouvelle : la route n'existe pas encore.
+CHROMA_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+
+def chroma_scenario(**routes):
+    """
+    Un scénario associe une réponse (statut, corps) à chacun des quatre chemins
+    que le template interroge. Les clés sont nommées pour que l'intention reste
+    lisible ; l'ordre, lui, est imposé par le template au moment de l'évaluation.
+    """
+    return {
+        CHROMA_V2_HEARTBEAT: routes["v2_heartbeat"],
+        CHROMA_V2_COLLECTIONS: routes["v2_collections"],
+        CHROMA_V1_HEARTBEAT: routes["v1_heartbeat"],
+        CHROMA_V1_COLLECTIONS: routes["v1_collections"],
+    }
+
+
+V1_GONE = (410, CHROMA_V1_GONE_BODY)
+V2_ABSENT = (404, CHROMA_NOT_FOUND_BODY)
+
+# Instance 1.x servant un corpus, rien devant elle.
+CHROMA_MODERN = chroma_scenario(
+    v2_heartbeat=(200, CHROMA_HEARTBEAT_BODY),
+    v2_collections=(200, CHROMA_COLLECTIONS_BODY),
+    v1_heartbeat=V1_GONE, v1_collections=V1_GONE,
+)
+
+# Même instance au lendemain de son démarrage : l'index est vide. C'est celle
+# qu'on trouve oubliée sur un port ouvert, et elle doit remonter.
+CHROMA_MODERN_IDLE = chroma_scenario(
+    v2_heartbeat=(200, CHROMA_HEARTBEAT_BODY),
+    v2_collections=(200, CHROMA_EMPTY_COLLECTIONS_BODY),
+    v1_heartbeat=V1_GONE, v1_collections=V1_GONE,
+)
+
+# Un intermédiaire réindente ce qu'il relaie : le corps n'est plus compact et
+# l'index ne commence plus par son crochet.
+CHROMA_MODERN_REFORMATTED = chroma_scenario(
+    v2_heartbeat=(200, '{\n  "nanosecond heartbeat": 1785309961123456789\n}'),
+    v2_collections=(200, '\n[\n  {\n    "id": "6f1a9c40",\n'
+                         '    "name": "support-rag"\n  }\n]\n'),
+    v1_heartbeat=V1_GONE, v1_collections=V1_GONE,
+)
+
+# Instance 0.5.x sans CHROMA_SERVER_AUTHN_PROVIDER : le réglage vaut None par
+# défaut, donc l'API de gestion répond à l'anonyme. La nouvelle API n'existe pas
+# encore sur cette version.
+CHROMA_LEGACY = chroma_scenario(
+    v2_heartbeat=V2_ABSENT, v2_collections=V2_ABSENT,
+    v1_heartbeat=(200, CHROMA_HEARTBEAT_BODY),
+    v1_collections=(200, CHROMA_COLLECTIONS_BODY),
+)
+
+# Même version, jeton posé : authenticate_or_raise refuse l'index, mais le
+# heartbeat reste servi — il n'est gardé par rien. C'est l'instance fermée.
+CHROMA_LEGACY_AUTHN = chroma_scenario(
+    v2_heartbeat=V2_ABSENT, v2_collections=V2_ABSENT,
+    v1_heartbeat=(200, CHROMA_HEARTBEAT_BODY),
+    v1_collections=(401, CHROMA_UNAUTHORIZED_BODY),
+)
+
+# Instance 1.x dont seul le plan de données est gardé par un proxy : le
+# heartbeat passe, l'index non. Le serveur libre ne sachant plus refuser une
+# requête, c'est la seule façon de fermer une 1.x — et le template ne doit pas
+# la faire remonter.
+CHROMA_MODERN_BEHIND_PROXY = chroma_scenario(
+    v2_heartbeat=(200, CHROMA_HEARTBEAT_BODY),
+    v2_collections=(401, CHROMA_UNAUTHORIZED_BODY),
+    v1_heartbeat=V1_GONE, v1_collections=V1_GONE,
+)
+
+# Le même proxy, réglé pour tout garder.
+CHROMA_BEHIND_AUTH_PROXY = chroma_scenario(
+    v2_heartbeat=(401, CHROMA_UNAUTHORIZED_BODY),
+    v2_collections=(401, CHROMA_UNAUTHORIZED_BODY),
+    v1_heartbeat=(401, CHROMA_UNAUTHORIZED_BODY),
+    v1_collections=(401, CHROMA_UNAUTHORIZED_BODY),
+)
+
+# Un serveur quelconque qui répond 200 à tout ce qu'on lui demande.
+OTHER_SERVER_ALWAYS_200 = chroma_scenario(
+    v2_heartbeat=(200, '{"status":"ok"}'),
+    v2_collections=(200, '{"status":"ok"}'),
+    v1_heartbeat=(200, '{"status":"ok"}'),
+    v1_collections=(200, '{"status":"ok"}'),
+)
+
+# Le pire de ce genre : il répond 200 et un tableau vide partout, donc satisfait
+# tout ce que le template attend de l'index. Seule la signature du heartbeat
+# l'en sépare.
+OTHER_SERVER_ALWAYS_EMPTY_ARRAY = chroma_scenario(
+    v2_heartbeat=(200, "[]"), v2_collections=(200, "[]"),
+    v1_heartbeat=(200, "[]"), v1_collections=(200, "[]"),
+)
+
+# Portail captif devant une vraie instance : il laisse filer le heartbeat et
+# répond 200 à l'index, mais avec sa page de connexion.
+CHROMA_BEHIND_CAPTIVE_PORTAL = chroma_scenario(
+    v2_heartbeat=(200, CHROMA_HEARTBEAT_BODY),
+    v2_collections=(200, "<html><body>Connexion requise</body></html>"),
+    v1_heartbeat=V1_GONE, v1_collections=V1_GONE,
+)
+
+
+def dsl_matcher_hits(matcher, responses):
+    """
+    Sémantique nuclei d'un matcher `dsl` sous req-condition : les réponses déjà
+    reçues peuplent body_N et status_code_N, chaque expression est évaluée
+    contre cet espace de noms, et la condition vaut `or` par défaut.
+
+    Le sous-ensemble du langage employé ici — contains, starts_with, trim_space,
+    `&&` et `||` — se traduit terme à terme en Python. L'espace de noms est clos :
+    aucune autre fonction n'y est atteignable.
+    """
+    env = {
+        "contains": lambda s, sub: sub in s,
+        "starts_with": lambda s, *prefixes: any(s.startswith(p) for p in prefixes),
+        "trim_space": lambda s: s.strip(),
+    }
+    for i, (status, body) in enumerate(responses, start=1):
+        env[f"status_code_{i}"] = status
+        env[f"body_{i}"] = body
+
+    def hit(expr):
+        python_expr = expr.replace("&&", " and ").replace("||", " or ")
+        return bool(eval(python_expr, {"__builtins__": {}}, env))  # noqa: S307
+
+    exprs = matcher.get("dsl") or []
+    assert exprs, "matcher dsl sans expression"
+    if matcher.get("condition") == "and":
+        return all(hit(e) for e in exprs)
+    return any(hit(e) for e in exprs)
+
+
+def chromadb_block():
+    doc = load(CHROMADB_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith("/heartbeat") for p in (b.get("path") or []))]
+    assert blocks, (
+        "le template n'interroge pas le heartbeat — c'est pourtant la seule "
+        "route qui nomme le produit, l'index des collections étant vide sur "
+        "une instance neuve"
+    )
+    return blocks[0]
+
+
+def chromadb_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in chromadb_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que ChromaDB ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def chromadb_fires(scenario):
+    block = chromadb_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = chromadb_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_chromadb_probe_only_reads_and_never_touches_the_data_plane():
+    doc = load(CHROMADB_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'index des collections se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/reset", "le template appelle POST /api/v2/reset, qui vide "
+                           "l'instance : il détruirait le corpus qu'il est censé "
+                           "protéger"),
+                ("/get", "le template appelle /get, qui rend les documents et "
+                         "leurs embeddings : Chroma stocke le texte en clair, "
+                         "donc le template exfiltrerait le corpus qu'il signale"),
+                ("/query", "le template appelle /query : il ferait classer le "
+                           "corpus par proximité sémantique, c'est-à-dire "
+                           "désigner les passages sensibles"),
+                ("/add", "le template écrit dans une collection de l'instance "
+                         "qu'il audite"),
+                ("/update", "le template récrit des documents que l'assistant "
+                            "citera ensuite comme sources"),
+                ("/upsert", "le template écrit dans une collection de "
+                            "l'instance qu'il audite"),
+                ("/delete", "le template supprime des documents de l'instance "
+                            "qu'il audite"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_chromadb_probe_covers_both_api_generations():
+    paths = [p for p in chromadb_block().get("path") or []]
+
+    assert any(CHROMA_V2_COLLECTIONS in p for p in paths), (
+        "le template n'interroge pas l'index sous /api/v2 — depuis la version "
+        "1.0 c'est la seule API servie, /api/v1 y répond 410"
+    )
+    assert any(p.endswith(CHROMA_V1_COLLECTIONS) for p in paths), (
+        "le template n'interroge pas l'index sous /api/v1 — les instances 0.4 "
+        "et 0.5 ne connaissent que celle-là, et ce sont elles qui traînent "
+        "exposées"
+    )
+    assert chromadb_block().get("req-condition") is True, (
+        "sans req-condition, les deux réponses ne peuvent pas être liées : le "
+        "heartbeat conclurait seul, or il n'est gardé par rien"
+    )
+
+
+def test_chromadb_matcher_needs_the_guarded_route_not_just_the_heartbeat():
+    assert chromadb_fires(CHROMA_MODERN), (
+        "le template ne reconnaît pas une instance 1.x dont l'index des "
+        "collections répond à l'anonyme"
+    )
+    assert chromadb_fires(CHROMA_MODERN_IDLE), (
+        "le template exige une collection dans l'index : il raterait l'instance "
+        "qui vient d'être lancée, précisément celle qu'on trouve oubliée sur un "
+        "port ouvert"
+    )
+    assert chromadb_fires(CHROMA_MODERN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+    assert chromadb_fires(CHROMA_LEGACY), (
+        "le template ne couvre pas les instances 0.4 et 0.5, qui ne servent que "
+        "/api/v1 — or l'authentification y était facultative et elles sont les "
+        "plus anciennes du parc"
+    )
+
+    assert not chromadb_fires(CHROMA_LEGACY_AUTHN), (
+        "le template déclenche sur une instance dont CHROMA_SERVER_AUTHN_PROVIDER "
+        "est posé : son index rend 401, seul le heartbeat répond encore"
+    )
+    assert not chromadb_fires(CHROMA_MODERN_BEHIND_PROXY), (
+        "le template conclut du seul heartbeat : ce handler n'appelle aucun "
+        "contrôle d'accès, donc il répond même à travers le proxy qui est la "
+        "seule façon de fermer une instance 1.x"
+    )
+    assert not chromadb_fires(CHROMA_BEHIND_AUTH_PROXY), (
+        "le template déclenche sur une instance entièrement gardée"
+    )
+    assert not chromadb_fires(OTHER_SERVER_ALWAYS_200), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+    assert not chromadb_fires(OTHER_SERVER_ALWAYS_EMPTY_ARRAY), (
+        "le template déclenche sur un serveur qui rend un tableau vide partout : "
+        "il satisfait tout ce qu'on attend de l'index, seule la signature du "
+        "heartbeat l'en sépare"
+    )
+    assert not chromadb_fires(CHROMA_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise d'index : un portail captif "
+        "qui répond 200 suffirait à le faire remonter"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

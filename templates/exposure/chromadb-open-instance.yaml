@@ -1,0 +1,128 @@
+id: chromadb-open-instance
+
+info:
+  name: ChromaDB - Open Instance (Unauthenticated Collection Enumeration)
+  author: popy21
+  severity: high
+  description: |
+    ChromaDB écoute sur toutes les interfaces par défaut — CHROMA_LISTEN_ADDRESS
+    vaut 0.0.0.0, le port 8000, et le compose officiel du projet publie 8000:8000
+    — et rien ne garde ce port. Jusqu'aux versions 0.6, le serveur Python ne
+    montait d'authentification que si CHROMA_SERVER_AUTHN_PROVIDER était posé, et
+    ce réglage vaut None par défaut. Depuis la réécriture Rust de la version 1.0,
+    le serveur libre n'embarque plus du tout d'implémentation d'authentification :
+    l'implémentation par défaut du trait AuthenticateAndAuthorize rend une
+    identité valide à chaque appel, quels que soient les en-têtes, et la
+    documentation range les variables CHROMA_SERVER_AUTHN_* parmi les réglages
+    hérités. Le heartbeat, lui, n'est gardé dans aucune des deux branches : il
+    répond aussi bien sur une instance placée derrière un proxy qui authentifie,
+    donc il désigne le produit sans rien prouver. C'est l'énumération des
+    collections qui porte le contrôle d'accès, et c'est son 200 anonyme qui
+    constitue le constat.
+  impact: |
+    L'index des collections livre d'abord les noms que l'exploitant a donnés à ses
+    corpus, avec leurs métadonnées et le tenant qui les porte : de quoi nommer les
+    projets internes avant même de lire quoi que ce soit. Mais l'énumération n'est
+    que le témoin — la même surface non authentifiée sert tout le plan de données
+    de chaque collection. /get rend les documents et leurs embeddings, et Chroma
+    stocke le texte en clair à côté du vecteur : le corpus RAG entier — contrats,
+    tickets, documentation interne, ce qui alimente l'assistant — s'extrait sans
+    inversion ni recherche, page par page. /query classe ce corpus par proximité
+    sémantique, donc désigne les passages sensibles sans qu'il faille tout tirer.
+    Les verbes d'écriture du même chemin — /add, /update, /upsert, /delete —
+    laissent réécrire les documents que le modèle citera ensuite comme sources,
+    c'est-à-dire empoisonner les réponses de l'assistant sans jamais toucher au
+    modèle. POST /api/v2/reset efface l'instance, et n'est retenu que par
+    CHROMA_ALLOW_RESET, laissé à false par défaut mais activé sur toute
+    installation qui a eu besoin de vider sa base une fois.
+  remediation: |
+    Lier le serveur à 127.0.0.1 via CHROMA_LISTEN_ADDRESS et le publier derrière
+    un proxy qui authentifie ; ne pas mapper le port 8000 du conteneur sur un
+    réseau non maîtrisé. Sur une version 1.x, ce proxy est le seul levier : il n'y
+    a rien à activer dans le serveur, qui ne sait plus refuser une requête.
+    Sur une version 0.x, CHROMA_SERVER_AUTHN_PROVIDER ferme l'accès anonyme mais
+    ne délivre qu'un jeton statique partagé, sans notion d'utilisateur ni piste
+    d'audit. Laisser CHROMA_ALLOW_RESET à false dans tous les cas. Après une
+    exposition, considérer le corpus comme lu : les documents y sont stockés en
+    clair. Et comme les verbes d'écriture étaient ouverts au même titre que ceux
+    de lecture, en contrôler le contenu plutôt que de le supposer intact — un
+    document réécrit reste cité comme source par l'assistant qu'il alimente.
+  reference:
+    - https://docs.trychroma.com/reference/server-env-vars
+    - https://github.com/chroma-core/chroma/blob/main/rust/frontend/src/server.rs
+    - https://github.com/chroma-core/chroma/blob/main/rust/frontend-core/src/routes.rs
+    - https://github.com/chroma-core/chroma/blob/main/rust/frontend-core/src/auth.rs
+    - https://github.com/chroma-core/chroma/blob/main/chromadb/config.py
+  metadata:
+    max-request: 4
+    vendor: chroma-core
+    product: chroma
+  tags: ai,vectordb,chromadb,exposure,unauth,misconfig
+
+http:
+  # Quatre lectures, deux branches de deux, et c'est le produit qui l'impose :
+  # la version 1.0 a déplacé toute l'API sous /api/v2 et rend désormais 410 sur
+  # /api/v1/*, tandis que les instances 0.4 et 0.5 — celles de la vague RAG de
+  # 2023, précisément celles qui traînent oubliées sur un port ouvert — ne
+  # connaissent que /api/v1. Couvrir une seule branche reviendrait à ne voir
+  # qu'une moitié du parc.
+  #
+  # Dans chaque branche, le heartbeat identifie et l'index des collections
+  # prouve. Cette séparation n'est pas un confort de rédaction, c'est la
+  # structure du serveur : le handler heartbeat n'appelle aucun contrôle d'accès,
+  # ni côté Rust ni côté Python, donc il répond 200 même à travers un proxy qui
+  # authentifie — le reconnaître seul ferait remonter les instances correctement
+  # gardées. list_collections, lui, passe par authenticate_and_authorize avec
+  # l'action ListCollections : son 200 anonyme est le constat entier.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v2/heartbeat"
+      - "{{BaseURL}}/api/v2/tenants/default_tenant/databases/default_database/collections"
+      - "{{BaseURL}}/api/v1/heartbeat"
+      - "{{BaseURL}}/api/v1/collections"
+
+    # En lecture seule, et strictement : le même préfixe sert /add, /update,
+    # /upsert et /delete sur chaque collection, /get et /query qui rendraient les
+    # documents que le template est censé protéger, et POST /api/v2/reset qui
+    # efface l'instance. Signaler une exposition ne demande d'en toucher aucun.
+    #
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # deux réponses à la fois ; stop-at-first-match ferme la marche dès que la
+    # première branche conclut — sans lui, le moteur réévalue le matcher après
+    # chaque requête restante et remonte trois fois la même instance. Une
+    # instance 1.x s'arrête ainsi à deux requêtes, et les deux dernières ne
+    # partent que vers un hôte qui n'a pas répondu en v2.
+    stop-at-first-match: true
+    req-condition: true
+
+    matchers:
+      # Une seule expression par branche, et les deux conditions y sont liées :
+      # le corps du heartbeat pour le produit, le statut de l'index pour
+      # l'absence d'authentification.
+      #
+      # "nanosecond heartbeat" est la signature : la clé porte une espace au
+      # milieu, parce que le champ Rust nanosecond_heartbeat est explicitement
+      # renommé ainsi à la sérialisation et que le serveur Python écrivait déjà
+      # ce littéral. Personne n'écrit une espace dans une clé JSON par accident.
+      #
+      # Le statut, et non le corps, pour l'index : une instance neuve n'a aucune
+      # collection et rend un tableau vide. Exiger "configuration_json" ou
+      # "log_position" raterait exactement l'instance qu'on trouve oubliée. Le
+      # tableau reste vérifié — starts_with écarte la page HTML d'un portail
+      # captif ou d'un proxy qui répondrait 200 à tout — mais son contenu ne
+      # conditionne rien.
+      - type: dsl
+        dsl:
+          - 'contains(body_1, "nanosecond heartbeat") && status_code_2 == 200 && starts_with(trim_space(body_2), "[")'
+          - 'contains(body_3, "nanosecond heartbeat") && status_code_4 == 200 && starts_with(trim_space(body_4), "[")'
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses corpus : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire. Les deux branches sont extraites, une seule aura répondu.
+      - type: regex
+        part: body
+        name: collection
+        group: 1
+        regex:
+          - '"name"\s*:\s*"([^"]+)"'
