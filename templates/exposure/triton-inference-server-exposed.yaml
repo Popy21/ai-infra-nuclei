@@ -1,0 +1,260 @@
+id: triton-inference-server-exposed
+
+info:
+  name: NVIDIA Triton Inference Server - Unauthenticated KServe v2 API (Model Repository Index Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    Triton n'a pas de réglage d'authentification à laisser à false, et il n'a pas
+    non plus de garde qu'on désactiverait : le serveur HTTP est un routeur evhtp
+    dont chaque handler commence par la même macro,
+    RETURN_AND_RESPOND_IF_RESTRICTED, et cette macro sort sans rien faire tant que
+    la catégorie visée n'est pas déclarée restreinte. Le commentaire de
+    RestrictedFeatures le dit sans détour — « Initially empty and all categories
+    unrestricted » : le tableau restricted_categories_ est construit à faux, et il
+    n'est rempli que si l'exploitant a écrit --http-restricted-api. Une instance
+    lancée sans ce drapeau ne consulte donc jamais l'identité de l'appelant, sur
+    aucune des neuf catégories que l'énumération déclare — health, metadata,
+    inference, shared-memory, model-config, model-repository, statistics, trace,
+    logging.
+    Ce que le drapeau apporte n'est d'ailleurs pas un compte mais un secret
+    partagé : --http-restricted-api=<catégories>:<clé>=<valeur> fait exiger un
+    en-tête de nom <clé> portant exactement <valeur>. C'est une porte, pas une
+    identité — rien n'y est révocable individuellement, rien n'y est journalisé au
+    nom de quelqu'un — et il faut l'avoir posée catégorie par catégorie.
+    Trois routes suffisent à établir l'exposition, et elles ne disent pas la même
+    chose. GET /v2/health/ready est la sonde de disponibilité : HandleServerHealth
+    n'écrit rien dans buffer_out et finit sur
+    « evhtp_send_reply(req, ready ? EVHTP_RES_OK : EVHTP_RES_BADREQ) », donc un
+    corps vide et 200 contre 400. Le 200 n'est pas cosmétique : sous
+    --strict-readiness, qui vaut vrai par défaut, le serveur ne se déclare prêt
+    qu'une fois tous ses modèles chargés, et c'est le serveur lui-même qui fait
+    cette distinction. Mais un corps vide ne désigne personne.
+    GET /v2 porte l'identification. HandleServerMetadata sert la chaîne que
+    TRITONSERVER_ServerMetadata a construite au démarrage : « name », « version »
+    et « extensions ». Le nom n'est pas la signature — il vaut « triton » par
+    défaut mais --id le change — et la version encore moins. Ce qui identifie est
+    la liste d'extensions, écrite en dur et sans condition dans le constructeur
+    d'InferenceServer, où figurent notamment « model_repository(unload_dependents) »
+    et « cuda_shared_memory » ; la première, avec sa parenthèse à l'intérieur du
+    nom, est une singularité de ce serveur.
+    POST /v2/repository/index est l'index lui-même, et il se lit sans rien
+    envoyer : HandleRepositoryIndex n'inspecte le corps que sous « if (buffer_len
+    > 0) », donc une requête sans corps prend le défaut « ready: false » et
+    demande tout le dépôt. La réponse est un tableau JSON dont chaque entrée porte
+    toujours « name », et « version », « state », « reason » dès que le modèle a
+    un état — c'est-à-dire, en mode NONE qui est le mode par défaut, sur tout le
+    dépôt, puisque Triton y charge tous les modèles au démarrage.
+  impact: |
+    L'index n'est pas un inventaire technique, c'est la nomenclature des modèles
+    que l'exploitant sert : RepositoryIndex énumère les sous-répertoires de chaque
+    dépôt, donc les noms tels qu'ils ont été donnés, y compris ceux des modèles
+    présents mais non chargés. Un nom de modèle dit le produit qu'il sert, et
+    souvent le client pour lequel il a été entraîné. La suite est immédiate et
+    ouverte par la même absence de garde : GET /v2/models/{nom} rend les tenseurs
+    d'entrée et de sortie avec leur datatype et leur forme, GET
+    /v2/models/{nom}/config rend la configuration complète — plateforme, backend,
+    groupes d'instances, donc le matériel — et GET /v2/models/stats rend le compte
+    des inférences et les latences, c'est-à-dire le rythme réel du service.
+    Ce qui suit la lecture est l'appel, et c'est lui qui fixe la sévérité. Une
+    fois le nom du modèle et la forme de ses entrées connus, POST
+    /v2/models/{nom}/infer les fournit : chaque requête fait tourner le modèle sur
+    les accélérateurs de l'exploitant, sans compte à débiter et sans rien à
+    deviner. Sur les modèles de génération, /generate et /generate_stream y
+    ajoutent une interface directe. Un modèle propriétaire servi sans garde est un
+    modèle qu'on peut interroger à volonté, donc distiller ; un modèle de langage
+    servi sans garde est une facture de calcul ouverte, et le vol de capacité y
+    est le premier usage constaté.
+    L'écriture est de l'autre côté du même chemin ouvert, et son étendue dépend du
+    mode. En mode EXPLICIT, POST /v2/repository/models/{nom}/load charge ce que
+    l'index vient de nommer et /unload le retire — LoadUnloadModel refuse hors de
+    ce mode, mais le refus vient du mode, pas d'un contrôle d'identité. Sur toute
+    instance en revanche, POST /v2/systemsharedmemory/region/{nom}/register et son
+    équivalent CUDA inscrivent des régions de mémoire partagée, POST /v2/logging
+    change la journalisation en cours — donc ce que les traces retiendront de la
+    visite — et POST /v2/trace/setting le traçage. Et comme aucun compte n'existe,
+    rien de tout cela n'est attribuable à personne : les journaux ne porteront
+    qu'une adresse.
+  remediation: |
+    Il n'y a pas de mot de passe à définir. La seule fermeture que le serveur
+    connaisse est --http-restricted-api=<catégories>:<clé>=<valeur>, qui exige un
+    en-tête portant une valeur convenue : un secret partagé, à poser explicitement
+    sur chaque catégorie qu'on veut fermer — inference et model-repository ne sont
+    pas couvertes par la restriction de health — et son équivalent gRPC
+    --grpc-restricted-protocol est à poser séparément, le port 8001 servant les
+    mêmes appels.
+    Le reste est du réseau. Ne pas publier les ports de Triton — 8000 pour HTTP,
+    8001 pour gRPC, 8002 pour les métriques — s'en tenir à une écoute locale ou à
+    un réseau interne, ne pas laisser un Service Kubernetes passer en NodePort ou
+    en LoadBalancer le temps d'une démonstration, et ne pas mapper les ports du
+    conteneur sur toutes les interfaces de l'hôte. Placer devant un mandataire qui
+    authentifie, et n'y laisser passer que les routes d'inférence effectivement
+    destinées à un client.
+    Ne pas compter sur le mode de contrôle des modèles pour fermer : NONE et POLL
+    font refuser load et unload, mais ce refus tient au mode et non à l'appelant —
+    l'index, les métadonnées, la configuration, les statistiques et l'inférence
+    elle-même restent servis à qui les demande. Ne pas compter davantage sur --id,
+    qui change le nom rendu par /v2 sans rien fermer.
+    Contrôler ensuite depuis l'extérieur, sur les chemins eux-mêmes : GET
+    /v2/health/ready puis POST /v2/repository/index depuis un réseau non approuvé.
+    Un 200 anonyme sur le second signifie que la porte est ouverte, quelle que soit
+    la configuration supposée. Ne pas contrôler sur /v2/health/live seul, dont la
+    réponse ne dit rien d'autre que la présence d'un processus.
+    Après une exposition, considérer les modèles comme interrogés et non seulement
+    nommés. Relire les métriques du port 8002 et les journaux d'accès pour mesurer
+    le volume d'inférences non attribuées, inspecter GET /v2/models/stats modèle
+    par modèle, et vérifier les régions de mémoire partagée enregistrées ainsi que
+    le réglage de journalisation en cours : POST /v2/logging se change par une
+    seule requête, et cette écriture-là décide de ce que les traces garderont.
+  reference:
+    - https://github.com/triton-inference-server/server/blob/main/docs/protocol/extension_model_repository.md
+    - https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/inference_protocols.md
+    - https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_management.md
+    - https://github.com/triton-inference-server/server/blob/main/src/http_server.cc
+    - https://github.com/triton-inference-server/server/blob/main/src/restricted_features.h
+    - https://github.com/triton-inference-server/core/blob/main/src/tritonserver.cc
+    - https://github.com/triton-inference-server/core/blob/main/src/server.cc
+    - https://github.com/triton-inference-server/core/blob/main/src/model_repository_manager/model_repository_manager.cc
+    - https://github.com/kserve/kserve/blob/master/docs/predict-api/v2/required_api.md
+  metadata:
+    max-request: 3
+    vendor: nvidia
+    product: triton-inference-server
+  tags: ai,ml,triton,nvidia,inference,exposure,unauth,misconfig
+
+http:
+  # Trois lectures, et le partage est net : la première dit l'état du service, la
+  # deuxième dit quel produit c'est, la troisième est le constat lui-même.
+  #
+  # raw plutôt que path, parce que les méthodes diffèrent et qu'un bloc n'en
+  # porte qu'une. Ce n'est pas un choix de forme : la sonde est GET-seul —
+  # HandleServerHealth rend 405 sur autre chose — et l'index est POST-seul,
+  # HandleRepositoryIndex de même. Les trois doivent pourtant être jugées
+  # ensemble, donc dans un seul bloc.
+  #
+  # /v2/health/ready est la sonde de disponibilité, et son apport est double. Le
+  # corps est vide par construction — HandleServerHealth n'écrit rien dans
+  # buffer_out et finit sur « evhtp_send_reply(req, ready ? EVHTP_RES_OK :
+  # EVHTP_RES_BADREQ) » — ce qui écarte le portail captif qui répond 200 et sa
+  # page à tout ce qu'on lui demande. Et le 200 lui-même porte un sens : sous
+  # --strict-readiness, vrai par défaut, le serveur ne se déclare prêt qu'une
+  # fois tous ses modèles chargés. Conclure de cette seule réponse serait en
+  # revanche rapporter qu'un serveur répond : un corps vide n'appartient à
+  # personne.
+  #
+  # /v2 porte l'identification, et par des chaînes écrites en dur plutôt que par
+  # une forme. Ni « name » ni « version » ne conviennent — le premier vaut
+  # « triton » par défaut mais --id le change, et « name », « version »,
+  # « extensions » sont le vocabulaire du protocole KServe v2, que d'autres
+  # serveurs implémentent. Ce qui identifie Triton est le contenu de la liste
+  # d'extensions, posée sans condition par le constructeur d'InferenceServer.
+  #
+  # /v2/repository/index est le constat. POST parce que le protocole l'impose,
+  # mais sans corps : HandleRepositoryIndex n'inspecte le corps que sous
+  # « if (buffer_len > 0) », donc l'absence de corps prend le défaut
+  # « ready: false » et demande tout le dépôt. N'envoyer rien est ici la garantie
+  # que le serveur ne dit que ce qu'il sait de lui-même.
+  #
+  # En lecture seule, et strictement : le même serveur non gardé sert
+  # /v2/models/{nom}/infer, /generate et /generate_stream, dont chaque appel
+  # ferait tourner le modèle sur les accélérateurs de l'exploitant,
+  # /v2/repository/models/{nom}/load et /unload, qui chargeraient ou retireraient
+  # ce que l'index vient de nommer, les enregistrements de mémoire partagée, et
+  # /v2/logging, qui changerait ce que les traces retiendront de la visite.
+  # Signaler une exposition ne demande d'en toucher aucun — et l'index que le
+  # template lit est précisément ce qui dirait quel modèle appeler.
+  - raw:
+      - |
+        GET /v2/health/ready HTTP/1.1
+        Host: {{Hostname}}
+      - |
+        GET /v2 HTTP/1.1
+        Host: {{Hostname}}
+      - |
+        POST /v2/repository/index HTTP/1.1
+        Host: {{Hostname}}
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les trois réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # la sonde ne rend qu'un corps vide, et l'index seul ne nomme aucun produit.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La sonde a répondu, et elle a répondu comme Triton la sert : rien.
+          # Le contrôle porte sur le vide plutôt que sur une chaîne, puisqu'il
+          # n'y en a aucune à attendre ; ce qu'il écarte est la page — portail
+          # captif ou mandataire qui répond 200 et son formulaire à n'importe
+          # quel chemin. trim_space parce qu'un intermédiaire peut ajouter une
+          # fin de ligne à ce qu'il relaie.
+          #
+          # Le statut est l'autre moitié : 400 tant que le serveur n'est pas
+          # prêt, et sous --strict-readiness il ne l'est qu'une fois tous ses
+          # modèles chargés. L'exiger sépare « un serveur Triton est joignable »
+          # de « l'inférence est servie à qui la demande ».
+          - 'status_code_1 == 200 && trim_space(body_1) == ""'
+
+          # Les métadonnées ont été servies, et non relayées par un cache sous le
+          # statut d'un refus. Ce statut distingue aussi l'instance ouverte du
+          # montage où --http-restricted-api ferme metadata sans fermer health.
+          #
+          # Puis l'identification, et par la liste d'extensions plutôt que par le
+          # nom : lserver->Id() vaut « triton » par défaut, mais --id le change,
+          # et « name », « version », « extensions » sont le vocabulaire de
+          # KServe v2, que d'autres serveurs implémentent. Les deux chaînes
+          # exigées ici sont poussées sans condition par le constructeur
+          # d'InferenceServer, avant les extensions qu'un drapeau de compilation
+          # subordonne — statistics, trace, logging — donc elles tiennent d'une
+          # version et d'une compilation à l'autre, ce qui importe puisque les
+          # instances qui traînent exposées ne sont pas les plus récentes.
+          #
+          # Deux chaînes plutôt qu'une, et pour la même raison que chez BentoML :
+          # une passerelle peut nommer une extension de Triton dans le document
+          # d'un service qu'elle proxifie. « model_repository(unload_dependents) »
+          # porte l'essentiel — une parenthèse à l'intérieur d'un nom d'extension
+          # est une singularité de ce serveur — et « cuda_shared_memory »
+          # rattache la réponse à la même liste.
+          #
+          # Vérifiées sur la chaîne nue : rapidjson sérialise en compact, mais un
+          # intermédiaire qui réindenterait ce qu'il relaie n'a pas à s'y tenir.
+          - 'status_code_2 == 200 && contains(body_2, "\"extensions\"")'
+          - 'contains(body_2, "model_repository(unload_dependents)") && contains(body_2, "cuda_shared_memory")'
+
+          # L'index, et c'est lui que le constat revendique. Le statut d'abord :
+          # model-repository est une catégorie restreignable à part, donc un
+          # mandataire — ou --http-restricted-api — peut ouvrir la sonde et les
+          # métadonnées en gardant l'index, et les deux premières réponses sont
+          # alors exactement celles de l'instance ouverte.
+          #
+          # La forme ensuite : TRITONSERVER_ServerModelIndex construit un tableau
+          # JSON, là où /v2 rend un objet et où la sonde ne rend rien. C'est ce
+          # qui empêche un cache indexé sur l'hôte et non sur le chemin de faire
+          # conclure de trois routes quand une seule a répondu — le tableau, la
+          # forme d'objet et le vide s'excluent trois à trois.
+          #
+          # Et « name », qui est la seule clé que le sérialiseur écrive sans
+          # condition : version, state et reason sont subordonnés à name_only_ et
+          # à l'état du modèle. L'exiger demande donc qu'au moins un modèle soit
+          # nommé, ce qui est le fond du constat — un dépôt vide sérialiserait
+          # « [] » et ne divulguerait rien. La contrepartie est assumée, et elle
+          # coûte peu : en mode NONE, qui est le mode par défaut, Triton charge
+          # au démarrage tous les modèles du dépôt.
+          - 'status_code_3 == 200 && starts_with(trim_space(body_3), "[") && contains(body_3, "\"name\"")'
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses modèles : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire — chacun désigne une route /v2/models/{nom}/infer appelable.
+      #
+      # Un seul extracteur, et borné à body_3 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second ferait
+      # remonter deux fois la même instance — et la sonde n'a de toute façon rien
+      # à en extraire.
+      - type: json
+        part: body_3
+        name: model
+        json:
+          - ".[].name"

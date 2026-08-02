@@ -5613,6 +5613,493 @@ def test_bentoml_extractor_stays_on_the_schema_response():
     )
 
 
+# --------------------------------------------------------------------------
+# Triton pose une difficulté qu'aucun template précédent n'avait : ses trois
+# routes n'ont pas la même méthode. La sonde est GET-seul, l'index est POST-seul,
+# et les deux doivent pourtant être jugées ensemble — d'où `raw` plutôt que
+# `path`, un bloc ne portant qu'une méthode. Le partage des rôles est en
+# revanche le même que chez BentoML : la sonde dit l'état sans nommer personne,
+# une seconde route identifie le produit, la troisième porte le constat. Ce qui
+# identifie n'est ici ni le nom rendu par /v2 — « triton » par défaut, mais --id
+# le change — ni la forme de la réponse, « name », « version » et
+# « extensions » étant le vocabulaire du protocole KServe v2 que d'autres
+# serveurs implémentent, mais le contenu de la liste d'extensions.
+
+TRITON_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "triton-inference-server-exposed.yaml")
+
+TRITON_READY = "/v2/health/ready"
+TRITON_METADATA = "/v2"
+TRITON_INDEX = "/v2/repository/index"
+
+# Ce que rend HandleServerHealth : rien n'est écrit dans buffer_out, la réponse
+# se réduit à « evhtp_send_reply(req, ready ? EVHTP_RES_OK : EVHTP_RES_BADREQ) ».
+TRITON_READY_BODY = ""
+
+# Les extensions poussées sans condition par le constructeur d'InferenceServer,
+# avant celles qu'un drapeau de compilation subordonne.
+TRITON_CORE_EXTENSIONS = [
+    "classification", "sequence", "model_repository",
+    "model_repository(unload_dependents)", "schedule_policy",
+    "model_configuration", "system_shared_memory", "cuda_shared_memory",
+    "binary_tensor_data", "parameters",
+]
+
+# Celles que TRITON_ENABLE_STATS, TRITON_ENABLE_TRACING et TRITON_ENABLE_LOGGING
+# ajoutent : une compilation qui les retire ne doit pas faire taire le template.
+TRITON_OPTIONAL_EXTENSIONS = ["statistics", "trace", "logging"]
+
+
+def triton_metadata_body(name="triton", version="2.62.0", extensions=None):
+    """
+    Ce que /v2 rend : les trois clés que TRITONSERVER_ServerMetadata pose, dans
+    la sérialisation compacte de rapidjson.
+
+    `name` vaut lserver->Id(), donc « triton » par défaut et ce que --id dit
+    sinon — le template ne doit pas en dépendre.
+    """
+    if extensions is None:
+        extensions = TRITON_CORE_EXTENSIONS + TRITON_OPTIONAL_EXTENSIONS
+    return json.dumps({"name": name, "version": version,
+                       "extensions": extensions}, separators=(",", ":"))
+
+
+def triton_index_body(models=(("densenet_onnx", "1", "READY"),
+                              ("simple", "1", "READY"))):
+    """
+    Ce que rend TRITONSERVER_ServerModelIndex : un tableau dont chaque entrée
+    porte toujours « name », et « version » / « state » seulement quand le
+    modèle a un état — un modèle présent au dépôt mais jamais chargé est écrit
+    sous son seul nom, name_only_ valant alors vrai.
+    """
+    entries = []
+    for name, version, state in models:
+        entry = {"name": name}
+        if version is not None:
+            entry["version"] = version
+        if state is not None:
+            entry["state"] = state
+        entries.append(entry)
+    return json.dumps(entries, separators=(",", ":"))
+
+
+TRITON_METADATA_BODY = triton_metadata_body()
+TRITON_INDEX_BODY = triton_index_body()
+
+# Une instance dont l'exploitant a changé le nom rendu par /v2 : --id le pose, et
+# il ne ferme rien. Le template doit toujours la reconnaître.
+TRITON_METADATA_RENAMED_BODY = triton_metadata_body(name="prod-inference-01")
+
+# Une compilation sans statistiques, sans traçage et sans journalisation : trois
+# extensions en moins, et ce sont justement celles qui sont conditionnelles.
+TRITON_METADATA_MINIMAL_BODY = triton_metadata_body(
+    extensions=TRITON_CORE_EXTENSIONS)
+
+# Un dépôt en mode EXPLICIT dont les modèles ne sont pas chargés : le
+# sérialiseur n'écrit que « name ». C'est le cas qui interdit d'exiger « state ».
+TRITON_INDEX_NAME_ONLY_BODY = triton_index_body(
+    models=(("densenet_onnx", None, None), ("simple", None, None)))
+
+# Les mêmes corps relayés par un intermédiaire qui réindente ce qu'il transporte.
+TRITON_METADATA_REFORMATTED_BODY = json.dumps(json.loads(TRITON_METADATA_BODY),
+                                              indent=2)
+TRITON_INDEX_REFORMATTED_BODY = json.dumps(json.loads(TRITON_INDEX_BODY),
+                                           indent=2)
+
+# Un dépôt vide : le tableau est là, il ne nomme personne.
+TRITON_INDEX_EMPTY_BODY = "[]"
+
+# Un autre serveur d'inférence parlant le même protocole KServe v2 : mêmes
+# routes, mêmes trois clés dans /v2, même forme de réponse. Tout le vocabulaire
+# du protocole y est, aucune des deux extensions de Triton n'y est.
+OTHER_KSERVE_METADATA_BODY = json.dumps(
+    {"name": "mlserver", "version": "1.7.0",
+     "extensions": ["kserve", "model_repository"]}, separators=(",", ":"))
+
+# Une passerelle qui republie une extension du serveur qu'elle proxifie — cas
+# ordinaire d'un agrégateur. La chaîne la plus distinctive de Triton figure donc
+# mot pour mot dans sa réponse sans qu'il soit Triton, et la seconde n'y est
+# pas : c'est ce corps qui rend nécessaire d'exiger les deux ensemble.
+OTHER_GATEWAY_QUOTING_TRITON_BODY = json.dumps(
+    {"name": "inference-gateway", "version": "2.3.0",
+     "extensions": ["model_repository", "model_repository(unload_dependents)"]},
+    separators=(",", ":"))
+
+
+def triton_scenario(ready, metadata, index):
+    return {TRITON_READY: ready, TRITON_METADATA: metadata, TRITON_INDEX: index}
+
+
+TRITON_READY_OK = (200, TRITON_READY_BODY)
+
+# Une instance servie telle quelle : la sonde répond, les métadonnées se lisent,
+# l'index nomme les modèles.
+TRITON_OPEN = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, TRITON_METADATA_BODY),
+    index=(200, TRITON_INDEX_BODY))
+
+# La même, renommée par --id et compilée sans les extensions conditionnelles.
+TRITON_OPEN_RENAMED = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, TRITON_METADATA_RENAMED_BODY),
+    index=(200, TRITON_INDEX_BODY))
+TRITON_OPEN_MINIMAL_BUILD = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, TRITON_METADATA_MINIMAL_BODY),
+    index=(200, TRITON_INDEX_BODY))
+
+# La même, en mode EXPLICIT avec un dépôt dont rien n'est chargé : l'index ne
+# porte que des noms.
+TRITON_OPEN_NAME_ONLY_INDEX = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, TRITON_METADATA_BODY),
+    index=(200, TRITON_INDEX_NAME_ONLY_BODY))
+
+# La même, derrière un intermédiaire qui réindente et ajoute une fin de ligne.
+TRITON_OPEN_REFORMATTED = triton_scenario(
+    ready=(200, "\n"), metadata=(200, TRITON_METADATA_REFORMATTED_BODY),
+    index=(200, TRITON_INDEX_REFORMATTED_BODY))
+
+# Le serveur tourne mais ne se déclare pas prêt : HandleServerHealth rend 400, et
+# sous --strict-readiness — vrai par défaut — cela veut dire qu'un modèle au
+# moins n'est pas chargé.
+TRITON_NOT_READY = triton_scenario(
+    ready=(400, ""), metadata=(200, TRITON_METADATA_BODY),
+    index=(200, TRITON_INDEX_BODY))
+
+# --http-restricted-api ferme metadata sans fermer health : les catégories se
+# restreignent une à une, et la sonde reste exactement celle de l'instance
+# ouverte.
+TRITON_METADATA_RESTRICTED = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(401, '{"error":"This API is restricted"}'),
+    index=(200, TRITON_INDEX_BODY))
+
+# La même restriction posée sur model-repository : c'est le constat lui-même qui
+# est refusé, et les deux premières réponses ne le disent pas.
+TRITON_INDEX_RESTRICTED = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, TRITON_METADATA_BODY),
+    index=(401, '{"error":"This API is restricted"}'))
+
+# Un cache placé devant relaie l'index qu'il détient sous le statut du refus,
+# alors que le serveur, lui, a refusé.
+TRITON_CACHED_UNDER_REFUSAL = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, TRITON_METADATA_BODY),
+    index=(401, TRITON_INDEX_BODY))
+
+# Un dépôt vide : le template ne doit pas conclure d'un tableau qui ne nomme
+# personne.
+TRITON_EMPTY_REPOSITORY = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, TRITON_METADATA_BODY),
+    index=(200, TRITON_INDEX_EMPTY_BODY))
+
+# Un cache indexé sur l'hôte et non sur le chemin sert la même réponse aux trois.
+TRITON_METADATA_ON_ALL_PATHS = triton_scenario(
+    ready=(200, TRITON_METADATA_BODY), metadata=(200, TRITON_METADATA_BODY),
+    index=(200, TRITON_METADATA_BODY))
+TRITON_INDEX_ON_ALL_PATHS = triton_scenario(
+    ready=(200, TRITON_INDEX_BODY), metadata=(200, TRITON_INDEX_BODY),
+    index=(200, TRITON_INDEX_BODY))
+TRITON_PROBE_ON_ALL_PATHS = triton_scenario(
+    ready=TRITON_READY_OK, metadata=TRITON_READY_OK, index=TRITON_READY_OK)
+
+# Un autre serveur d'inférence parlant KServe v2.
+OTHER_KSERVE_SERVER = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, OTHER_KSERVE_METADATA_BODY),
+    index=(200, TRITON_INDEX_BODY))
+
+# La passerelle qui republie l'extension la plus distinctive de Triton.
+OTHER_GATEWAY_QUOTING_TRITON = triton_scenario(
+    ready=TRITON_READY_OK, metadata=(200, OTHER_GATEWAY_QUOTING_TRITON_BODY),
+    index=(200, TRITON_INDEX_BODY))
+
+# Un portail captif qui répond 200 et sa page à tout ce qu'on lui demande.
+TRITON_BEHIND_CAPTIVE_PORTAL = triton_scenario(
+    ready=(200, "<html><body>Connexion requise</body></html>"),
+    metadata=(200, "<html><body>Connexion requise</body></html>"),
+    index=(200, "<html><body>Connexion requise</body></html>"))
+
+# Un serveur quelconque qui répond 200 à tout.
+TRITON_SERVER_ALWAYS_UP = triton_scenario(
+    ready=(200, '{"status":"ok"}'), metadata=(200, '{"status":"ok"}'),
+    index=(200, '{"status":"ok"}'))
+
+
+def triton_block():
+    doc = load(TRITON_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(TRITON_INDEX in raw for raw in (b.get("raw") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {TRITON_INDEX} — c'est pourtant l'index "
+        "que le constat revendique, la sonde ne rendant rien et /v2 ne disant "
+        "que ce que le serveur sait de lui-même"
+    )
+    return blocks[0]
+
+
+def triton_requests():
+    """
+    (méthode, chemin) de chaque requête brute, dans l'ordre déclaré : c'est cet
+    ordre qui donne son numéro à chaque body_N.
+
+    Le bloc emploie `raw` et non `path` parce que les méthodes diffèrent —
+    HandleServerHealth rend 405 sur autre chose qu'un GET, HandleRepositoryIndex
+    sur autre chose qu'un POST — et qu'un bloc `path` n'en porte qu'une.
+    """
+    out = []
+    for raw in triton_block().get("raw") or []:
+        start_line = raw.strip().splitlines()[0].split()
+        assert len(start_line) >= 2, f"requête brute illisible : {raw!r}"
+        out.append((start_line[0], start_line[1]))
+    return out
+
+
+def triton_responses(scenario):
+    ordered = []
+    for _, route in triton_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que Triton ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def triton_fires(scenario):
+    block = triton_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = triton_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les trois réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_triton_probe_reads_the_index_and_touches_nothing_else():
+    """
+    L'index que le template lit est précisément ce qui dirait quel modèle
+    appeler : chaque nom qu'il rend désigne une route /v2/models/{nom}/infer.
+    Le lire est le constat ; s'en servir serait la consommation qu'il signale.
+    """
+    assert triton_block().get("req-condition") is True, (
+        "le template ne lie pas les trois réponses : sans req-condition, ni "
+        "body_N ni status_code_N n'existent, chaque réponse est jugée seule, et "
+        "la sonde conclurait de son côté — or elle ne rend rien du tout, et un "
+        "corps vide ne désigne aucun produit"
+    )
+
+    assert triton_requests() == [
+        ("GET", TRITON_READY), ("GET", TRITON_METADATA), ("POST", TRITON_INDEX),
+    ], (
+        "les trois requêtes ne sont plus celles que Triton sert sous ces "
+        "méthodes : HandleServerHealth et HandleServerMetadata rendent 405 sur "
+        f"autre chose qu'un GET, HandleRepositoryIndex 405 sur autre chose "
+        f"qu'un POST — {triton_requests()}"
+    )
+
+    for raw in triton_block().get("raw") or []:
+        method, route = raw.strip().splitlines()[0].split()[:2]
+
+        # Le POST de l'index n'envoie rien : HandleRepositoryIndex n'inspecte le
+        # corps que sous « if (buffer_len > 0) », donc l'absence de corps prend
+        # le défaut « ready: false » et demande tout le dépôt. Ne rien envoyer
+        # est la garantie que le serveur ne dit que ce qu'il sait de lui-même.
+        assert "\n\n" not in raw.strip(), (
+            f"le template envoie un corps à {route} : la requête doit se "
+            "réduire à sa ligne de départ et à son en-tête d'hôte"
+        )
+
+        for forbidden, why in (
+            ("/infer",
+             "le template appelle une route d'inférence : chaque appel ferait "
+             "tourner le modèle sur les accélérateurs de l'exploitant"),
+            ("/generate",
+             "le template appelle /generate ou /generate_stream, donc fait "
+             "produire du texte aux frais de l'exploitant"),
+            ("/load",
+             "le template charge un modèle que l'index vient de nommer"),
+            ("/unload",
+             "le template retire de la mémoire un modèle que l'exploitant "
+             "sert : il interromprait le service qu'il audite"),
+            ("register",
+             "le template inscrit une région de mémoire partagée sur "
+             "l'instance qu'il audite"),
+            ("/v2/logging",
+             "le template change la journalisation en cours, donc ce que les "
+             "traces retiendront de sa propre visite"),
+            ("/trace",
+             "le template change le réglage de traçage de l'instance"),
+        ):
+            assert forbidden not in route, f"{why} ({method} {route})"
+
+
+def test_triton_matcher_needs_the_extension_list_not_just_the_kserve_shape():
+    assert triton_fires(TRITON_OPEN), (
+        "le template ne reconnaît pas une instance servie telle quelle, celle "
+        "dont la sonde répond et dont l'index nomme les modèles"
+    )
+    assert triton_fires(TRITON_OPEN_RENAMED), (
+        "le template dépend du nom rendu par /v2 : lserver->Id() vaut « triton » "
+        "par défaut, mais --id le change sans rien fermer — une instance "
+        "renommée reste une instance ouverte"
+    )
+    assert triton_fires(TRITON_OPEN_MINIMAL_BUILD), (
+        "le template exige une extension que TRITON_ENABLE_STATS, "
+        "TRITON_ENABLE_TRACING ou TRITON_ENABLE_LOGGING subordonnent : une "
+        "compilation qui les retire le mettrait en défaut"
+    )
+    assert triton_fires(TRITON_OPEN_NAME_ONLY_INDEX), (
+        "le template exige « state » ou « version » dans l'index : le "
+        "sérialiseur ne les écrit que lorsque le modèle a un état, et un dépôt "
+        "en mode EXPLICIT dont rien n'est chargé n'est écrit que sous ses noms"
+    )
+    assert triton_fires(TRITON_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte de rapidjson ou de "
+        "l'absence exacte de fin de ligne sur la sonde : un intermédiaire qui "
+        "réindente ce qu'il relaie le mettrait en défaut"
+    )
+
+    assert not triton_fires(OTHER_KSERVE_SERVER), (
+        "le template déclenche sur un autre serveur parlant KServe v2 : "
+        "« name », « version » et « extensions » sont le vocabulaire du "
+        "protocole, pas la signature de Triton — ce qui l'identifie est le "
+        "contenu de la liste, écrit en dur dans le constructeur "
+        "d'InferenceServer"
+    )
+    assert not triton_fires(OTHER_GATEWAY_QUOTING_TRITON), (
+        "le template conclut d'une seule extension : une passerelle qui "
+        "republie celle du serveur qu'elle proxifie porte "
+        "« model_repository(unload_dependents) » mot pour mot sans être Triton "
+        "— c'est l'exigence des deux ensemble qui demande la liste elle-même "
+        "plutôt qu'une mention"
+    )
+    assert not triton_fires(TRITON_METADATA_RESTRICTED), (
+        "le template conclut de la sonde et de l'index seuls : "
+        "--http-restricted-api se pose catégorie par catégorie, donc metadata "
+        "peut être fermée quand health ne l'est pas"
+    )
+    assert not triton_fires(TRITON_INDEX_RESTRICTED), (
+        "le template conclut de la sonde et des métadonnées seules : "
+        "model-repository est une catégorie restreignable à part, et les deux "
+        "premières réponses sont alors exactement celles de l'instance ouverte"
+    )
+    assert not triton_fires(TRITON_CACHED_UNDER_REFUSAL), (
+        "le template conclut du seul corps de l'index : un cache placé devant "
+        "l'instance peut relayer celui qu'il détient sous le statut du refus, "
+        "alors que le serveur, lui, a refusé"
+    )
+    assert not triton_fires(TRITON_METADATA_ON_ALL_PATHS), (
+        "le template accepte n'importe quoi en guise d'index : un cache indexé "
+        "sur l'hôte et non sur le chemin sert les métadonnées aux trois, et le "
+        "constat porterait alors sur une seule route interrogée trois fois"
+    )
+    assert not triton_fires(TRITON_INDEX_ON_ALL_PATHS), (
+        "le template accepte n'importe quoi en guise de sonde et de "
+        "métadonnées : le même cache sert l'index aux trois, et rien n'a "
+        "identifié le produit"
+    )
+    assert not triton_fires(TRITON_PROBE_ON_ALL_PATHS), (
+        "le template conclut de trois corps vides : le même cache sert la "
+        "réponse de la sonde aux trois, et rien n'a été divulgué"
+    )
+    assert not triton_fires(TRITON_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML là où la sonde ne rend rien : un "
+        "portail captif qui répond 200 à tout suffirait à le faire remonter"
+    )
+    assert not triton_fires(TRITON_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
+def test_triton_stays_silent_when_nothing_is_served():
+    """
+    Les deux frontières que le template revendique, fixées dans le sens qui
+    coûte.
+
+    La première est l'état : /v2/health/ready rend 400 tant que le serveur ne se
+    déclare pas prêt, et sous --strict-readiness — vrai par défaut — cela veut
+    dire qu'un modèle au moins n'est pas chargé. L'exiger sépare « un serveur
+    Triton est joignable » de « l'inférence est servie à qui la demande », qui
+    est le constat que la sévérité retenue suppose.
+
+    La seconde est le fond : un dépôt vide sérialise « [] », et un index qui ne
+    nomme personne ne divulgue rien. Ce cas est rare à l'endroit qui compte — en
+    mode NONE, qui est le mode par défaut, Triton charge au démarrage tous les
+    modèles du dépôt.
+
+    Les deux contreparties sont assumées : ces instances-là ne remontent pas, et
+    elles se referment d'elles-mêmes au passage suivant.
+    """
+    assert not triton_fires(TRITON_NOT_READY), (
+        "le template remonte une instance dont la sonde rend 400 : le serveur "
+        "ne se déclare pas prêt, donc l'inférence n'est servie à personne"
+    )
+    assert not triton_fires(TRITON_EMPTY_REPOSITORY), (
+        "le template remonte une instance dont l'index est vide : le tableau ne "
+        "nomme aucun modèle, et il n'y a rien à divulguer"
+    )
+
+    # La contrepartie de ces deux choix : chaque scénario doit rester celui d'une
+    # instance ouverte à tout le reste, sans quoi le silence ci-dessus ne prouve
+    # rien.
+    assert TRITON_NOT_READY[TRITON_INDEX] == (200, TRITON_INDEX_BODY), (
+        "le scénario ne modélise plus un index lisible : le silence viendrait "
+        "d'ailleurs que de la sonde"
+    )
+    assert TRITON_EMPTY_REPOSITORY[TRITON_READY] == TRITON_READY_OK, (
+        "le scénario ne modélise plus un serveur prêt : le silence viendrait "
+        "d'ailleurs que du dépôt vide"
+    )
+    assert TRITON_EMPTY_REPOSITORY[TRITON_METADATA] == (200,
+                                                        TRITON_METADATA_BODY), (
+        "le scénario ne modélise plus des métadonnées lisibles"
+    )
+
+
+def test_triton_extractor_stays_on_the_index_response():
+    routes = [route for _, route in triton_requests()]
+    block = triton_block()
+    extractors = block.get("extractors") or []
+
+    assert extractors, (
+        "le template ne remonte rien à l'exploitant : signaler que le port "
+        "répond ne lui dit pas quels modèles sont servis"
+    )
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "émet un résultat par extracteur qui rend quelque chose, donc la même "
+        "instance est signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "l'extracteur ne lit pas le JSON de l'index : une expression libre "
+        "remonterait aussi bien des fragments de page"
+    )
+    assert extractor.get("part") == f"body_{routes.index(TRITON_INDEX) + 1}", (
+        "l'extracteur n'est pas borné à la réponse de l'index : sous "
+        "req-condition il serait évalué contre les trois, et la sonde n'a rien "
+        "à en rendre"
+    )
+
+    expressions = extractor.get("json") or []
+    assert expressions, "l'extracteur ne porte aucune expression"
+    for expression in expressions:
+        assert "name" in expression, (
+            f"l'extracteur ne remonte pas les noms des modèles ({expression!r}) "
+            "— « name » est la seule clé que le sérialiseur écrive sans "
+            "condition, et chaque nom désigne une route /v2/models/{nom}/infer "
+            "appelable"
+        )
+
+    # Et il doit rendre quelque chose sur la réponse qu'il vise, y compris quand
+    # l'index ne porte que des noms.
+    for body, cas in ((TRITON_INDEX_BODY, "un dépôt chargé"),
+                      (TRITON_INDEX_NAME_ONLY_BODY, "un dépôt non chargé")):
+        names = [entry.get("name") for entry in json.loads(body)]
+        assert names == ["densenet_onnx", "simple"], (
+            f"l'index de {cas} ne nomme plus les modèles attendus : {names}"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
