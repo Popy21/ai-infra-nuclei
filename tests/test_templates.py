@@ -6,6 +6,7 @@ jamais être commité. C'est cette contrainte qui rend un commit automatique
 significatif : sans elle, un commit ne prouve rien.
 """
 
+import ast
 import json
 import os
 import re
@@ -6098,6 +6099,563 @@ def test_triton_extractor_stays_on_the_index_response():
         assert names == ["densenet_onnx", "simple"], (
             f"l'index de {cas} ne nomme plus les modèles attendus : {names}"
         )
+
+
+# --------------------------------------------------------------------------
+# CVE-2026-0770. Le template ne constate pas une exposition, il constate qu'un
+# sink d'exécution répond à un anonyme — et il doit l'établir en touchant ce
+# sink, ce qu'aucun autre template du pack ne fait. Deux exigences en découlent,
+# et elles tirent en sens contraire : la sonde doit atteindre exec() pour que le
+# constat porte, et elle ne doit rien exécuter d'autre qu'une recherche de nom
+# vouée à l'échec.
+#
+# Le voisin exposure/langflow-unauthenticated.yaml s'interdit explicitement
+# cette route ; ici elle est le sujet. C'est la sonde qui doit porter la
+# différence, pas l'intention.
+
+CVE_2026_0770_TEMPLATE = os.path.join(TEMPLATES_DIR, "cves", "CVE-2026-0770.yaml")
+
+LANGFLOW_VERSION = "/api/v1/version"
+LANGFLOW_VALIDATE = "/api/v1/validate/code"
+
+# Réponse de /api/v1/version, telle que _get_version_info() la construit.
+LANGFLOW_VERSION_BODY = (
+    '{"version":"1.7.3","main_version":"1.7.3","package":"Langflow"}'
+)
+
+# La même route sur une distribution nightly : le nom du paquet change, et la
+# version publiée se sépare de sa forme sans segment de pré-publication.
+LANGFLOW_VERSION_NIGHTLY_BODY = (
+    '{"version":"1.8.0.dev41","main_version":"1.8.0","package":"Langflow Nightly"}'
+)
+
+# Le même corps réindenté par un intermédiaire qui relaie.
+LANGFLOW_VERSION_REFORMATTED_BODY = json.dumps(
+    json.loads(LANGFLOW_VERSION_BODY), indent=2)
+
+# Refus de la dépendance depuis la 1.5 quand LANGFLOW_SKIP_AUTH_AUTO_LOGIN n'est
+# pas posé : le corps de la route n'a jamais tourné.
+LANGFLOW_AUTO_LOGIN_CLOSED_BODY = (
+    '{"detail":"Since v1.5, LANGFLOW_AUTO_LOGIN requires a valid API key. '
+    'Set LANGFLOW_SKIP_AUTH_AUTO_LOGIN=true to skip this check. '
+    'Please update your authentication method."}'
+)
+
+# Refus ordinaire de get_current_user quand AUTO_LOGIN est fermé.
+LANGFLOW_API_KEY_REQUIRED_BODY = '{"detail":"Invalid or missing API key"}'
+
+# Enveloppe de CodeValidationResponse quand aucune définition de fonction n'a été
+# soumise : la route a désérialisé, mais exec() n'a pas tourné.
+LANGFLOW_VALIDATE_INERT_BODY = (
+    '{"imports":{"errors":[]},"function":{"errors":[]}}'
+)
+
+# Page d'un portail captif qui répond 200 à tout.
+CAPTIVE_PORTAL_BODY = "<html><body>Connexion requise</body></html>"
+
+
+def cve_2026_0770_block():
+    doc = load(CVE_2026_0770_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(LANGFLOW_VALIDATE in raw for raw in (b.get("raw") or []))]
+    assert blocks, (
+        f"le template n'interroge pas POST {LANGFLOW_VALIDATE} — c'est pourtant "
+        "la seule route qui mène au exec(code_obj, exec_globals) de "
+        "validate_code(), et le constat porte sur ce sink, pas sur l'exposition "
+        "de l'API que couvre déjà exposure/langflow-unauthenticated.yaml"
+    )
+    return blocks[0]
+
+
+def cve_2026_0770_requests():
+    """
+    (méthode, chemin) de chaque requête brute, dans l'ordre déclaré : c'est cet
+    ordre qui donne son numéro à chaque body_N.
+    """
+    out = []
+    for raw in cve_2026_0770_block().get("raw") or []:
+        start_line = raw.strip().splitlines()[0].split()
+        assert len(start_line) >= 2, f"requête brute illisible : {raw!r}"
+        out.append((start_line[0], start_line[1]))
+    return out
+
+
+def cve_2026_0770_posted_code():
+    """
+    Le code Python que le template poste, extrait de la requête brute : en-têtes
+    puis ligne vide puis corps, et le corps est le modèle Code de Langflow.
+    """
+    raws = [raw for raw in cve_2026_0770_block().get("raw") or []
+            if LANGFLOW_VALIDATE in raw]
+    assert raws, "aucune requête brute vers la route de validation"
+
+    head, sep, body = raws[0].partition("\n\n")
+    assert sep, (
+        "la requête brute n'a pas de corps : sans corps, la route rend une "
+        "erreur de validation et le sink n'est pas atteint"
+    )
+    assert "Content-Type: application/json" in head, (
+        "la requête ne déclare pas de corps JSON : FastAPI refuserait avant "
+        "d'atteindre validate_code()"
+    )
+
+    sent = json.loads(body)
+    assert isinstance(sent, dict), "le corps envoyé n'est pas un objet JSON"
+    assert set(sent) == {"code"}, (
+        f"le corps envoyé n'est pas le modèle Code de Langflow : {sorted(sent)}"
+    )
+    return sent["code"]
+
+
+def assert_probe_is_inert(tree):
+    """
+    Ce que la sonde a le droit de contenir, et rien d'autre : une définition de
+    fonction, un corps vide, une unique valeur par défaut qui soit un nom nu.
+
+    Ce contrôle est la condition d'exécution de la transcription ci-dessous.
+    L'ordre compte : la suite de tests fait tourner ce que le template poste,
+    donc elle doit refuser d'exécuter avant de savoir ce qu'elle exécute. Un
+    contrôle qui ne rejetterait que les nœuds `import` laisserait passer
+    « __import__(...) », qui est un appel.
+    """
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    assert len(tree.body) == 1 and len(functions) == 1, (
+        "la sonde n'est pas une définition de fonction seule : tout ce qui "
+        "l'entoure est du code que le template envoie sans nécessité"
+    )
+
+    function = functions[0]
+    assert all(isinstance(stmt, ast.Pass) for stmt in function.body), (
+        "le corps de la fonction n'est pas vide : il ne serait certes jamais "
+        "exécuté, personne n'appelant la fonction, mais le template n'a aucune "
+        "raison de poster du code qu'il ne maîtrise pas"
+    )
+
+    defaults = function.args.defaults + [d for d in function.args.kw_defaults if d]
+    assert len(defaults) == 1, (
+        "la sonde n'a pas exactement une valeur par défaut : c'est elle, et elle "
+        "seule, que Python évalue à la définition"
+    )
+    assert isinstance(defaults[0], ast.Name), (
+        "la valeur par défaut n'est pas un nom nu : toute autre expression est "
+        "du code que le template ferait tourner sur l'hôte"
+    )
+
+    for node in ast.walk(tree):
+        assert not isinstance(node, (ast.Import, ast.ImportFrom)), (
+            "la sonde contient un import : validate_code() charge réellement "
+            "les modules qu'il trouve"
+        )
+        assert not isinstance(node, (ast.Call, ast.Attribute, ast.Subscript)), (
+            f"la sonde contient un {type(node).__name__} : un appel, un accès "
+            "d'attribut ou une souscription dans une valeur par défaut est "
+            "exactement la primitive de la faille"
+        )
+
+    return defaults[0]
+
+
+def langflow_validate_code(code):
+    """
+    validate_code() de lfx/custom/validate.py, transcrit terme à terme, pour
+    dériver la réponse attendue de l'algorithme lui-même plutôt que de la
+    recopier. La branche `import` est délibérément laissée à un refus :
+    assert_probe_is_inert établit d'abord que la sonde n'en contient aucun, et
+    une transcription qui importerait ferait de la suite de tests le chargeur de
+    modules qu'elle est censée interdire.
+    """
+    errors = {"imports": {"errors": []}, "function": {"errors": []}}
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        errors["function"]["errors"].append(str(e))
+        return errors
+
+    assert_probe_is_inert(tree)
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            code_obj = compile(ast.Module(body=[node], type_ignores=[]),
+                               "<string>", "exec")
+            try:
+                # _create_langflow_execution_context() en rend davantage — Data,
+                # Message, Component, Output — mais aucune version n'y met le nom
+                # que la sonde cherche, et les instances antérieures à ce
+                # contexte appellent exec(code_obj) tout court.
+                exec(code_obj, {})  # noqa: S102
+            except Exception as e:  # noqa: BLE001
+                errors["function"]["errors"].append(str(e))
+
+    return errors
+
+
+def cve_2026_0770_scenario(version, validate):
+    return {LANGFLOW_VERSION: version, LANGFLOW_VALIDATE: validate}
+
+
+def cve_2026_0770_responses(scenario):
+    ordered = []
+    for _, route in cve_2026_0770_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que Langflow ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def cve_2026_0770_fires(scenario):
+    block = cve_2026_0770_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = cve_2026_0770_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_cve_2026_0770_identifies_the_vulnerability_it_claims():
+    doc = load(CVE_2026_0770_TEMPLATE)
+    classification = (doc.get("info") or {}).get("classification") or {}
+
+    assert classification.get("cve-id") == doc.get("id"), (
+        "le template ne se réclame pas de la faille que son identifiant nomme : "
+        f"cve-id={classification.get('cve-id')!r}, id={doc.get('id')!r}"
+    )
+    assert classification.get("cwe-id") == "CWE-829", (
+        "l'avis retient CWE-829, inclusion de fonctionnalité depuis une sphère "
+        "de contrôle non approuvée"
+    )
+
+    refs = [str(r) for r in ((doc.get("info") or {}).get("reference") or [])]
+    assert any("CVE-2026-0770" in r for r in refs), (
+        "aucune référence ne renvoie à l'avis lui-même"
+    )
+
+    tags = [t.strip() for t in str((doc.get("info") or {}).get("tags")).split(",")]
+    assert "kev" in tags, (
+        "la faille est au catalogue KEV de la CISA depuis le 21 juillet 2026 : "
+        "le marqueur est ce qui permet de la trier avec les autres"
+    )
+
+
+def test_cve_2026_0770_dsl_expressions_can_be_compiled_by_the_engine():
+    """
+    Le message que la sonde fait remonter porte des apostrophes — CPython écrit
+    « name 'x' is not defined » — et le moteur d'expressions de nuclei n'a qu'un
+    seul type de littéral de chaîne : une apostrophe à l'intérieur d'un
+    littéral coupe le jeton, et le template est rejeté au chargement avec
+    « Cannot transition token types from STRING to VARIABLE ».
+
+    Le piège est que la porte du dépôt ne le voit pas : `nuclei -validate` rend
+    « All templates validated successfully » sur un template que le moteur
+    refusera ensuite de charger, et `nuclei -tl` l'énumère encore puisqu'il
+    liste avant de compiler. Le seul signe est un avertissement au chargement
+    d'un vrai scan. Le contrôle porte donc ici, sur le texte des expressions, où
+    il est déterministe et ne dépend d'aucun binaire.
+    """
+    for matcher in cve_2026_0770_block().get("matchers") or []:
+        if matcher.get("type") != "dsl":
+            continue
+        for expression in matcher.get("dsl") or []:
+            assert "'" not in expression, (
+                "une apostrophe dans une expression dsl empêche le moteur de "
+                f"charger le template, et -validate ne le dit pas : {expression}"
+            )
+
+
+def test_cve_2026_0770_probe_reaches_exec_and_does_nothing_else():
+    """
+    Les deux moitiés de la contrainte, dans l'ordre où elles se vérifient.
+
+    Atteindre exec() : validate_code() n'exécute que les définitions de
+    fonction, donc un corps sans `def` n'aurait pas touché le sink et le constat
+    ne porterait plus que sur la désérialisation.
+
+    Ne rien exécuter d'autre : aucun import, aucun appel, aucun accès
+    d'attribut, aucune souscription — la valeur par défaut doit être un nom nu,
+    et le corps de la fonction inatteignable. Ce qui reste est une recherche
+    dans un dictionnaire, et elle échoue.
+    """
+    block = cve_2026_0770_block()
+
+    assert block.get("req-condition") is True, (
+        "le template ne lie pas les deux réponses : sans req-condition, la "
+        "version conclurait seule — or elle répond sur toute instance, y "
+        "compris fermée"
+    )
+
+    methods = dict((route, method) for method, route in cve_2026_0770_requests())
+    assert methods.get(LANGFLOW_VALIDATE) == "POST", (
+        "la route de validation n'est servie qu'en POST : autre chose ne prouve "
+        "pas que le sink est atteignable"
+    )
+    assert methods.get(LANGFLOW_VERSION) == "GET", (
+        "la version se lit en GET"
+    )
+
+    for _, route in cve_2026_0770_requests():
+        assert "auto_login" not in route, (
+            "le template appelle /api/v1/auto_login : la route délivre une "
+            "session de superutilisateur à qui la demande, et elle écrit en "
+            "base au passage"
+        )
+        assert "custom_component" not in route, (
+            "le template appelle /api/v1/custom_component : cette route-là "
+            "instancie le composant et exécute son corps, là où la validation "
+            "s'arrête à la définition"
+        )
+
+    tree = ast.parse(cve_2026_0770_posted_code())
+
+    assert [n for n in tree.body if isinstance(n, ast.FunctionDef)], (
+        "la sonde ne définit aucune fonction : validate_code() n'exécute que "
+        "les définitions, donc exec() ne tournerait pas et le sink ne serait "
+        "pas atteint"
+    )
+
+    probe = assert_probe_is_inert(tree).id
+    assert "0770" in probe, (
+        f"le nom cherché ne porte pas l'identifiant de la faille ({probe!r}) : "
+        "l'exploitant qui relit ses journaux doit pouvoir séparer la sonde "
+        "d'une tentative"
+    )
+
+
+def test_cve_2026_0770_probe_response_is_derived_from_langflow_own_algorithm():
+    """
+    La réponse que le matcher attend n'est pas recopiée d'un avis : elle est
+    produite en faisant passer la sonde du template dans la transcription de
+    validate_code(). Si CPython changeait la formulation du NameError, ou si
+    quelqu'un modifiait la sonde, ce test tomberait avant le matcher.
+    """
+    code = cve_2026_0770_posted_code()
+    errors = langflow_validate_code(code)
+
+    assert errors["imports"]["errors"] == [], (
+        "la sonde a fait échouer un import : elle en contient donc un"
+    )
+
+    messages = errors["function"]["errors"]
+    assert len(messages) == 1, (
+        "exec() n'a pas rendu exactement une erreur : sans erreur, la réponse "
+        "est indiscernable de celle d'un corps sans définition de fonction, et "
+        f"le constat ne porterait plus sur le sink ({messages})"
+    )
+    assert "is not defined" in messages[0], (
+        f"exec() a échoué autrement que sur une recherche de nom : {messages[0]!r}"
+    )
+
+    body = json.dumps(errors, separators=(",", ":"))
+    block = cve_2026_0770_block()
+    responses = cve_2026_0770_responses(
+        cve_2026_0770_scenario(version=(200, LANGFLOW_VERSION_BODY),
+                               validate=(200, body)))
+    assert all(dsl_matcher_hits(m, responses)
+               for m in (block.get("matchers") or []) if m.get("type") == "dsl"), (
+        "le template ne reconnaît pas la réponse que sa propre sonde produit en "
+        f"passant dans validate_code() : {body}"
+    )
+
+
+# Les scénarios. La réponse de la route de validation est dérivée de
+# l'algorithme, pas recopiée — c'est le même corps que le test précédent
+# vérifie.
+LANGFLOW_VALIDATE_EXECUTED_BODY = json.dumps(
+    langflow_validate_code(cve_2026_0770_posted_code()), separators=(",", ":"))
+
+# Un mandataire qui renverrait la requête en écho : le nom de la sonde y est,
+# l'enveloppe non.
+LANGFLOW_VALIDATE_ECHO_BODY = json.dumps(
+    {"code": cve_2026_0770_posted_code()}, separators=(",", ":"))
+
+# L'instance atteinte : la version se lit, et la validation a exécuté.
+CVE_2026_0770_OPEN = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_BODY),
+    validate=(200, LANGFLOW_VALIDATE_EXECUTED_BODY))
+
+# La même sur une distribution nightly, et derrière un intermédiaire qui
+# réindente ce qu'il relaie.
+CVE_2026_0770_OPEN_NIGHTLY = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_NIGHTLY_BODY),
+    validate=(200, LANGFLOW_VALIDATE_EXECUTED_BODY))
+CVE_2026_0770_OPEN_REFORMATTED = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_REFORMATTED_BODY),
+    validate=(200, json.dumps(json.loads(LANGFLOW_VALIDATE_EXECUTED_BODY),
+                              indent=2)))
+
+# Instance dont la dépendance refuse : depuis la 1.5 sans
+# LANGFLOW_SKIP_AUTH_AUTO_LOGIN, puis AUTO_LOGIN fermé. Dans les deux cas le
+# corps de la route n'a pas tourné.
+CVE_2026_0770_AUTO_LOGIN_GUARDED = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_BODY),
+    validate=(403, LANGFLOW_AUTO_LOGIN_CLOSED_BODY))
+CVE_2026_0770_API_KEY_REQUIRED = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_BODY),
+    validate=(403, LANGFLOW_API_KEY_REQUIRED_BODY))
+
+# Instance atteinte, mais dont la réponse ne porte pas la trace du exec() : ce
+# que rendrait la route si la sonde n'avait pas défini de fonction. Le template
+# ne doit pas conclure de la seule enveloppe.
+CVE_2026_0770_NO_EXEC_TRACE = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_BODY),
+    validate=(200, LANGFLOW_VALIDATE_INERT_BODY))
+
+# Mandataire qui renvoie la requête en écho sous un 200.
+CVE_2026_0770_ECHOED = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_BODY),
+    validate=(200, LANGFLOW_VALIDATE_ECHO_BODY))
+
+# Cache indexé sur l'hôte et non sur le chemin : il sert la même réponse aux
+# deux, dans un sens puis dans l'autre.
+CVE_2026_0770_VERSION_ON_BOTH_PATHS = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_BODY),
+    validate=(200, LANGFLOW_VERSION_BODY))
+CVE_2026_0770_VALIDATE_ON_BOTH_PATHS = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VALIDATE_EXECUTED_BODY),
+    validate=(200, LANGFLOW_VALIDATE_EXECUTED_BODY))
+
+# Cache qui relaie le corps d'une instance atteinte sous le statut du refus que
+# le serveur, lui, a émis.
+CVE_2026_0770_CACHED_UNDER_REFUSAL = cve_2026_0770_scenario(
+    version=(200, LANGFLOW_VERSION_BODY),
+    validate=(403, LANGFLOW_VALIDATE_EXECUTED_BODY))
+
+# Portail captif qui répond 200 et sa page à n'importe quel chemin.
+CVE_2026_0770_CAPTIVE_PORTAL = cve_2026_0770_scenario(
+    version=(200, CAPTIVE_PORTAL_BODY), validate=(200, CAPTIVE_PORTAL_BODY))
+
+# Serveur quelconque répondant 200 à tout.
+CVE_2026_0770_SERVER_ALWAYS_OK = cve_2026_0770_scenario(
+    version=(200, '{"status":"ok"}'), validate=(200, '{"status":"ok"}'))
+
+
+def test_cve_2026_0770_fires_on_a_reachable_sink_across_distributions():
+    assert cve_2026_0770_fires(CVE_2026_0770_OPEN), (
+        "le template ne reconnaît pas une instance dont /api/v1/validate/code "
+        "a exécuté le code d'un appelant sans identifiant"
+    )
+    assert cve_2026_0770_fires(CVE_2026_0770_OPEN_NIGHTLY), (
+        "le template exige le nom de paquet « Langflow » exact : il raterait "
+        "les distributions nightly et langflow-base, que _get_version_info() "
+        "nomme « Langflow Nightly » et « Langflow Base »"
+    )
+    assert cve_2026_0770_fires(CVE_2026_0770_OPEN_REFORMATTED), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindente ce qu'il relaie suffirait à le faire taire"
+    )
+
+
+def test_cve_2026_0770_stays_silent_when_the_sink_did_not_run():
+    assert not cve_2026_0770_fires(CVE_2026_0770_AUTO_LOGIN_GUARDED), (
+        "le template remonte une instance dont la dépendance a refusé : depuis "
+        "la 1.5, AUTO_LOGIN sans LANGFLOW_SKIP_AUTH_AUTO_LOGIN rend 403 et le "
+        "corps de la route n'a jamais tourné"
+    )
+    assert not cve_2026_0770_fires(CVE_2026_0770_API_KEY_REQUIRED), (
+        "le template remonte une instance qui réclame une clé d'API"
+    )
+    assert not cve_2026_0770_fires(CVE_2026_0770_NO_EXEC_TRACE), (
+        "le template conclut de la seule enveloppe de CodeValidationResponse : "
+        "elle est rendue même quand aucune définition de fonction n'a été "
+        "soumise, donc sans que exec() ait tourné — ce serait constater que la "
+        "route désérialise, pas que le sink est atteignable"
+    )
+    assert not cve_2026_0770_fires(CVE_2026_0770_CACHED_UNDER_REFUSAL), (
+        "le template conclut du seul corps : un cache placé devant l'instance "
+        "peut relayer celui qu'il détient sous le statut du refus, alors que le "
+        "serveur, lui, a refusé"
+    )
+
+
+def test_cve_2026_0770_stays_silent_on_what_only_looks_like_the_proof():
+    assert not cve_2026_0770_fires(CVE_2026_0770_ECHOED), (
+        "le template déclenche sur un écho de sa propre requête : le nom de la "
+        "sonde y figure puisque c'est lui qui l'a envoyé, mais rien ne l'a "
+        "exécuté — c'est l'enveloppe de la réponse qui sépare les deux"
+    )
+    assert not cve_2026_0770_fires(CVE_2026_0770_VERSION_ON_BOTH_PATHS), (
+        "le template accepte n'importe quoi en guise de réponse de validation : "
+        "un cache indexé sur l'hôte et non sur le chemin sert la version aux "
+        "deux, et le sink n'a été ni atteint ni même interrogé"
+    )
+    assert not cve_2026_0770_fires(CVE_2026_0770_VALIDATE_ON_BOTH_PATHS), (
+        "le template accepte n'importe quoi en guise de version : le même cache "
+        "sert la réponse de validation aux deux, et rien n'a nommé le produit"
+    )
+    assert not cve_2026_0770_fires(CVE_2026_0770_CAPTIVE_PORTAL), (
+        "le template déclenche sur un portail captif qui répond 200 et sa page "
+        "à tout ce qu'on lui demande"
+    )
+    assert not cve_2026_0770_fires(CVE_2026_0770_SERVER_ALWAYS_OK), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
+def test_cve_2026_0770_assumes_the_version_route_answers():
+    """
+    La contrepartie du choix, fixée dans le sens qui coûte : le template exige
+    un 200 sur /api/v1/version, donc une instance dont un mandataire fermerait
+    cette route-là tout en laissant passer la validation ne remonte pas.
+
+    Le cas est assumé et il est ténu — la route n'a aucune dépendance
+    d'authentification et un montage qui refuserait la lecture de la version en
+    servant l'exécution de code prendrait les choses à l'envers. Ce qu'il achète
+    en retour est la version elle-même, que l'avis ne permet pas de déduire :
+    aucune version corrigée n'y est nommée.
+    """
+    version_closed = cve_2026_0770_scenario(
+        version=(403, LANGFLOW_API_KEY_REQUIRED_BODY),
+        validate=(200, LANGFLOW_VALIDATE_EXECUTED_BODY))
+
+    assert not cve_2026_0770_fires(version_closed)
+
+    # La contrepartie n'a de sens que si le scénario modélise bien une instance
+    # atteinte par ailleurs, sans quoi le silence viendrait d'autre chose.
+    assert cve_2026_0770_fires(cve_2026_0770_scenario(
+        version=(200, LANGFLOW_VERSION_BODY),
+        validate=version_closed[LANGFLOW_VALIDATE])), (
+        "le scénario ne modélise plus un sink atteint : le silence viendrait "
+        "d'ailleurs que de la route de version"
+    )
+
+
+def test_cve_2026_0770_extractor_stays_on_the_version_response():
+    routes = [route for _, route in cve_2026_0770_requests()]
+    block = cve_2026_0770_block()
+    extractors = block.get("extractors") or []
+
+    assert len(extractors) == 1, (
+        "le template ne remonte pas exactement un renseignement : sous "
+        "req-condition le moteur émet un résultat par extracteur qui rend "
+        "quelque chose, donc la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "l'extracteur ne lit pas le JSON de la version"
+    )
+    assert extractor.get("part") == f"body_{routes.index(LANGFLOW_VERSION) + 1}", (
+        "l'extracteur n'est pas borné à la réponse de la version : sous "
+        "req-condition il serait évalué contre les deux, et la réponse de la "
+        "sonde ne contient que l'écho de ce que le template a envoyé"
+    )
+
+    expressions = extractor.get("json") or []
+    assert expressions, "l'extracteur ne porte aucune expression"
+    for expression in expressions:
+        assert "version" in expression, (
+            f"l'extracteur ne remonte pas la version ({expression!r}) — c'est "
+            "le renseignement qui manque au rapport, l'avis ne nommant aucune "
+            "version corrigée"
+        )
+
+    # Et il doit rendre quelque chose sur la réponse qu'il vise.
+    assert json.loads(LANGFLOW_VERSION_BODY)["version"] == "1.7.3", (
+        "le corps de référence ne porte plus la version attendue"
+    )
 
 
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
