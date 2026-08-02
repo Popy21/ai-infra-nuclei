@@ -1,0 +1,204 @@
+id: mlflow-tracking-server-unauth
+
+info:
+  name: MLflow - Unauthenticated Tracking Server (Experiment Index & Artifact Store Disclosure)
+  author: popy21
+  severity: critical
+  description: |
+    MLflow ne se ferme pas par réglage, il se ferme par greffe : l'authentification
+    est une application Flask distincte qu'on demande au démarrage — « mlflow
+    server --app-name basic-auth » — et sans ce drapeau aucun crochet
+    before_request n'est enregistré. La pile ne tourne pas avec un garde
+    permissif, elle tourne sans garde du tout. La documentation ne dit pas autre
+    chose, qui explique comment revenir en arrière : « restart the server without
+    the --app-name basic-auth flag ».
+    Quand le drapeau est posé, le crochet est en revanche global, et sa liste
+    d'exceptions tient en trois préfixes — _UNPROTECTED_PATH_PREFIXES vaut
+    ("/static", "/favicon.ico", "/health"). Tout le reste passe par
+    make_basic_auth_response, qui rend 401, l'en-tête « WWW-Authenticate: Basic
+    realm="mlflow" » et la phrase « You are not authenticated. Please see … on how
+    to authenticate. » — un texte, pas du JSON. GET
+    /api/2.0/mlflow/experiments/search est donc gardé comme le reste, et son 200
+    anonyme est le constat entier. C'est aussi pourquoi /health ne sert à rien
+    ici : il rend « OK » sur l'instance fermée comme sur l'ouverte.
+    La route se lit bien en GET, et sans rien envoyer : service.proto déclare pour
+    searchExperiments deux points d'entrée depuis la version 2.0, POST et GET sur
+    le même chemin, et _get_request_message ne consulte flask_request.args que si
+    la requête en porte — une chaîne de requête vide laisse chaque champ à son
+    défaut, max_results à 1000 et view_type à ACTIVE_ONLY.
+    L'index n'est enfin jamais vide au lendemain d'un démarrage, contrairement à
+    ce qu'on trouve chez les bases vectorielles du même pack :
+    _initialize_store_state va chercher l'expérience d'identifiant 0 et appelle
+    _create_default_experiment si elle manque, dont le commentaire dit la raison —
+    « MLflow UI and client code expects a default experiment with ID 0 ». Le nom
+    qu'elle porte, « Default », n'est pas retenu comme signature pour autant : à
+    la différence de la base « default » de Milvus, rien n'empêche de la
+    supprimer.
+  impact: |
+    La réponse porte artifact_location, et c'est le renseignement qui compte avant
+    même le nom des projets : cette valeur nomme le dépôt — s3://, gs://, wasbs://,
+    un chemin local, ou mlflow-artifacts:/N quand le serveur fait lui-même relais.
+    Or ce relais est actif par défaut, --serve-artifacts/--no-serve-artifacts
+    valant True : GET /api/2.0/mlflow-artifacts/artifacts/{chemin} sert alors les
+    fichiers depuis --artifacts-destination, donc avec les identifiants de dépôt
+    que porte le serveur et non ceux du lecteur — l'anonyme emprunte l'accès au
+    seau plutôt que d'avoir à le trouver. Ce que contient un artefact n'est pas un
+    accessoire : les poids et le modèle sérialisé, les jeux de données, les
+    rapports d'évaluation, et tout ce que le code d'entraînement a enregistré, un
+    mlflow.log_artifact sur un fichier de configuration étant courant. POST
+    /api/2.0/mlflow/runs/search rend de son côté les paramètres et les métriques
+    de chaque exécution, là où mlflow.log_param et mlflow.autolog inscrivent sans
+    trier ce que le code a reçu : chaînes de connexion, points d'entrée internes,
+    chemins de jeux de données.
+    La lecture n'est pourtant que la moitié du sujet. Le même chemin d'artefacts
+    accepte PUT et DELETE, et un artefact de modèle MLflow est précisément ce que
+    mlflow.pyfunc.load_model va désérialiser : récrire l'artefact d'une version
+    enregistrée revient à exécuter du code sur l'hôte qui la déploiera ensuite.
+    POST /api/2.0/mlflow/registered-models/create et .../model-versions/create
+    laissent de surcroît inscrire une version dont on choisit la source, puis lui
+    poser l'étiquette ou l'alias que la chaîne de déploiement interroge — la
+    substitution emprunte le chemin auquel l'exploitant fait déjà confiance. Et
+    comme aucun compte n'existe, rien de tout cela n'est attribuable à personne.
+  remediation: |
+    Démarrer avec --app-name basic-auth — après avoir posé
+    MLFLOW_FLASK_SERVER_SECRET_KEY, que l'application d'authentification exige —
+    puis changer immédiatement l'administrateur créé au premier démarrage :
+    MLflow inscrit admin / password1234, ce couple est documenté, et une instance
+    authentifiée dont ce mot de passe n'a pas bougé est aussi ouverte qu'avant.
+    Contrôler ensuite sur GET /api/2.0/mlflow/experiments/search, jamais sur
+    /health : ce dernier est l'un des trois préfixes que le crochet épargne et
+    rend « OK » dans les deux cas.
+    Ne pas confondre --host avec une fermeture — l'aide de la commande le dit
+    elle-même, « This is NOT a security setting - it only controls network
+    binding » —, sa valeur par défaut 127.0.0.1 ne survivant de toute façon pas à
+    une publication de port en conteneur ; --allowed-hosts restreint l'en-tête
+    Host, pas l'identité de qui appelle. Une authentification basique reste par
+    ailleurs un secret unique partagé : ce sont les permissions par expérience et
+    par modèle enregistré qui rendent la trace exploitable. Poser
+    --no-serve-artifacts quand le relais n'est pas nécessaire — il est actif par
+    défaut, et c'est lui qui sert les fichiers avec les identifiants de dépôt du
+    serveur.
+    Après une exposition, considérer les artefacts comme lus, et surtout comme
+    possiblement récrits : recalculer les empreintes des versions destinées au
+    déploiement plutôt que de les supposer intactes, puisque la suivante sera
+    désérialisée telle quelle. Renouveler tout identifiant qui figure dans un
+    paramètre d'exécution ou dans un artefact enregistré, ainsi que ceux dont le
+    serveur se sert lui-même pour --artifacts-destination. Vérifier enfin le
+    registre : une version ou un alias que personne n'a posés sont la trace d'une
+    substitution, tandis que la lecture, elle, n'a laissé aucune trace côté
+    MLflow.
+  reference:
+    - https://mlflow.org/docs/latest/self-hosting/security/basic-http-auth/
+    - https://github.com/mlflow/mlflow/blob/master/mlflow/server/auth/__init__.py
+    - https://github.com/mlflow/mlflow/blob/master/mlflow/server/handlers.py
+    - https://github.com/mlflow/mlflow/blob/master/mlflow/protos/service.proto
+    - https://github.com/mlflow/mlflow/blob/master/mlflow/protos/mlflow_artifacts.proto
+    - https://github.com/mlflow/mlflow/blob/master/mlflow/store/tracking/sqlalchemy_store.py
+    - https://github.com/mlflow/mlflow/blob/master/mlflow/utils/proto_json_utils.py
+    - https://github.com/mlflow/mlflow/blob/master/mlflow/utils/cli_args.py
+  metadata:
+    max-request: 1
+    vendor: mlflow
+    product: mlflow
+  tags: ai,ml,mlops,mlflow,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte tout le constat — c'est la particularité de
+  # MLflow dans ce pack. Chez Qdrant la bannière est sur une liste blanche, chez
+  # Weaviate la route qui nomme le produit ne dit rien de l'autorisation : il y
+  # fallait deux requêtes. Ici le crochet before_request de l'application
+  # d'authentification est global et n'épargne que trois préfixes — /static,
+  # /favicon.ico et /health —, donc une instance fermée refuse cette route comme
+  # toutes les autres. Le 200 anonyme prouve à lui seul qu'aucune
+  # authentification n'est montée.
+  #
+  # /health serait le contre-exemple exact : c'est justement l'un des trois
+  # préfixes épargnés, il rend « OK » quel que soit l'état de l'instance, et il
+  # ne nomme aucun produit. /version est bien gardé, lui, mais ne rend que la
+  # version en texte brut — une chaîne qui n'appartient à personne.
+  #
+  # GET, et sans paramètre : service.proto déclare searchExperiments sur POST et
+  # sur GET depuis la version 2.0, et _get_request_message ne lit
+  # flask_request.args que si la requête en porte. Une chaîne de requête vide
+  # laisse max_results à son défaut de 1000 et view_type à ACTIVE_ONLY.
+  #
+  # En lecture seule, et strictement : la même surface non authentifiée sert
+  # /api/2.0/mlflow-artifacts/artifacts/{chemin}, qui rendrait les fichiers — donc
+  # les poids, les jeux de données et ce que le code d'entraînement a enregistré —
+  # en PUT les récrirait et en DELETE les emporterait, /get-artifact et
+  # /model-versions/get-artifact, qui les rendent par le détour d'une exécution ou
+  # d'une version, /api/2.0/mlflow/runs/search, qui livrerait les paramètres où
+  # atterrissent les chaînes de connexion, et les verbes /create, /update,
+  # /delete et /set-tag du registre, dont une inscription survivrait à la
+  # fermeture de l'instance. Signaler une exposition ne demande d'en toucher
+  # aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/2.0/mlflow/experiments/search"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      # _search_experiments construit sa réponse avec Response(mimetype=
+      # "application/json") : le type est posé par le handler, pas déduit. Le
+      # refus de l'application d'authentification, lui, sort de make_response sur
+      # une chaîne, donc en text/html — cette ligne écarte aussi le portail
+      # captif qui répondrait 200 et une page à tout ce qu'on lui demande.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Quatre clés, et le vocabulaire compte plus que la forme. « experiments »
+      # et « experiment_id » ne désignent rien à eux seuls : c'est mot pour mot
+      # celui des plateformes d'expérimentation A/B, qui servent la même liste
+      # sous les mêmes noms. Ce qui sépare MLflow est la paire suivante —
+      # « artifact_location », le dépôt où atterrissent les poids, et
+      # « lifecycle_stage », dont le domaine se réduit à « active » et
+      # « deleted ». Les quatre ensemble sont les champs que Experiment.to_proto
+      # pose systématiquement, et les seuls que MessageToDict ne peut donc pas
+      # omettre.
+      #
+      # Vérifiées sur la clé nue, sans les deux-points : message_to_json sérialise
+      # avec pretty=True, soit json.dumps(indent=2), et rien ne garantit qu'un
+      # intermédiaire relaie cette indentation-là. preserving_proto_field_name
+      # vaut en revanche True, donc la graphie serpent est stable d'une version à
+      # l'autre.
+      #
+      # Le nom « Default » est délibérément absent de la liste. L'expérience
+      # d'identifiant 0 existe bien sur toute instance neuve —
+      # _create_default_experiment la crée si elle manque — mais rien n'empêche
+      # de la supprimer, et search_experiments ne rend par défaut que les
+      # actives : l'exiger raterait l'instance rangée par un exploitant
+      # soigneux, sans rien ajouter que les quatre clés ne prouvent déjà.
+      - type: word
+        part: body
+        words:
+          - '"experiments"'
+          - '"experiment_id"'
+          - '"artifact_location"'
+          - '"lifecycle_stage"'
+        condition: and
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses expériences : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire.
+      - type: json
+        part: body
+        name: experiment
+        json:
+          - '.experiments[].name'
+
+      # Et le dépôt où atterrissent les artefacts de chacune : s3://, gs://,
+      # wasbs:// ou mlflow-artifacts:/N. C'est ce qu'il faut remonter avec le
+      # reste — la route de relais étant servie par défaut, ce dépôt est lisible
+      # par la même porte ouverte, avec les identifiants du serveur.
+      - type: json
+        part: body
+        name: artifact_store
+        json:
+          - '.experiments[].artifact_location'

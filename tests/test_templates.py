@@ -3435,6 +3435,425 @@ def test_milvus_matcher_needs_the_default_database_not_a_generic_envelope():
     )
 
 
+# --------------------------------------------------------------------------
+# MLflow est le premier du pack dont une seule requête porte tout le constat, et
+# c'est une propriété du serveur, pas un raccourci : le crochet before_request de
+# l'application d'authentification est global et n'épargne que trois préfixes —
+# _UNPROTECTED_PATH_PREFIXES vaut ("/static", "/favicon.ico", "/health"). Une
+# instance fermée refuse donc /api/2.0/mlflow/experiments/search comme le reste,
+# et son 200 anonyme suffit. Le corollaire est que /health est exactement la
+# route à ne pas interroger : elle rend « OK » dans les deux cas.
+#
+# Le piège de rédaction est ailleurs, et il est sérieux : « experiments » et
+# « experiment_id » sont mot pour mot le vocabulaire des plateformes
+# d'expérimentation A/B, qui servent la même liste sous les mêmes noms. Ce qui
+# désigne MLflow est la paire suivante — « artifact_location », le dépôt où
+# atterrissent les poids, et « lifecycle_stage », dont le domaine se réduit à
+# « active » et « deleted ».
+#
+# Les corps ci-dessous fixent les deux bornes : le template doit reconnaître
+# l'instance neuve comme celle dont l'expérience « Default » a été rangée, tenir
+# quelle que soit l'indentation — message_to_json sérialise avec pretty=True
+# depuis peu, non indenté auparavant — et rejeter aussi bien l'authentification
+# posée que le vocabulaire voisin. Chacun des quatre corps étrangers porte trois
+# des quatre clés, de sorte qu'aucun terme de la signature ne peut être retiré
+# sans qu'un de ces services remonte.
+
+MLFLOW_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "mlflow-tracking-server-unauth.yaml")
+
+MLFLOW_SEARCH = "/api/2.0/mlflow/experiments/search"
+
+# Réponse de _search_experiments telle que message_to_json la sérialise
+# aujourd'hui : preserving_proto_field_name=True, pretty=True donc indent=2, et
+# les int64 rendus en nombres.
+MLFLOW_EXPERIMENTS_BODY = """{
+  "experiments": [
+    {
+      "experiment_id": "0",
+      "name": "Default",
+      "artifact_location": "mlflow-artifacts:/0",
+      "lifecycle_stage": "active",
+      "last_update_time": 1753900000000,
+      "creation_time": 1753900000000
+    },
+    {
+      "experiment_id": "3",
+      "name": "support-rag-finetune",
+      "artifact_location": "s3://ml-artifacts-prod/3",
+      "lifecycle_stage": "active",
+      "last_update_time": 1754000000000,
+      "creation_time": 1753950000000
+    }
+  ]
+}"""
+
+# La même instance au lendemain de son démarrage. _initialize_store_state appelle
+# _create_default_experiment quand l'identifiant 0 manque, donc l'index n'est
+# jamais vide — c'est celle qu'on trouve oubliée sur un port ouvert, et elle doit
+# remonter.
+MLFLOW_FRESH_INSTALL_BODY = """{
+  "experiments": [
+    {
+      "experiment_id": "0",
+      "name": "Default",
+      "artifact_location": "mlflow-artifacts:/0",
+      "lifecycle_stage": "active",
+      "last_update_time": 1753900000000,
+      "creation_time": 1753900000000
+    }
+  ]
+}"""
+
+# L'inverse : un exploitant qui a supprimé l'expérience « Default ». Rien ne
+# l'en empêche — à la différence de la base « default » de Milvus — et
+# search_experiments ne rend par défaut que les actives, donc le nom disparaît de
+# la réponse. Le template ne doit pas en dépendre.
+MLFLOW_WITHOUT_DEFAULT_EXPERIMENT_BODY = """{
+  "experiments": [
+    {
+      "experiment_id": "7",
+      "name": "forecast-conso",
+      "artifact_location": "wasbs://artifacts@mlstore.blob.core.windows.net/7",
+      "lifecycle_stage": "active",
+      "last_update_time": 1754100000000,
+      "creation_time": 1754050000000
+    }
+  ]
+}"""
+
+# La sérialisation des versions antérieures à l'ajout du paramètre pretty, et
+# aussi bien ce qu'un intermédiaire recompacte en relayant : plus d'indentation,
+# les deux-points collés aux clés.
+MLFLOW_COMPACT_BODY = (
+    '{"experiments":[{"experiment_id":"0","name":"Default",'
+    '"artifact_location":"./mlruns/0","lifecycle_stage":"active",'
+    '"creation_time":1753900000000,"last_update_time":1753900000000}]}'
+)
+
+# Ce qu'écrit make_basic_auth_response quand « --app-name basic-auth » est posé :
+# 401, l'en-tête WWW-Authenticate, et un texte — make_response sur une chaîne,
+# donc text/html, pas du JSON.
+MLFLOW_BASIC_AUTH_BODY = (
+    "You are not authenticated. Please see "
+    "https://www.mlflow.org/docs/latest/auth/index.html#authenticating-to-mlflow "
+    "on how to authenticate."
+)
+
+# Une plateforme d'expérimentation A/B : même mot, même clé d'identifiant, aucun
+# rapport. C'est le faux positif que le template doit écarter en premier.
+OTHER_AB_TESTING_BODY = (
+    '{"experiments":[{"experiment_id":"exp_7f2","name":"checkout-cta",'
+    '"status":"running","variants":[{"key":"control","weight":50},'
+    '{"key":"treatment","weight":50}],"created_at":"2026-05-02T09:14:00Z"}]}'
+)
+
+# Un autre suivi d'entraînement, qui nomme son identifiant « id » : sans
+# « experiment_id », le vocabulaire n'est plus celui de MLflow.
+OTHER_TRACKER_WITHOUT_EXPERIMENT_ID_BODY = (
+    '{"experiments":[{"id":"14","name":"tabular-baseline",'
+    '"artifact_location":"s3://runs/14","lifecycle_stage":"active"}]}'
+)
+
+# Un catalogue interne d'expériences, qui a repris le vocabulaire de cycle de vie
+# de MLflow — beaucoup d'outils maison le copient — mais ne range aucun artefact,
+# donc n'a pas de dépôt à nommer. C'est le corps qui rend « artifact_location »
+# indispensable : sans cette clé, la signature ne sépare plus le serveur de ce
+# qui l'imite, et le renseignement qui fait la sévérité — l'emplacement des
+# poids — disparaît du constat.
+OTHER_CATALOG_WITHOUT_ARTIFACT_LOCATION_BODY = (
+    '{"experiments":[{"experiment_id":"14","name":"tabular-baseline",'
+    '"lifecycle_stage":"active","owner":"ml-platform",'
+    '"updated_at":"2026-06-11T08:02:00Z"}]}'
+)
+
+# Le même en sens inverse : il connaît l'identifiant et le dépôt, mais parle
+# d'état plutôt que de cycle de vie.
+OTHER_TRACKER_WITHOUT_LIFECYCLE_BODY = (
+    '{"experiments":[{"experiment_id":"14","name":"tabular-baseline",'
+    '"artifact_location":"gs://ml-runs/14","status":"ACTIVE"}]}'
+)
+
+# Un agrégateur qui republie des enregistrements MLflow sous sa propre
+# enveloppe : les trois clés de l'objet y sont, la clé de collection non. Ce
+# n'est pas le serveur, et ce n'est donc pas le constat.
+OTHER_AGGREGATOR_BODY = (
+    '{"items":[{"experiment_id":"14","name":"tabular-baseline",'
+    '"artifact_location":"s3://ml-runs/14","lifecycle_stage":"active"}],'
+    '"next_page_token":"eyJvIjoyMH0"}'
+)
+
+# Portail captif devant une vraie instance : sa page de connexion répond 200 et
+# embarque son état initial, donc les quatre clés s'y trouvent. Seul le type de
+# contenu l'en sépare.
+MLFLOW_CAPTIVE_PORTAL_BODY = (
+    '<!doctype html><html><head><title>SSO</title></head><body>'
+    '<script>window.__STATE__={"experiments":[{"experiment_id":"0",'
+    '"name":"Default","artifact_location":"mlflow-artifacts:/0",'
+    '"lifecycle_stage":"active"}]}</script></body></html>'
+)
+
+
+def mlflow_response(status, body, content_type="application/json"):
+    """
+    Une réponse HTTP réduite à ce que les matchers du template observent : le
+    statut, le bloc d'en-têtes brut — c'est contre lui que nuclei évalue
+    `part: header` — et le corps.
+    """
+    return {
+        "status": status,
+        "headers": (
+            f"HTTP/1.1 {status}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            "Server: gunicorn\r\n"
+        ),
+        "body": body,
+    }
+
+
+# Instance servie sans « --app-name basic-auth » : aucun crochet before_request
+# n'est enregistré, la route répond.
+MLFLOW_OPEN = mlflow_response(200, MLFLOW_EXPERIMENTS_BODY)
+
+# La même au lendemain de son démarrage, puis celle dont « Default » a été
+# supprimée, puis la sérialisation non indentée.
+MLFLOW_OPEN_FRESH = mlflow_response(200, MLFLOW_FRESH_INSTALL_BODY)
+MLFLOW_OPEN_WITHOUT_DEFAULT = mlflow_response(
+    200, MLFLOW_WITHOUT_DEFAULT_EXPERIMENT_BODY)
+MLFLOW_OPEN_COMPACT = mlflow_response(200, MLFLOW_COMPACT_BODY)
+
+# Un proxy qui ajoute le jeu de caractères au type de contenu qu'il relaie.
+MLFLOW_OPEN_BEHIND_PROXY = mlflow_response(
+    200, MLFLOW_EXPERIMENTS_BODY, content_type="application/json; charset=utf-8")
+
+# « --app-name basic-auth » posé : le crochet est global et n'épargne pas cette
+# route.
+MLFLOW_BASIC_AUTH_ENABLED = mlflow_response(
+    401, MLFLOW_BASIC_AUTH_BODY, content_type="text/html; charset=utf-8")
+
+# Un proxy réglé pour tout garder.
+MLFLOW_BEHIND_AUTH_PROXY = mlflow_response(
+    403, "<html><body><h1>403 Forbidden</h1></body></html>",
+    content_type="text/html")
+
+# Un cache placé devant l'instance, réglé pour exiger une identité depuis que
+# l'authentification a été posée, mais qui relaie encore le corps qu'il détient
+# sous le statut du refus. Il n'existe que pour que le statut reste vérifié : le
+# corps, lui, est authentique.
+MLFLOW_CACHED_BODY_UNDER_REFUSAL = mlflow_response(401, MLFLOW_EXPERIMENTS_BODY)
+
+MLFLOW_AB_TESTING_PLATFORM = mlflow_response(200, OTHER_AB_TESTING_BODY)
+MLFLOW_TRACKER_WITHOUT_EXPERIMENT_ID = mlflow_response(
+    200, OTHER_TRACKER_WITHOUT_EXPERIMENT_ID_BODY)
+MLFLOW_CATALOG_WITHOUT_ARTIFACT_LOCATION = mlflow_response(
+    200, OTHER_CATALOG_WITHOUT_ARTIFACT_LOCATION_BODY)
+MLFLOW_TRACKER_WITHOUT_LIFECYCLE = mlflow_response(
+    200, OTHER_TRACKER_WITHOUT_LIFECYCLE_BODY)
+MLFLOW_AGGREGATOR = mlflow_response(200, OTHER_AGGREGATOR_BODY)
+MLFLOW_BEHIND_CAPTIVE_PORTAL = mlflow_response(
+    200, MLFLOW_CAPTIVE_PORTAL_BODY, content_type="text/html; charset=utf-8")
+
+# Un serveur quelconque qui répond 200 à tout ce qu'on lui demande.
+MLFLOW_SERVER_ALWAYS_UP = mlflow_response(200, "OK", content_type="text/plain")
+
+
+def mlflow_search_block():
+    doc = load(MLFLOW_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.replace("{{BaseURL}}", "") == MLFLOW_SEARCH
+                     for p in (b.get("path") or []))]
+    assert blocks, f"le template ne vise pas GET {MLFLOW_SEARCH}"
+    return blocks[0]
+
+
+def mlflow_fires(response):
+    """
+    Sémantique nuclei du bloc entier contre une réponse unique : statut,
+    en-têtes et corps. Le template n'ayant qu'un chemin, il n'y a pas de
+    req-condition et chaque matcher voit la même réponse.
+    """
+    block = mlflow_search_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+
+    verdicts = []
+    for matcher in matchers:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(response["status"] in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(word_matcher_hits(matcher, response["headers"]))
+        else:
+            verdicts.append(body_matcher_hits(matcher, response["body"]))
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_mlflow_probe_reads_the_search_route_and_never_touches_the_artifacts():
+    doc = load(MLFLOW_TEMPLATE)
+    block = mlflow_search_block()
+
+    assert block.get("method") == "GET", (
+        "l'index des expériences se lit en GET — service.proto déclare "
+        "searchExperiments sur POST et sur GET depuis la version 2.0 — donc le "
+        "template ne doit rien envoyer à une instance qu'il découvre"
+    )
+    assert block.get("body") is None, (
+        "le template envoie un corps : la route se lit sans paramètre, "
+        "_get_request_message ne consultant flask_request.args que si la requête "
+        "en porte"
+    )
+
+    for other in (doc.get("http") or []):
+        for path in (other.get("path") or []):
+            assert "?" not in path, (
+                "le template passe des paramètres de requête : une chaîne vide "
+                "laisse max_results à son défaut de 1000 et view_type à "
+                "ACTIVE_ONLY, il n'y a rien à préciser"
+            )
+            for forbidden, why in (
+                ("/mlflow-artifacts/",
+                 "le template appelle la route de relais des artefacts : elle "
+                 "rend les fichiers — poids, jeux de données, ce que le code "
+                 "d'entraînement a enregistré — avec les identifiants de dépôt "
+                 "du serveur, donc le template exfiltrerait ce qu'il signale"),
+                ("get-artifact",
+                 "le template télécharge un artefact de l'instance qu'il audite"),
+                ("/runs/",
+                 "le template lit le plan des exécutions : les paramètres "
+                 "enregistrés par mlflow.log_param et mlflow.autolog y portent "
+                 "les chaînes de connexion du code d'entraînement"),
+                ("/registered-models/",
+                 "le template touche le registre des modèles : une version ou un "
+                 "alias posés là survivraient à la fermeture de l'instance"),
+                ("/create",
+                 "le template crée un objet sur l'instance qu'il audite"),
+                ("/delete",
+                 "le template appelle une route de suppression sur l'instance "
+                 "qu'il audite"),
+                ("/set-",
+                 "le template écrit une étiquette sur l'instance qu'il audite"),
+            ):
+                assert forbidden not in path, why
+
+            assert "/health" not in path, (
+                "le template interroge /health : c'est l'un des trois préfixes "
+                "que le crochet before_request épargne — "
+                "_UNPROTECTED_PATH_PREFIXES vaut (\"/static\", \"/favicon.ico\", "
+                "\"/health\") — donc il rend « OK » sur une instance "
+                "correctement fermée aussi, et il ne nomme aucun produit"
+            )
+
+
+def test_mlflow_extractors_stay_on_the_experiment_index():
+    block = mlflow_search_block()
+    extractors = block.get("extractors") or []
+    assert extractors, (
+        "le template ne remonte rien à l'exploitant : signaler que le port "
+        "répond ne lui dit ni quels projets sont lisibles ni où sont les "
+        "artefacts"
+    )
+
+    # Plusieurs extracteurs ne sont admissibles que parce qu'il n'y a qu'un
+    # chemin : sous req-condition, chacun rendant quelque chose ajouterait un
+    # résultat, donc la même instance remonterait plusieurs fois.
+    assert block.get("req-condition") is not True, (
+        "le bloc porte req-condition alors qu'il n'interroge qu'un chemin : les "
+        "extracteurs y seraient évalués réponse par réponse"
+    )
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "l'extracteur ne lit pas le JSON de la réponse : une expression "
+            "libre remonterait aussi bien des fragments de page"
+        )
+        for expression in (extractor.get("json") or []):
+            assert expression.startswith(".experiments[]"), (
+                f"l'extracteur n'est pas borné à l'index des expériences "
+                f"({expression!r})"
+            )
+
+
+def test_mlflow_matcher_needs_the_tracking_vocabulary_not_a_generic_experiment_list():
+    assert mlflow_fires(MLFLOW_OPEN), (
+        "le template ne reconnaît pas une instance dont le serveur de suivi "
+        "répond à une requête sans en-tête d'autorisation"
+    )
+    assert mlflow_fires(MLFLOW_OPEN_FRESH), (
+        "le template exige plus que l'expérience « Default » : il raterait "
+        "l'instance qui vient d'être lancée, précisément celle qu'on trouve "
+        "oubliée sur un port ouvert"
+    )
+    assert mlflow_fires(MLFLOW_OPEN_WITHOUT_DEFAULT), (
+        "le template dépend du nom « Default » : rien n'empêche de supprimer "
+        "cette expérience — à la différence de la base « default » de Milvus — "
+        "et search_experiments ne rend par défaut que les actives"
+    )
+    assert mlflow_fires(MLFLOW_OPEN_COMPACT), (
+        "le template dépend de l'indentation posée par message_to_json : le "
+        "paramètre pretty est récent, les versions antérieures sérialisaient "
+        "sans indenter, et un intermédiaire qui recompacte le corps mettrait le "
+        "matcher en défaut"
+    )
+    assert mlflow_fires(MLFLOW_OPEN_BEHIND_PROXY), (
+        "le template exige un type de contenu exact : un proxy qui ajoute le jeu "
+        "de caractères en relayant le mettrait en défaut"
+    )
+
+    assert not mlflow_fires(MLFLOW_BASIC_AUTH_ENABLED), (
+        "le template déclenche sur une instance démarrée avec « --app-name "
+        "basic-auth » : le crochet before_request est alors global et cette "
+        "route reçoit le 401 de make_basic_auth_response"
+    )
+    assert not mlflow_fires(MLFLOW_BEHIND_AUTH_PROXY), (
+        "le template déclenche sur une instance entièrement gardée"
+    )
+    assert not mlflow_fires(MLFLOW_CACHED_BODY_UNDER_REFUSAL), (
+        "le template conclut du seul corps : un cache placé devant l'instance "
+        "peut relayer celui qu'il détient sous le statut du refus, alors que "
+        "l'API, elle, a refusé"
+    )
+    assert not mlflow_fires(MLFLOW_AB_TESTING_PLATFORM), (
+        "le template déclenche sur une plateforme d'expérimentation A/B : "
+        "« experiments » et « experiment_id » sont mot pour mot son vocabulaire, "
+        "et ce sont « artifact_location » et « lifecycle_stage » qui désignent "
+        "MLflow"
+    )
+    assert not mlflow_fires(MLFLOW_TRACKER_WITHOUT_EXPERIMENT_ID), (
+        "le template déclenche sur un suivi d'entraînement qui nomme son "
+        "identifiant « id » : sans « experiment_id », le vocabulaire n'est plus "
+        "celui de MLflow"
+    )
+    assert not mlflow_fires(MLFLOW_CATALOG_WITHOUT_ARTIFACT_LOCATION), (
+        "le template déclenche sur un catalogue interne qui a copié le "
+        "vocabulaire de cycle de vie de MLflow sans ranger d'artefact : "
+        "« artifact_location » est ce qui rattache la réponse au serveur, et "
+        "c'est aussi le renseignement qui fait la sévérité — le dépôt où "
+        "atterrissent les poids, servi par la même porte ouverte"
+    )
+    assert not mlflow_fires(MLFLOW_TRACKER_WITHOUT_LIFECYCLE), (
+        "le template déclenche sur un suivi qui parle d'état plutôt que de cycle "
+        "de vie : « lifecycle_stage », dont le domaine se réduit à « active » et "
+        "« deleted », fait partie de la signature"
+    )
+    assert not mlflow_fires(MLFLOW_AGGREGATOR), (
+        "le template déclenche sur un agrégateur qui republie des "
+        "enregistrements MLflow sous sa propre enveloppe : la clé de collection "
+        "« experiments » est ce qui rattache la réponse au serveur lui-même"
+    )
+    assert not mlflow_fires(MLFLOW_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise d'index : un portail captif "
+        "qui embarque son état initial porte les quatre clés, et seul le type de "
+        "contenu l'en sépare — _search_experiments construit sa réponse avec "
+        "Response(mimetype=\"application/json\")"
+    )
+    assert not mlflow_fires(MLFLOW_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
