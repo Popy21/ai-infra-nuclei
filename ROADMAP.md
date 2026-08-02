@@ -36,17 +36,17 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 
 - [x] `templates/exposure/chromadb-open-instance.yaml` — ChromaDB, `GET /api/v1/heartbeat` puis énumération des collections. Sévérité high.
 - [x] `templates/exposure/qdrant-no-api-key.yaml` — Qdrant sans clé d'API : `GET /collections` répond. Sévérité high.
-- [ ] `templates/exposure/weaviate-anonymous-access.yaml` — Weaviate avec accès anonyme activé, `GET /v1/meta`. Sévérité high.
-- [ ] `templates/exposure/milvus-exposed.yaml` — Milvus atteignable sans authentification. Sévérité high.
+- [ ] `templates/exposure/weaviate-anonymous-access.yaml` — Weaviate : `GET /v1/meta` renvoie `{"hostname":...,"version":"1.x.x","modules":{...}}`. `AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED` vaut `true` par défaut. Confirmer avec `GET /v1/schema`, qui passe, lui, par le contrôle d'accès. Sévérité high.
+- [ ] `templates/exposure/milvus-exposed.yaml` — ⚠️ Milvus parle surtout **gRPC** (19530) ; seul 9091 sert de l'HTTP (`/healthz`), et l'API RESTful v2 est sous `/v2/vectordb/`. Vérifier qu'une détection HTTP porteuse de sens existe — **si non, rendre `SKIP` immédiatement** plutôt que d'insister. Sévérité high.
 
 ## MLOps & suivi d'expériences
 
 - [ ] `templates/exposure/mlflow-tracking-server-unauth.yaml` — MLflow, `GET /api/2.0/mlflow/experiments/search` sans authentification. Sévérité critical (lecture d'artefacts arbitraires).
 - [ ] `templates/exposure/jupyter-no-token.yaml` — Jupyter sans jeton : `GET /api/kernels` répond, donc exécution de code. Sévérité critical.
-- [ ] `templates/exposure/kubeflow-pipelines-exposed.yaml` — API Kubeflow Pipelines exposée. Sévérité high.
-- [ ] `templates/exposure/clearml-server-exposed.yaml` — serveur ClearML atteignable. Sévérité high.
-- [ ] `templates/exposure/label-studio-signup-open.yaml` — Label Studio avec inscription ouverte. Sévérité medium.
-- [ ] `templates/exposure/bentoml-yatai-exposed.yaml` — BentoML/Yatai exposé. Sévérité high.
+- [ ] `templates/exposure/kubeflow-pipelines-exposed.yaml` — Kubeflow Pipelines : `GET /apis/v1beta1/pipelines` (ou `/pipeline/apis/v1beta1/...` derrière Istio) renvoie la liste JSON des pipelines. Sévérité high.
+- [ ] `templates/exposure/clearml-server-exposed.yaml` — ClearML : l'API (8008) répond sur `POST /debug.ping` ; le webserver (8080) sert l'app. Chercher la signature de version dans la réponse. Sévérité high.
+- [ ] `templates/exposure/label-studio-signup-open.yaml` — Label Studio : `GET /user/signup` sert le formulaire quand l'inscription est ouverte ; `GET /version` expose les versions des composants. Sévérité medium.
+- [ ] `templates/exposure/bentoml-yatai-exposed.yaml` — BentoML : le serveur sert `GET /livez`, `/readyz` et `GET /docs.json` (schéma OpenAPI listant les endpoints d'inférence). Sévérité high.
 - [ ] `templates/exposure/triton-inference-server-exposed.yaml` — NVIDIA Triton, `GET /v2/health/ready` puis index des modèles. Sévérité high.
 
 ## CVE sans template amont
