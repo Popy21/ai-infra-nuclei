@@ -1,0 +1,197 @@
+id: jupyter-no-token
+
+info:
+  name: Jupyter Server - Authentication Disabled (Unauthenticated Kernel API, Arbitrary Code Execution)
+  author: popy21
+  severity: critical
+  description: |
+    Jupyter ne s'ouvre pas sur un réglage oublié, il s'ouvre quand on vide celui
+    qui existe. Le jeton est engendré au démarrage — _token_default rend
+    binascii.hexlify(os.urandom(24)) faute de JUPYTER_TOKEN, de JUPYTER_TOKEN_FILE
+    ou d'un mot de passe — et PasswordIdentityProvider.auth_enabled se réduit à
+    « bool(self.hashed_password or self.token) ». Deux chaînes vides, et la
+    propriété devient fausse.
+    Ce qui suit n'est pas un garde assoupli mais une identité distribuée à qui
+    passe : _get_user, lorsque ni jeton ni cookie ne porte d'utilisateur, prend la
+    branche « if not self.auth_enabled » et appelle generate_anonymous_user, sous
+    un commentaire qui ne cache rien — « Completely insecure! No authentication at
+    all. » Le décorateur @web.authenticated est donc satisfait, et la pile tourne
+    sans authentification plutôt qu'avec une authentification permissive. La
+    documentation dit la même chose de l'autre côté : « It is possible to disable
+    authentication altogether by setting the token and password to empty strings,
+    but this is NOT RECOMMENDED », et validate_security journalise au démarrage
+    « All authentication is disabled.  Anyone who can connect to this server will
+    be able to run code. »
+    Les deux routes interrogées ici sont gardées à l'identique — @web.authenticated
+    puis @authorized sur MainKernelHandler comme sur MainKernelSpecHandler — et un
+    refus ne prend pas la forme d'une redirection vers /login : APIHandler
+    surcharge get_login_url pour lever web.HTTPError(403) plutôt que rediriger,
+    « instead of redirecting, raise 403 instead », et write_error rend alors
+    {"message": "Forbidden"} en application/json. Un 200 anonyme sur ces routes est
+    donc le constat entier.
+    Encore faut-il ne pas le lire sur la mauvaise route. GET /api est le
+    contre-exemple exact : APIVersionHandler y est décoré @allow_unauthenticated —
+    « not authenticated, so give as few info as possible » — et rend
+    {"version": …} sur l'instance fermée comme sur l'ouverte. Le serveur
+    historique — notebook 5 et 6, dont jupyter_server a été extrait — sert ces
+    mêmes chemins avec les mêmes modèles et la même surcharge de get_login_url : ce
+    qui est écrit ici vaut pour lui.
+  impact: |
+    Un noyau Jupyter est un processus, pas un document : POST /api/kernels en
+    démarre un sur l'hôte, sous le compte qui fait tourner le serveur, puis la
+    websocket /api/kernels/{id}/channels y porte les execute_request. C'est de
+    l'exécution de code arbitraire non authentifiée, et POST /api/sessions y mène
+    par une autre porte. Quand les terminaux sont montés — terminals_enabled vaut
+    True par défaut — POST /api/terminals ouvre directement un shell, l'aide du
+    réglage précisant qu'en désactiver n'aide en rien : « Anything the user can in
+    a terminal, they can also do in a notebook. » Le contrôle XSRF n'est pas
+    l'obstacle qu'on croit : check_xsrf_cookie compare un cookie à l'argument de
+    même nom, donc n'établit aucune identité — il protège le navigateur d'un tiers,
+    pas le serveur d'un client qui prend le cookie sur une première lecture — et le
+    code le dit lui-même, « Servers without authentication are vulnerable to
+    XSRF ».
+    Ce que le processus atteint est tout l'environnement du serveur : les
+    identifiants montés dans le conteneur, le service de métadonnées de l'instance
+    cloud, ~/.aws, ~/.kube, les jetons de dépôt de modèles, et le GPU, dont
+    l'occupation est facturée à l'exploitant. La lecture seule suffit déjà à faire
+    mal : GET /api/contents énumère et rend l'arborescence servie sous root_dir —
+    les carnets avec leurs sorties, où atterrissent les clés collées dans une
+    cellule — et /files/{chemin} les sert bruts. L'écriture referme la boucle :
+    récrire un carnet, c'est poser du code que le prochain lecteur exécutera lui
+    même, sous son compte à lui.
+    Enfin rien de tout cela n'est attribuable : aucun compte n'existe,
+    generate_anonymous_user en fabrique un à la volée et le persiste dans un cookie
+    — les journaux ne portent qu'un nom tiré au sort.
+  remediation: |
+    Ne pas vider le jeton : le laisser tel qu'engendré au démarrage, ou poser un
+    mot de passe avec « jupyter server password », l'une ou l'autre valeur
+    suffisant à ce que auth_enabled reste vrai. C'est le couple
+    c.ServerApp.token = "" et c.ServerApp.password = "" que la documentation
+    qualifie de NOT RECOMMENDED, et il ne se tient que si l'authentification est
+    assurée par une couche placée devant — auquel cas c'est cette couche qu'il faut
+    vérifier, pas le port.
+    Contrôler ensuite sur GET /api/kernels ou GET /api/kernelspecs, jamais sur
+    GET /api : cette dernière est décorée @allow_unauthenticated par construction
+    et rend la version sur une instance correctement fermée aussi. Ne pas confondre
+    non plus ServerApp.ip avec une fermeture — c'est une adresse d'écoute, et
+    127.0.0.1 ne survit pas à une publication de port en conteneur. Un jeton reste
+    par ailleurs un secret unique et partagé, qui n'identifie personne : c'est un
+    frontal qui donne une identité par utilisateur, JupyterHub étant la réponse
+    prévue pour cela.
+    Après une exposition, considérer l'hôte comme exécuté et non seulement lu.
+    Renouveler tout identifiant atteignable depuis l'environnement du serveur — y
+    compris ceux que le service de métadonnées de l'instance délivre — puis
+    inspecter GET /api/kernels, /api/sessions et /api/terminals : un noyau, une
+    session ou un terminal que personne n'a ouverts sont la trace d'une exécution.
+    Contrôler enfin les carnets sous root_dir plutôt que de les supposer intacts :
+    une cellule ajoutée par un tiers s'exécutera sous le compte du prochain
+    lecteur, et cette écriture-là survit à la fermeture du port.
+  reference:
+    - https://jupyter-server.readthedocs.io/en/latest/operators/security.html
+    - https://jupyter-server.readthedocs.io/en/latest/operators/public-server.html
+    - https://github.com/jupyter-server/jupyter_server/blob/main/jupyter_server/auth/identity.py
+    - https://github.com/jupyter-server/jupyter_server/blob/main/jupyter_server/base/handlers.py
+    - https://github.com/jupyter-server/jupyter_server/blob/main/jupyter_server/services/kernels/handlers.py
+    - https://github.com/jupyter-server/jupyter_server/blob/main/jupyter_server/services/kernelspecs/handlers.py
+    - https://github.com/jupyter-server/jupyter_server/blob/main/jupyter_server/services/contents/handlers.py
+    - https://github.com/jupyter-server/jupyter_server_terminals/blob/main/jupyter_server_terminals/api_handlers.py
+    - https://github.com/jupyter/jupyter_client/blob/main/jupyter_client/kernelspec.py
+  metadata:
+    max-request: 2
+    vendor: jupyter
+    product: jupyter_server
+  tags: ai,ml,jupyter,notebook,exposure,unauth,rce,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /api/kernels est la route du sujet — c'est elle que le verbe POST double
+  # pour démarrer un noyau, donc pour exécuter du code — mais son corps ne nomme
+  # personne : MainKernelHandler.get sérialise list_kernels(), qui parcourt les
+  # noyaux en cours et rend donc « [] » sur une instance au repos. Or c'est
+  # exactement l'instance qu'on trouve oubliée sur un port ouvert. Exiger un noyau
+  # vivant reviendrait à ne signaler que les serveurs en cours d'usage, et un
+  # tableau vide, lui, ne désigne aucun produit.
+  #
+  # GET /api/kernelspecs comble ce manque sans rien concéder : le handler est gardé
+  # à l'identique — @web.authenticated puis @authorized, comme celui des noyaux —
+  # donc son 200 anonyme prouve la même chose, et son corps est celui du protocole
+  # de noyau. MainKernelSpecHandler assemble {"default": …, "kernelspecs": {…}} et
+  # chaque entrée porte ce que KernelSpec.to_dict sérialise sans condition — argv,
+  # env, display_name, language, interrupt_mode, metadata — quoi que contienne
+  # kernel.json. Un catalogue vide ne remonte pas, et c'est voulu : sans
+  # kernelspec, aucun noyau ne peut démarrer, donc l'exécution de code que ce
+  # template signale n'existe pas.
+  #
+  # GET /api serait le contre-exemple exact : APIVersionHandler y est décoré
+  # @allow_unauthenticated — « not authenticated, so give as few info as
+  # possible » — et rend {"version": …} sur l'instance fermée comme sur l'ouverte.
+  # /api/status, à l'inverse, est bien gardée, mais son corps — started,
+  # last_activity, kernels, connections — est celui de n'importe quelle page
+  # d'état.
+  #
+  # En lecture seule, et strictement : la même surface non authentifiée sert
+  # POST /api/kernels et POST /api/sessions, qui lanceraient un processus sur
+  # l'hôte, la websocket /api/kernels/{id}/channels, qui y porterait les
+  # execute_request, POST /api/terminals, qui ouvrirait un shell,
+  # /api/contents/{chemin} et /files/{chemin}, qui rendraient les carnets et les
+  # fichiers servis sous root_dir, et les verbes /restart, /interrupt et DELETE des
+  # noyaux, qui emporteraient le travail en cours de l'exploitant. Signaler une
+  # exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/kernels"
+      - "{{BaseURL}}/api/kernelspecs"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, le catalogue conclurait seul — or il
+    # dit que c'est Jupyter, pas que l'API des noyaux répond.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'API des noyaux a répondu à une requête anonyme, et c'est le constat :
+          # la même route en POST démarre un noyau. Le statut est vérifié à part du
+          # corps parce qu'un cache placé devant l'instance peut relayer la liste
+          # qu'il détient sous le statut du refus — et parce que ce refus est du
+          # JSON lui aussi, write_error rendant {"message": "Forbidden"} en
+          # application/json.
+          - "status_code_1 == 200"
+
+          # De cette première réponse, la forme et rien de plus : le handler
+          # sérialise une liste, donc le corps commence par son crochet, vide ou
+          # non. C'est ce qui la sépare de la page qu'un portail captif rendrait
+          # sous un 200. trim_space parce qu'un intermédiaire peut préfixer une
+          # nouvelle ligne. Exiger un noyau nommé raterait l'instance au repos,
+          # précisément celle qu'on trouve oubliée sur un port ouvert.
+          - 'starts_with(trim_space(body_1), "[")'
+
+          # Le catalogue a répondu lui aussi — un proxy peut n'ouvrir qu'une des
+          # deux routes — et il porte le vocabulaire du protocole de noyau.
+          # « kernelspecs » est la clé de collection propre à cette API ; « argv »
+          # et « interrupt_mode » viennent de KernelSpec.to_dict, qui les sérialise
+          # sans condition depuis les versions 5.x de jupyter_client, donc la
+          # signature ne dépend d'aucun kernel.json particulier. Les trois réunies
+          # décrivent ce qu'aucun autre produit ne publie : une liste de noyaux
+          # lançables, chacun avec sa ligne de commande et son mode d'interruption.
+          # Vérifiées sur la clé nue, sans les deux-points, pour qu'un intermédiaire
+          # qui réindente ce qu'il relaie ne mette pas le matcher en défaut.
+          - 'status_code_2 == 200 && contains(body_2, "\"kernelspecs\"") && contains(body_2, "\"argv\"") && contains(body_2, "\"interrupt_mode\"")'
+
+    extractors:
+      # Les noyaux qu'un anonyme peut démarrer : c'est le renseignement qui fait la
+      # sévérité, puisque c'est la liste des interpréteurs disponibles sur l'hôte.
+      # C'est aussi ce qui fixe l'ordre des deux chemins : sous req-condition,
+      # `part: body` désigne la dernière réponse reçue, donc le catalogue doit être
+      # interrogé en second — placé en premier, l'extracteur serait évalué contre
+      # le tableau des noyaux et ne rendrait jamais rien.
+      # Un seul extracteur, et c'est délibéré : chacun qui rend quelque chose
+      # ajoute un résultat, donc un second ferait remonter deux fois la même
+      # instance dans un rapport de scan.
+      - type: json
+        part: body
+        name: kernel
+        json:
+          - '.kernelspecs[].name'

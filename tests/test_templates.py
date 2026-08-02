@@ -3854,6 +3854,479 @@ def test_mlflow_matcher_needs_the_tracking_vocabulary_not_a_generic_experiment_l
     )
 
 
+# --------------------------------------------------------------------------
+# Jupyter est le cas où la route qui porte la sévérité est aussi celle qui ne
+# prouve rien toute seule. GET /api/kernels est bien la route du sujet — le verbe
+# POST y démarre un noyau, donc exécute du code — mais MainKernelHandler.get
+# sérialise list_kernels(), qui parcourt les noyaux en cours : sur une instance au
+# repos le corps vaut « [] », et un tableau vide ne désigne aucun produit. Or
+# l'instance au repos est précisément celle qu'on trouve oubliée sur un port
+# ouvert ; exiger un noyau vivant reviendrait à ne signaler que les serveurs en
+# cours d'usage.
+#
+# D'où la seconde lecture, GET /api/kernelspecs, gardée par les mêmes décorateurs
+# — @web.authenticated puis @authorized — donc dont le 200 anonyme prouve
+# exactement la même chose, et dont le corps, lui, est celui du protocole de
+# noyau : « kernelspecs » est la clé de collection de cette API, « argv » et
+# « interrupt_mode » viennent de KernelSpec.to_dict, qui les sérialise sans
+# condition depuis les versions 5.x de jupyter_client.
+#
+# Deux pièges de rédaction encadrent ce choix, et les scénarios ci-dessous les
+# fixent. Le premier est de conclure de la seule route qui nomme le produit : un
+# proxy peut n'ouvrir que le catalogue, auquel cas la route qui démarre un noyau
+# n'est pas atteignable. Le second est de se poser sur GET /api, seule route de
+# l'API décorée @allow_unauthenticated, qui rend la version sur l'instance fermée
+# comme sur l'ouverte — c'est ici l'équivalent du /health de MLflow.
+
+JUPYTER_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "jupyter-no-token.yaml")
+
+JUPYTER_KERNELSPECS = "/api/kernelspecs"
+JUPYTER_KERNELS = "/api/kernels"
+
+# Catalogue d'une instance récente : le modèle que MainKernelSpecHandler assemble,
+# chaque entrée portant le dict de KernelSpec.to_dict et les ressources ajoutées
+# par kernelspec_model.
+JUPYTER_KERNELSPECS_BODY = (
+    '{"default":"python3","kernelspecs":{"python3":{"name":"python3",'
+    '"spec":{"argv":["/opt/conda/bin/python","-m","ipykernel_launcher","-f",'
+    '"{connection_file}"],"env":{},"display_name":"Python 3 (ipykernel)",'
+    '"language":"python","interrupt_mode":"signal",'
+    '"metadata":{"debugger":true},"kernel_protocol_version":""},'
+    '"resources":{"logo-32x32":"/kernelspecs/python3/logo-32x32.png",'
+    '"logo-64x64":"/kernelspecs/python3/logo-64x64.png",'
+    '"logo-svg":"/kernelspecs/python3/logo-svg.svg"}}}}'
+)
+
+# Le même catalogue sur une instance plus ancienne — notebook 6 et les
+# jupyter_client antérieurs à la version 8 : ni kernel_protocol_version dans le
+# dict, ni debugger dans les métadonnées, ni logo vectoriel dans les ressources.
+# Le template doit toujours la reconnaître : ce sont elles qui traînent exposées.
+JUPYTER_OLD_KERNELSPECS_BODY = (
+    '{"default":"python3","kernelspecs":{"python3":{"name":"python3",'
+    '"spec":{"argv":["/usr/bin/python3","-m","ipykernel_launcher","-f",'
+    '"{connection_file}"],"env":{},"display_name":"Python 3",'
+    '"language":"python","interrupt_mode":"signal","metadata":{}},'
+    '"resources":{"logo-64x64":"/kernelspecs/python3/logo-64x64.png"}}}}'
+)
+
+# Une instance sur laquelle aucun kernelspec n'est installé. La clé de collection
+# est bien là, mais vide : aucun noyau ne peut démarrer, donc l'exécution de code
+# que le template signale n'existe pas. C'est le corps qui rend « argv » et
+# « interrupt_mode » indispensables.
+JUPYTER_EMPTY_KERNELSPECS_BODY = '{"default":"python3","kernelspecs":{}}'
+
+# Un noyau en cours, tel que kernel_model le rend.
+JUPYTER_KERNELS_BODY = (
+    '[{"id":"6f1a9c40-3b7e-4d21-9a0c-1f8e5b2d7c33","name":"python3",'
+    '"last_activity":"2026-07-19T14:05:02.886901Z","execution_state":"idle",'
+    '"connections":1}]'
+)
+
+# La même instance au repos : list_kernels() ne parcourt rien. C'est celle qu'on
+# trouve oubliée sur un port ouvert, et elle doit remonter.
+JUPYTER_NO_KERNEL_BODY = "[]"
+
+# Ce qu'écrit write_error quand le jeton est en place : APIHandler surcharge
+# get_login_url pour lever 403 plutôt que rediriger vers /login, et le corps du
+# refus est du JSON lui aussi.
+JUPYTER_FORBIDDEN_BODY = '{"message": "Forbidden", "reason": null}'
+
+# Un superviseur de processus quelconque : il énumère des commandes avec leur
+# ligne d'appel et le signal qui les interrompt, donc porte « argv » et
+# « interrupt_mode » sans être Jupyter. Ces deux clés seules ne prouvent rien.
+OTHER_PROCESS_SUPERVISOR_BODY = (
+    '{"processes":[{"name":"ingest-worker",'
+    '"argv":["/usr/bin/python3","-m","worker","--queue","ingest"],"env":{},'
+    '"interrupt_mode":"signal","state":"RUNNING","pid":4412}]}'
+)
+
+
+def jupyter_scenario(kernelspecs, kernels):
+    """
+    Un scénario associe une réponse (statut, corps) à chacune des deux routes que
+    le template interroge. L'ordre, lui, est imposé par le template au moment de
+    l'évaluation.
+    """
+    return {JUPYTER_KERNELSPECS: kernelspecs, JUPYTER_KERNELS: kernels}
+
+
+# Instance démarrée avec le jeton vidé : auth_enabled est faux, _get_user fabrique
+# un utilisateur anonyme, les deux routes répondent.
+JUPYTER_OPEN = jupyter_scenario(
+    kernelspecs=(200, JUPYTER_KERNELSPECS_BODY),
+    kernels=(200, JUPYTER_KERNELS_BODY),
+)
+
+# La même au repos : aucun noyau n'a encore été démarré.
+JUPYTER_OPEN_IDLE = jupyter_scenario(
+    kernelspecs=(200, JUPYTER_KERNELSPECS_BODY),
+    kernels=(200, JUPYTER_NO_KERNEL_BODY),
+)
+
+# Une instance ancienne, au repos elle aussi.
+JUPYTER_OPEN_OLD = jupyter_scenario(
+    kernelspecs=(200, JUPYTER_OLD_KERNELSPECS_BODY),
+    kernels=(200, JUPYTER_NO_KERNEL_BODY),
+)
+
+# Un intermédiaire réindente ce qu'il relaie : le corps n'est plus compact et le
+# tableau des noyaux ne commence plus par son crochet.
+JUPYTER_OPEN_REFORMATTED = jupyter_scenario(
+    kernelspecs=(200, '{\n  "default": "python3",\n  "kernelspecs": {\n'
+                      '    "python3": {\n      "name": "python3",\n'
+                      '      "spec": {\n        "argv": [\n'
+                      '          "/usr/bin/python3",\n          "-m",\n'
+                      '          "ipykernel_launcher"\n        ],\n'
+                      '        "interrupt_mode": "signal"\n      }\n'
+                      '    }\n  }\n}'),
+    kernels=(200, "\n[\n]\n"),
+)
+
+# Jeton en place — l'instance par défaut, donc : les deux routes reçoivent le 403
+# que lève get_login_url.
+JUPYTER_TOKEN_ENABLED = jupyter_scenario(
+    kernelspecs=(403, JUPYTER_FORBIDDEN_BODY),
+    kernels=(403, JUPYTER_FORBIDDEN_BODY),
+)
+
+# Un proxy réglé pour tout garder.
+JUPYTER_BEHIND_AUTH_PROXY = jupyter_scenario(
+    kernelspecs=(401, "<html><body><h1>401 Unauthorized</h1></body></html>"),
+    kernels=(401, "<html><body><h1>401 Unauthorized</h1></body></html>"),
+)
+
+# Le même proxy réglé pour n'ouvrir que le catalogue — la route qui démarre un
+# noyau n'est alors pas atteignable, et il n'y a pas de constat.
+JUPYTER_KERNEL_API_GUARDED = jupyter_scenario(
+    kernelspecs=(200, JUPYTER_KERNELSPECS_BODY),
+    kernels=(403, JUPYTER_FORBIDDEN_BODY),
+)
+
+# Un cache placé devant l'instance, réglé pour exiger une identité depuis que le
+# jeton a été reposé, mais qui relaie encore le catalogue qu'il détient sous le
+# statut du refus. Il n'existe que pour que le statut du catalogue reste vérifié :
+# le corps, lui, est authentique.
+JUPYTER_CACHED_BODY_UNDER_REFUSAL = jupyter_scenario(
+    kernelspecs=(403, JUPYTER_KERNELSPECS_BODY),
+    kernels=(200, JUPYTER_NO_KERNEL_BODY),
+)
+
+# Le même cache, du côté de l'API des noyaux : il relaie la liste qu'il détient
+# sous le statut du refus. La forme du corps est alors celle qu'attend le
+# template, et seul le statut sépare cette instance-là de l'instance ouverte.
+JUPYTER_CACHED_KERNELS_UNDER_REFUSAL = jupyter_scenario(
+    kernelspecs=(200, JUPYTER_KERNELSPECS_BODY),
+    kernels=(403, JUPYTER_KERNELS_BODY),
+)
+
+# Portail captif devant une vraie instance : il répond 200 et sa page de connexion
+# à tout ce qu'on lui demande.
+JUPYTER_BEHIND_CAPTIVE_PORTAL = jupyter_scenario(
+    kernelspecs=(200, "<html><body>Connexion requise</body></html>"),
+    kernels=(200, "<html><body>Connexion requise</body></html>"),
+)
+
+# Le même portail, mais qui laisse filer le catalogue et n'intercepte que l'API
+# des noyaux : le statut ne l'en sépare plus, seule la forme de la réponse le
+# fait.
+JUPYTER_KERNEL_API_INTERCEPTED = jupyter_scenario(
+    kernelspecs=(200, JUPYTER_KERNELSPECS_BODY),
+    kernels=(200, "<html><body>Connexion requise</body></html>"),
+)
+
+# Une instance ouverte, mais sans aucun kernelspec installé : rien à démarrer,
+# donc rien à signaler.
+JUPYTER_WITHOUT_KERNELSPEC = jupyter_scenario(
+    kernelspecs=(200, JUPYTER_EMPTY_KERNELSPECS_BODY),
+    kernels=(200, JUPYTER_NO_KERNEL_BODY),
+)
+
+# Le superviseur de processus, derrière un routeur qui lui renvoie tout.
+OTHER_SUPERVISOR = jupyter_scenario(
+    kernelspecs=(200, OTHER_PROCESS_SUPERVISOR_BODY),
+    kernels=(200, OTHER_PROCESS_SUPERVISOR_BODY),
+)
+
+# Un serveur quelconque qui répond 200 à tout ce qu'on lui demande.
+JUPYTER_SERVER_ALWAYS_UP = jupyter_scenario(
+    kernelspecs=(200, '{"status":"ok"}'), kernels=(200, '{"status":"ok"}'))
+
+# Le pire de ce genre : il répond 200 et un tableau vide partout, donc satisfait
+# tout ce que le template attend de l'API des noyaux. Seule la signature du
+# catalogue l'en sépare.
+JUPYTER_SERVER_ALWAYS_EMPTY_ARRAY = jupyter_scenario(
+    kernelspecs=(200, "[]"), kernels=(200, "[]"))
+
+
+def jupyter_block():
+    doc = load(JUPYTER_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.replace("{{BaseURL}}", "") == JUPYTER_KERNELS
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas GET {JUPYTER_KERNELS} — c'est pourtant la "
+        "route du constat, celle que le verbe POST double pour démarrer un noyau"
+    )
+    return blocks[0]
+
+
+def jupyter_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in jupyter_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que Jupyter ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def jupyter_fires(scenario):
+    block = jupyter_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = jupyter_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_jupyter_probe_never_starts_a_kernel_nor_reads_the_working_tree():
+    doc = load(JUPYTER_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'API des noyaux se lit en GET : le même chemin en POST démarre un "
+            "noyau, donc lance un processus sur l'hôte audité"
+        )
+        assert block.get("body") is None, (
+            "le template envoie un corps : les deux routes se lisent sans "
+            "paramètre, et un corps sur ce chemin est ce qui décrit le noyau à "
+            "démarrer"
+        )
+        for path in (block.get("path") or []):
+            route = path.replace("{{BaseURL}}", "")
+
+            for forbidden, why in (
+                ("/channels",
+                 "le template ouvre la websocket d'un noyau : c'est elle qui "
+                 "porte les execute_request, donc l'exécution de code qu'il est "
+                 "censé signaler"),
+                ("/api/sessions",
+                 "le template touche les sessions : en démarrer une lance un "
+                 "noyau, exactement comme la route des noyaux"),
+                ("/api/terminals",
+                 "le template touche les terminaux : en ouvrir un donne un shell "
+                 "sur l'hôte audité"),
+                ("/api/contents",
+                 "le template lit l'arborescence servie sous root_dir : elle "
+                 "rend les carnets avec leurs sorties, donc le template "
+                 "exfiltrerait ce qu'il signale"),
+                ("/files/",
+                 "le template télécharge un fichier de l'instance qu'il audite"),
+                ("/nbconvert",
+                 "le template fait convertir un carnet, ce qui l'exécute selon "
+                 "l'exportateur demandé"),
+                ("/restart",
+                 "le template redémarre un noyau, donc emporte le travail en "
+                 "cours de l'exploitant"),
+                ("/interrupt",
+                 "le template interrompt un noyau de l'instance qu'il audite"),
+                ("/login",
+                 "le template poste sur le formulaire de connexion : il "
+                 "tenterait de s'authentifier plutôt que de constater qu'aucune "
+                 "authentification n'est demandée"),
+            ):
+                assert forbidden not in route, why
+
+            # L'API des noyaux se lit sur /api/kernels tout court : le même chemin
+            # suffixé d'un identifiant accepte DELETE, qui arrête le noyau.
+            assert not route.startswith(JUPYTER_KERNELS + "/"), (
+                f"le template vise un noyau nommé ({route}) plutôt que la liste : "
+                "c'est le préfixe dont le verbe DELETE arrête le noyau et emporte "
+                "l'état de la session en cours"
+            )
+
+
+def test_jupyter_probe_links_the_kernel_api_to_the_kernelspec_catalogue():
+    block = jupyter_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+
+    assert JUPYTER_KERNELSPECS in paths, (
+        "le template n'interroge pas GET /api/kernelspecs — c'est la seule des "
+        "deux routes qui nomme le produit, l'API des noyaux rendant « [] » sur "
+        "une instance au repos"
+    )
+    assert JUPYTER_KERNELS in paths, (
+        "le template n'interroge pas GET /api/kernels, la route dont le 200 "
+        "anonyme établit que l'API qui démarre un noyau est atteignable"
+    )
+    assert block.get("req-condition") is True, (
+        "sans req-condition, les deux réponses ne peuvent pas être liées : le "
+        "catalogue conclurait seul, or il dit que c'est Jupyter, pas que l'API "
+        "des noyaux répond"
+    )
+
+    for route in paths:
+        assert route.rstrip("/") != "/api", (
+            "le template interroge GET /api : APIVersionHandler y est décoré "
+            "@allow_unauthenticated par construction — « not authenticated, so "
+            "give as few info as possible » — donc cette route rend la version "
+            "sur une instance correctement fermée aussi, et ne prouve rien"
+        )
+
+    # Sous req-condition, chaque extracteur qui rend quelque chose ajoute un
+    # résultat : deux extracteurs feraient remonter deux fois la même instance.
+    assert len(block.get("extractors") or []) <= 1, (
+        "le template porte plus d'un extracteur : sous req-condition, chacun "
+        "rendant quelque chose ajoute un résultat, donc la même instance est "
+        "signalée plusieurs fois dans un rapport de scan"
+    )
+
+
+def test_jupyter_extractor_is_evaluated_against_the_catalogue():
+    """
+    L'ordre des deux chemins n'est pas indifférent, et le contraire ne se voit
+    pas : sous req-condition, « part: body » désigne la dernière réponse reçue.
+    Le catalogue interrogé en premier, l'extracteur serait évalué contre le
+    tableau des noyaux, ne rendrait jamais rien, et le template signalerait sans
+    dire quels interpréteurs un anonyme peut lancer — sans qu'aucun matcher ne
+    s'en trouve changé, donc sans que rien ne le trahisse.
+    """
+    block = jupyter_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+    extractors = block.get("extractors") or []
+
+    assert extractors, (
+        "le template ne remonte rien à l'exploitant : signaler que le port "
+        "répond ne lui dit pas quels noyaux un anonyme peut y démarrer"
+    )
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "l'extracteur ne lit pas le JSON de la réponse : une expression "
+            "libre remonterait aussi bien des fragments de page"
+        )
+        for expression in (extractor.get("json") or []):
+            assert expression.startswith(".kernelspecs[]"), (
+                f"l'extracteur n'est pas borné au catalogue des noyaux "
+                f"({expression!r})"
+            )
+        if extractor.get("part", "body") == "body":
+            assert paths[-1] == JUPYTER_KERNELSPECS, (
+                "l'extracteur lit le catalogue mais celui-ci n'est pas le "
+                "dernier chemin interrogé : sous req-condition, « part: body » "
+                "désigne la dernière réponse reçue, donc l'expression serait "
+                "évaluée contre le tableau des noyaux et ne rendrait rien"
+            )
+
+
+def test_jupyter_matcher_needs_the_kernel_protocol_not_an_empty_array():
+    assert jupyter_fires(JUPYTER_OPEN), (
+        "le template ne reconnaît pas une instance dont l'API des noyaux répond "
+        "à une requête sans jeton"
+    )
+    assert jupyter_fires(JUPYTER_OPEN_IDLE), (
+        "le template exige un noyau en cours : list_kernels() rend « [] » tant "
+        "qu'aucun n'a été démarré, donc il raterait l'instance au repos — "
+        "précisément celle qu'on trouve oubliée sur un port ouvert"
+    )
+    assert jupyter_fires(JUPYTER_OPEN_OLD), (
+        "le template exige des clés absentes des versions plus anciennes — "
+        "kernel_protocol_version n'a été ajouté au dict de KernelSpec.to_dict que "
+        "tard, et les métadonnées du débogueur plus tard encore — il raterait les "
+        "instances qui traînent exposées"
+    )
+    assert jupyter_fires(JUPYTER_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps, ou qui préfixe une nouvelle ligne "
+        "au tableau des noyaux, le mettrait en défaut"
+    )
+
+    assert not jupyter_fires(JUPYTER_TOKEN_ENABLED), (
+        "le template déclenche sur une instance dont le jeton est en place : "
+        "auth_enabled y est vrai, _get_user ne fabrique aucun utilisateur "
+        "anonyme, et get_login_url lève 403 sur les deux routes"
+    )
+    assert not jupyter_fires(JUPYTER_BEHIND_AUTH_PROXY), (
+        "le template déclenche sur une instance entièrement gardée"
+    )
+    assert not jupyter_fires(JUPYTER_KERNEL_API_GUARDED), (
+        "le template conclut du seul catalogue : un proxy peut n'ouvrir "
+        "/api/kernelspecs qu'à l'inventaire de son parc et garder le reste, "
+        "auquel cas la route qui démarre un noyau n'est pas atteignable — c'est "
+        "le statut de cette route-là qui l'établit"
+    )
+    assert not jupyter_fires(JUPYTER_CACHED_BODY_UNDER_REFUSAL), (
+        "le template conclut du seul corps du catalogue : un cache placé devant "
+        "l'instance peut relayer celui qu'il détient sous le statut du refus, "
+        "alors que l'API, elle, a refusé"
+    )
+    assert not jupyter_fires(JUPYTER_CACHED_KERNELS_UNDER_REFUSAL), (
+        "le template conclut de la seule forme du tableau des noyaux : le même "
+        "cache peut relayer la liste qu'il détient sous le statut du refus, "
+        "auquel cas l'API des noyaux, elle, a refusé"
+    )
+    assert not jupyter_fires(JUPYTER_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise de catalogue : un portail "
+        "captif qui répond 200 à tout suffirait à le faire remonter"
+    )
+    assert not jupyter_fires(JUPYTER_KERNEL_API_INTERCEPTED), (
+        "le template accepte une page HTML en guise de liste de noyaux : le "
+        "handler sérialise une liste, donc le corps commence par son crochet, "
+        "vide ou non — sans cette forme, un portail qui laisse filer le "
+        "catalogue et intercepte le reste remonterait"
+    )
+    assert not jupyter_fires(OTHER_SUPERVISOR), (
+        "le template déclenche sur un superviseur de processus qui n'est pas "
+        "Jupyter : « argv » et « interrupt_mode » sont ce qu'écrit n'importe quel "
+        "gestionnaire décrivant les commandes qu'il lance, et c'est "
+        "« kernelspecs » qui rattache la réponse au produit"
+    )
+    assert not jupyter_fires(JUPYTER_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+    assert not jupyter_fires(JUPYTER_SERVER_ALWAYS_EMPTY_ARRAY), (
+        "le template déclenche sur un serveur qui rend un tableau vide partout : "
+        "c'est exactement ce que sert l'API des noyaux au repos, et seule la "
+        "signature du catalogue l'en sépare"
+    )
+
+
+def test_jupyter_stays_silent_when_no_kernel_can_be_started():
+    """
+    La frontière que le template revendique, fixée dans le sens qui coûte.
+
+    Une instance ouverte mais sans aucun kernelspec ne remonte pas, et c'est
+    délibéré : sans spec, POST /api/kernels n'a rien à démarrer, donc l'exécution
+    de code qui fonde la sévérité critical n'existe pas. C'est ce scénario qui
+    rend « argv » et « interrupt_mode » nécessaires plutôt qu'ornementaux — la
+    clé de collection, elle, est bien présente dans ce corps.
+
+    Ce test existe pour que ce choix reste un choix : quiconque relâcherait la
+    signature jusqu'à la seule clé « kernelspecs » ferait remonter une instance
+    incapable d'exécuter quoi que ce soit sous une sévérité critical, et c'est
+    ici qu'il doit s'en apercevoir.
+    """
+    assert not jupyter_fires(JUPYTER_WITHOUT_KERNELSPEC), (
+        "le template remonte une instance dont le catalogue est vide : aucun "
+        "noyau ne peut y démarrer, donc rien n'y justifie une sévérité critical"
+    )
+
+    # La contrepartie de ce choix : ce corps doit rester celui d'un catalogue
+    # vide, sans quoi le raisonnement ci-dessus ne tient plus.
+    assert '"kernelspecs":{}' in JUPYTER_EMPTY_KERNELSPECS_BODY, (
+        "le scénario ne modélise plus une instance sans kernelspec"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

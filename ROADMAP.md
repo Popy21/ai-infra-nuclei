@@ -42,7 +42,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 ## MLOps & suivi d'expériences
 
 - [x] `templates/exposure/mlflow-tracking-server-unauth.yaml` — MLflow, `GET /api/2.0/mlflow/experiments/search` sans authentification. Sévérité critical (lecture d'artefacts arbitraires).
-- [ ] `templates/exposure/jupyter-no-token.yaml` — Jupyter sans jeton : `GET /api/kernels` répond, donc exécution de code. Sévérité critical.
+- [x] `templates/exposure/jupyter-no-token.yaml` — Jupyter sans jeton : `GET /api/kernels` répond, donc exécution de code. Sévérité critical.
 - [ ] `templates/exposure/kubeflow-pipelines-exposed.yaml` — Kubeflow Pipelines : `GET /apis/v1beta1/pipelines` (ou `/pipeline/apis/v1beta1/...` derrière Istio) renvoie la liste JSON des pipelines. Sévérité high.
 - [ ] `templates/exposure/clearml-server-exposed.yaml` — ClearML : l'API (8008) répond sur `POST /debug.ping` ; le webserver (8080) sert l'app. Chercher la signature de version dans la réponse. Sévérité high.
 - [ ] `templates/exposure/label-studio-signup-open.yaml` — Label Studio : `GET /user/signup` sert le formulaire quand l'inscription est ouverte ; `GET /version` expose les versions des composants. Sévérité medium.
