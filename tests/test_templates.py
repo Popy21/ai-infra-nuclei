@@ -5146,6 +5146,473 @@ def test_clearml_extractor_reports_the_api_version_of_the_ping_response():
     )
 
 
+# --------------------------------------------------------------------------
+# BentoML sépare lui aussi les deux questions, mais autrement que ClearML : ici
+# aucune route ne dit l'état de l'authentification, puisqu'il n'y en a pas —
+# get_system_routes greffe /livez, /healthz et /readyz sans intercalaire, et
+# aucune branche du code ne consulte l'identité de l'appelant. Ce qui reste à
+# établir est donc, d'un côté, que le service tourne et sert effectivement
+# l'inférence — c'est readyz, que le serveur lui-même distingue de livez — et de
+# l'autre quel produit répond. Les sondes ne peuvent rien pour la seconde
+# question : elles rendent « PlainTextResponse("\n") », et un saut de ligne
+# n'appartient à personne. C'est /docs.json qui la tranche, et par deux chaînes
+# écrites en dur plutôt que par une forme, « openapi », « paths » et « /livez »
+# étant le vocabulaire de n'importe quelle application FastAPI munie de sondes
+# Kubernetes.
+
+BENTOML_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "bentoml-yatai-exposed.yaml")
+
+BENTOML_LIVEZ = "/livez"
+BENTOML_READYZ = "/readyz"
+BENTOML_DOCS = "/docs.json"
+
+# Ce que rendent livez et readyz : PlainTextResponse("\n", status_code=200).
+BENTOML_PROBE_BODY = "\n"
+
+# Les deux libellés que generate_spec pose dans le document. Ils sont écrits en
+# dur dans _internal/service/openapi — APP_TAG et INFRA_TAG — et la fabrique de
+# service actuelle réemploie les mêmes constantes que la génération à runners de
+# la 1.1 : c'est ce qui rend la signature stable d'une version à l'autre.
+BENTOML_APP_TAG = {"name": "Service APIs",
+                   "description": "BentoML Service API endpoints for inference."}
+BENTOML_INFRA_TAG = {
+    "name": "Infrastructure",
+    "description": "Common infrastructure endpoints for observability.",
+}
+
+# Les quatre entrées que make_infra_endpoints écrit sans condition, avec les
+# descriptions d'INFRA_DECRIPTION.
+BENTOML_INFRA_PATHS = {
+    "/healthz": "Health check endpoint. Expecting an empty response with status "
+                "code <code>200</code> when the service is in health state. The "
+                "<code>/healthz</code> endpoint is <b>deprecated</b>. (since "
+                "Kubernetes v1.16)",
+    "/livez": "Health check endpoint for Kubernetes. Healthy endpoint responses "
+              "with a <code>200</code> OK status.",
+    "/readyz": "A <code>200</code> OK status from <code>/readyz</code> endpoint "
+               "indicated the service is ready to accept traffic. From that "
+               "point and onward, Kubernetes will use <code>/livez</code> "
+               "endpoint to perform periodic health checks.",
+    "/metrics": "Prometheus metrics endpoint. The <code>/metrics</code> "
+                "responses with a <code>200</code>. The output can then be used "
+                "by a Prometheus sidecar to scrape the metrics of the service.",
+}
+
+
+def bentoml_docs_body(title="summarization", version="hkwqxdst5ct4jnry",
+                      api_path="/summarize", api_name="summarize",
+                      description="Un service de résumé.", components=True):
+    """
+    Le document que /docs.json rend : la structure d'OpenAPISpecification, telle
+    que JSONResponse la sérialise — d'où les séparateurs compacts, qui sont ceux
+    du rendu de Starlette et non un choix de ce fichier.
+
+    Les deux paramètres qui portent une variation réelle : `description` vaut
+    None quand le service n'a pas de docstring, et `components` est absent quand
+    aucune méthode ne déclare de modèle d'entrée — dans les deux cas
+    __omit_if_default__ retire la clé du document plutôt que d'y écrire un null.
+    Le template ne doit dépendre ni de l'une ni de l'autre.
+    """
+    info = {"title": title, "version": version}
+    if description is not None:
+        info["description"] = description
+    info["contact"] = {"name": "BentoML Team", "email": "contact@bentoml.com"}
+
+    paths = {
+        endpoint: {"get": {
+            "responses": {"200": {"description": "Successful Response"}},
+            "tags": [BENTOML_INFRA_TAG["name"]],
+            "description": text,
+        }}
+        for endpoint, text in BENTOML_INFRA_PATHS.items()
+    }
+    paths[api_path] = {"post": {
+        "tags": [BENTOML_APP_TAG["name"]],
+        "operationId": f"{title}__{api_name}",
+        "responses": {"200": {"description": "Successful Response",
+                              "content": {"application/json": {
+                                  "schema": {"type": "string"}}}}},
+    }}
+
+    spec = {
+        "openapi": "3.0.2",
+        "info": info,
+        "servers": [{"url": "."}],
+        "tags": [BENTOML_APP_TAG, BENTOML_INFRA_TAG],
+        "paths": paths,
+    }
+    if components:
+        schema_name = f"{title.capitalize()}{api_name.capitalize()}Input"
+        spec["paths"][api_path]["post"]["requestBody"] = {
+            "content": {"application/json": {
+                "schema": {"$ref": f"#/components/schemas/{schema_name}"}}}}
+        spec["components"] = {"schemas": {schema_name: {
+            "type": "object", "properties": {"text": {"type": "string"}},
+            "title": "Input"}}}
+
+    return json.dumps(spec, ensure_ascii=False, separators=(",", ":"))
+
+
+# Un service courant : une méthode d'inférence, un modèle d'entrée déclaré.
+BENTOML_DOCS_BODY = bentoml_docs_body()
+
+# Le même document sur un service sans docstring et dont la méthode ne déclare
+# aucun modèle d'entrée : ni info.description ni components ne sont écrits. Le
+# template doit toujours le reconnaître.
+BENTOML_DOCS_MINIMAL_BODY = bentoml_docs_body(
+    title="iris_classifier", version="rfwc3ndq2gsbg6qr",
+    api_path="/classify", api_name="classify",
+    description=None, components=False)
+
+# Le même corps relayé par un intermédiaire qui réindente ce qu'il transporte.
+BENTOML_DOCS_REFORMATTED_BODY = json.dumps(json.loads(BENTOML_DOCS_BODY),
+                                           ensure_ascii=False, indent=2)
+
+# Une autre passerelle d'inférence, application FastAPI munie des mêmes sondes
+# Kubernetes et publiant son schéma au même endroit : « openapi », « paths »,
+# « /livez », « /readyz », « /healthz », « /metrics » et une route POST
+# d'inférence. Tout le vocabulaire y est, aucun des deux libellés n'y est.
+OTHER_FASTAPI_DOCS_BODY = json.dumps({
+    "openapi": "3.1.0",
+    "info": {"title": "inference-gateway", "version": "2.3.0"},
+    "paths": {
+        "/livez": {"get": {"summary": "Livez", "tags": ["health"]}},
+        "/readyz": {"get": {"summary": "Readyz", "tags": ["health"]}},
+        "/healthz": {"get": {"summary": "Healthz", "tags": ["health"]}},
+        "/metrics": {"get": {"summary": "Metrics", "tags": ["health"]}},
+        "/predict": {"post": {"summary": "Predict", "tags": ["inference"],
+                              "operationId": "predict_predict_post"}},
+    },
+}, ensure_ascii=False, separators=(",", ":"))
+
+# La même passerelle, mais placée devant un service BentoML dont elle recopie la
+# description de la route proxifiée — cas ordinaire d'un agrégateur qui republie
+# les schémas qu'il rassemble. Le libellé d'APP_TAG figure donc mot pour mot dans
+# son document sans qu'il soit BentoML, et celui d'INFRA_TAG n'y est pas : c'est
+# ce corps qui rend nécessaire d'exiger les deux ensemble.
+OTHER_GATEWAY_QUOTING_BENTOML_BODY = json.dumps({
+    "openapi": "3.1.0",
+    "info": {"title": "inference-gateway", "version": "2.3.0",
+             "description": BENTOML_APP_TAG["description"]},
+    "paths": {
+        "/livez": {"get": {"summary": "Livez"}},
+        "/readyz": {"get": {"summary": "Readyz"}},
+        "/upstream/summarize": {"post": {
+            "summary": "Summarize",
+            "description": BENTOML_APP_TAG["description"]}},
+    },
+}, ensure_ascii=False, separators=(",", ":"))
+
+
+def bentoml_scenario(livez, readyz, docs):
+    return {BENTOML_LIVEZ: livez, BENTOML_READYZ: readyz, BENTOML_DOCS: docs}
+
+
+BENTOML_PROBE_OK = (200, BENTOML_PROBE_BODY)
+
+# Une instance servie telle quelle : les sondes répondent, le document se lit.
+BENTOML_OPEN = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK,
+    docs=(200, BENTOML_DOCS_BODY))
+
+# La même, sur un service sans docstring ni modèle d'entrée déclaré.
+BENTOML_OPEN_MINIMAL = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK,
+    docs=(200, BENTOML_DOCS_MINIMAL_BODY))
+
+# La même, derrière un intermédiaire qui réindente le document et normalise la
+# fin de ligne des sondes.
+BENTOML_OPEN_REFORMATTED = bentoml_scenario(
+    livez=(200, "\r\n"), readyz=(200, "\r\n"),
+    docs=(200, BENTOML_DOCS_REFORMATTED_BODY))
+
+# Le service tourne mais n'est pas prêt à recevoir du trafic : readyz refuse,
+# HTTPException(500). L'inférence n'est alors servie à personne.
+BENTOML_NOT_READY = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=(500, "Internal Server Error"),
+    docs=(200, BENTOML_DOCS_BODY))
+
+# Un mandataire n'ouvre les sondes qu'à sa supervision et garde le reste : les
+# deux premières réponses sont exactement celles de l'instance ouverte.
+BENTOML_DOCS_GUARDED = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK,
+    docs=(401, '{"detail":"Not authenticated"}'))
+
+# Un cache placé devant relaie le document qu'il détient sous le statut du refus,
+# alors que le serveur, lui, a refusé.
+BENTOML_CACHED_UNDER_REFUSAL = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK,
+    docs=(401, BENTOML_DOCS_BODY))
+
+# Un cache indexé sur l'hôte et non sur le chemin sert la même réponse aux trois.
+BENTOML_DOCS_ON_ALL_PATHS = bentoml_scenario(
+    livez=(200, BENTOML_DOCS_BODY), readyz=(200, BENTOML_DOCS_BODY),
+    docs=(200, BENTOML_DOCS_BODY))
+BENTOML_PROBES_ON_ALL_PATHS = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK, docs=BENTOML_PROBE_OK)
+
+# Une autre passerelle d'inférence, avec les mêmes sondes et son propre schéma.
+OTHER_FASTAPI_SERVICE = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK,
+    docs=(200, OTHER_FASTAPI_DOCS_BODY))
+
+# La passerelle qui republie la description d'un service BentoML qu'elle
+# proxifie.
+OTHER_GATEWAY_QUOTING_BENTOML = bentoml_scenario(
+    livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK,
+    docs=(200, OTHER_GATEWAY_QUOTING_BENTOML_BODY))
+
+# Un portail captif qui répond 200 et sa page à tout ce qu'on lui demande.
+BENTOML_BEHIND_CAPTIVE_PORTAL = bentoml_scenario(
+    livez=(200, "<html><body>Connexion requise</body></html>"),
+    readyz=(200, "<html><body>Connexion requise</body></html>"),
+    docs=(200, "<html><body>Connexion requise</body></html>"))
+
+# Un serveur quelconque qui répond 200 à tout.
+BENTOML_SERVER_ALWAYS_UP = bentoml_scenario(
+    livez=(200, '{"status":"ok"}'), readyz=(200, '{"status":"ok"}'),
+    docs=(200, '{"status":"ok"}'))
+
+
+def bentoml_block():
+    doc = load(BENTOML_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.replace("{{BaseURL}}", "") == BENTOML_DOCS
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {BENTOML_DOCS} — les sondes rendent "
+        "« PlainTextResponse(\"\\n\") », donc rien qui désigne un produit, et "
+        "c'est le document OpenAPI qui porte les deux libellés nommant BentoML"
+    )
+    return blocks[0]
+
+
+def bentoml_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in bentoml_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que BentoML ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def bentoml_fires(scenario):
+    block = bentoml_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = bentoml_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les trois réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_bentoml_probe_reads_the_schema_and_touches_nothing_else():
+    """
+    Le document que le template lit est précisément celui qui dirait comment
+    appeler le modèle : chemin, méthode et schéma du corps attendu. Le lire est
+    le constat ; s'en servir serait la consommation qu'il signale.
+    """
+    doc = load(BENTOML_TEMPLATE)
+
+    assert bentoml_block().get("req-condition") is True, (
+        "le template ne lie pas les trois réponses : sans req-condition, ni "
+        "body_N ni status_code_N n'existent, chaque réponse est jugée seule, et "
+        "les sondes concluraient de leur côté — or elles ne rendent qu'un saut "
+        "de ligne, qui ne désigne aucun produit"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "GET", (
+            "les trois routes se lisent en GET : un POST sur ce serveur est un "
+            "appel d'inférence, donc du calcul déclenché sur les accélérateurs "
+            "de l'exploitant"
+        )
+        assert block.get("body") is None, (
+            "le template envoie un corps : sur un serveur BentoML, un corps est "
+            "l'entrée d'une méthode d'API"
+        )
+
+        for path in (block.get("path") or []):
+            route = path.replace("{{BaseURL}}", "")
+
+            for forbidden, why in (
+                ("/submit",
+                 "le template inscrit une tâche dans la file du service : elle "
+                 "serait exécutée aux frais de l'exploitant"),
+                ("/retry",
+                 "le template relance une tâche déjà soumise"),
+                ("/cancel",
+                 "le template annule une tâche que l'exploitant a soumise"),
+            ):
+                assert forbidden not in route, why
+
+
+def test_bentoml_matcher_needs_the_schema_not_just_the_probes():
+    assert bentoml_fires(BENTOML_OPEN), (
+        "le template ne reconnaît pas une instance servie telle quelle, celle "
+        "dont les sondes répondent et dont le document se lit"
+    )
+    assert bentoml_fires(BENTOML_OPEN_MINIMAL), (
+        "le template exige des clés qu'__omit_if_default__ retire du document — "
+        "info.description quand le service n'a pas de docstring, components "
+        "quand aucune méthode ne déclare de modèle d'entrée"
+    )
+    assert bentoml_fires(BENTOML_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte de JSONResponse ou de "
+        "la fin de ligne exacte des sondes : un intermédiaire qui réindente ce "
+        "qu'il relaie le mettrait en défaut"
+    )
+
+    assert not bentoml_fires(OTHER_FASTAPI_SERVICE), (
+        "le template déclenche sur une passerelle d'inférence qui n'est pas "
+        "BentoML : « openapi », « paths », « /livez » et « /readyz » sont le "
+        "vocabulaire de n'importe quelle application FastAPI munie de sondes "
+        "Kubernetes, et ne désignent aucun produit"
+    )
+    assert not bentoml_fires(OTHER_GATEWAY_QUOTING_BENTOML), (
+        "le template conclut d'un seul libellé : une passerelle qui republie la "
+        "description d'un service BentoML qu'elle proxifie porte celui d'APP_TAG "
+        "mot pour mot sans être BentoML — c'est l'exigence des deux ensemble qui "
+        "demande le document lui-même plutôt qu'une mention"
+    )
+    assert not bentoml_fires(BENTOML_DOCS_GUARDED), (
+        "le template conclut des sondes seules : elles sont greffées par "
+        "get_system_routes et un mandataire peut ne les ouvrir qu'à sa "
+        "supervision en gardant le reste — les deux premières réponses sont "
+        "alors exactement celles de l'instance ouverte"
+    )
+    assert not bentoml_fires(BENTOML_CACHED_UNDER_REFUSAL), (
+        "le template conclut du seul corps du document : un cache placé devant "
+        "l'instance peut relayer celui qu'il détient sous le statut du refus, "
+        "alors que le serveur, lui, a refusé"
+    )
+    assert not bentoml_fires(BENTOML_DOCS_ON_ALL_PATHS), (
+        "le template accepte n'importe quoi en guise de réponse des sondes : un "
+        "cache indexé sur l'hôte et non sur le chemin sert le document aux "
+        "trois, et le constat porterait alors sur une seule route interrogée "
+        "trois fois"
+    )
+    assert not bentoml_fires(BENTOML_PROBES_ON_ALL_PATHS), (
+        "le template conclut de trois corps vides : le même cache sert la "
+        "réponse des sondes à /docs.json, et rien n'a identifié le produit"
+    )
+    assert not bentoml_fires(BENTOML_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML là où les sondes rendent un corps "
+        "vide : un portail captif qui répond 200 à tout suffirait à le faire "
+        "remonter"
+    )
+    assert not bentoml_fires(BENTOML_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+    # Collisions internes au pack : ces produits sont eux aussi des applications
+    # FastAPI et publient un document OpenAPI de la même famille. Deux templates
+    # ne doivent pas revendiquer la même instance.
+    for other_body, produit in ((LANGSERVE_OPENAPI_BODY, "LangServe"),
+                                (VLLM_OPENAPI_BODY, "vLLM")):
+        assert not bentoml_fires(bentoml_scenario(
+            livez=BENTOML_PROBE_OK, readyz=BENTOML_PROBE_OK,
+            docs=(200, other_body))), (
+            f"le template déclenche sur {produit}, déjà couvert par son propre "
+            "template"
+        )
+
+
+def test_bentoml_stays_silent_when_the_service_is_not_ready():
+    """
+    La frontière que le template revendique, fixée dans le sens qui coûte.
+
+    livez rend 200 dès que le processus tourne ; readyz ne le rend qu'une fois le
+    service prêt à recevoir du trafic. C'est le serveur lui-même qui fait cette
+    distinction, et l'exiger est ce qui sépare « un serveur BentoML est
+    joignable » de « l'inférence est servie à qui la demande » — le constat que
+    la sévérité retenue suppose.
+
+    La contrepartie est assumée : une instance exposée mais pas encore prête ne
+    remonte pas. Elle ne sert alors rien à personne, et elle se referme d'elle-
+    même au passage suivant.
+    """
+    assert not bentoml_fires(BENTOML_NOT_READY), (
+        "le template remonte une instance dont readyz refuse : le service n'est "
+        "pas prêt à recevoir du trafic, donc l'inférence n'est servie à personne"
+    )
+
+    # La contrepartie de ce choix : ce scénario doit rester celui d'une instance
+    # ouverte à tout le reste, sans quoi le silence ci-dessus ne prouve rien.
+    assert BENTOML_NOT_READY[BENTOML_LIVEZ] == BENTOML_PROBE_OK, (
+        "le scénario ne modélise plus un processus qui tourne"
+    )
+    assert BENTOML_NOT_READY[BENTOML_DOCS] == (200, BENTOML_DOCS_BODY), (
+        "le scénario ne modélise plus un document lisible : le silence "
+        "viendrait d'ailleurs que de readyz"
+    )
+
+
+def test_bentoml_extractor_stays_on_the_schema_response():
+    block = bentoml_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+    extractors = block.get("extractors") or []
+
+    assert extractors, (
+        "le template ne remonte rien à l'exploitant : signaler que le port "
+        "répond ne lui dit ni quel service est servi ni ce qui y est appelable"
+    )
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "émet un résultat par extracteur qui rend quelque chose, donc la même "
+        "instance est signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "l'extracteur ne lit pas le JSON du document : une expression libre "
+        "remonterait aussi bien des fragments de page"
+    )
+    assert extractor.get("part") == f"body_{paths.index(BENTOML_DOCS) + 1}", (
+        "l'extracteur n'est pas borné à la réponse de /docs.json : sous "
+        "req-condition il serait évalué contre les trois, et les deux sondes "
+        "n'ont rien à en rendre"
+    )
+
+    expressions = extractor.get("json") or []
+    assert any(e.startswith(".info.") for e in expressions), (
+        "l'extracteur ne remonte pas le nom du service : c'est ce qui, dans le "
+        "document, appartient à l'exploitant"
+    )
+    assert any(e.startswith(".paths") for e in expressions), (
+        "l'extracteur ne remonte pas les routes du document : elles sont le "
+        "fond du constat, puisqu'un tiers peut les appeler"
+    )
+    for expression in expressions:
+        assert expression.startswith((".info.", ".paths")), (
+            f"l'extracteur sort du document ({expression!r})"
+        )
+
+    # Et il doit rendre quelque chose sur la réponse qu'il vise. Les routes
+    # d'inférence sont les entrées portant un POST : les quatre routes
+    # d'infrastructure n'ayant qu'un GET, la sélection les écarte d'elle-même.
+    document = json.loads(BENTOML_DOCS_BODY)
+    assert document["info"]["title"], (
+        "le document ne porte plus de titre : l'extracteur ne rendrait rien"
+    )
+    inference_routes = [route for route, item in document["paths"].items()
+                        if "post" in item]
+    assert inference_routes == ["/summarize"], (
+        "la sélection des routes d'inférence ne rend plus les seules entrées "
+        f"appelables du document : {inference_routes}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

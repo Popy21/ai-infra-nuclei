@@ -1,0 +1,226 @@
+id: bentoml-yatai-exposed
+
+info:
+  name: BentoML - Unauthenticated Model Server (OpenAPI Schema and Inference Endpoint Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    BentoML n'a pas de réglage d'authentification à laisser à false : la couche
+    de service n'en porte aucune. L'application ASGI se construit par
+    BaseAppFactory, dont get_system_routes greffe /livez, /healthz et /readyz
+    sans intercalaire, puis la fabrique du service y ajoute la documentation et
+    les routes d'inférence. Il n'y a pas de branche à emprunter pour refuser un
+    appelant, parce qu'aucune n'est écrite : l'identité de celui qui appelle
+    n'est jamais consultée. Ce que BentoCloud pose devant un déploiement est une
+    couche extérieure, et le serveur qu'on lance soi-même ne l'a pas.
+    Trois routes suffisent à l'établir, et elles ne disent pas la même chose.
+    /livez et /readyz sont les sondes que Kubernetes appelle : livez rend
+    « PlainTextResponse("\n", status_code=200) » dès que le processus tourne,
+    readyz la même chose mais seulement une fois le service prêt à recevoir du
+    trafic — c'est le serveur lui-même qui distingue les deux, et un 200 sur la
+    seconde dit donc que l'inférence est servie, pas seulement qu'un port est
+    ouvert. Aucun des deux corps ne désigne quoi que ce soit : un saut de ligne
+    n'appartient à personne.
+    L'identification tient à la troisième. /docs.json rend le document OpenAPI
+    que generate_spec construit, et deux de ses chaînes nomment le produit
+    textuellement : APP_TAG porte « BentoML Service API endpoints for
+    inference. », INFRA_TAG porte « Common infrastructure endpoints for
+    observability. ». Ces deux libellés sont écrits en dur dans
+    _internal/service/openapi et n'ont pas bougé entre la génération à runners de
+    la 1.1 et le SDK de service actuel, qui les réemploie tels quels — ce qui
+    importe ici, les instances qui traînent exposées n'étant pas les plus
+    récentes. Le document porte de surcroît la liste des chemins : les quatre
+    routes d'infrastructure, que make_infra_endpoints écrit sans condition, et
+    une entrée POST par méthode d'API exposée, dont l'operationId reprend le nom
+    du service et celui de la méthode.
+    Une frontière que le template tient volontairement. path_prefix déplace
+    ensemble les sondes et la documentation sous un préfixe choisi par
+    l'exploitant : une instance ainsi montée ne répond pas aux chemins nus, et le
+    template se tait. Il se tait aussi quand readyz refuse — le service n'est
+    alors pas en train de servir l'inférence, et c'est cette qualité-là que le
+    constat revendique.
+  impact: |
+    Le document n'est pas un catalogue, c'est un mode d'emploi. Chaque route
+    d'inférence y figure avec son chemin, sa méthode et le schéma exact de son
+    corps de requête, puisque le composant est dérivé du modèle d'entrée que le
+    code du service déclare. Un tiers n'a donc rien à deviner : il lit la forme
+    attendue et poste. Le titre et la description viennent du nom du service et
+    de sa docstring, qui nomment le produit servi ; la version est celle du
+    bento, donc l'état exact du modèle déployé.
+    Ce qui suit la lecture est l'appel, et c'est lui qui fixe la sévérité. Une
+    route d'inférence BentoML n'est pas un enregistrement à consulter, c'est du
+    calcul à déclencher : chaque POST fait tourner le modèle sur le matériel de
+    l'exploitant, avec les accélérateurs qu'il paie et les identifiants que le
+    service porte déjà pour atteindre son stockage de modèles. Un modèle
+    propriétaire servi sans garde est un modèle qu'on peut interroger à volonté,
+    donc distiller ; un modèle de langage servi sans garde est une facture de
+    calcul ouverte, et le vol de capacité y est le premier usage constaté. Sur
+    les services à tâches, /submit, /retry et /cancel prolongent cela dans le
+    temps : l'appelant inscrit du travail dans la file et gouverne celui qui s'y
+    trouve.
+    Le reste du service élargit la prise sans rien demander de plus. Les
+    applications ASGI montées par l'exploitant apparaissent dans le même document
+    et sont servies par le même processus non gardé — ce qui a été greffé pour la
+    commodité interne est publié avec le reste. /metrics, quand la métrologie est
+    active, rend le détail des appels par route et par code, donc le rythme réel
+    du service et l'usage qu'en font ses clients légitimes. Et comme aucun compte
+    n'existe, rien de tout cela n'est attribuable à personne : les journaux ne
+    porteront qu'une adresse.
+  remediation: |
+    Il n'y a pas de drapeau à poser sur le serveur, puisqu'aucune vérification
+    d'identité n'y est écrite : la protection est extérieure au processus. Ne pas
+    publier le port de service — s'en tenir à une écoute locale ou à un réseau
+    interne, ne pas laisser un Service Kubernetes passer en NodePort ou en
+    LoadBalancer le temps d'une démonstration, et ne pas mapper le port du
+    conteneur sur toutes les interfaces de l'hôte. Placer devant un mandataire
+    qui authentifie, et n'y laisser passer que les routes d'inférence
+    effectivement destinées à un client.
+    Ne pas compter sur path_prefix pour fermer : il déplace les chemins, il ne
+    les garde pas — un document OpenAPI accessible sous un préfixe reste un
+    document accessible, et il énumère lui-même ce qui a été déplacé. Ne pas
+    compter davantage sur le silence de /docs.json si on le retirait : les
+    operationId et les schémas ne sont que la description de routes qui, elles,
+    répondent toujours.
+    Contrôler ensuite depuis l'extérieur, sur les chemins eux-mêmes : GET
+    /readyz puis GET /docs.json depuis un réseau non approuvé. Un 200 anonyme sur
+    le second signifie que la porte est ouverte, quelle que soit la configuration
+    supposée. Ne pas contrôler sur /livez seul, dont la réponse ne dit rien
+    d'autre que la présence d'un processus.
+    Après une exposition, considérer le modèle comme interrogé et non seulement
+    décrit. Relire /metrics et les journaux d'accès pour mesurer le volume d'appels
+    non attribués, renouveler les identifiants que le service porte pour joindre
+    son stockage de modèles et ses dépendances, et inspecter la file des tâches
+    quand le service en expose une : un travail que personne n'a soumis a déjà
+    consommé du calcul.
+  reference:
+    - https://docs.bentoml.com/en/latest/build-with-bentoml/services.html
+    - https://docs.bentoml.com/en/latest/build-with-bentoml/observability/monitoring-and-data-collection.html
+    - https://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/server/base_app.py
+    - https://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/server/http_app.py
+    - https://github.com/bentoml/BentoML/blob/main/src/_bentoml_impl/server/app.py
+    - https://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/service/openapi/__init__.py
+    - https://github.com/bentoml/BentoML/blob/main/src/bentoml/_internal/service/openapi/specification.py
+    - https://github.com/bentoml/BentoML/blob/main/src/_bentoml_sdk/service/openapi.py
+  metadata:
+    max-request: 3
+    vendor: bentoml
+    product: bentoml
+  tags: ai,ml,mlops,bentoml,exposure,unauth,misconfig
+
+http:
+  # Trois lectures, et le partage est net : deux disent l'état du service, la
+  # troisième dit quel produit c'est.
+  #
+  # /livez et /readyz sont greffées par get_system_routes, donc présentes sur
+  # toute application BentoML sans que rien ne les garde. Ce qu'elles rendent est
+  # « PlainTextResponse("\n") », c'est-à-dire rien qui désigne un produit —
+  # conclure de leur seul 200 serait rapporter qu'un serveur répond. Leur apport
+  # est ailleurs, et il est double : le corps vide écarte le portail qui répond
+  # 200 et sa page à tout ce qu'on lui demande, et readyz, qui refuse tant que le
+  # service n'est pas prêt à recevoir du trafic, établit que l'inférence est
+  # effectivement servie — c'est le serveur lui-même qui fait cette distinction,
+  # le template ne fait que la lire.
+  #
+  # /docs.json porte l'identification, et par une chaîne écrite en dur plutôt que
+  # par une forme : generate_spec pose APP_TAG et INFRA_TAG dans le document, et
+  # leurs descriptions nomment BentoML textuellement. C'est ce qu'il faut ici,
+  # « openapi », « paths » et « /livez » étant le vocabulaire de n'importe quelle
+  # application FastAPI munie de sondes Kubernetes.
+  #
+  # GET, et sans rien envoyer : les trois routes se lisent, et les défauts du
+  # serveur suffisent. En lecture seule, et strictement : le même processus non
+  # gardé sert un POST par méthode d'API, dont chaque appel ferait tourner le
+  # modèle sur les accélérateurs de l'exploitant, plus /submit, /retry et /cancel
+  # sur les services à tâches, qui inscriraient du travail dans sa file et
+  # gouverneraient celui qui s'y trouve. Signaler une exposition ne demande d'en
+  # toucher aucun — et le document que le template lit est précisément ce qui
+  # dirait comment le faire.
+  - method: GET
+    path:
+      - "{{BaseURL}}/livez"
+      - "{{BaseURL}}/readyz"
+      - "{{BaseURL}}/docs.json"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les trois réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # aucune des deux sondes ne dit quoi que ce soit du produit, et le document
+    # seul ne dit pas que le service tourne.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La sonde de vivacité a répondu, et elle a répondu comme BentoML la
+          # sert : « PlainTextResponse("\n") », donc un corps qui ne contient
+          # qu'un blanc. Le contrôle porte sur le vide plutôt que sur le saut de
+          # ligne exact, un intermédiaire pouvant normaliser la fin de ligne ;
+          # ce qu'il écarte est la page — portail captif ou mandataire qui
+          # répond 200 et son formulaire à n'importe quel chemin.
+          - 'status_code_1 == 200 && trim_space(body_1) == ""'
+
+          # La sonde de disponibilité, et c'est celle-ci qui porte le constat :
+          # readyz ne rend 200 qu'une fois le service prêt à recevoir du trafic,
+          # là où livez répond dès que le processus tourne. L'exiger est ce qui
+          # sépare « un serveur BentoML est joignable » de « l'inférence est
+          # servie à qui la demande ».
+          #
+          # La contrepartie est assumée : une instance exposée mais pas encore
+          # prête ne remonte pas. C'est une frontière et non un oubli — elle ne
+          # sert alors rien à personne — et elle se referme d'elle-même au
+          # passage suivant.
+          - 'status_code_2 == 200 && trim_space(body_2) == ""'
+
+          # Le document a été servi, et non relayé par un cache sous le statut
+          # d'un refus. Ce statut est aussi ce qui distingue l'instance ouverte
+          # du montage où un mandataire n'ouvre les sondes qu'à sa supervision
+          # et garde le reste : les deux premières réponses sont identiques dans
+          # les deux cas.
+          - "status_code_3 == 200"
+
+          # Les deux libellés qui nomment le produit. Ils sont écrits en dur dans
+          # _internal/service/openapi — APP_TAG et INFRA_TAG — et generate_spec
+          # les pose sans condition dans le document, la fabrique de service
+          # actuelle réemployant les mêmes constantes que la génération à runners
+          # de la 1.1 : la signature tient donc d'une version à l'autre, ce qui
+          # importe puisque les instances qui traînent exposées ne sont pas les
+          # plus récentes.
+          #
+          # Deux libellés plutôt qu'un : « BentoML » figure dans le premier, mais
+          # un service quelconque peut nommer BentoML dans la description d'une
+          # route qu'il proxifie. Le second est la formulation exacte d'INFRA_TAG,
+          # et exiger les deux ensemble demande le document lui-même, pas une
+          # mention.
+          #
+          # Vérifiés sur la chaîne nue, sans les guillemets ni la clé qui la
+          # porte : la sérialisation compacte du serveur n'est pas garantie de
+          # bout en bout, un intermédiaire pouvant réindenter ce qu'il relaie.
+          - 'contains(body_3, "BentoML Service API endpoints for inference.")'
+          - 'contains(body_3, "Common infrastructure endpoints for observability.")'
+
+          # Et le rattachement des trois réponses à une même application : le
+          # document déclare les deux chemins qui viennent d'être appelés.
+          # make_infra_endpoints les écrit sans condition, donc l'exigence ne
+          # coûte aucune instance ; ce qu'elle écarte est le montage où
+          # /docs.json est servi par autre chose que le processus dont on vient
+          # de lire les sondes.
+          - 'contains(body_3, "\"/livez\"") && contains(body_3, "\"/readyz\"")'
+
+    extractors:
+      # Ce que le document apprend à qui le lit : le nom que l'exploitant a donné
+      # à son service, et les routes d'inférence qu'il expose. Les secondes sont
+      # les entrées portant un POST — les quatre routes d'infrastructure n'ayant
+      # qu'un GET, la sélection les écarte d'elle-même — c'est-à-dire exactement
+      # ce qu'un tiers peut appeler.
+      #
+      # Un seul extracteur, et borné à body_3 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second ferait
+      # remonter deux fois la même instance — et les deux sondes n'ont de toute
+      # façon rien à en extraire.
+      - type: json
+        part: body_3
+        name: service
+        json:
+          - ".info.title"
+          - '.paths | to_entries[] | select(.value.post != null) | .key'
