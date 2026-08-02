@@ -37,7 +37,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/chromadb-open-instance.yaml` — ChromaDB, `GET /api/v1/heartbeat` puis énumération des collections. Sévérité high.
 - [x] `templates/exposure/qdrant-no-api-key.yaml` — Qdrant sans clé d'API : `GET /collections` répond. Sévérité high.
 - [x] `templates/exposure/weaviate-anonymous-access.yaml` — Weaviate : `GET /v1/meta` renvoie `{"hostname":...,"version":"1.x.x","modules":{...}}`. `AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED` vaut `true` par défaut. Confirmer avec `GET /v1/schema`, qui passe, lui, par le contrôle d'accès. Sévérité high.
-- [ ] `templates/exposure/milvus-exposed.yaml` — ⚠️ Milvus parle surtout **gRPC** (19530) ; seul 9091 sert de l'HTTP (`/healthz`), et l'API RESTful v2 est sous `/v2/vectordb/`. Vérifier qu'une détection HTTP porteuse de sens existe — **si non, rendre `SKIP` immédiatement** plutôt que d'insister. Sévérité high.
+- [x] `templates/exposure/milvus-exposed.yaml` — ⚠️ Milvus parle surtout **gRPC** (19530) ; seul 9091 sert de l'HTTP (`/healthz`), et l'API RESTful v2 est sous `/v2/vectordb/`. Vérifier qu'une détection HTTP porteuse de sens existe — **si non, rendre `SKIP` immédiatement** plutôt que d'insister. Sévérité high.
 
 ## MLOps & suivi d'expériences
 

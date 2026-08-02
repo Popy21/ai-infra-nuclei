@@ -1,0 +1,194 @@
+id: milvus-exposed
+
+info:
+  name: Milvus - Unauthenticated RESTful API (Collection Enumeration)
+  author: popy21
+  severity: high
+  description: |
+    Milvus est réputé ne parler que gRPC, et c'est ce qui le fait passer pour
+    hors de portée d'un scan HTTP. Le proxy sert pourtant les deux sur le même
+    port : proxy.http.enabled vaut true dans le milvus.yaml livré, proxy.http.port
+    y est laissé vide — donc le mode port partagé s'applique — et startHTTPServer
+    monte le routeur gin sous h2c avant de le placer derrière httpHandler, lequel
+    n'aiguille vers grpcExternalServer que les requêtes HTTP/2 portant
+    « Content-Type: application/grpc » et sert tout le reste au routeur. L'API
+    RESTful v2 est ainsi servie sur 19530, le port gRPC lui-même, sous le groupe
+    « /v2/vectordb ». Le port 9091, souvent cité comme le seul port HTTP, ne porte
+    que la supervision — /healthz, /livez, /metrics, /webui/ et les routes
+    /management/* — et son « OK » ne nomme aucun produit : il ne peut pas porter
+    le constat, d'où une détection posée sur 19530 et non sur lui.
+    L'authentification, elle, tient à un seul réglage :
+    common.security.authorizationEnabled vaut false dans le fichier livré, et
+    c'est cette valeur qui décide si le middleware authenticate est monté sur le
+    routeur. Une instance par défaut ne tourne donc pas avec un garde
+    permissif, elle tourne sans garde du tout — ginHandler.Use(authenticate)
+    n'est jamais exécuté. Quand le réglage est posé, à l'inverse, le middleware
+    est global et n'épargne aucune route : ce n'est pas la liste blanche qu'on
+    trouve chez Qdrant, il n'y a pas de chemin de supervision qui continuerait de
+    répondre. Toute route de /v2/vectordb rend alors 401 et
+    « {"code":1800,"message":"user hasn't authenticated"} », merr.ErrNeedAuthenticate
+    portant précisément ce code et ce message. Un 200 anonyme sur n'importe
+    laquelle d'entre elles est par conséquent le constat entier.
+  impact: |
+    L'index des collections livre d'abord les noms que l'exploitant a donnés à
+    ses corpus : de quoi nommer les projets internes avant même d'en lire une
+    ligne. Mais l'énumération n'est que le témoin — la même absence de garde
+    couvre tout le plan de données. POST /v2/vectordb/entities/query pagine les
+    entités avec leurs champs scalaires, et le champ scalaire est précisément
+    l'endroit où une chaîne RAG range le texte source à côté du vecteur : le
+    corpus — contrats, tickets, documentation interne, ce qui alimente
+    l'assistant — s'extrait page par page, sans inversion ni recherche.
+    /v2/vectordb/entities/get le fait par identifiant, /entities/search et
+    /entities/advanced_search le classent par proximité sémantique, donc
+    désignent les passages sensibles sans qu'il faille tout tirer. Les verbes
+    d'écriture du même chemin — /entities/insert, /entities/upsert,
+    /entities/delete — laissent récrire les documents que le modèle citera
+    ensuite comme sources, c'est-à-dire empoisonner les réponses de l'assistant
+    sans jamais toucher au modèle, tandis que /v2/vectordb/collections/drop et
+    /collections/truncate emportent la collection ou son contenu, et
+    /v2/vectordb/jobs/import/create fait ingérer au serveur les fichiers qu'on
+    lui désigne. Le plan d'administration passe par la même porte ouverte :
+    /v2/vectordb/users/list et /roles/list énumèrent les comptes et les rôles,
+    et /v2/vectordb/users/create y inscrit un compte qui survivra à l'activation
+    ultérieure de l'authentification — laquelle, sur une instance jamais
+    configurée, laisse de toute façon le compte root sur le
+    defaultRootPassword du fichier livré, « Milvus ». Enfin le port 19530 sert
+    aussi le gRPC, gouverné par le même réglage : fermer l'HTTP seul ne
+    retirerait rien.
+  remediation: |
+    Poser common.security.authorizationEnabled à true — c'est ce booléen, et lui
+    seul, qui monte le middleware authenticate sur le routeur — puis changer le
+    mot de passe du compte root, que common.security.defaultRootPassword laisse
+    sinon à « Milvus ». Vérifier ensuite sur POST /v2/vectordb/collections/list
+    que la réponse est bien un 401 portant le code 1800 : le middleware étant
+    global et sans liste blanche, c'est la vérification la plus courte, et un 200
+    signifie que le réglage n'a pas pris. Ne pas contrôler sur 9091/healthz, qui
+    répond « OK » dans les deux cas et ne prouve donc rien. La clé et le mot de
+    passe voyagent en clair sur HTTP tant que common.security.tlsMode n'est pas
+    posé ou que le TLS n'est pas terminé sur un proxy. Indépendamment de tout
+    cela, ne pas publier 19530 sur un réseau non maîtrisé — c'est le même port
+    qui sert le gRPC et l'API RESTful, et ils dépendent du même réglage — ni
+    9091, dont les routes /management/* pilotent le cluster. Après une
+    exposition, considérer le corpus comme lu : les champs scalaires d'une entité
+    contiennent le texte source en clair. Et comme les verbes d'écriture étaient
+    ouverts au même titre que ceux de lecture, en contrôler le contenu plutôt que
+    de le supposer intact — un document récrit reste cité comme source par
+    l'assistant qu'il alimente. Contrôler enfin /v2/vectordb/users/list et
+    /roles/list : un compte que personne n'a créé reste valide une fois
+    l'authentification activée.
+  reference:
+    - https://milvus.io/docs/authenticate.md
+    - https://milvus.io/api-reference/restful/v2.5.x/v2/Collection%20(v2)/List.md
+    - https://github.com/milvus-io/milvus/blob/master/configs/milvus.yaml
+    - https://github.com/milvus-io/milvus/blob/master/internal/distributed/proxy/service.go
+    - https://github.com/milvus-io/milvus/blob/master/internal/distributed/proxy/httpserver/handler_v2.go
+    - https://github.com/milvus-io/milvus/blob/master/internal/distributed/proxy/httpserver/request_v2.go
+    - https://github.com/milvus-io/milvus/blob/master/internal/rootcoord/meta_table.go
+    - https://github.com/milvus-io/milvus/blob/master/pkg/util/merr/errors.go
+    - https://github.com/milvus-io/milvus/blob/master/internal/http/router.go
+  metadata:
+    max-request: 2
+    vendor: milvus
+    product: milvus
+    shodan-query: port:19530
+  tags: ai,vectordb,milvus,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et leur séparation ne tient pas ici au contrôle d'accès : le
+  # middleware authenticate est global et n'épargne aucune route, donc les deux
+  # chemins prouvent également l'absence d'authentification. Ce que la première
+  # apporte est la signature produit qui manque à la seconde.
+  #
+  # POST /v2/vectordb/databases/list rend toujours quelque chose, et toujours la
+  # même chose : « default » y figure sur toute instance, CheckIfDatabaseDroppable
+  # refusant de supprimer cette base — « can not drop default database » — et
+  # reloadDatabases la recréant au démarrage quand elle manque au catalogue. Ce
+  # nom, dans un tableau « data » à côté d'un « code », est ce qui sépare Milvus
+  # de l'enveloppe {"code":…,"data":…} que sert quantité d'API sans rapport.
+  #
+  # POST /v2/vectordb/collections/list est le constat proprement dit : c'est
+  # l'index des corpus, et donc ce qu'un tiers lit en premier. Son corps ne porte
+  # en revanche aucune signature quand l'instance est neuve — wrapperReturnList
+  # rend {"code":0,"data":[]} — d'où le premier chemin.
+  #
+  # POST, et non GET, parce que le groupe /v2/vectordb n'enregistre que des
+  # routes POST : un GET y rendrait le 404 de gin, qui ne prouverait rien.
+  #
+  # En lecture seule, et strictement : le même préfixe sert /entities/query et
+  # /entities/get, qui rendraient les champs scalaires — donc le texte source en
+  # clair — /entities/search, qui classerait le corpus par proximité sémantique,
+  # /entities/insert, /upsert et /delete, qui toucheraient au corpus,
+  # /collections/drop et /collections/truncate, qui l'emporteraient,
+  # /jobs/import/create, qui ferait ingérer des fichiers au serveur, et
+  # /users/create, qui inscrirait un compte survivant à la fermeture de
+  # l'instance. Signaler une exposition ne demande d'en toucher aucun.
+  - method: POST
+    path:
+      - "{{BaseURL}}/v2/vectordb/databases/list"
+      - "{{BaseURL}}/v2/vectordb/collections/list"
+
+    headers:
+      Content-Type: application/json
+
+    # Le corps vide est explicitement prévu par le serveur, dont le refus de
+    # désérialisation le rappelle : « the request body should be nil, however {}
+    # is valid ». /databases/list lie un EmptyReq, /collections/list un
+    # DatabaseReq dont le dbName absent retombe sur la base par défaut. Rien
+    # d'autre n'est envoyé : ni nom de collection, ni filtre, ni vecteur —
+    # aucun des champs par lesquels ces mêmes routes rendraient des données.
+    body: "{}"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, le registre des bases conclurait
+    # seul — or ce n'est pas lui qui intéresse un tiers.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le registre des bases a répondu à une requête sans en-tête
+          # d'autorisation. Avec authorizationEnabled, ce serait 401.
+          - "status_code_1 == 200"
+
+          # L'enveloppe et son contenu invariant, vérifiés sur les clés JSON
+          # plutôt que sur la sérialisation compacte du serveur : un
+          # intermédiaire qui réindente ce qu'il relaie laisse « code », « data »
+          # et « default » intacts, alors qu'il disloquerait "code":0.
+          # « default » est le terme qui désigne le produit — le reste de
+          # l'expression n'est qu'une enveloppe banale, et sans lui n'importe
+          # quelle API rendant {"code":…,"data":…} remonterait.
+          - 'contains(body_1, "\"code\"") && contains(body_1, "\"data\"") && contains(body_1, "\"default\"")'
+
+          # L'index des corpus a répondu de même. Le statut, et non le contenu :
+          # une instance neuve n'a aucune collection et rend
+          # {"code":0,"data":[]} — exiger un nom raterait précisément l'instance
+          # qu'on trouve oubliée sur un port ouvert.
+          - "status_code_2 == 200"
+
+          # La clé « data » n'est écrite que sur le chemin nominal : wrapperReturnList
+          # la sérialise toujours — une tranche nulle devient []string{} — tandis
+          # qu'un refus ou une erreur ne portent que « code » et « message ».
+          # C'est donc elle qui distingue la réponse servie du 200 d'erreur que
+          # rend HTTPAbortReturn.
+          - 'contains(body_2, "\"code\"") && contains(body_2, "\"data\"")'
+
+          # Et le corps est bien celui d'une API, non une page qui embarquerait
+          # ces mots dans son état initial : un portail captif répondant 200 à
+          # tout ne doit pas suffire.
+          - 'starts_with(trim_space(body_2), "{")'
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses corpus : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire.
+      # L'extraction est bornée à la seconde réponse — getMatchPart résout la
+      # partie demandée dans l'espace de noms accumulé par req-condition, où
+      # body_2 est l'index des collections. Sans cette borne, « default » y
+      # entrerait depuis la première réponse et le rapport mêlerait un nom de
+      # base aux noms de collections.
+      - type: json
+        part: body_2
+        name: collection
+        json:
+          - '.data[]'

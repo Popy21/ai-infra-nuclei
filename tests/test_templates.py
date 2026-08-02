@@ -3090,6 +3090,351 @@ def test_weaviate_reports_anonymous_access_and_claims_nothing_of_authorization()
     ), "le scénario RBAC ne modélise plus le corps d'un dump filtré à vide"
 
 
+# --------------------------------------------------------------------------
+# Milvus est le cas où le template a le plus de chances d'être écrit faux, et de
+# deux façons opposées.
+#
+# La première est de le poser sur 9091, seul port réputé servir de l'HTTP. Ce
+# port ne porte que la supervision — /healthz, /livez, /metrics, /webui/ et les
+# routes /management/* — et son « OK » ne nomme aucun produit. L'API RESTful est
+# ailleurs : proxy.http.enabled vaut true et proxy.http.port est laissé vide dans
+# le milvus.yaml livré, donc le mode port partagé s'applique et le routeur gin
+# est servi sous h2c sur 19530, derrière un httpHandler qui n'aiguille vers le
+# serveur gRPC que les requêtes portant « Content-Type: application/grpc ».
+#
+# La seconde est de conclure d'un seul 200. Le groupe /v2/vectordb rend
+# {"code":0,"data":[…]} sur ses deux routes d'énumération, et cette enveloppe
+# n'appartient à personne : c'est celle de quantité d'API sans rapport. Ce qui
+# désigne Milvus est le contenu invariant du registre des bases — « default » y
+# figure toujours, CheckIfDatabaseDroppable refusant de le supprimer et
+# reloadDatabases le recréant au démarrage.
+#
+# Ces tests fixent les deux bornes : le template doit reconnaître l'instance
+# neuve, dont l'index des collections est vide, et rejeter aussi bien
+# l'authentification posée que l'enveloppe générique.
+
+MILVUS_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "milvus-exposed.yaml")
+
+MILVUS_DATABASES = "/v2/vectordb/databases/list"
+MILVUS_COLLECTIONS = "/v2/vectordb/collections/list"
+
+# Le registre des bases d'une instance qui en a créé une seconde.
+MILVUS_DATABASES_BODY = '{"code":0,"data":["default","rag_prod"]}'
+
+# La même sur une instance qui n'a jamais rien créé : « default » demeure.
+MILVUS_DEFAULT_DATABASE_ONLY_BODY = '{"code":0,"data":["default"]}'
+
+# L'index des corpus d'une instance qui en sert.
+MILVUS_COLLECTIONS_BODY = '{"code":0,"data":["support_rag","contrats_2026"]}'
+
+# Le même au lendemain du démarrage : wrapperReturnList sérialise « data » même
+# quand la tranche est nulle, donc la clé reste écrite.
+MILVUS_EMPTY_COLLECTIONS_BODY = '{"code":0,"data":[]}'
+
+# Ce qu'écrit le middleware authenticate quand authorizationEnabled est posé et
+# qu'aucune identité n'est présentée : merr.ErrNeedAuthenticate porte le code
+# 1800 et ce message.
+MILVUS_NEED_AUTHENTICATE_BODY = (
+    '{"code":1800,"message":"user hasn\'t authenticated"}'
+)
+
+# Une erreur applicative, rendue par HTTPAbortReturn : le statut reste 200, mais
+# le corps ne porte que « code » et « message ». C'est ce cas que la clé
+# « data » sépare du chemin nominal.
+MILVUS_APPLICATION_ERROR_BODY = (
+    '{"code":800,"message":"database not found, database: absente"}'
+)
+
+
+def milvus_scenario(databases, collections):
+    return {MILVUS_DATABASES: databases, MILVUS_COLLECTIONS: collections}
+
+
+# Instance servant un corpus, authorizationEnabled laissé à false : le
+# middleware authenticate n'est pas monté du tout.
+MILVUS_OPEN = milvus_scenario(
+    databases=(200, MILVUS_DATABASES_BODY),
+    collections=(200, MILVUS_COLLECTIONS_BODY),
+)
+
+# La même au lendemain de son démarrage : aucune collection, aucune base créée.
+# C'est celle qu'on trouve oubliée sur un port ouvert, et elle doit remonter.
+MILVUS_OPEN_IDLE = milvus_scenario(
+    databases=(200, MILVUS_DEFAULT_DATABASE_ONLY_BODY),
+    collections=(200, MILVUS_EMPTY_COLLECTIONS_BODY),
+)
+
+# Un intermédiaire réindente ce qu'il relaie : le corps n'est plus compact et les
+# deux-points ne touchent plus les clés.
+MILVUS_OPEN_REFORMATTED = milvus_scenario(
+    databases=(200, '{\n  "code": 0,\n  "data": [\n    "default"\n  ]\n}'),
+    collections=(200, '\n{\n  "code": 0,\n  "data": [\n    "support_rag"\n  ]\n}\n'),
+)
+
+# common.security.authorizationEnabled posé : le middleware est global et
+# n'épargne aucune route, donc les deux chemins refusent.
+MILVUS_AUTHORIZATION_ENABLED = milvus_scenario(
+    databases=(401, MILVUS_NEED_AUTHENTICATE_BODY),
+    collections=(401, MILVUS_NEED_AUTHENTICATE_BODY),
+)
+
+# Un proxy réglé pour tout garder.
+MILVUS_BEHIND_AUTH_PROXY = milvus_scenario(
+    databases=(401, "Unauthorized"),
+    collections=(401, "Unauthorized"),
+)
+
+# Un proxy qui n'ouvre le registre des bases qu'à sa supervision et exige une
+# authentification sur tout le reste : la signature répond, l'index non.
+MILVUS_BEHIND_PARTIAL_PROXY = milvus_scenario(
+    databases=(200, MILVUS_DATABASES_BODY),
+    collections=(401, "Unauthorized"),
+)
+
+# Portail captif devant une vraie instance : sa page de connexion répond 200 et
+# embarque son état initial, donc les deux clés de l'enveloppe s'y trouvent.
+MILVUS_BEHIND_CAPTIVE_PORTAL = milvus_scenario(
+    databases=(200, MILVUS_DATABASES_BODY),
+    collections=(200, '<html><body>Connexion requise'
+                      '<script>window.__STATE__={"code":0,"data":[]}</script>'
+                      '</body></html>'),
+)
+
+# Les deux qui suivent modélisent le même intermédiaire : un cache placé devant
+# l'instance, réglé pour exiger une identité depuis qu'authorizationEnabled a été
+# posé, mais qui relaie encore le corps qu'il détient sous le statut du refus.
+# Ils n'existent que pour que le statut de chaque réponse reste vérifié : le
+# corps, lui, est authentique et satisferait toutes les autres conditions.
+MILVUS_CACHED_DATABASES_UNDER_REFUSAL = milvus_scenario(
+    databases=(401, MILVUS_DATABASES_BODY),
+    collections=(200, MILVUS_COLLECTIONS_BODY),
+)
+
+MILVUS_CACHED_COLLECTIONS_UNDER_REFUSAL = milvus_scenario(
+    databases=(200, MILVUS_DATABASES_BODY),
+    collections=(401, MILVUS_COLLECTIONS_BODY),
+)
+
+# L'index a bien répondu 200, mais sur une erreur applicative : pas de « data ».
+MILVUS_APPLICATION_ERROR = milvus_scenario(
+    databases=(200, MILVUS_DATABASES_BODY),
+    collections=(200, MILVUS_APPLICATION_ERROR_BODY),
+)
+
+# L'enveloppe {"code":…,"data":…} est la convention de quantité d'API sans
+# rapport avec Milvus. Celle-ci répond 200 sur les deux chemins ; seul
+# « default » l'en sépare.
+OTHER_CODE_DATA_ENVELOPE = milvus_scenario(
+    databases=(200, '{"code":0,"data":[],"message":"success"}'),
+    collections=(200, '{"code":0,"data":[],"message":"success"}'),
+)
+
+# Un serveur quelconque qui répond 200 à tout ce qu'on lui demande.
+MILVUS_SERVER_ALWAYS_UP = milvus_scenario(
+    databases=(200, '{"status":"ok"}'),
+    collections=(200, '{"status":"ok"}'),
+)
+
+
+def milvus_block():
+    doc = load(MILVUS_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(MILVUS_COLLECTIONS) for p in (b.get("path") or []))]
+    assert blocks, (
+        "le template n'interroge pas POST /v2/vectordb/collections/list — c'est "
+        "l'index des corpus, donc le constat, et le port 9091 ne sert que la "
+        "supervision"
+    )
+    return blocks[0]
+
+
+def milvus_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in milvus_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que Milvus ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def milvus_fires(scenario):
+    block = milvus_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = milvus_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_milvus_probe_targets_the_restful_api_not_the_metrics_port():
+    block = milvus_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+
+    assert MILVUS_DATABASES in paths, (
+        "le template n'interroge pas POST /v2/vectordb/databases/list — c'est la "
+        "seule route dont le corps désigne le produit, « default » y figurant "
+        "toujours, l'index des collections étant vide sur une instance neuve"
+    )
+    assert MILVUS_COLLECTIONS in paths, (
+        "le template n'interroge pas POST /v2/vectordb/collections/list, l'index "
+        "des corpus"
+    )
+    assert all(p.startswith("/v2/vectordb/") for p in paths), (
+        "le template sort du groupe /v2/vectordb : le port 9091 ne sert que la "
+        "supervision — /healthz rend « OK », qui ne nomme aucun produit — et "
+        "l'API v1 héritée ne couvre pas ce que couvre déjà v2"
+    )
+    for path in paths:
+        assert "healthz" not in path and "livez" not in path, (
+            "le template conclut d'une sonde de vivacité : elle répond « OK » "
+            "aussi bien sur une instance dont authorizationEnabled est posé, "
+            "donc elle ne prouve rien"
+        )
+
+    assert block.get("method") == "POST", (
+        "le groupe /v2/vectordb n'enregistre que des routes POST : un GET y "
+        "rendrait le 404 de gin, qui ne prouverait rien"
+    )
+    assert block.get("req-condition") is True, (
+        "sans req-condition, les deux réponses ne peuvent pas être liées : "
+        "l'index des collections conclurait seul, or son corps ne porte aucune "
+        "signature quand l'instance est neuve"
+    )
+
+
+def test_milvus_probe_only_reads_and_never_touches_the_data_plane():
+    doc = load(MILVUS_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/entities/", "le template appelle une route /entities/ : "
+                               "/query et /get rendent les champs scalaires, où "
+                               "une chaîne RAG range le texte source en clair, "
+                               "/search classerait le corpus par proximité "
+                               "sémantique, et /insert, /upsert et /delete y "
+                               "écriraient — le template exfiltrerait ou "
+                               "récrirait le corpus qu'il signale"),
+                ("/drop", "le template appelle une route de suppression sur "
+                          "l'instance qu'il audite"),
+                ("/truncate", "le template vide une collection de l'instance "
+                              "qu'il audite"),
+                ("/jobs/", "le template appelle une route d'import : le serveur "
+                           "irait chercher les fichiers qu'on lui désigne"),
+                ("/users/", "le template touche le plan d'administration des "
+                            "comptes : /users/create y inscrirait un compte qui "
+                            "survivrait à l'activation de l'authentification"),
+                ("/roles/", "le template touche le plan d'administration des "
+                            "rôles"),
+                ("/create", "le template crée un objet sur l'instance qu'il "
+                            "audite"),
+            ):
+                assert forbidden not in path, why
+
+        # Ces routes ne se lisent qu'en POST, donc le corps envoyé est le seul
+        # garde-fou : c'est lui qui doit rester vide.
+        sent = json.loads(block.get("body") or "null")
+        assert sent == {}, (
+            f"le template envoie autre chose qu'un corps vide ({sent!r}) : les "
+            "champs de ces requêtes — collectionName, filter, data — sont "
+            "précisément ceux par lesquels ces routes rendent ou modifient des "
+            "données"
+        )
+
+
+def test_milvus_extractor_is_scoped_to_the_collection_index():
+    block = milvus_block()
+    extractors = block.get("extractors") or []
+
+    # Sous req-condition, le moteur évalue les extracteurs contre chacune des
+    # deux réponses et émet un résultat par extracteur qui rend quelque chose :
+    # deux extracteurs feraient remonter deux fois la même instance.
+    assert len(extractors) <= 1, (
+        "le template porte plus d'un extracteur : sous req-condition, chacun "
+        "rendant quelque chose ajoute un résultat, donc la même instance est "
+        "signalée plusieurs fois dans un rapport de scan"
+    )
+
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+    for extractor in extractors:
+        part = extractor.get("part")
+        assert part == f"body_{paths.index(MILVUS_COLLECTIONS) + 1}", (
+            "l'extracteur n'est pas borné à la réponse de l'index des "
+            f"collections (part={part!r}) : les deux chemins rendent leur "
+            "contenu sous la même clé « data », donc « default » entrerait dans "
+            "le rapport comme s'il était une collection"
+        )
+
+
+def test_milvus_matcher_needs_the_default_database_not_a_generic_envelope():
+    assert milvus_fires(MILVUS_OPEN), (
+        "le template ne reconnaît pas une instance dont l'API RESTful répond à "
+        "une requête sans en-tête d'autorisation"
+    )
+    assert milvus_fires(MILVUS_OPEN_IDLE), (
+        "le template exige une collection dans l'index : il raterait l'instance "
+        "qui vient d'être lancée, précisément celle qu'on trouve oubliée sur un "
+        "port ouvert — wrapperReturnList sérialise pourtant « data » même vide"
+    )
+    assert milvus_fires(MILVUS_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not milvus_fires(MILVUS_AUTHORIZATION_ENABLED), (
+        "le template déclenche sur une instance dont "
+        "common.security.authorizationEnabled est posé : le middleware "
+        "authenticate est alors global et rend 401 avec le code 1800 sur les "
+        "deux chemins"
+    )
+    assert not milvus_fires(MILVUS_BEHIND_AUTH_PROXY), (
+        "le template déclenche sur une instance entièrement gardée"
+    )
+    assert not milvus_fires(MILVUS_BEHIND_PARTIAL_PROXY), (
+        "le template conclut de la seule signature : un proxy peut n'ouvrir le "
+        "registre des bases qu'à sa supervision et garder tout le reste, auquel "
+        "cas l'index n'est pas atteignable — c'est le statut du second chemin "
+        "qui l'établit"
+    )
+    assert not milvus_fires(MILVUS_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise d'index : un portail captif "
+        "qui embarque son état initial porte les deux clés de l'enveloppe et "
+        "suffirait à le faire remonter"
+    )
+    assert not milvus_fires(MILVUS_CACHED_DATABASES_UNDER_REFUSAL), (
+        "le template conclut du seul corps du registre des bases : un cache "
+        "placé devant l'instance peut relayer celui qu'il détient sous le "
+        "statut du refus, et ce corps-là ne prouve plus rien"
+    )
+    assert not milvus_fires(MILVUS_CACHED_COLLECTIONS_UNDER_REFUSAL), (
+        "le template conclut du seul corps de l'index : le même cache le "
+        "relaierait sous un 401, alors que l'API, elle, a refusé"
+    )
+    assert not milvus_fires(MILVUS_APPLICATION_ERROR), (
+        "le template conclut du seul statut de l'index : HTTPAbortReturn rend "
+        "les erreurs en 200, et seule l'absence de « data » les distingue du "
+        "chemin nominal"
+    )
+    assert not milvus_fires(OTHER_CODE_DATA_ENVELOPE), (
+        "le template déclenche sur une API qui n'est pas Milvus : "
+        "{\"code\":…,\"data\":…} est une enveloppe banale, et c'est « default » "
+        "dans le registre des bases qui désigne le produit"
+    )
+    assert not milvus_fires(MILVUS_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
