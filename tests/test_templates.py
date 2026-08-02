@@ -2202,13 +2202,20 @@ def dsl_matcher_hits(matcher, responses):
     contre cet espace de noms, et la condition vaut `or` par défaut.
 
     Le sous-ensemble du langage employé ici — contains, starts_with, trim_space,
-    `&&` et `||` — se traduit terme à terme en Python. L'espace de noms est clos :
-    aucune autre fonction n'y est atteignable.
+    regex, `&&` et `||` — se traduit terme à terme en Python. L'espace de noms est
+    clos : aucune autre fonction n'y est atteignable.
+
+    `regex` prend le motif d'abord, comme la fonction nuclei du même nom, et rend
+    un booléen : une correspondance n'importe où dans le sujet, donc `re.search`
+    et non `re.match`. Les échappements du littéral de chaîne sont les mêmes des
+    deux côtés — `\\"` pour un guillemet, `\\\\s` pour la classe d'espaces — donc
+    l'expression lue dans le template est évaluée telle quelle.
     """
     env = {
         "contains": lambda s, sub: sub in s,
         "starts_with": lambda s, *prefixes: any(s.startswith(p) for p in prefixes),
         "trim_space": lambda s: s.strip(),
+        "regex": lambda pattern, s: re.search(pattern, s) is not None,
     }
     for i, (status, body) in enumerate(responses, start=1):
         env[f"status_code_{i}"] = status
@@ -4683,6 +4690,460 @@ def test_kubeflow_extractors_stay_on_the_pipeline_index():
                 "défaut : c'est un chemin à joindre, pas un renseignement à "
                 "recopier dans un rapport de scan"
             )
+
+
+# --------------------------------------------------------------------------
+# ClearML sépare nettement les deux questions, et le template doit les poser
+# séparément. /debug.ping dit quel produit répond — son schéma pose
+# « authorize: false », donc il répond aussi bien sur l'instance fermée et ne
+# prouve rien de l'authentification. /login.supported_modes dit l'état de
+# celle-ci, mais par la valeur qu'il porte et non par le fait de répondre : son
+# schéma pose « authorize: null », le cas que validate_auth décrit par « the
+# validation will be tried, but it does not have to succeed », donc la route
+# répond des deux côtés de la frontière.
+
+CLEARML_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "clearml-server-exposed.yaml")
+
+CLEARML_PING = "/debug.ping"
+CLEARML_LOGIN_MODES = "/login.supported_modes"
+
+
+def clearml_envelope(endpoint_name, data, requested="2.35", actual="1.0"):
+    """
+    L'enveloppe que get_response construit pour tout appel : meta.endpoint porte
+    le nom appelé encadré de requested_version et actual_version, puis les codes
+    de résultat, puis les données du point d'entrée sous « data ».
+    """
+    return (
+        '{"meta":{"id":"9c3f8b7a5e1d4a02b6c7d8e9f0a1b2c3",'
+        '"trx":"9c3f8b7a5e1d4a02b6c7d8e9f0a1b2c3","endpoint":{'
+        f'"name":"{endpoint_name}","requested_version":"{requested}",'
+        f'"actual_version":"{actual}"}},'
+        '"result_code":200,"result_subcode":0,"result_msg":"OK",'
+        '"error_stack":null,"error_data":{}},'
+        f'"data":{data}}}'
+    )
+
+
+# Réponse de /debug.ping appelé sans corps ni paramètre : ping pose
+# {"msg": "ClearML server"} et n'a rien reçu à y verser.
+CLEARML_PING_BODY = clearml_envelope("debug.ping", '{"msg":"ClearML server"}')
+
+# Le même appel sur un serveur plus ancien : seule la version d'API maximale
+# change, et c'est précisément ce que le template en extrait plutôt que d'en
+# exiger la valeur.
+CLEARML_PING_OLD_BODY = clearml_envelope(
+    "debug.ping", '{"msg":"ClearML server"}', requested="2.20")
+
+# Le même corps relayé par un intermédiaire qui réindente ce qu'il transporte.
+CLEARML_PING_REFORMATTED_BODY = json.dumps(json.loads(CLEARML_PING_BODY),
+                                           indent=2)
+
+# /login.supported_modes sur l'instance livrée telle quelle : la section
+# auth.fixed_users est commentée dans apiserver.conf, FixedUser.enabled() rend
+# donc son défaut False, et l'écran de connexion ne demande qu'un nom.
+CLEARML_LOGIN_OPEN_BODY = clearml_envelope(
+    "login.supported_modes",
+    '{"authenticated":false,"basic":{"enabled":false,"guest":{"enabled":false}},'
+    '"server_errors":{"es_connection_error":false,"missed_es_upgrade":false},'
+    '"sso":{},"sso_providers":[]}',
+    actual="2.9",
+)
+
+# Le même corps réindenté : la graphie des clés est stable, sa sérialisation
+# compacte ne l'est pas.
+CLEARML_LOGIN_OPEN_REFORMATTED_BODY = json.dumps(
+    json.loads(CLEARML_LOGIN_OPEN_BODY), indent=2)
+
+# La même route sur une instance fermée : le bloc auth.fixed_users a été ajouté,
+# donc basic.enabled vaut true. Le « enabled » de guest, lui, reste faux —
+# c'est ce corps qui exige que le motif soit borné à l'objet basic.
+CLEARML_LOGIN_FIXED_USERS_BODY = clearml_envelope(
+    "login.supported_modes",
+    '{"authenticated":false,"basic":{"enabled":true,"guest":{"enabled":false}},'
+    '"server_errors":{"es_connection_error":false,"missed_es_upgrade":false},'
+    '"sso":{},"sso_providers":[]}',
+    actual="2.9",
+)
+
+# Utilisateurs fixes posés et mode invité activé par-dessus :
+# FixedUser.get_guest_user() recopie le nom, l'identifiant et le mot de passe de
+# l'invité dans une réponse que n'importe qui obtient. C'est une exposition, mais
+# ce n'est pas celle que ce template revendique.
+CLEARML_LOGIN_GUEST_BODY = clearml_envelope(
+    "login.supported_modes",
+    '{"authenticated":false,"basic":{"enabled":true,"guest":{"enabled":true,'
+    '"name":"Guest","password":"guest-secret","username":"guest"}},'
+    '"server_errors":{"es_connection_error":false,"missed_es_upgrade":false},'
+    '"sso":{},"sso_providers":[]}',
+    actual="2.9",
+)
+
+# Une passerelle quelconque qui publie elle aussi ses modes de connexion : elle
+# emploie le même vocabulaire — basic, enabled, authenticated, sso_providers —
+# sans être ClearML. C'est ce corps qui rend l'enveloppe de /debug.ping
+# nécessaire plutôt qu'ornementale.
+#
+# Elle recopie en outre dans sa réponse le nom de la route qu'elle a résolue,
+# comme le font les passerelles qui tracent : « debug.ping » se retrouve donc
+# dans le corps sans que rien de l'enveloppe n'y soit. C'est ce détail qui rend
+# requested_version et actual_version nécessaires plutôt qu'ornementaux — le nom
+# seul est un mot que n'importe quel intermédiaire peut renvoyer.
+def other_login_modes_body(route):
+    return (
+        '{"basic":{"enabled":false},"sso_providers":[],"authenticated":false,'
+        f'"realm":"corp-sso","version":"4.2.0","endpoint":"{route.lstrip("/")}"}}'
+    )
+
+
+def clearml_scenario(ping, login_modes):
+    return {CLEARML_PING: ping, CLEARML_LOGIN_MODES: login_modes}
+
+
+# Une instance livrée telle quelle : les deux routes répondent, et la seconde
+# annonce qu'aucun utilisateur fixe n'est posé.
+CLEARML_OPEN = clearml_scenario(
+    ping=(200, CLEARML_PING_BODY), login_modes=(200, CLEARML_LOGIN_OPEN_BODY))
+
+# La même, sur un serveur plus ancien.
+CLEARML_OPEN_OLD = clearml_scenario(
+    ping=(200, CLEARML_PING_OLD_BODY),
+    login_modes=(200, CLEARML_LOGIN_OPEN_BODY))
+
+# La même, derrière un intermédiaire qui réindente ce qu'il relaie.
+CLEARML_OPEN_REFORMATTED = clearml_scenario(
+    ping=(200, CLEARML_PING_REFORMATTED_BODY),
+    login_modes=(200, CLEARML_LOGIN_OPEN_REFORMATTED_BODY))
+
+# Une instance fermée : le bloc auth.fixed_users a été ajouté.
+CLEARML_FIXED_USERS = clearml_scenario(
+    ping=(200, CLEARML_PING_BODY),
+    login_modes=(200, CLEARML_LOGIN_FIXED_USERS_BODY))
+
+# Fermée, avec le mode invité activé par-dessus.
+CLEARML_GUEST_MODE = clearml_scenario(
+    ping=(200, CLEARML_PING_BODY),
+    login_modes=(200, CLEARML_LOGIN_GUEST_BODY))
+
+# Un mandataire n'ouvre /debug.ping qu'à sa supervision et garde le reste : le
+# produit est nommé, mais l'état de l'authentification n'a pas été établi.
+CLEARML_LOGIN_MODES_GUARDED = clearml_scenario(
+    ping=(200, CLEARML_PING_BODY),
+    login_modes=(403, '{"meta":{"result_code":403},"data":{}}'))
+
+# Un cache placé devant relaie le corps qu'il détient sous le statut du refus,
+# d'un côté puis de l'autre.
+CLEARML_CACHED_UNDER_REFUSAL = clearml_scenario(
+    ping=(200, CLEARML_PING_BODY),
+    login_modes=(401, CLEARML_LOGIN_OPEN_BODY))
+CLEARML_PING_CACHED_UNDER_REFUSAL = clearml_scenario(
+    ping=(403, CLEARML_PING_BODY),
+    login_modes=(200, CLEARML_LOGIN_OPEN_BODY))
+
+# Un cache indexé sur l'hôte et non sur le chemin sert la même réponse aux deux
+# routes. Dans un sens rien ne dit l'état de l'authentification ; dans l'autre
+# rien n'a établi que /debug.ping ait répondu — et c'est le nom que porte chaque
+# enveloppe qui rattache une réponse à l'appel qui l'a produite.
+CLEARML_PING_ON_BOTH_PATHS = clearml_scenario(
+    ping=(200, CLEARML_PING_BODY), login_modes=(200, CLEARML_PING_BODY))
+CLEARML_LOGIN_MODES_ON_BOTH_PATHS = clearml_scenario(
+    ping=(200, CLEARML_LOGIN_OPEN_BODY),
+    login_modes=(200, CLEARML_LOGIN_OPEN_BODY))
+
+# Un portail SSO qui possède le préfixe /login devant l'application, montage
+# courant : /debug.ping traverse jusqu'au serveur ClearML, mais c'est le portail
+# qui répond à /login.supported_modes, avec son propre descripteur — où
+# « basic » est bien à false, puisqu'il n'authentifie pas en basique. Le premier
+# corps est authentique, le second ne vient pas du serveur, et seul le nom que
+# porte l'enveloppe les distingue.
+CLEARML_BEHIND_SSO_PORTAL = clearml_scenario(
+    ping=(200, CLEARML_PING_BODY),
+    login_modes=(200, '{"basic":{"enabled":false},"oidc":{"enabled":true},'
+                      '"portal":"sso.internal","redirect":"/oauth2/start"}'))
+
+# La passerelle qui publie ses modes de connexion, derrière un routeur qui lui
+# renvoie tout — et qui rapporte à chaque fois la route qu'elle a résolue.
+OTHER_LOGIN_GATEWAY = clearml_scenario(
+    ping=(200, other_login_modes_body(CLEARML_PING)),
+    login_modes=(200, other_login_modes_body(CLEARML_LOGIN_MODES)))
+
+# Un portail captif qui répond 200 et sa page à tout ce qu'on lui demande.
+CLEARML_BEHIND_CAPTIVE_PORTAL = clearml_scenario(
+    ping=(200, "<html><body>Connexion requise</body></html>"),
+    login_modes=(200, "<html><body>Connexion requise</body></html>"))
+
+# Un serveur quelconque qui répond 200 à tout.
+CLEARML_SERVER_ALWAYS_UP = clearml_scenario(
+    ping=(200, '{"status":"ok"}'), login_modes=(200, '{"status":"ok"}'))
+
+
+def clearml_block():
+    doc = load(CLEARML_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.replace("{{BaseURL}}", "") == CLEARML_LOGIN_MODES
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {CLEARML_LOGIN_MODES} — c'est pourtant la "
+        "seule route qui dit l'état de l'authentification web, /debug.ping "
+        "répondant sur l'instance fermée comme sur l'ouverte"
+    )
+    return blocks[0]
+
+
+def clearml_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in clearml_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que ClearML ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def clearml_fires(scenario):
+    block = clearml_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = clearml_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_clearml_probe_sends_nothing_that_the_ping_would_echo_back():
+    """
+    La singularité de /debug.ping : ping fait « res.update(call.data) », et
+    _update_call_data verse dans call.data le corps JSON comme la chaîne de
+    requête. Tout ce que le template enverrait lui reviendrait donc à l'intérieur
+    de la réponse qu'il examine — un template qui poserait sa propre signature en
+    paramètre la retrouverait sur n'importe quel serveur ClearML, et un attaquant
+    la retrouverait sur n'importe quoi.
+    """
+    doc = load(CLEARML_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("body") is None, (
+            "le template envoie un corps : debug.ping le reverse tel quel dans "
+            "sa réponse, donc le template se fournirait à lui-même la signature "
+            "qu'il cherche"
+        )
+        for path in (block.get("path") or []):
+            assert "?" not in path, (
+                "le template passe des paramètres de requête : "
+                "_apply_multi_dict les verse dans call.data, que debug.ping "
+                "reverse dans sa réponse — même effet qu'un corps"
+            )
+
+
+def test_clearml_probe_reads_the_two_open_routes_and_touches_nothing_else():
+    doc = load(CLEARML_TEMPLATE)
+
+    assert clearml_block().get("req-condition") is True, (
+        "le template ne lie pas les deux réponses : sans req-condition, ni "
+        "body_N ni status_code_N n'existent, chaque réponse est jugée seule, et "
+        "/debug.ping conclurait de son côté — or son schéma pose "
+        "« authorize: false », donc il répond aussi sur l'instance fermée"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "POST", (
+            "les points d'entrée de cette API se demandent en POST : la "
+            "documentation annonce « POST /debug.ping », et le template ne doit "
+            "pas dépendre d'un verbe que le service n'annonce pas"
+        )
+
+        for path in (block.get("path") or []):
+            route = path.replace("{{BaseURL}}", "")
+
+            for forbidden, why in (
+                ("auth.login",
+                 "le template ouvre une session sur l'instance qu'il audite"),
+                ("auth.create_credentials",
+                 "le template inscrit un couple clé/secret : il survivrait à la "
+                 "fermeture du port qu'il signale"),
+                ("users.create",
+                 "le template crée un compte sur l'instance qu'il audite"),
+                ("tasks.clone",
+                 "le template recopie une tâche : c'est la première moitié du "
+                 "détournement qu'il est censé signaler"),
+                ("tasks.edit",
+                 "le template récrit le dépôt, le commit ou l'image d'une "
+                 "tâche, donc ce qu'un agent exécutera"),
+                ("tasks.enqueue",
+                 "le template pose une tâche dans une file : un clearml-agent "
+                 "viendrait l'exécuter sur les machines de l'exploitant"),
+                ("tasks.get_all",
+                 "le template lit les expériences : hyperparamètres et blobs de "
+                 "configuration, où Task.connect inscrit sans trier ce que le "
+                 "code d'entraînement lui a passé"),
+                ("events.",
+                 "le template lit les sorties console, qui n'ont jamais été "
+                 "filtrées pour être lues par un tiers"),
+                ("models.get_all",
+                 "le template lit l'uri des poids, servie par un fileserver qui "
+                 "n'a pas d'authentification propre"),
+                ("server.config",
+                 "le template fait rendre la configuration du serveur, hors du "
+                 "constat qu'il revendique"),
+            ):
+                assert forbidden not in route, why
+
+
+def test_clearml_matcher_needs_both_the_api_envelope_and_the_open_login_mode():
+    assert clearml_fires(CLEARML_OPEN), (
+        "le template ne reconnaît pas une instance livrée telle quelle, celle "
+        "dont la section auth.fixed_users n'a jamais été ajoutée"
+    )
+    assert clearml_fires(CLEARML_OPEN_OLD), (
+        "le template dépend de la version d'API maximale que le serveur rend "
+        "dans requested_version : elle monte à chaque publication, donc "
+        "l'exiger raterait les instances anciennes, précisément celles qui "
+        "traînent exposées"
+    )
+    assert clearml_fires(CLEARML_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte de rapidjson : un "
+        "intermédiaire qui réindente ce qu'il relaie le mettrait en défaut"
+    )
+
+    assert not clearml_fires(OTHER_LOGIN_GATEWAY), (
+        "le template déclenche sur une passerelle qui n'est pas ClearML : "
+        "« basic », « enabled » et « sso_providers » sont le vocabulaire de "
+        "n'importe quel service publiant ses modes de connexion, et c'est "
+        "l'enveloppe de /debug.ping qui rattache la réponse au produit — or "
+        "cette passerelle rapporte la route résolue, donc « debug.ping » figure "
+        "dans son corps sans que requested_version ni actual_version y soient"
+    )
+    assert not clearml_fires(CLEARML_PING_ON_BOTH_PATHS), (
+        "le template conclut de la seule enveloppe : un service qui renvoie la "
+        "réponse de /debug.ping sur les deux chemins la satisfait, alors que "
+        "rien n'y dit l'état de l'authentification"
+    )
+    assert not clearml_fires(CLEARML_LOGIN_MODES_ON_BOTH_PATHS), (
+        "le template ne vérifie pas que chaque réponse nomme l'appel qui l'a "
+        "produite : un cache indexé sur l'hôte et non sur le chemin sert la "
+        "même réponse aux deux, et le constat porterait alors sur une seule "
+        "route interrogée deux fois"
+    )
+    assert not clearml_fires(CLEARML_BEHIND_SSO_PORTAL), (
+        "le template accepte pour réponse du serveur celle d'un portail qui "
+        "possède le préfixe /login devant lui : son descripteur porte lui aussi "
+        "un « basic » à false, et c'est le nom que porte l'enveloppe qui établit "
+        "que la seconde réponse vient bien du serveur ClearML"
+    )
+    assert not clearml_fires(CLEARML_LOGIN_MODES_GUARDED), (
+        "le template conclut de /debug.ping seul : son schéma pose "
+        "« authorize: false », donc la route répond sur l'instance fermée, et "
+        "un mandataire peut ne l'ouvrir qu'à sa supervision en gardant le reste"
+    )
+    assert not clearml_fires(CLEARML_CACHED_UNDER_REFUSAL), (
+        "le template conclut du seul corps : un cache placé devant l'instance "
+        "peut relayer celui qu'il détient sous le statut du refus, alors que le "
+        "serveur, lui, a refusé"
+    )
+    assert not clearml_fires(CLEARML_PING_CACHED_UNDER_REFUSAL), (
+        "le template ne contrôle le statut que de la seconde réponse : le même "
+        "cache peut relayer l'enveloppe de /debug.ping sous un statut de refus, "
+        "auquel cas le produit n'a pas été identifié par le service lui-même"
+    )
+    assert not clearml_fires(CLEARML_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise de réponse d'API : un "
+        "portail captif qui répond 200 à tout suffirait à le faire remonter"
+    )
+    assert not clearml_fires(CLEARML_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
+def test_clearml_stays_silent_when_fixed_users_are_enabled():
+    """
+    La frontière que le template revendique, fixée dans le sens qui coûte.
+
+    login.supported_modes répond des deux côtés — son schéma pose
+    « authorize: null », le cas que validate_auth décrit par « the validation
+    will be tried, but it does not have to succeed » — donc c'est la valeur de
+    basic.enabled, et elle seule, qui sépare l'instance ouverte de l'instance
+    fermée. Le piège est que guest porte son propre « enabled », faux sur toute
+    instance sans invité : un motif cherché au large du corps ferait remonter
+    l'instance fermée.
+
+    Le second corps dit la contrepartie de ce silence : quand le mode invité est
+    activé par-dessus les utilisateurs fixes, la même route rend au même anonyme
+    le mot de passe de l'invité en clair. C'est une exposition, ce n'est pas
+    celle-ci, et le template ne les confond pas.
+    """
+    assert not clearml_fires(CLEARML_FIXED_USERS), (
+        "le template remonte une instance dont le bloc auth.fixed_users est "
+        "posé : basic.enabled y vaut true, et c'est le « enabled » imbriqué de "
+        "guest qui le fait déclencher — le motif n'est pas borné à basic"
+    )
+    assert not clearml_fires(CLEARML_GUEST_MODE), (
+        "le template remonte une instance dont les utilisateurs fixes sont "
+        "posés : le mode invité est une autre exposition, qui appelle un autre "
+        "constat"
+    )
+
+    # La contrepartie de ce choix : ces deux corps doivent rester ceux d'une
+    # instance fermée, sans quoi le raisonnement ci-dessus ne tient plus.
+    for body, why in (
+        (CLEARML_LOGIN_FIXED_USERS_BODY,
+         "le scénario ne modélise plus une instance à utilisateurs fixes"),
+        (CLEARML_LOGIN_GUEST_BODY,
+         "le scénario ne modélise plus une instance à mode invité"),
+    ):
+        assert json.loads(body)["data"]["basic"]["enabled"] is True, why
+    assert (json.loads(CLEARML_LOGIN_FIXED_USERS_BODY)
+            ["data"]["basic"]["guest"]["enabled"] is False), (
+        "le scénario ne porte plus le « enabled » imbriqué qu'il sert à écarter"
+    )
+
+
+def test_clearml_extractor_reports_the_api_version_of_the_ping_response():
+    block = clearml_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+    extractors = block.get("extractors") or []
+
+    assert extractors, (
+        "le template ne remonte rien à l'exploitant : signaler que le port "
+        "répond ne lui dit pas de quelle version de serveur il s'agit"
+    )
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "émet un résultat par extracteur qui rend quelque chose, donc la même "
+        "instance est signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "l'extracteur ne lit pas le JSON de la réponse : une expression libre "
+        "remonterait aussi bien des fragments de page"
+    )
+    assert extractor.get("part") == f"body_{paths.index(CLEARML_PING) + 1}", (
+        "l'extracteur n'est pas borné à la réponse de /debug.ping : sous "
+        "req-condition il serait évalué contre les deux, et la signature de "
+        "version se lit dans l'enveloppe de celle-là"
+    )
+    for expression in (extractor.get("json") or []):
+        assert expression.startswith(".meta.endpoint."), (
+            f"l'extracteur sort de l'enveloppe de version ({expression!r})"
+        )
+
+    # Et il doit rendre quelque chose sur la réponse qu'il vise.
+    extracted = [json.loads(CLEARML_PING_BODY)["meta"]["endpoint"][
+        expression.rsplit(".", 1)[-1]]
+        for expression in (extractor.get("json") or [])]
+    assert all(extracted), (
+        "l'expression ne désigne aucun champ de l'enveloppe : l'extracteur ne "
+        "rendrait rien"
+    )
 
 
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")

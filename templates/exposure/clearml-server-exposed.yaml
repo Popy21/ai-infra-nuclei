@@ -1,0 +1,214 @@
+id: clearml-server-exposed
+
+info:
+  name: ClearML Server - Web Login Authentication Disabled (Unauthenticated API Server)
+  author: popy21
+  severity: high
+  description: |
+    ClearML ne se ferme pas par un réglage posé à false, il se ferme par un bloc
+    qu'on ajoute. La configuration livrée porte bien une section auth.fixed_users,
+    mais elle est entièrement commentée dans apiserver.conf, et FixedUser.enabled()
+    se lit « config.get("apiserver.auth.fixed_users.enabled", False) » : le défaut
+    n'est pas une liste vide d'utilisateurs autorisés, c'est l'absence de la
+    notion même d'utilisateur autorisé. La documentation ne dit pas autre chose —
+    « Without web login authentication, ClearML Server does not restrict access
+    (by default) ». L'écran de connexion qu'on trouve sur le port 8080 ne demande
+    alors qu'un nom, et le donne à qui l'écrit.
+    L'état se lit sans rien deviner, parce que le serveur le publie lui-même.
+    login.supported_modes existe pour que l'application web sache quel écran
+    dessiner, et il rend « basic: { enabled: FixedUser.enabled() } » — la valeur
+    est la question. Cette route répond sans identifiants et le fait par
+    construction : son schéma pose « authorize: null », et validate_auth traite ce
+    troisième cas explicitement — « For the endpoints with authorize==None the
+    validation will be tried, but it does not have to succeed ». Elle répond donc
+    sur l'instance fermée comme sur l'ouverte, et seule la valeur qu'elle porte
+    les sépare.
+    debug.ping, lui, ne prouve pas l'ouverture et le template ne le lui demande
+    pas : son schéma pose « authorize: false », donc validate_auth sort avant
+    toute vérification. Ce qu'il établit est l'identité du service, et il
+    l'établit entièrement — la réponse est l'enveloppe que get_response construit
+    pour tous les appels, où meta.endpoint porte le nom appelé et l'encadre de
+    requested_version et actual_version. La première est la signature de version
+    cherchée : parse_endpoint_path retenant « If endpoint is available, use the
+    max version » quand le chemin n'en précise aucune, un appel nu à /debug.ping
+    se fait rendre _max_version, c'est-à-dire la version d'API maximale que ce
+    serveur-là connaît.
+    Une précision sur la frontière que le template tient. Quand les utilisateurs
+    fixes sont posés, il se tait — et ce silence couvre un cas qui mérite d'être
+    connu : si le mode invité est activé par-dessus, login.supported_modes rend au
+    même anonyme le nom, l'identifiant et le mot de passe de l'invité en clair,
+    FixedUser.get_guest_user() les recopiant tels quels dans la réponse. Ce n'est
+    pas la même exposition, elle appelle un autre constat, et le template ne les
+    confond pas.
+  impact: |
+    Le premier fait est qu'aucun compte n'existe : un tiers entre sous le nom
+    qu'il choisit, et rien de ce qui suit n'est attribuable à personne. Ce qu'il
+    trouve alors est le journal de travail complet — tasks.get_all rend les
+    expériences avec leurs hyperparamètres et leurs blobs de configuration, là où
+    Task.connect inscrit sans trier ce que le code d'entraînement lui a passé,
+    chaînes de connexion et jetons de fournisseur compris ; script.repository,
+    script.branch et script.entry_point nomment le dépôt privé et le point
+    d'entrée ; events.get_task_log rend la sortie console, qui n'a jamais été
+    filtrée pour être lue par un tiers ; models.get_all rend l'uri des poids et
+    tasks lists leurs artefacts, servis par le fileserver du port 8081, lui-même
+    sans authentification.
+    La lecture n'est pourtant que la moitié du sujet, et c'est l'autre qui fixe la
+    sévérité. Une tâche ClearML n'est pas un enregistrement, c'est une commande en
+    attente : elle porte le dépôt à cloner, le commit, le point d'entrée et
+    l'image docker. tasks.clone puis tasks.edit laissent en choisir chaque champ,
+    et tasks.enqueue la pose dans une file où un clearml-agent viendra la prendre
+    pour l'exécuter — sur les machines à GPU de l'exploitant, avec les
+    identifiants que l'agent porte déjà. La porte ouverte sur le port 8008 est
+    donc une exécution de code sur le parc d'entraînement, par le chemin auquel
+    ce parc fait déjà confiance.
+    auth.create_credentials, enfin, rend un couple clé/secret durable. Il survit
+    à la fermeture du port : refermer l'accès web ne révoque pas ce qui a été
+    inscrit pendant qu'il était ouvert.
+  remediation: |
+    Ajouter la section auth.fixed_users à /opt/clearml/config/apiserver.conf avec
+    « enabled: true » et la liste des utilisateurs, puis redémarrer l'apiserver —
+    c'est l'ajout du bloc qui ferme, pas un drapeau à basculer, puisque le défaut
+    est son absence. Poser « pass_hashed: true » et n'y inscrire que des mots de
+    passe bcrypt encodés en base64 plutôt qu'en clair, le fichier étant monté dans
+    trois conteneurs. Contrôler ensuite sur login.supported_modes lui-même : la
+    réponse doit porter basic.enabled à true, et cette route répond sans
+    identifiants, donc la vérification se fait depuis l'extérieur.
+    Ne pas activer le mode invité sur un serveur joignable : ses identifiants sont
+    rendus en clair par cette même route à qui la demande, sans rien présenter.
+    Ne pas compter non plus sur le réseau tel qu'il est livré — listen.ip vaut
+    0.0.0.0 et le compose publie « 8008:8008 », « 8080:80 » et « 8081:8081 » sur
+    toutes les interfaces de l'hôte : les trois ports sont à tenir derrière un
+    filtrage ou un mandataire authentifiant, le fileserver du 8081 compris, qui
+    n'a pas d'authentification propre.
+    Après une exposition, considérer comme lus les hyperparamètres, les
+    configurations, les sorties console et les artefacts, et renouveler tout
+    identifiant qui y figure ainsi que ceux que portent les agents. Révoquer les
+    couples clé/secret créés par auth.create_credentials, qui survivent à la
+    fermeture. Vérifier enfin les files et les tâches : une tâche que personne n'a
+    soumise, ou dont le dépôt ou l'image ne sont pas ceux de l'équipe, a déjà été
+    exécutée par un agent.
+  reference:
+    - https://clear.ml/docs/latest/docs/deploying_clearml/clearml_server_config/
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/config/default/apiserver.conf
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/schema/services/debug.conf
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/schema/services/login.conf
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/services/debug.py
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/services/login/__init__.py
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/service_repo/validators.py
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/service_repo/apicall.py
+    - https://github.com/clearml/clearml-server/blob/master/apiserver/service_repo/auth/fixed_user.py
+    - https://github.com/clearml/clearml-server/blob/master/docker/docker-compose.yml
+  metadata:
+    max-request: 2
+    vendor: clearml
+    product: clearml-server
+  tags: ai,ml,mlops,clearml,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # /debug.ping nomme le service, et rien d'autre : son schéma pose
+  # « authorize: false », donc validate_auth sort avant toute vérification et la
+  # route répond aussi bien sur l'instance fermée. Conclure de son seul 200 serait
+  # rapporter qu'un serveur ClearML est joignable, ce qui n'est pas le constat
+  # revendiqué. Ce qu'elle établit en revanche sans réserve est l'identité :
+  # get_response enveloppe toute réponse dans meta.endpoint, qui porte le nom
+  # appelé encadré de requested_version et actual_version — trois clés qui
+  # n'appartiennent qu'à cette API.
+  #
+  # /login.supported_modes porte l'autre moitié, et c'est la valeur qui parle, pas
+  # la présence : le handler rend « basic: BasicMode(enabled=FixedUser.enabled()) »,
+  # donc l'état de l'authentification web tel que le serveur le connaît. La route
+  # répond sans identifiants par construction — son schéma pose « authorize: null »,
+  # et validate_auth réserve à ce cas une branche qui tente la vérification sans
+  # exiger qu'elle réussisse — ce qui est précisément ce qu'il faut ici : la
+  # réponse existe des deux côtés de la frontière, et seule sa valeur les sépare.
+  #
+  # POST, et sans rien envoyer. Le corps n'est pas un détail de forme sur cette
+  # route-là : ping fait « res.update(call.data) », et _update_call_data verse
+  # dans call.data le corps JSON comme la chaîne de requête. Tout ce que le
+  # template enverrait lui reviendrait donc à l'intérieur de la réponse qu'il
+  # examine — un template qui poserait sa propre signature en paramètre
+  # déclencherait sur n'importe quoi. Aucun corps, aucun paramètre : le serveur ne
+  # dit ici que ce qu'il sait de lui-même.
+  #
+  # En lecture seule, et strictement : la même porte sert auth.login et
+  # auth.create_credentials, qui inscriraient une session puis un couple clé/secret
+  # durable, users.create, tasks.get_all, models.get_all et events.get_task_log,
+  # qui rendraient les hyperparamètres, l'uri des poids et les sorties console —
+  # donc exfiltreraient ce que le template se contente de signaler —, et
+  # tasks.clone, tasks.edit puis tasks.enqueue, qui feraient exécuter par un
+  # clearml-agent le dépôt et l'image de son choix sur les machines de
+  # l'exploitant. Signaler une exposition ne demande d'en toucher aucun.
+  - method: POST
+    path:
+      - "{{BaseURL}}/debug.ping"
+      - "{{BaseURL}}/login.supported_modes"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, /debug.ping conclurait seul — or il
+    # ne dit rien de l'authentification.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'enveloppe, et le nom qu'elle rapporte à l'appel qu'on vient de
+          # faire. Le nom seul serait un mot ; les deux clés de version en font
+          # la signature d'une API précise, aucune autre ne décrivant ses
+          # réponses par un couple requested_version / actual_version. Vérifiées
+          # sans leur valeur, et sans les deux-points : requested_version suit
+          # _max_version, donc change à chaque publication du serveur, et
+          # rapidjson sérialise en compact sans qu'un intermédiaire qui
+          # réindenterait ce qu'il relaie ait à s'y tenir.
+          #
+          # « ClearML server » est délibérément absent de la liste : c'est la
+          # valeur que ping pose dans data.msg, mais c'est aussi précisément ce
+          # qu'un corps envoyé par le template ferait réapparaître, et le produit
+          # a porté un autre nom avant d'être renommé. Les clés de l'enveloppe,
+          # elles, n'ont pas bougé.
+          - 'status_code_1 == 200 && contains(body_1, "\"debug.ping\"") && contains(body_1, "\"requested_version\"") && contains(body_1, "\"actual_version\"")'
+
+          # La seconde route a répondu, et n'a pas été refusée — un mandataire
+          # peut n'ouvrir /debug.ping qu'à sa supervision et garder le reste, et
+          # c'est ce statut-là qui l'établit. Il tient aussi face à un cache qui
+          # relaierait un corps qu'il détient sous le statut d'un refus.
+          - "status_code_2 == 200"
+
+          # La même enveloppe, portant cette fois l'autre nom. La symétrie est
+          # le point : chaque réponse doit nommer l'appel qui l'a produite, sinon
+          # un cache indexé sur l'hôte et non sur le chemin — qui sert la même
+          # réponse aux deux — suffirait à faire conclure de deux routes quand
+          # une seule a répondu. Cette ligne écarte au passage le portail captif
+          # qui répondrait 200 et une page à tout ce qu'on lui demande.
+          - 'contains(body_2, "\"login.supported_modes\"")'
+
+          # Et sa valeur, qui est toute la différence entre l'instance ouverte et
+          # l'instance fermée : basic.enabled rend FixedUser.enabled(), donc false
+          # tant qu'aucune section auth.fixed_users n'a été ajoutée.
+          #
+          # Borné à l'objet basic, et pas au corps entier : guest y est imbriqué
+          # et porte son propre « enabled », faux sur toute instance qui n'a pas
+          # d'invité — le chercher au large ferait déclencher sur l'instance
+          # fermée. L'alternance ne franchit qu'un niveau d'accolades et aucune
+          # de ses deux branches ne consomme une accolade nue, donc la
+          # correspondance ne peut ni sortir de basic ni descendre dans guest.
+          # Les \s* absorbent l'indentation d'un intermédiaire qui reformaterait.
+          - 'regex("\"basic\"\\s*:\\s*\\{(?:[^{}]|\\{[^{}]*\\})*?\"enabled\"\\s*:\\s*false", body_2)'
+
+    extractors:
+      # La version d'API que ce serveur-là connaît. C'est la signature de version
+      # de la réponse : l'appel ne précisant aucune version, parse_endpoint_path
+      # lui rend _max_version, qui monte d'une publication à l'autre et situe donc
+      # le serveur — le renseignement qu'un exploitant veut lire à côté du constat.
+      #
+      # Un seul extracteur, et borné à body_1 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second, ou laisser
+      # celui-ci sans part, ferait remonter deux fois la même instance.
+      - type: json
+        part: body_1
+        name: api_version
+        json:
+          - ".meta.endpoint.requested_version"
