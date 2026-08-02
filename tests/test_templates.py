@@ -4327,6 +4327,364 @@ def test_jupyter_stays_silent_when_no_kernel_can_be_started():
     )
 
 
+# --------------------------------------------------------------------------
+# Kubeflow Pipelines se joint par deux préfixes — le serveur d'API sert
+# « /apis/v1beta1/... », le serveur d'IHM monte le même proxy sous
+# « ${basePath}/${apiVersion1Prefix}/* », d'où /pipeline/apis/v1beta1/... derrière
+# l'ingress — et sa réponse passe par un marshaler qui n'écrit pas les champs
+# restés à leur valeur nulle. Les deux faits commandent le template : il doit
+# interroger les deux montages, et sa signature ne peut tenir qu'aux clés d'une
+# liste peuplée.
+
+KUBEFLOW_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "kubeflow-pipelines-exposed.yaml")
+
+KUBEFLOW_API_MOUNT = "/apis/v1beta1/pipelines"
+KUBEFLOW_UI_MOUNT = "/pipeline/apis/v1beta1/pipelines"
+
+# Index d'une installation autonome telle qu'on la trouve : les deux pipelines
+# de tutoriel que sample_config.json fait recharger à chaque démarrage, chacun
+# porté par toApiPipelineV1 avec Id, CreatedAt, Name, Description et
+# DefaultVersion.
+KUBEFLOW_PIPELINES_BODY = (
+    '{"pipelines":[{"id":"7f9a1c2e-4b03-4c51-9a77-2d1e5f6b8c40",'
+    '"created_at":"2026-07-29T08:14:03Z",'
+    '"name":"tutorial-data-passing-in-python-components",'
+    '"description":"[source code](https://github.com/kubeflow/pipelines/tree/'
+    'master/samples/tutorials) Shows how to pass data between python '
+    'components.","default_version":{'
+    '"id":"1c0d7b93-5e2a-42f8-8a16-9b4c3d7e1f52",'
+    '"name":"tutorial-data-passing-in-python-components",'
+    '"created_at":"2026-07-29T08:14:03Z","resource_references":[{'
+    '"key":{"type":"PIPELINE","id":"7f9a1c2e-4b03-4c51-9a77-2d1e5f6b8c40"},'
+    '"relationship":"OWNER"}]}},'
+    '{"id":"b58e3a11-90cd-4f2b-bd07-6e8a4c25d913",'
+    '"created_at":"2026-07-29T08:14:04Z",'
+    '"name":"tutorial-dsl-control-structures",'
+    '"default_version":{"id":"d2f4a706-31bc-49e5-9c88-0a7b6e5d4c31",'
+    '"name":"tutorial-dsl-control-structures",'
+    '"created_at":"2026-07-29T08:14:04Z"}}],"total_size":2}'
+)
+
+# Le même index dépouillé : un pipeline téléversé sans description, dont la
+# version par défaut ne porte ni paramètre ni référence de ressource. Ne restent
+# que les champs que toApiPipelineV1 affecte sans condition — c'est le corps le
+# plus maigre qu'une instance ouverte puisse rendre, et il doit remonter.
+KUBEFLOW_MINIMAL_BODY = (
+    '{"pipelines":[{"id":"3a6c8d10-77f4-4be2-9d31-5c0e1a8b7f26",'
+    '"created_at":"2026-06-02T11:47:20Z","name":"prod-scoring-daily",'
+    '"default_version":{"id":"3a6c8d10-77f4-4be2-9d31-5c0e1a8b7f26",'
+    '"name":"prod-scoring-daily","created_at":"2026-06-02T11:47:20Z"}}],'
+    '"total_size":1}'
+)
+
+# Le même index relayé par un intermédiaire qui réindente ce qu'il transporte.
+# La graphie serpent est garantie par UseProtoNames, la sérialisation compacte
+# ne l'est pas.
+KUBEFLOW_REFORMATTED_BODY = json.dumps(json.loads(KUBEFLOW_MINIMAL_BODY),
+                                       indent=2)
+
+# Une instance ouverte dont l'index est vide. EmitUnpopulated valant false,
+# ListPipelinesResponse ne sérialise aucun de ses trois champs : il ne reste
+# rien à reconnaître.
+KUBEFLOW_EMPTY_BODY = "{}"
+
+# Ce que rend le serveur en mode multi-utilisateur quand l'identité manque :
+# canAccessPipeline enveloppe l'erreur d'IsAuthorized dans le message que
+# ListPipelinesV1 porte, et util.NewUnauthenticatedError donne le code gRPC 16,
+# rendu 401 par la passerelle.
+KUBEFLOW_UNAUTHENTICATED_BODY = (
+    '{"error":"Failed to list pipelines due to authorization error. Check if '
+    'you have read permission to namespace ","code":16,'
+    '"message":"Failed to list pipelines due to authorization error. Check if '
+    'you have read permission to namespace ","details":[]}'
+)
+
+# Le refus que le maillage oppose avant même d'atteindre le serveur, quand la
+# politique d'autorisation d'ml-pipeline tient la porte.
+KUBEFLOW_MESH_DENIED_BODY = "RBAC: access denied"
+
+# Un ordonnanceur de tâches quelconque : il énumère des « pipelines » avec leur
+# identifiant, leur date de création et le compte total, sous la même enveloppe
+# de pagination. Tout le vocabulaire générique y est, et il n'est pas Kubeflow —
+# c'est ce corps qui rend « default_version » nécessaire plutôt qu'ornemental.
+OTHER_ORCHESTRATOR_PIPELINES_BODY = (
+    '{"pipelines":[{"id":"pl-3391","name":"nightly-etl",'
+    '"created_at":"2026-07-29T02:00:00Z","status":"succeeded",'
+    '"duration_ms":184203},{"id":"pl-3392","name":"hourly-ingest",'
+    '"created_at":"2026-07-29T03:00:00Z","status":"running"}],'
+    '"total_size":17,"next_page_token":"eyJvIjoyfQ=="}'
+)
+
+
+def kubeflow_response(status, body, content_type="application/json"):
+    """
+    Une réponse HTTP réduite à ce que les matchers du template observent : le
+    statut, le bloc d'en-têtes brut — c'est contre lui que nuclei évalue
+    `part: header` — et le corps.
+    """
+    return {
+        "status": status,
+        "headers": (
+            f"HTTP/1.1 {status}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            "Server: envoy\r\n"
+        ),
+        "body": body,
+    }
+
+
+# Une instance ouverte, sur l'un ou l'autre de ses deux montages.
+KUBEFLOW_OPEN = kubeflow_response(200, KUBEFLOW_PIPELINES_BODY)
+KUBEFLOW_OPEN_MINIMAL = kubeflow_response(200, KUBEFLOW_MINIMAL_BODY)
+KUBEFLOW_OPEN_REFORMATTED = kubeflow_response(200, KUBEFLOW_REFORMATTED_BODY)
+
+# Une instance ouverte mais sans aucun pipeline.
+KUBEFLOW_OPEN_EMPTY = kubeflow_response(200, KUBEFLOW_EMPTY_BODY)
+
+# Une instance gardée : par le serveur lui-même en mode multi-utilisateur, puis
+# par le maillage placé devant.
+KUBEFLOW_GUARDED = kubeflow_response(401, KUBEFLOW_UNAUTHENTICATED_BODY)
+KUBEFLOW_MESH_GUARDED = kubeflow_response(
+    403, KUBEFLOW_MESH_DENIED_BODY, content_type="text/plain")
+
+# Un cache placé devant l'instance relaie l'index qu'il détient sous le statut du
+# refus : le serveur, lui, a refusé.
+KUBEFLOW_CACHED_UNDER_REFUSAL = kubeflow_response(401, KUBEFLOW_PIPELINES_BODY)
+
+# Un portail captif qui répond 200 et une page à tout ce qu'on lui demande, y
+# compris en embarquant ce vocabulaire dans son état initial.
+KUBEFLOW_BEHIND_CAPTIVE_PORTAL = kubeflow_response(
+    200,
+    '<!doctype html><html><body><script>window.__STATE__={"pipelines":[],'
+    '"total_size":0,"created_at":null,"default_version":null}</script>'
+    "</body></html>",
+    content_type="text/html; charset=utf-8",
+)
+
+# Un serveur quelconque qui répond 200 à tout.
+KUBEFLOW_SERVER_ALWAYS_UP = kubeflow_response(200, "OK",
+                                              content_type="text/plain")
+
+# Le même vocabulaire, autre produit.
+KUBEFLOW_OTHER_ORCHESTRATOR = kubeflow_response(
+    200, OTHER_ORCHESTRATOR_PIPELINES_BODY)
+
+
+def kubeflow_block():
+    doc = load(KUBEFLOW_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.replace("{{BaseURL}}", "") == KUBEFLOW_API_MOUNT
+                     for p in (b.get("path") or []))]
+    assert blocks, f"le template ne vise pas GET {KUBEFLOW_API_MOUNT}"
+    return blocks[0]
+
+
+def kubeflow_fires(response):
+    """
+    Sémantique nuclei du bloc entier contre une réponse unique : statut, en-têtes
+    et corps. Les deux chemins déclarés sont deux montages du même service, non
+    deux moitiés de preuve — il n'y a pas de req-condition, donc chaque matcher
+    voit la même réponse.
+    """
+    block = kubeflow_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+
+    verdicts = []
+    for matcher in matchers:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(response["status"] in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(word_matcher_hits(matcher, response["headers"]))
+        else:
+            verdicts.append(body_matcher_hits(matcher, response["body"]))
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_kubeflow_probe_covers_both_mount_points_without_double_reporting():
+    block = kubeflow_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+
+    assert KUBEFLOW_UI_MOUNT in paths, (
+        "le template n'interroge que le serveur d'API : le serveur d'IHM monte "
+        "le même proxy sous « ${basePath}/${apiVersion1Prefix}/* », donc une "
+        "instance jointe par l'ingress Kubeflow répond sur "
+        f"{KUBEFLOW_UI_MOUNT} et serait manquée"
+    )
+    assert block.get("req-condition") is not True, (
+        "le template lie les deux réponses : ce sont deux montages du même "
+        "service, une instance donnée répond sur l'un ou sur l'autre, et les "
+        "exiger ensemble ne remonterait plus rien"
+    )
+    assert block.get("stop-at-first-match") is True, (
+        "sans stop-at-first-match, une IHM qui sert les deux préfixes — elle "
+        "monte le proxy avec et sans basePath — fait remonter deux fois la même "
+        "instance"
+    )
+
+
+def test_kubeflow_probe_reads_the_index_and_touches_nothing_else():
+    doc = load(KUBEFLOW_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "GET", (
+            "l'index se lit en GET — pipeline.proto annote ListPipelinesV1 de "
+            "« get: \"/apis/v1beta1/pipelines\" » — et le même chemin en POST "
+            "crée un pipeline sur l'instance auditée"
+        )
+        assert block.get("body") is None, (
+            "le template envoie un corps : la route se lit sans paramètre, les "
+            "défauts du serveur suffisent"
+        )
+
+        for path in (block.get("path") or []):
+            assert "?" not in path, (
+                "le template passe des paramètres de requête : rien n'a à être "
+                "précisé pour lire l'index"
+            )
+            for forbidden, why in (
+                ("/templates",
+                 "le template lit le manifeste du pipeline : il porte les "
+                 "images employées, les arguments de chaque composant et les "
+                 "noms des secrets montés"),
+                ("/runs",
+                 "le template touche les exécutions : ce chemin rend en GET les "
+                 "paramètres soumis et lance en POST des conteneurs sur le "
+                 "cluster audité"),
+                ("/pipeline_versions",
+                 "le template touche les versions : une version inscrite là "
+                 "survivrait à la fermeture du port"),
+                ("default_version",
+                 "le template touche la version par défaut : la changer "
+                 "désigne ce que la prochaine exécution lancera"),
+                ("/upload",
+                 "le template téléverse sur l'instance qu'il audite"),
+                ("/experiments",
+                 "le template lit les expériences, hors du constat qu'il "
+                 "revendique"),
+            ):
+                assert forbidden not in path, why
+
+            assert "/healthz" not in path, (
+                "le template interroge /apis/v1beta1/healthz : GetHealthzResponse "
+                "ne porte qu'un booléen multi_user, et EmitUnpopulated valant "
+                "false il n'est pas écrit lorsqu'il est faux — la route rend "
+                "donc « {} » sur l'instance ouverte, ce qui ne prouve rien"
+            )
+
+
+def test_kubeflow_matcher_needs_the_pipeline_index_not_a_generic_task_list():
+    assert kubeflow_fires(KUBEFLOW_OPEN), (
+        "le template ne reconnaît pas l'index d'une installation autonome, "
+        "celle-là même que IsAuthorized laisse passer sans rien vérifier"
+    )
+    assert kubeflow_fires(KUBEFLOW_OPEN_MINIMAL), (
+        "le template exige des champs que toApiPipelineV1 laisse subordonnés à "
+        "un test — description, paramètres, références de ressource — il "
+        "raterait un pipeline téléversé sans description"
+    )
+    assert kubeflow_fires(KUBEFLOW_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui réindente ce qu'il relaie le mettrait en défaut, "
+        "alors que UseProtoNames ne garantit que la graphie des clés"
+    )
+
+    assert not kubeflow_fires(KUBEFLOW_OTHER_ORCHESTRATOR), (
+        "le template déclenche sur un ordonnanceur qui n'est pas Kubeflow : "
+        "« pipelines », « created_at » et « total_size » sont le vocabulaire de "
+        "n'importe quelle liste de tâches paginée, et c'est "
+        "« default_version » qui rattache la réponse au produit"
+    )
+    assert not kubeflow_fires(KUBEFLOW_GUARDED), (
+        "le template déclenche sur une instance en mode multi-utilisateur : "
+        "l'identité manquante y fait rendre util.NewUnauthenticatedError, soit "
+        "401"
+    )
+    assert not kubeflow_fires(KUBEFLOW_MESH_GUARDED), (
+        "le template déclenche sur une instance dont la politique "
+        "d'autorisation du maillage tient la porte"
+    )
+    assert not kubeflow_fires(KUBEFLOW_CACHED_UNDER_REFUSAL), (
+        "le template conclut du seul corps : un cache placé devant l'instance "
+        "peut relayer l'index qu'il détient sous le statut du refus, alors que "
+        "le serveur, lui, a refusé"
+    )
+    assert not kubeflow_fires(KUBEFLOW_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise d'index : un portail captif "
+        "qui répond 200 à tout suffirait à le faire remonter"
+    )
+    assert not kubeflow_fires(KUBEFLOW_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
+def test_kubeflow_stays_silent_on_an_empty_index():
+    """
+    La frontière que le template revendique, fixée dans le sens qui coûte.
+
+    CustomMarshaler pose EmitUnpopulated: false, donc ListPipelinesResponse ne
+    sérialise aucun de ses trois champs quand la liste est vide : une instance
+    ouverte sans pipeline rend « {} », et il n'y a rien à reconnaître là-dedans
+    qui ne déclencherait pas sur n'importe quel serveur. Elle ne remonte donc
+    pas — et c'est cohérent avec ce que le template affirme, l'index étant le
+    constat lui-même.
+
+    Ce test existe pour que ce choix reste un choix : quiconque relâcherait la
+    signature pour rattraper ce cas ferait remonter tout objet JSON vide, et
+    c'est ici qu'il doit s'en apercevoir.
+    """
+    assert not kubeflow_fires(KUBEFLOW_OPEN_EMPTY), (
+        "le template remonte une réponse vide : « {} » ne désigne aucun "
+        "produit, et l'accepter ferait déclencher sur tout service rendant un "
+        "objet JSON vide"
+    )
+
+    # La contrepartie de ce choix : ce corps doit rester celui que le marshaler
+    # produit sur une liste vide, sans quoi le raisonnement ci-dessus ne tient
+    # plus.
+    assert json.loads(KUBEFLOW_EMPTY_BODY) == {}, (
+        "le scénario ne modélise plus une instance sans pipeline"
+    )
+
+
+def test_kubeflow_extractors_stay_on_the_pipeline_index():
+    block = kubeflow_block()
+    extractors = block.get("extractors") or []
+    assert extractors, (
+        "le template ne remonte rien à l'exploitant : signaler que le port "
+        "répond ne lui dit pas quels pipelines un anonyme peut y lire"
+    )
+
+    # Plusieurs extracteurs ne sont admissibles que parce qu'il n'y a pas de
+    # req-condition : sous req-condition, chacun rendant quelque chose
+    # ajouterait un résultat pour la même instance.
+    assert block.get("req-condition") is not True, (
+        "le template porte plusieurs extracteurs sous req-condition : chacun "
+        "rendant quelque chose ajoute un résultat, donc la même instance est "
+        "signalée plusieurs fois"
+    )
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "l'extracteur ne lit pas le JSON de la réponse : une expression "
+            "libre remonterait aussi bien des fragments de page"
+        )
+        for expression in (extractor.get("json") or []):
+            assert expression.startswith((".pipelines[]", ".total_size")), (
+                f"l'extracteur sort de l'index des pipelines ({expression!r})"
+            )
+            assert "default_version" not in expression, (
+                "l'extracteur remonte l'URL du paquet de la version par "
+                "défaut : c'est un chemin à joindre, pas un renseignement à "
+                "recopier dans un rapport de scan"
+            )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

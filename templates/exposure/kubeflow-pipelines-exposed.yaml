@@ -1,0 +1,215 @@
+id: kubeflow-pipelines-exposed
+
+info:
+  name: Kubeflow Pipelines - Unauthenticated API Server (Pipeline Index Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    Kubeflow Pipelines ne se ferme pas par un réglage d'authentification, il se
+    ferme par un mode. ListPipelinesV1 appelle bien canAccessPipeline avant de
+    rendre quoi que ce soit, mais la fonction d'autorisation qu'il atteint
+    commence par sortir — IsAuthorized ouvre sur « if !common.IsMultiUserMode()
+    { // Skip authz if not multi-user mode. return nil } ». Une installation
+    autonome ne tourne donc pas avec un garde permissif, elle tourne sans garde
+    du tout : le contrôle est écrit, il est appelé, et il rend nil avant d'avoir
+    rien vérifié.
+    Le mode multi-utilisateur ne repose de son côté sur aucun mot de passe :
+    l'identité y est un en-tête, kubeflow-userid, que le serveur d'API relaie
+    explicitement par son matcher d'en-têtes et que le maillage est censé poser.
+    Ce qui tient la porte est l'AuthorizationPolicy Istio livrée sous
+    installs/multi-user — elle n'admet ml-pipeline que depuis une poignée de
+    comptes de service internes et refuse précisément les requêtes portant
+    kubeflow-userid d'elles-mêmes — le serveur rendant util.NewUnauthenticatedError,
+    soit le code gRPC 16, soit 401 côté HTTP, quand l'identité manque. Retirer
+    cette couche, ou joindre le service à côté d'elle, ramène au premier cas.
+    La route se lit en GET et sans rien envoyer : pipeline.proto annote
+    ListPipelinesV1 de « get: "/apis/v1beta1/pipelines" ». Deux préfixes la
+    servent, et le second n'est pas une variante d'écriture : le serveur d'IHM
+    ml-pipeline-ui monte le même proxy sous « /${apiVersion1Prefix}/* » et sous
+    « ${basePath}/${apiVersion1Prefix}/* », donc /pipeline/apis/v1beta1/pipelines
+    répond derrière l'ingress Kubeflow là où /apis/v1beta1/pipelines répond sur
+    le serveur d'API.
+    Reste la forme de la réponse, dont dépend directement ce qui est détectable :
+    CustomMarshaler pose protojson.MarshalOptions{UseProtoNames: true,
+    EmitUnpopulated: false}. La graphie serpent est donc stable d'une version à
+    l'autre — c'est ce qui rend « default_version » et « total_size » fiables —
+    mais un champ resté à sa valeur nulle n'est pas écrit, et une instance sans
+    aucun pipeline sérialise « {} », qui ne désigne rien. Le cas est rare à
+    l'endroit qui compte : le sample_config.json livré porte
+    « "loadSamplesOnRestart": true » et deux pipelines de tutoriel, qu'une
+    installation neuve recharge à chaque démarrage.
+  impact: |
+    L'index nomme les projets — un nom de pipeline dit le produit qu'il sert — et
+    default_version indique déjà où le lire, ses champs code_source_url et
+    package_url désignant le dépôt et le paquet. Mais l'énumération n'est que le
+    témoin : la même absence de garde couvre tout le service. GET
+    /apis/v1beta1/pipelines/{id}/templates rend le manifeste complet du pipeline,
+    donc les images employées, les arguments passés à chaque composant et les
+    noms des secrets montés ; GET /apis/v1beta1/runs rend les exécutions avec
+    leur pipeline_spec, que le proto décrit comme « what the pipeline manifest
+    and parameters to use for the run » — c'est-à-dire les paramètres tels qu'ils
+    ont été soumis, l'endroit exact où atterrissent les points d'entrée internes
+    et les jetons qu'on a passés en paramètre plutôt qu'en secret.
+    L'écriture est de l'autre côté du même chemin ouvert, et elle ne porte pas
+    que sur des données. POST /apis/v1beta1/runs fait tourner une exécution dont
+    l'appelant fournit lui-même le manifeste : soumettre revient à lancer les
+    conteneurs de son choix sur le cluster, avec le compte de service que KFP
+    prête à ses exécutions, les secrets du namespace, le stockage d'objets où
+    sont rangés les artefacts, et les GPU dont l'occupation est facturée à
+    l'exploitant. C'est de l'exécution de code non authentifiée sur une
+    infrastructure d'entraînement, pas une fuite de catalogue. POST
+    /apis/v1beta1/pipelines et POST /apis/v1beta1/pipeline_versions y inscrivent
+    de surcroît une version, et UpdatePipelineDefaultVersionV1 — POST
+    /apis/v1beta1/pipelines/{pipeline_id}/default_version/{version_id} — désigne
+    celle que la chaîne lancera ensuite : la substitution emprunte le pipeline
+    auquel l'exploitant fait déjà confiance, plutôt que d'avoir à s'en créer un.
+    DELETE sur les mêmes chemins emporte l'un ou l'autre. Et comme aucun compte
+    n'existe en mode autonome, rien de tout cela n'est attribuable à personne.
+  remediation: |
+    Il n'y a pas de drapeau à poser sur le serveur : le seul mode où une
+    autorisation est évaluée est le mode multi-utilisateur, et il suppose un
+    Kubeflow complet, où l'identité vient du maillage et de la couche
+    d'authentification placée devant l'ingress. Une installation autonome se
+    protège donc par le réseau — ne pas publier le serveur d'API (8888) ni le
+    serveur d'IHM, s'en tenir à un port-forward, et ne pas laisser un Service
+    passer en NodePort ou en LoadBalancer le temps d'une démonstration.
+    Contrôler ensuite sur la route elle-même, GET /apis/v1beta1/pipelines puis
+    /pipeline/apis/v1beta1/pipelines depuis l'extérieur : un 200 anonyme signifie
+    que la porte est ouverte, quelle que soit la configuration supposée. Ne pas
+    contrôler sur /apis/v1beta1/healthz, dont la réponse ne porte qu'un booléen
+    multi_user que le marshaler n'écrit même pas lorsqu'il est faux — soit « {} »
+    sur l'instance ouverte, ce qui ne prouve rien dans un sens ni dans l'autre.
+    Quand le mode multi-utilisateur est en place, c'est la politique
+    d'autorisation qui porte la sécurité, pas le serveur : la retirer, la
+    remplacer par une règle vide, ou joindre ml-pipeline sans passer par le
+    maillage suffit à revenir au premier cas — un en-tête kubeflow-userid posé à
+    la main est accepté par le serveur, et c'est justement ce que la politique
+    refuse depuis l'extérieur.
+    Après une exposition, considérer le cluster comme exécuté et non seulement
+    lu. Renouveler les identifiants atteignables depuis une exécution — secrets
+    du namespace, accès au stockage d'objets des artefacts, jetons de dépôt de
+    modèles — puis inspecter GET /apis/v1beta1/runs : une exécution que personne
+    n'a soumise est la trace d'un conteneur lancé. Contrôler enfin la version par
+    défaut de chaque pipeline plutôt que de la supposer intacte : elle se change
+    par une seule requête, et cette écriture-là survit à la fermeture du port.
+  reference:
+    - https://www.kubeflow.org/docs/components/pipelines/legacy-v1/reference/api/kubeflow-pipeline-api-spec/
+    - https://github.com/kubeflow/pipelines/blob/master/backend/api/v1beta1/pipeline.proto
+    - https://github.com/kubeflow/pipelines/blob/master/backend/api/v1beta1/run.proto
+    - https://github.com/kubeflow/pipelines/blob/master/backend/api/v1beta1/healthz.proto
+    - https://github.com/kubeflow/pipelines/blob/master/backend/src/apiserver/main.go
+    - https://github.com/kubeflow/pipelines/blob/master/backend/src/apiserver/common/utils.go
+    - https://github.com/kubeflow/pipelines/blob/master/backend/src/apiserver/server/pipeline_server.go
+    - https://github.com/kubeflow/pipelines/blob/master/backend/src/apiserver/server/api_converter.go
+    - https://github.com/kubeflow/pipelines/blob/master/backend/src/apiserver/resource/resource_manager.go
+    - https://github.com/kubeflow/pipelines/blob/master/backend/src/apiserver/config/sample_config.json
+    - https://github.com/kubeflow/pipelines/blob/master/frontend/server/app.ts
+    - https://github.com/kubeflow/pipelines/blob/master/manifests/kustomize/base/installs/multi-user/istio-authorization-config.yaml
+  metadata:
+    max-request: 2
+    vendor: kubeflow
+    product: kubeflow-pipelines
+  tags: ai,ml,mlops,kubeflow,pipelines,exposure,unauth,misconfig
+
+http:
+  # Deux chemins, mais un seul constat : ce ne sont pas deux moitiés de preuve
+  # comme chez Milvus ou Jupyter, ce sont deux montages du même service. Le
+  # serveur d'API sert « /apis/v1beta1/... » ; le serveur d'IHM monte le même
+  # proxy deux fois, sous « /${apiVersion1Prefix}/* » et sous
+  # « ${basePath}/${apiVersion1Prefix}/* », d'où le préfixe /pipeline derrière
+  # l'ingress Kubeflow. Une instance donnée répond sur l'un ou sur l'autre, et
+  # jamais la réponse de l'un n'a besoin de celle de l'autre — donc pas de
+  # req-condition, qui exigerait ici les deux à la fois, et stop-at-first-match
+  # pour ne pas signaler deux fois la même instance quand l'IHM sert les deux.
+  #
+  # GET, et sans paramètre : pipeline.proto annote ListPipelinesV1 de
+  # « get: "/apis/v1beta1/pipelines" », et les défauts du serveur suffisent.
+  #
+  # En lecture seule, et strictement : le même préfixe non authentifié sert
+  # /apis/v1beta1/pipelines/{id}/templates, qui rendrait le manifeste complet —
+  # donc les images et les noms de secrets montés — /apis/v1beta1/runs, qui
+  # rendrait en GET les paramètres soumis et lancerait en POST les conteneurs de
+  # son choix sur le cluster, /apis/v1beta1/pipeline_versions, qui inscrirait une
+  # version, /apis/v1beta1/pipelines/{pipeline_id}/default_version/{version_id},
+  # qui désignerait celle que la chaîne lancera ensuite, et les DELETE de chacun.
+  # Signaler une exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/apis/v1beta1/pipelines"
+      - "{{BaseURL}}/pipeline/apis/v1beta1/pipelines"
+
+    stop-at-first-match: true
+
+    matchers-condition: and
+    matchers:
+      # La route est gardée dans le seul mode où un garde existe : en
+      # multi-utilisateur, l'absence d'identité fait rendre
+      # util.NewUnauthenticatedError, soit 401, et la politique Istio coupe avant
+      # même cela. Un 200 anonyme dit donc que rien n'évalue l'appelant.
+      - type: status
+        status:
+          - 200
+
+      # runtime.JSONPb pose le type sur la réponse servie ; le refus, lui, ne
+      # vient pas de la même plume — l'ingress ou le maillage répondent en texte
+      # ou en HTML. Cette ligne écarte surtout le portail captif qui répondrait
+      # 200 et une page à tout ce qu'on lui demande.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Quatre clés, et le partage est le même que chez MLflow : deux qui situent
+      # la forme, deux qui désignent le produit.
+      #
+      # « pipelines » et « created_at » ne prouvent rien seules — c'est le
+      # vocabulaire de n'importe quel ordonnanceur de tâches, qui sert la même
+      # liste sous les mêmes noms. Ce qui sépare Kubeflow est la paire suivante :
+      # « total_size », l'enveloppe de pagination que ListPipelinesResponse
+      # déclare à côté de next_page_token, et surtout « default_version », le
+      # champ 8 du message Pipeline — la version qu'une exécution lancera à
+      # défaut d'indication. Aucun autre produit n'a de raison d'écrire ce mot
+      # dans une liste de pipelines.
+      #
+      # Toutes les quatre sont posées sans condition par toApiPipelineV1 dès
+      # qu'un pipeline existe : Id, CreatedAt, Name et DefaultVersion y sont
+      # affectés sur le chemin nominal, là où Parameters, ResourceReferences et
+      # Url restent subordonnés à un test. total_size, lui, vaut au moins 1 dès
+      # que la liste n'est pas vide, donc EmitUnpopulated ne l'omet pas.
+      #
+      # Vérifiées sur la clé nue, sans les deux-points : la graphie serpent est
+      # garantie par UseProtoNames, mais rien ne garantit qu'un intermédiaire
+      # relaie la sérialisation compacte du serveur.
+      #
+      # La contrepartie est assumée : une instance sans aucun pipeline sérialise
+      # « {} », puisque EmitUnpopulated vaut false, et ne remonte pas. C'est une
+      # frontière et non un oubli — sans pipeline, l'index qui fonde ce template
+      # ne divulgue rien — et elle coûte peu, le sample_config.json livré portant
+      # « "loadSamplesOnRestart": true » et deux pipelines de tutoriel qu'une
+      # installation neuve recharge à chaque démarrage.
+      - type: word
+        part: body
+        words:
+          - '"pipelines"'
+          - '"created_at"'
+          - '"total_size"'
+          - '"default_version"'
+        condition: and
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses pipelines : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire.
+      - type: json
+        part: body
+        name: pipeline
+        json:
+          - '.pipelines[].name'
+
+      # Et le nombre total, qui n'est pas une décoration : la liste est paginée,
+      # donc ce champ dit ce que la page ne montre pas.
+      - type: json
+        part: body
+        name: total_size
+        json:
+          - '.total_size'
