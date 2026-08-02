@@ -56,6 +56,6 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 
 ## Outillage du dépôt
 
-- [ ] Ajouter `scripts/coverage.py` qui compare les identifiants du pack à ceux de `nuclei-templates` et signale les doublons, avec un test associé.
+- [x] Ajouter `scripts/coverage.py` qui compare les identifiants du pack à ceux de `nuclei-templates` et signale les doublons, avec un test associé.
 - [ ] Ajouter au README un tableau de couverture généré par `scripts/coverage.py`.
 - [ ] Ajouter un test vérifiant que deux templates ne partagent pas le même couple (endpoint, produit).
