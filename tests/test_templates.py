@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 
 import pytest
 import yaml
@@ -6656,6 +6657,535 @@ def test_cve_2026_0770_extractor_stays_on_the_version_response():
     assert json.loads(LANGFLOW_VERSION_BODY)["version"] == "1.7.3", (
         "le corps de référence ne porte plus la version attendue"
     )
+
+
+# --------------------------------------------------------------------------
+# CVE-2026-55255. Deux choses séparent ce template de son voisin CVE-2026-0770,
+# et les deux tirent la suite de tests.
+#
+# La première : le correctif ne change rien de ce que le serveur donne à lire.
+# La 1.9.1 pose un filtre à l'intérieur de get_flow_by_id_or_endpoint_name() ;
+# vue du dehors, elle répond à la sonde exactement comme la 1.9.0. La version
+# est donc le seul discriminant, et un template qui ne la bornerait pas
+# signalerait toutes les instances corrigées. C'est ce que teste la table des
+# versions ci-dessous, et c'est la raison d'être de ce bloc.
+#
+# La seconde : le sink est ici une exécution de flux, pas une compilation. La
+# sonde doit atteindre la recherche non filtrée sans que rien ne tourne — donc
+# un UUID qui ne peut désigner aucun flux, et aucun autre champ qui ferait
+# dévier le handler.
+
+CVE_2026_55255_TEMPLATE = os.path.join(TEMPLATES_DIR, "cves", "CVE-2026-55255.yaml")
+
+LANGFLOW_RESPONSES = "/api/v1/responses"
+
+# La version corrigée, telle que l'avis GHSA-qrpv-q767-xqq2 la nomme. Tout ce
+# qui est en dessous est atteint, tout ce qui est au-dessus ne l'est plus.
+LANGFLOW_IDOR_FIXED_IN = (1, 9, 1)
+
+
+def langflow_version_body(version, package="Langflow", indent=None):
+    """
+    Réponse de /api/v1/version, telle que _get_version_info() la construit :
+    la version publiée, la même privée de son segment de pré-publication, et le
+    nom d'affichage du paquet installé.
+    """
+    main = version
+    for keyword in ("a", "b", "rc", "dev", "post"):
+        if keyword in main:
+            main = main.split(keyword)[0][:-1]
+            break
+    payload = {"version": version, "main_version": main, "package": package}
+    if indent is None:
+        return json.dumps(payload, separators=(",", ":"))
+    return json.dumps(payload, indent=indent)
+
+
+def langflow_flow_not_found_body(model, indent=None):
+    """
+    Ce que rend POST /api/v1/responses sur un identifiant qui ne désigne aucun
+    flux, transcrit du handler plutôt que recopié d'un avis.
+
+    Le chemin est celui-ci : get_flow_by_id_or_endpoint_name() lève un 404, le
+    handler le rattrape et met flow à None, puis rend OpenAIErrorResponse
+    construit par create_openai_error(). Le tout sous un 200 — l'erreur est une
+    valeur de retour, pas une exception, donc FastAPI ne change pas le statut.
+    """
+    error = {
+        "message": f"Flow with id '{model}' not found",
+        "type": "invalid_request_error",
+        "code": "flow_not_found",
+    }
+    payload = {"error": error}
+    if indent is None:
+        return json.dumps(payload, separators=(",", ":"))
+    return json.dumps(payload, indent=indent)
+
+
+# Refus de api_key_security quand AUTO_LOGIN est posé sans
+# LANGFLOW_SKIP_AUTH_AUTO_LOGIN : le corps de la route n'a jamais tourné.
+LANGFLOW_AUTO_LOGIN_ERROR_BODY = json.dumps(
+    {"detail": "Since v1.5, LANGFLOW_AUTO_LOGIN requires a valid API key. "
+               "Set LANGFLOW_SKIP_AUTH_AUTO_LOGIN=true to skip this check. "
+               "Please update your authentication method."},
+    separators=(",", ":"))
+
+# Refus de la même dépendance quand AUTO_LOGIN est fermé et qu'aucune clé n'est
+# présentée.
+LANGFLOW_API_KEY_MISSING_BODY = json.dumps(
+    {"detail": "An API key must be passed as query or header"},
+    separators=(",", ":"))
+
+
+def cve_2026_55255_block():
+    doc = load(CVE_2026_55255_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(LANGFLOW_RESPONSES in raw for raw in (b.get("raw") or []))]
+    assert blocks, (
+        f"le template n'interroge pas POST {LANGFLOW_RESPONSES} — c'est "
+        "pourtant la seule route qui remet l'identifiant du flux à l'appelant, "
+        "donc la seule qui expose la branche UUID non filtrée de "
+        "get_flow_by_id_or_endpoint_name()"
+    )
+    return blocks[0]
+
+
+def cve_2026_55255_requests():
+    out = []
+    for raw in cve_2026_55255_block().get("raw") or []:
+        start_line = raw.strip().splitlines()[0].split()
+        assert len(start_line) >= 2, f"requête brute illisible : {raw!r}"
+        out.append((start_line[0], start_line[1]))
+    return out
+
+
+def cve_2026_55255_posted_request():
+    """
+    Le corps JSON que le template poste, extrait de la requête brute : c'est le
+    modèle OpenAIResponsesRequest.
+    """
+    raws = [raw for raw in cve_2026_55255_block().get("raw") or []
+            if LANGFLOW_RESPONSES in raw]
+    assert raws, "aucune requête brute vers la route des réponses"
+
+    head, sep, body = raws[0].partition("\n\n")
+    assert sep, (
+        "la requête brute n'a pas de corps : sans corps, FastAPI rend une "
+        "erreur de validation et le helper n'est jamais interrogé"
+    )
+    assert "Content-Type: application/json" in head, (
+        "la requête ne déclare pas de corps JSON : FastAPI refuserait avant "
+        "d'atteindre le handler"
+    )
+
+    sent = json.loads(body)
+    assert isinstance(sent, dict), "le corps envoyé n'est pas un objet JSON"
+    return sent
+
+
+def cve_2026_55255_scenario(version, responses):
+    return {LANGFLOW_VERSION: version, LANGFLOW_RESPONSES: responses}
+
+
+def cve_2026_55255_responses(scenario):
+    ordered = []
+    for _, route in cve_2026_55255_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que Langflow ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def cve_2026_55255_fires(scenario):
+    block = cve_2026_55255_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = cve_2026_55255_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def cve_2026_55255_open_on(version, package="Langflow"):
+    """
+    Instance atteinte tournant `version` : la version se lit, et la route des
+    réponses a servi l'anonyme. La réponse de la sonde est dérivée du handler,
+    pas recopiée.
+    """
+    return cve_2026_55255_scenario(
+        version=(200, langflow_version_body(version, package)),
+        responses=(200, langflow_flow_not_found_body(
+            cve_2026_55255_posted_request()["model"])))
+
+
+def test_cve_2026_55255_identifies_the_vulnerability_it_claims():
+    doc = load(CVE_2026_55255_TEMPLATE)
+    classification = (doc.get("info") or {}).get("classification") or {}
+
+    assert classification.get("cve-id") == doc.get("id"), (
+        "le template ne se réclame pas de la faille que son identifiant nomme : "
+        f"cve-id={classification.get('cve-id')!r}, id={doc.get('id')!r}"
+    )
+    assert classification.get("cwe-id") == "CWE-639", (
+        "l'avis retient CWE-639, contournement d'autorisation par clé contrôlée "
+        "par l'utilisateur — ce n'est pas une exécution de code, et confondre "
+        "les deux ferait sur-noter le rapport"
+    )
+
+    refs = [str(r) for r in ((doc.get("info") or {}).get("reference") or [])]
+    assert any("CVE-2026-55255" in r for r in refs), (
+        "aucune référence ne renvoie à l'avis lui-même"
+    )
+
+    tags = [t.strip() for t in str((doc.get("info") or {}).get("tags")).split(",")]
+    assert "kev" in tags, (
+        "la faille est au catalogue KEV de la CISA depuis le 7 juillet 2026 : "
+        "le marqueur est ce qui permet de la trier avec les autres"
+    )
+
+
+def test_cve_2026_55255_dsl_expressions_can_be_compiled_by_the_engine():
+    """
+    Le message que la sonde fait remonter porte des apostrophes — le handler
+    écrit « Flow with id 'x' not found » — et le moteur d'expressions de nuclei
+    n'a qu'un seul type de littéral de chaîne : une apostrophe à l'intérieur
+    d'un littéral coupe le jeton, et le template est rejeté au chargement avec
+    « Cannot transition token types from STRING to VARIABLE ».
+
+    `nuclei -validate` ne le voit pas. Le contrôle porte donc sur le texte des
+    expressions, où il est déterministe et ne dépend d'aucun binaire.
+    """
+    for matcher in cve_2026_55255_block().get("matchers") or []:
+        if matcher.get("type") != "dsl":
+            continue
+        for expression in matcher.get("dsl") or []:
+            assert "'" not in expression, (
+                "une apostrophe dans une expression dsl empêche le moteur de "
+                f"charger le template, et -validate ne le dit pas : {expression}"
+            )
+
+
+def test_cve_2026_55255_probe_reaches_the_lookup_and_runs_no_flow():
+    """
+    Les deux moitiés de la contrainte.
+
+    Atteindre la recherche non filtrée : seule la branche UUID de
+    get_flow_by_id_or_endpoint_name() est celle que la faille ouvre — la branche
+    endpoint_name, elle, reçoit bien le user_id que openai_responses.py lui
+    passe. Un identifiant qui ne se parse pas en UUID prendrait donc la branche
+    filtrée, et le constat porterait à côté.
+
+    Ne rien exécuter : l'UUID ne doit désigner aucun flux, sans quoi le template
+    ferait tourner celui d'autrui — c'est-à-dire commettrait la faille qu'il
+    signale, appellerait les fournisseurs de modèles et lirait les secrets. Et
+    rien d'autre dans le corps ne doit détourner le handler.
+    """
+    block = cve_2026_55255_block()
+
+    assert block.get("req-condition") is True, (
+        "le template ne lie pas les deux réponses : sans req-condition, la "
+        "borne de version et le constat ne se jugent plus ensemble, et chacun "
+        "seul est insuffisant"
+    )
+
+    methods = dict((route, method) for method, route in cve_2026_55255_requests())
+    assert methods.get(LANGFLOW_RESPONSES) == "POST", (
+        "la route des réponses n'est servie qu'en POST"
+    )
+    assert methods.get(LANGFLOW_VERSION) == "GET", (
+        "la version se lit en GET"
+    )
+
+    for _, route in cve_2026_55255_requests():
+        for forbidden, why in (
+            ("auto_login", "le template appelle /api/v1/auto_login : la route "
+                           "délivre une session de superutilisateur à qui la "
+                           "demande, et elle écrit en base au passage"),
+            ("/run", "le template appelle une route d'exécution de flux : elle "
+                     "fait tourner le flux désigné, ce que ce template a "
+                     "précisément pour objet de ne pas faire"),
+            ("/webhook", "le template déclenche un flux par son webhook"),
+            ("/build", "le template fait construire un flux sur l'instance"),
+            ("validate/code", "le template poste du code à exécuter : c'est "
+                              "l'objet de CVE-2026-0770.yaml, pas de celui-ci"),
+            ("custom_component", "le template instancie un composant, donc "
+                                 "exécute son corps"),
+        ):
+            assert forbidden not in route, why
+
+    sent = cve_2026_55255_posted_request()
+
+    assert set(sent) >= {"model", "input"}, (
+        "le corps ne porte pas les deux champs obligatoires de "
+        f"OpenAIResponsesRequest : {sorted(sent)} — FastAPI rendrait un 422 et "
+        "le handler ne tournerait pas"
+    )
+    assert "tools" not in sent, (
+        "le corps porte « tools » : le handler y répond avant tout le reste par "
+        "« Tools are not supported yet » et la recherche du flux n'a pas lieu"
+    )
+    assert sent.get("stream") in (None, False), (
+        "le corps demande un flux SSE : la réponse cesse d'être une enveloppe "
+        "lisible d'un bloc"
+    )
+    assert not sent.get("background"), (
+        "le corps demande un traitement en arrière-plan"
+    )
+
+    model = sent["model"]
+    assert isinstance(model, str), "« model » n'est pas une chaîne"
+
+    parsed = uuid.UUID(model)
+    assert str(parsed) == model.lower(), (
+        f"« model » n'est pas un UUID canonique ({model!r}) : la branche "
+        "vulnérable est celle qui se parse en UUID, tout le reste part dans la "
+        "branche endpoint_name, qui est filtrée par user_id"
+    )
+
+    # Un UUID que Langflow ne peut pas avoir tiré. uuid4() remplit 122 bits ;
+    # celui-ci les laisse tous à zéro sauf le dernier groupe, qui porte le
+    # marqueur en clair. Ce qui reste — le numéro de version et la variante —
+    # est la forme sous laquelle UUID() l'accepte, rien de plus.
+    assert parsed.version == 4, (
+        f"l'UUID de la sonde n'a pas la forme d'un uuid4 ({model!r}) : Langflow "
+        "tire les siens ainsi, et une forme exotique risque d'être rejetée avant "
+        "d'atteindre le helper"
+    )
+    random_bits = parsed.int & ~((0xF << 76) | (0x3 << 62))
+    assert random_bits < (1 << 48), (
+        f"l'UUID de la sonde porte des bits aléatoires ({model!r}) : rien "
+        "n'exclut alors qu'il désigne un flux réel, et le template exécuterait "
+        "le flux d'autrui"
+    )
+    assert "55255" in model, (
+        f"l'UUID de la sonde ne porte pas l'identifiant de la faille ({model!r}) "
+        ": l'exploitant qui relit ses journaux doit pouvoir séparer la sonde "
+        "d'une tentative — celles observées dans la nature portent des UUID "
+        "récoltés sur l'instance"
+    )
+
+
+def test_cve_2026_55255_matcher_recognises_what_the_handler_itself_returns():
+    """
+    La réponse que le matcher attend n'est pas recopiée d'un avis : elle est
+    produite en faisant passer l'identifiant de la sonde dans la transcription du
+    chemin d'échec du handler. Si quelqu'un changeait la sonde sans changer le
+    matcher, ou l'inverse, ce test tomberait avant eux.
+    """
+    model = cve_2026_55255_posted_request()["model"]
+    body = langflow_flow_not_found_body(model)
+
+    assert model in body, (
+        "le message ne renvoie pas l'identifiant demandé : le handler "
+        "l'interpole pourtant, et c'est ce qui prouve que cette valeur-là est "
+        "descendue dans le helper"
+    )
+    assert cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, langflow_version_body("1.9.0")),
+        responses=(200, body))), (
+        f"le template ne reconnaît pas la réponse que sa propre sonde produit "
+        f"en passant dans le handler : {body}"
+    )
+
+
+# La table des versions, dérivée de la seule chose que l'avis affirme : le
+# correctif est la 1.9.1. Ce qui est en dessous est atteint, ce qui est au-dessus
+# ne l'est plus — y compris 1.10 et 1.11, que toute borne écrite à la main
+# risque de ranger du mauvais côté en comparant « 1.10 » à « 1.9 » caractère par
+# caractère.
+LANGFLOW_RELEASED_VERSIONS = [
+    "0.6.19", "1.0.19", "1.1.4", "1.2.0", "1.3.0", "1.4.2", "1.5.0", "1.6.9",
+    "1.7.0", "1.7.3", "1.8.0", "1.8.4", "1.9.0",
+    "1.9.1", "1.9.2", "1.9.3", "1.9.6", "1.10.0", "1.10.3", "1.11.0", "1.11.1",
+]
+
+
+def version_tuple(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+@pytest.mark.parametrize("version", LANGFLOW_RELEASED_VERSIONS)
+def test_cve_2026_55255_fires_only_below_the_fixed_version(version):
+    """
+    Le test qui porte ce template.
+
+    Le correctif de la 1.9.1 pose un filtre user_id à l'intérieur de
+    get_flow_by_id_or_endpoint_name(). Rien de ce filtre ne traverse la réponse
+    HTTP : sur une 1.9.1 comme sur une 1.9.0, un UUID inconnu rend la même
+    enveloppe d'erreur, sous le même 200. La version lue sur /api/v1/version est
+    donc le seul discriminant, et un template qui ne la bornerait pas
+    signalerait toutes les instances déjà corrigées.
+
+    Le piège est dans la forme de la borne : une comparaison lexicale range
+    « 1.10.0 » en dessous de « 1.9.0 ». Les versions au-dessus du correctif sont
+    ici gardées en table pour que ce cas-là soit couvert.
+    """
+    vulnerable = version_tuple(version) < LANGFLOW_IDOR_FIXED_IN
+
+    assert cve_2026_55255_fires(cve_2026_55255_open_on(version)) is vulnerable, (
+        f"la version {version} est {'atteinte' if vulnerable else 'corrigée'} "
+        f"selon l'avis, et le template dit le contraire — le correctif étant "
+        f"invisible du dehors, c'est la borne de version qui décide seule"
+    )
+
+
+def test_cve_2026_55255_fires_across_distributions_and_intermediaries():
+    assert cve_2026_55255_fires(cve_2026_55255_open_on("1.9.0.dev41",
+                                                      "Langflow Nightly")), (
+        "le template rate les distributions nightly : _get_version_info() les "
+        "nomme « Langflow Nightly » et sépare la version publiée "
+        "« 1.9.0.dev41 » de sa forme normalisée « 1.9.0 », qui est celle sur "
+        "laquelle la borne doit se lire"
+    )
+    assert cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, langflow_version_body("1.8.4", "Langflow Base")),
+        responses=(200, langflow_flow_not_found_body(
+            cve_2026_55255_posted_request()["model"])))), (
+        "le template exige le nom de paquet « Langflow » exact : il raterait "
+        "langflow-base, que _get_version_info() nomme « Langflow Base »"
+    )
+    assert cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, langflow_version_body("1.9.0", indent=2)),
+        responses=(200, langflow_flow_not_found_body(
+            cve_2026_55255_posted_request()["model"], indent=2)))), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindente ce qu'il relaie suffirait à le faire taire, "
+        "or la borne de version se lit sur un couple clé/valeur, donc sur "
+        "l'espace qui les sépare"
+    )
+
+
+def test_cve_2026_55255_stays_silent_when_the_route_refused():
+    model = cve_2026_55255_posted_request()["model"]
+
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, langflow_version_body("1.9.0")),
+        responses=(403, LANGFLOW_AUTO_LOGIN_ERROR_BODY))), (
+        "le template remonte une instance dont la dépendance a refusé : depuis "
+        "la 1.5, AUTO_LOGIN sans LANGFLOW_SKIP_AUTH_AUTO_LOGIN rend 403 et le "
+        "corps de la route n'a jamais tourné"
+    )
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, langflow_version_body("1.9.0")),
+        responses=(403, LANGFLOW_API_KEY_MISSING_BODY))), (
+        "le template remonte une instance qui réclame une clé d'API"
+    )
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, langflow_version_body("1.9.0")),
+        responses=(403, langflow_flow_not_found_body(model)))), (
+        "le template conclut du seul corps : un cache placé devant l'instance "
+        "peut relayer celui qu'il détient sous le statut du refus, alors que le "
+        "serveur, lui, a refusé"
+    )
+
+
+def test_cve_2026_55255_stays_silent_on_what_only_looks_like_the_proof():
+    model = cve_2026_55255_posted_request()["model"]
+    version_body = langflow_version_body("1.9.0")
+
+    # Un mandataire qui renvoie la requête en écho : l'UUID de la sonde y est,
+    # puisque c'est lui qui l'a envoyé, mais rien ne l'a cherché.
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, version_body),
+        responses=(200, json.dumps(cve_2026_55255_posted_request(),
+                                   separators=(",", ":"))))), (
+        "le template déclenche sur un écho de sa propre requête : c'est "
+        "l'enveloppe d'erreur OpenAI qui sépare les deux"
+    )
+
+    # L'enveloppe est là, mais le message nomme un autre identifiant : ce que
+    # rendrait un cache servant l'erreur produite pour un autre appelant. Rien
+    # ne dit alors que la valeur du template soit descendue dans le helper.
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, version_body),
+        responses=(200, langflow_flow_not_found_body(
+            "3f2a1c88-1d0e-4b7a-9c31-6ee2b0d4a915")))), (
+        "le template se contente de l'enveloppe sans vérifier qu'elle renvoie "
+        "l'identifiant qu'il a demandé : une erreur mise en cache pour un autre "
+        "appelant suffirait à le faire conclure"
+    )
+
+    # Cache indexé sur l'hôte et non sur le chemin : il sert la même réponse aux
+    # deux, dans un sens puis dans l'autre.
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, version_body), responses=(200, version_body))), (
+        "le template accepte n'importe quoi en guise de réponse de la route : "
+        "un cache indexé sur l'hôte sert la version aux deux, et la route n'a "
+        "été ni servie ni même interrogée"
+    )
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, langflow_flow_not_found_body(model)),
+        responses=(200, langflow_flow_not_found_body(model)))), (
+        "le template accepte n'importe quoi en guise de version : le même cache "
+        "sert l'erreur aux deux, et rien n'a nommé le produit ni sa version"
+    )
+
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, CAPTIVE_PORTAL_BODY),
+        responses=(200, CAPTIVE_PORTAL_BODY))), (
+        "le template déclenche sur un portail captif qui répond 200 et sa page "
+        "à tout ce qu'on lui demande"
+    )
+    assert not cve_2026_55255_fires(cve_2026_55255_scenario(
+        version=(200, '{"status":"ok"}'),
+        responses=(200, '{"status":"ok"}'))), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+
+def test_cve_2026_55255_extractor_stays_on_the_version_response():
+    routes = [route for _, route in cve_2026_55255_requests()]
+    extractors = cve_2026_55255_block().get("extractors") or []
+
+    assert len(extractors) == 1, (
+        "le template ne remonte pas exactement un renseignement : sous "
+        "req-condition le moteur émet un résultat par extracteur qui rend "
+        "quelque chose, donc la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "l'extracteur ne lit pas le JSON de la version"
+    )
+    assert extractor.get("part") == f"body_{routes.index(LANGFLOW_VERSION) + 1}", (
+        "l'extracteur n'est pas borné à la réponse de la version : sous "
+        "req-condition il serait évalué contre les deux, et la réponse de la "
+        "sonde ne contient que l'écho de l'identifiant envoyé"
+    )
+
+    expressions = extractor.get("json") or []
+    assert expressions, "l'extracteur ne porte aucune expression"
+    for expression in expressions:
+        assert "version" in expression, (
+            f"l'extracteur ne remonte pas la version ({expression!r}) — c'est "
+            "elle qui dit la distance à la 1.9.1, donc s'il s'agit d'une mise à "
+            "jour de retard ou de neuf"
+        )
+
+
+def test_cve_2026_55255_does_not_duplicate_its_neighbour():
+    """
+    Deux templates Langflow dans templates/cves/, et le pack n'a de valeur que
+    s'ils constatent deux choses différentes. CVE-2026-0770 poste du code à
+    /api/v1/validate/code ; celui-ci cherche un flux via /api/v1/responses. Ni
+    l'un ni l'autre ne doit se mettre à interroger la route de l'autre.
+    """
+    ours = {route for _, route in cve_2026_55255_requests()}
+    theirs = {route for _, route in cve_2026_0770_requests()}
+
+    assert LANGFLOW_RESPONSES in ours and LANGFLOW_RESPONSES not in theirs
+    assert LANGFLOW_VALIDATE in theirs and LANGFLOW_VALIDATE not in ours, (
+        "le template poste du code à la route de validation : c'est le constat "
+        "de CVE-2026-0770.yaml, et deux templates qui déclenchent sur la même "
+        "réponse ne font qu'un doublon de plus"
+    )
+
+    assert (load(CVE_2026_55255_TEMPLATE).get("info") or {}).get("severity") \
+        in VALID_SEVERITY
 
 
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")

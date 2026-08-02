@@ -52,7 +52,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 ## CVE sans template amont
 
 - [x] `templates/cves/CVE-2026-0770.yaml` — Langflow, présent au catalogue CISA KEV, aucun template amont. Vérifier l'avis avant d'écrire le matcher.
-- [ ] `templates/cves/CVE-2026-55255.yaml` — Langflow, également au KEV.
+- [x] `templates/cves/CVE-2026-55255.yaml` — Langflow, également au KEV.
 
 ## Outillage du dépôt
 
