@@ -1,0 +1,193 @@
+id: weaviate-anonymous-access
+
+info:
+  name: Weaviate - Anonymous Access Enabled (Unauthenticated Schema Dump)
+  author: popy21
+  severity: high
+  description: |
+    Weaviate n'ouvre pas l'accès anonyme sur un réglage oublié, il y retombe :
+    la dernière ligne de parsing de l'environnement pose
+    « if !config.Authentication.AnyAuthMethodSelected() { config.Authentication
+    = DefaultAuthentication } », et DefaultAuthentication ne contient qu'une
+    chose, AnonymousAccess.Enabled à true. C'est donc l'absence de tout autre
+    schéma qui allume l'anonyme, pas une variable. Le détail se retourne contre
+    l'exploitant qui croit fermer : AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED
+    n'est lu que par entcfg.Enabled, qui ne sait que poser le drapeau à true —
+    le mettre à « false » sans activer par ailleurs les clés d'API ou l'OIDC ne
+    retire rien, le repli s'applique quand même. Le middleware, lui, ne fait pas
+    semblant de garder quoi que ce soit : anonymous.Client.Middleware rend
+    « next » tel quel quand l'anonyme est activé — la pile ne tourne pas avec un
+    garde permissif, elle tourne sans garde du tout — et n'écrit 401 « anonymous
+    access not enabled. Please authenticate through one of the available
+    methods » que dans le cas contraire.
+    Ce middleware étant global — il enveloppe la pile entière, pas une liste de
+    routes — le 200 anonyme de GET /v1/meta suffit à établir le constat : sur
+    une instance fermée, cette route répond 401 comme les autres. C'est aussi
+    la seule qui nomme le produit, son handler assemblant models.Meta, donc
+    hostname, version et modules.
+    GET /v1/schema confirme que l'API répond bien de bout en bout à cette même
+    requête anonyme — un proxy qui n'ouvrirait /v1/meta que pour sa supervision
+    ne la sert pas — et c'est le premier renseignement qu'un tiers lit. Une
+    précision s'impose toutefois sur ce que cette seconde réponse prouve :
+    GetConsistentSchema ne refuse pas, il filtre. ResourceFilter.Filter rend nil
+    dès que l'autorisateur écarte le principal, et getSchema sérialise ce vide
+    en 200 — la branche SchemaDumpForbidden n'est jamais atteinte par cette
+    route. Un dump vide ne distingue donc pas l'instance neuve de celle dont
+    l'autorisation retient tout. Ce que le template rapporte est l'accès anonyme
+    lui-même, et c'est le constat : l'autorisation est facultative et absente
+    par défaut, configureAuthorizer n'installant RBAC ou adminlist que si on les
+    a demandés, et retombant sinon sur DummyAuthorizer, qui accorde tout. Une
+    instance qui n'a rien configuré — celle qu'on trouve oubliée sur un port
+    ouvert — est donc à la fois anonyme et sans restriction aucune.
+  impact: |
+    Le dump du schéma livre d'abord les noms des classes et de leurs propriétés
+    — la nomenclature interne, donc les projets, avant même qu'on lise une
+    ligne — et le moduleConfig de chaque classe, qui nomme le vectoriseur
+    employé. Mais l'énumération n'est que le témoin : la même absence de garde
+    couvre tout le plan de données. GET /v1/objects pagine les objets avec leurs
+    propriétés, et Weaviate y range le texte source en clair à côté du vecteur —
+    le corpus RAG entier, contrats, tickets, documentation interne, ce qui
+    alimente l'assistant, s'extrait page par page, sans inversion ni recherche.
+    POST /v1/graphql le classe par proximité sémantique, donc désigne les
+    passages sensibles sans qu'il faille tout tirer ; et quand la classe est
+    vectorisée par un module hébergé, cette requête fait vectoriser le texte de
+    l'attaquant avec la clé du fournisseur que porte le serveur, aux frais de
+    l'exploitant. Les verbes d'écriture du même plan — POST et PATCH
+    /v1/objects, POST /v1/batch/objects, DELETE /v1/objects/{classe}/{id} —
+    laissent récrire les documents que le modèle citera ensuite comme sources,
+    c'est-à-dire empoisonner les réponses de l'assistant sans jamais toucher au
+    modèle, et DELETE /v1/schema/{classe} emporte la classe avec tous ses
+    objets. POST /v1/backups/{backend} rend le corpus entier en une archive.
+    Enfin la version exacte que sert /v1/meta date l'instance, donc désigne les
+    avis publiés qui la concernent.
+  remediation: |
+    Poser un vrai schéma d'authentification, et non le drapeau anonyme à
+    « false » : c'est l'activation d'AUTHENTICATION_APIKEY_ENABLED — avec
+    AUTHENTICATION_APIKEY_ALLOWED_KEYS et AUTHENTICATION_APIKEY_USERS — ou de
+    l'OIDC qui empêche le repli sur DefaultAuthentication, le drapeau seul ne
+    retirant rien. Une fois la clé posée, contrôler sur GET /v1/meta : le
+    middleware anonyme étant global, c'est la vérification la plus courte, et un
+    200 sans en-tête signifie que le repli s'applique encore. Ne pas se fier en
+    revanche à un GET /v1/schema qui rendrait une liste vide — le dump est
+    filtré et non refusé, donc ce vide dit aussi bien que rien n'est indexé.
+    L'authentification ne suffit d'ailleurs pas à elle seule — une clé unique et
+    partagée n'identifie personne, et tant qu'aucune autorisation n'est demandée
+    c'est DummyAuthorizer qui répond, lequel accorde tout :
+    AUTHORIZATION_RBAC_ENABLED avec AUTHORIZATION_RBAC_ROOT_USERS sur les
+    versions 1.29 et suivantes, ou AUTHORIZATION_ADMINLIST_ENABLED avec ses
+    listes d'administrateurs et de lecteurs sur les antérieures, sont ce qui
+    donne des droits à un porteur plutôt qu'un laissez-passer. Indépendamment de
+    tout cela, ne pas publier 8080 sur un réseau non maîtrisé — ni 50051, le
+    port gRPC, qui dépend des mêmes réglages d'authentification. Après une
+    exposition, considérer le corpus comme lu : les propriétés d'un objet
+    contiennent le texte source en clair. Et comme les verbes d'écriture étaient
+    ouverts au même titre que ceux de lecture, en contrôler le contenu plutôt
+    que de le supposer intact — un objet récrit reste cité comme source par
+    l'assistant qu'il alimente. Contrôler enfin le dépôt de sauvegarde configuré
+    par BACKUP_FILESYSTEM_PATH ou son équivalent objet : une archive que
+    personne n'a demandée est la trace d'une copie du corpus entier.
+  reference:
+    - https://docs.weaviate.io/deploy/configuration/authentication
+    - https://docs.weaviate.io/deploy/configuration/authorization
+    - https://github.com/weaviate/weaviate/blob/main/usecases/config/authentication.go
+    - https://github.com/weaviate/weaviate/blob/main/usecases/config/environment.go
+    - https://github.com/weaviate/weaviate/blob/main/usecases/auth/authentication/anonymous/middleware.go
+    - https://github.com/weaviate/weaviate/blob/main/usecases/auth/authorization/adminlist/authorizer.go
+    - https://github.com/weaviate/weaviate/blob/main/adapters/handlers/rest/handlers_misc.go
+    - https://github.com/weaviate/weaviate/blob/main/adapters/handlers/rest/handlers_schema.go
+  metadata:
+    max-request: 2
+    vendor: weaviate
+    product: weaviate
+  tags: ai,vectordb,weaviate,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /v1/meta est la route qui nomme le produit — models.Meta porte hostname,
+  # version et modules, et le champ Modules reçoit toujours une carte non nulle,
+  # GetMeta l'initialisant avant de la remplir, donc la clé est sérialisée même
+  # quand aucun module n'est activé. C'est aussi elle qui prouve : le middleware
+  # anonyme est global, il enveloppe la pile entière plutôt qu'une liste de
+  # routes, donc une instance fermée rend 401 ici comme partout ailleurs. Ce
+  # n'est pas la bannière épargnée par une liste blanche qu'on trouve chez
+  # Qdrant — c'est une route gardée comme les autres, qui répond quand même.
+  #
+  # GET /v1/schema est ce que lit d'abord un tiers, et il confirme que l'API
+  # répond bien de bout en bout à la même requête anonyme : un proxy qui
+  # n'ouvrirait /v1/meta que pour sa supervision ne sert pas le dump. Il ne
+  # prouve en revanche rien de l'autorisation, et le template ne le lui demande
+  # pas — GetConsistentSchema ne refuse pas, il filtre, ResourceFilter.Filter
+  # rendant nil dès que l'autorisateur écarte le principal, et getSchema
+  # sérialisant ce vide en 200. La branche SchemaDumpForbidden n'est jamais
+  # atteinte par cette route, donc un dump vide ne sépare pas l'instance neuve
+  # de celle dont l'autorisation retient tout. Exiger une classe pour trancher
+  # raterait exactement l'instance qu'on trouve oubliée sur un port ouvert, et
+  # l'accès anonyme suffit au constat : tant que ni RBAC ni adminlist ne sont
+  # demandés, configureAuthorizer installe DummyAuthorizer, qui accorde tout.
+  #
+  # En lecture seule, et strictement : le même préfixe sert /v1/objects, qui
+  # rendrait les propriétés — donc le texte source en clair — /v1/graphql, qui
+  # classerait le corpus par proximité sémantique et ferait au passage vectoriser
+  # la requête avec la clé du fournisseur que porte le serveur, /v1/batch/objects
+  # et DELETE /v1/schema/{classe}, qui toucheraient au corpus, et
+  # /v1/backups/{backend}, qui écrirait l'archive de tout. Signaler une
+  # exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/meta"
+      - "{{BaseURL}}/v1/schema"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, /v1/meta conclurait seul — or il ne
+    # dit rien de l'autorisation.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Les trois clés de models.Meta, vérifiées sans leur valeur : hostname
+          # vaut « http://[::]:8080 » par défaut mais suit --host et --port, et
+          # version change à chaque publication. Sans les deux-points non plus,
+          # pour qu'un intermédiaire qui réindente ce qu'il relaie ne mette pas le
+          # matcher en défaut. grpcMaxMessageSize est délibérément absent de la
+          # liste : le champ est omitempty et n'existe que depuis les versions
+          # récentes, l'exiger raterait précisément les instances anciennes qui
+          # traînent exposées.
+          # Un 401 du middleware anonyme ne porte que code et message, donc ne
+          # satisfait aucune de ces trois clés : le statut n'a pas à être répété.
+          - 'contains(body_1, "\"hostname\"") && contains(body_1, "\"modules\"") && contains(body_1, "\"version\"")'
+
+          # Le dump a répondu, et n'a pas été refusé — un proxy peut n'ouvrir
+          # /v1/meta qu'à sa supervision et garder tout le reste. Les refus
+          # qu'on sait modéliser sont déjà écartés par la clé attendue plus bas,
+          # aucun corps d'erreur ne la portant ; cette ligne dit néanmoins autre
+          # chose que celle-là, et c'est elle qui tiendrait face à un
+          # intermédiaire qui relaierait un corps en cache sous un statut de
+          # refus. Elle est gardée à ce titre.
+          - "status_code_2 == 200"
+
+          # models.Schema.Classes n'est pas omitempty : la clé est sérialisée même
+          # sur une instance neuve, où le dump vaut {"classes":[]}. Exiger un nom
+          # de classe raterait exactement l'instance qu'on trouve oubliée sur un
+          # port ouvert ; la clé, elle, écarte le portail captif ou le proxy qui
+          # répondrait 200 et une page HTML à tout ce qu'on lui demande, et le
+          # service qui se contenterait de renvoyer /v1/meta sur les deux chemins.
+          - 'contains(body_2, "\"classes\"")'
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses classes : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire.
+      # Un seul extracteur, et c'est délibéré : sous req-condition, le moteur
+      # évalue les extracteurs contre chacune des deux réponses et émet un
+      # résultat par extracteur qui rend quelque chose. En ajouter un second sur
+      # la version ferait remonter deux fois la même instance dans le rapport de
+      # scan — et la version se lit de toute façon sur /v1/meta, que
+      # l'autorisation soit posée ou non ; elle ne fait pas partie du constat.
+      - type: json
+        part: body
+        name: class
+        json:
+          - '.classes[].class'

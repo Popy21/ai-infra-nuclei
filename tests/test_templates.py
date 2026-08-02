@@ -2639,6 +2639,457 @@ def test_qdrant_matcher_needs_the_guarded_index_not_the_whitelisted_banner():
     )
 
 
+# --------------------------------------------------------------------------
+# Weaviate inverse la structure des deux templates précédents. Chez ChromaDB et
+# Qdrant, la route qui nomme le produit échappe à l'authentification, et c'est
+# une seconde route qui porte la preuve. Ici le middleware anonyme est global —
+# anonymous.Client.Middleware enveloppe la pile entière et rend « next » tel quel
+# quand l'anonyme est activé — donc GET /v1/meta est gardé comme le reste et son
+# 200 est déjà le constat.
+#
+# Le piège est ailleurs, et il est de bonne foi : on attendrait de GET /v1/schema
+# qu'il refuse en 403 quand l'autorisation écarte l'anonyme, puisque getSchema
+# prévoit une branche SchemaDumpForbidden. Elle n'est jamais atteinte par cette
+# route — GetConsistentSchema n'appelle pas Authorize, il passe par
+# ResourceFilter.Filter, qui rend nil quand le principal est écarté, et ce vide
+# est sérialisé en 200. Un dump vide ne distingue donc pas l'instance neuve de
+# l'instance restreinte, et un template qui exigerait une classe pour trancher
+# raterait précisément celle qu'on trouve oubliée sur un port ouvert. Ces tests
+# fixent ce que le template prouve — l'accès anonyme — et ce qu'il ne prétend pas
+# prouver.
+
+WEAVIATE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "weaviate-anonymous-access.yaml")
+
+WEAVIATE_META = "/v1/meta"
+WEAVIATE_SCHEMA = "/v1/schema"
+
+# models.Meta sérialisé par go-swagger : les champs sortent dans l'ordre du
+# struct, donc alphabétique. grpcMaxMessageSize n'existe que sur les versions
+# récentes.
+WEAVIATE_META_BODY = (
+    '{"grpcMaxMessageSize":104858000,"hostname":"http://[::]:8080",'
+    '"modules":{"text2vec-openai":{"documentationHref":'
+    '"https://platform.openai.com/docs/guides/embeddings",'
+    '"name":"OpenAI Module"},"generative-openai":{"documentationHref":'
+    '"https://platform.openai.com/docs/api-reference/completions",'
+    '"name":"Generative Search - OpenAI"}},"version":"1.34.2"}'
+)
+
+# Même route sur une instance antérieure à l'ajout de grpcMaxMessageSize, et sans
+# aucun module activé : GetMeta initialise la carte avant de la remplir, donc la
+# clé est sérialisée vide plutôt qu'omise. Le template doit toujours reconnaître
+# celle-ci — ce sont les instances anciennes qui traînent exposées.
+WEAVIATE_OLD_META_BODY = (
+    '{"hostname":"http://[::]:8080","modules":{},"version":"1.19.6"}'
+)
+
+# Le dump du schéma d'une instance qui sert un corpus.
+WEAVIATE_SCHEMA_BODY = (
+    '{"classes":[{"class":"SupportRag","description":"Base de connaissance",'
+    '"vectorizer":"text2vec-openai","vectorIndexType":"hnsw",'
+    '"moduleConfig":{"text2vec-openai":{"model":"text-embedding-3-small",'
+    '"vectorizeClassName":true}},'
+    '"properties":[{"name":"contenu","dataType":["text"]},'
+    '{"name":"source","dataType":["text"]}]},'
+    '{"class":"Contrats2026","vectorizer":"text2vec-openai",'
+    '"properties":[{"name":"texte","dataType":["text"]}]}]}'
+)
+
+# La même route sur une instance qui vient d'être lancée : aucune classe n'a
+# encore été créée. Classes n'étant pas omitempty, la clé reste sérialisée.
+WEAVIATE_EMPTY_SCHEMA_BODY = '{"classes":[]}'
+
+# Ce qu'écrit anonymous.Client.Middleware quand l'anonyme est coupé et qu'aucun
+# jeton n'est présenté — noter l'espace après "message", le corps étant assemblé
+# à la main par un Sprintf plutôt que sérialisé.
+WEAVIATE_ANON_DISABLED_BODY = (
+    '{"code":401,"message": "anonymous access not enabled. Please authenticate '
+    'through one of the available methods: [API-keys]" }'
+)
+
+# Ce que rend le dump quand l'autorisateur écarte le principal alors que le RBAC
+# n'est pas actif : ResourceFilter.Filter fait « return nil » sur l'échec du seul
+# Authorize qu'il tente, et une tranche nulle se sérialise en null — Classes
+# n'étant pas omitempty, la clé reste écrite.
+WEAVIATE_FILTERED_NULL_SCHEMA_BODY = '{"classes":null}'
+
+
+def weaviate_scenario(meta, schema):
+    return {WEAVIATE_META: meta, WEAVIATE_SCHEMA: schema}
+
+
+# Instance servant un corpus, sans aucun schéma d'authentification configuré :
+# le repli sur DefaultAuthentication a allumé l'anonyme.
+WEAVIATE_OPEN = weaviate_scenario(
+    meta=(200, WEAVIATE_META_BODY),
+    schema=(200, WEAVIATE_SCHEMA_BODY),
+)
+
+# La même au lendemain de son démarrage : le schéma est vide. C'est celle qu'on
+# trouve oubliée sur un port ouvert, et elle doit remonter.
+WEAVIATE_OPEN_IDLE = weaviate_scenario(
+    meta=(200, WEAVIATE_META_BODY),
+    schema=(200, WEAVIATE_EMPTY_SCHEMA_BODY),
+)
+
+# Une version antérieure, sans grpcMaxMessageSize ni module activé.
+WEAVIATE_OPEN_OLD = weaviate_scenario(
+    meta=(200, WEAVIATE_OLD_META_BODY),
+    schema=(200, WEAVIATE_SCHEMA_BODY),
+)
+
+# Un intermédiaire réindente ce qu'il relaie : le corps n'est plus compact et les
+# deux-points ne touchent plus les clés.
+WEAVIATE_OPEN_REFORMATTED = weaviate_scenario(
+    meta=(200, '{\n  "hostname": "http://[::]:8080",\n  "modules": {},\n'
+               '  "version": "1.34.2"\n}'),
+    schema=(200, '\n{\n  "classes": [\n    {\n'
+                 '      "class": "SupportRag"\n    }\n  ]\n}\n'),
+)
+
+# AUTHENTICATION_APIKEY_ENABLED posé : le repli ne s'applique plus, le middleware
+# anonyme refuse tout ce qui n'a pas de jeton — /v1/meta compris.
+WEAVIATE_ANONYMOUS_DISABLED = weaviate_scenario(
+    meta=(401, WEAVIATE_ANON_DISABLED_BODY),
+    schema=(401, WEAVIATE_ANON_DISABLED_BODY),
+)
+
+# L'anonyme est authentifié, mais AUTHORIZATION_ADMINLIST_ENABLED ne l'inscrit
+# sur aucune de ses deux listes. Le dump n'est pas refusé pour autant : Filter
+# rend nil et le serveur répond 200 null.
+WEAVIATE_ADMINLIST_RESTRICTED = weaviate_scenario(
+    meta=(200, WEAVIATE_META_BODY),
+    schema=(200, WEAVIATE_FILTERED_NULL_SCHEMA_BODY),
+)
+
+# Même situation sous le RBAC des versions 1.29 et suivantes : le principal
+# anonyme n'a aucun rôle. La branche RBAC de Filter construit une tranche vide
+# plutôt que nulle, donc le corps est indiscernable de celui d'une instance
+# neuve.
+WEAVIATE_RBAC_RESTRICTED = weaviate_scenario(
+    meta=(200, WEAVIATE_META_BODY),
+    schema=(200, WEAVIATE_EMPTY_SCHEMA_BODY),
+)
+
+# Un proxy réglé pour tout garder, /v1/meta compris.
+WEAVIATE_BEHIND_AUTH_PROXY = weaviate_scenario(
+    meta=(401, "Unauthorized"),
+    schema=(401, "Unauthorized"),
+)
+
+# Un proxy qui n'ouvre /v1/meta qu'à sa supervision et exige une
+# authentification sur tout le reste : la bannière répond, le dump non.
+WEAVIATE_BEHIND_PARTIAL_PROXY = weaviate_scenario(
+    meta=(200, WEAVIATE_META_BODY),
+    schema=(401, "Unauthorized"),
+)
+
+# Portail captif devant une vraie instance : il laisse filer /v1/meta et répond
+# 200 au dump, mais avec sa page de connexion.
+WEAVIATE_BEHIND_CAPTIVE_PORTAL = weaviate_scenario(
+    meta=(200, WEAVIATE_META_BODY),
+    schema=(200, "<html><body>Connexion requise</body></html>"),
+)
+
+# Un proxy qui sert /v1/meta sur tout ce qu'on lui demande : la bannière est
+# authentique, mais le dump n'a jamais répondu.
+WEAVIATE_META_MIRRORED = weaviate_scenario(
+    meta=(200, WEAVIATE_META_BODY),
+    schema=(200, WEAVIATE_META_BODY),
+)
+
+# Une sonde de supervision quelconque : un hôte, une version, une liste de
+# modules chargés. Ces trois clés sont exactement celles de /v1/meta, et elles
+# n'appartiennent à personne — seul le dump du schéma l'en sépare.
+OTHER_AGENT_META_BODY = (
+    '{"hostname":"gpu-node-04","version":"2.4.1",'
+    '"modules":["cpu","mem","nvidia"],"uptime":918273}'
+)
+
+OTHER_MONITORING_AGENT = weaviate_scenario(
+    meta=(200, OTHER_AGENT_META_BODY),
+    schema=(404, '{"error":"not found"}'),
+)
+
+# Le pire de ce genre : la même sonde derrière un routeur qui lui renvoie tout,
+# donc elle satisfait le premier chemin sur les deux.
+OTHER_MONITORING_AGENT_MIRRORED = weaviate_scenario(
+    meta=(200, OTHER_AGENT_META_BODY),
+    schema=(200, OTHER_AGENT_META_BODY),
+)
+
+# Un serveur quelconque qui répond 200 à tout ce qu'on lui demande.
+OTHER_SERVER_ALWAYS_UP = weaviate_scenario(
+    meta=(200, '{"status":"ok"}'),
+    schema=(200, '{"status":"ok"}'),
+)
+
+# Les trois qui suivent partagent le même piège, et c'est le plus sérieux du
+# lot : « classes » n'appartient pas à Weaviate. Un service d'ontologie, un
+# registre de schémas, un annuaire de formations en servent tous une liste, et
+# rien n'empêche qu'ils la publient sous /v1/schema. Ce qui les écarte n'est donc
+# pas le second chemin mais le premier — les trois clés de models.Meta réunies.
+# Chacun de ces corps en porte deux sur trois, de sorte qu'aucun des trois termes
+# de la signature ne peut être retiré sans qu'un de ces services remonte.
+
+# Un service de taxonomie : il se décrit par un nom et une version.
+OTHER_ONTOLOGY_SERVICE = weaviate_scenario(
+    meta=(200, '{"service":"taxonomy-api","version":"3.2.0","build":"9f3c1ab"}'),
+    schema=(200, '{"classes":["Person","Organisation"],'
+                 '"properties":["name","memberOf"]}'),
+)
+
+# Un registre de schémas qui nomme son hôte et sa version, sans notion de module.
+OTHER_SCHEMA_REGISTRY = weaviate_scenario(
+    meta=(200, '{"hostname":"registry-02.corp.internal","version":"7.1.4",'
+               '"uptime":918273}'),
+    schema=(200, '{"classes":[{"name":"Invoice","namespace":"billing"}]}'),
+)
+
+# Un hôte d'extensions qui énumère ses modules et sa version, sans nommer sa
+# machine, et dont le registre de types est encore vide.
+OTHER_PLUGIN_HOST = weaviate_scenario(
+    meta=(200, '{"version":"2.0.1","modules":{"auth":{"enabled":true},'
+               '"billing":{"enabled":false}},"env":"prod"}'),
+    schema=(200, '{"classes":[]}'),
+)
+
+# Une page d'état applicative : elle nomme sa machine et les modules qu'elle a
+# chargés, mais ne publie pas de version.
+OTHER_RUNTIME_STATUS = weaviate_scenario(
+    meta=(200, '{"hostname":"app-07.corp.internal","node":"app@app-07",'
+               '"modules":{"cache":"running","queue":"running"},"pid":4412}'),
+    schema=(200, '{"classes":[{"name":"Invoice"},{"name":"Customer"}]}'),
+)
+
+
+def weaviate_block():
+    doc = load(WEAVIATE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(WEAVIATE_SCHEMA) for p in (b.get("path") or []))]
+    assert blocks, (
+        "le template n'interroge pas GET /v1/schema — c'est pourtant la seule "
+        "route du constat, /v1/meta n'appelant aucun autorisateur et répondant "
+        "donc encore sur une instance dont l'anonyme n'a aucun droit"
+    )
+    return blocks[0]
+
+
+def weaviate_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in weaviate_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que Weaviate ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def weaviate_fires(scenario):
+    block = weaviate_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = weaviate_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_weaviate_probe_only_reads_and_never_touches_the_data_plane():
+    doc = load(WEAVIATE_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "le dump du schéma se lit en GET : le template ne doit rien envoyer "
+            "à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/objects", "le template appelle /v1/objects, qui rend les "
+                             "propriétés des objets : Weaviate y range le texte "
+                             "source en clair, donc le template exfiltrerait le "
+                             "corpus qu'il signale"),
+                ("/graphql", "le template appelle /v1/graphql : il ferait classer "
+                             "le corpus par proximité sémantique, et sur une "
+                             "classe vectorisée par un module hébergé il ferait "
+                             "au passage vectoriser sa requête avec la clé du "
+                             "fournisseur, aux frais de l'exploitant"),
+                ("/batch", "le template écrit en masse dans l'instance qu'il "
+                           "audite"),
+                ("/backups", "le template déclenche une sauvegarde, donc écrit "
+                             "sur le disque de l'hôte audité l'archive du corpus "
+                             "entier"),
+                ("/classifications", "le template lance une classification, qui "
+                                     "récrit les objets de l'instance qu'il "
+                                     "audite"),
+            ):
+                assert forbidden not in path, why
+
+        # Le dump se lit sur /v1/schema tout court : le même chemin suffixé d'un
+        # nom de classe accepte DELETE, qui emporte la classe et tous ses objets.
+        for path in (block.get("path") or []):
+            route = path.replace("{{BaseURL}}", "")
+            assert not route.startswith(WEAVIATE_SCHEMA + "/"), (
+                f"le template vise une classe nommée ({route}) plutôt que le "
+                "dump : c'est le préfixe dont le verbe DELETE emporte la classe "
+                "et tous ses objets"
+            )
+
+
+def test_weaviate_probe_links_the_unauthorized_meta_to_the_authorized_schema():
+    block = weaviate_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+
+    assert WEAVIATE_META in paths, (
+        "le template n'interroge pas GET /v1/meta — c'est la seule route qui "
+        "nomme le produit, le dump du schéma étant vide sur une instance neuve"
+    )
+    assert WEAVIATE_SCHEMA in paths, (
+        "le template n'interroge pas GET /v1/schema, la seule route dont le 200 "
+        "anonyme prouve que l'autorisation elle aussi laisse passer"
+    )
+    assert block.get("req-condition") is True, (
+        "sans req-condition, les deux réponses ne peuvent pas être liées : "
+        "/v1/meta conclurait seul, or son handler n'appelle aucun autorisateur"
+    )
+
+    # Sous req-condition, le moteur évalue les extracteurs contre chacune des
+    # deux réponses et émet un résultat par extracteur qui rend quelque chose :
+    # deux extracteurs feraient remonter deux fois la même instance.
+    assert len(block.get("extractors") or []) <= 1, (
+        "le template porte plus d'un extracteur : sous req-condition, chacun "
+        "rendant quelque chose ajoute un résultat, donc la même instance est "
+        "signalée plusieurs fois dans un rapport de scan"
+    )
+
+
+def test_weaviate_matcher_needs_the_authorized_dump_not_just_the_meta_route():
+    assert weaviate_fires(WEAVIATE_OPEN), (
+        "le template ne reconnaît pas une instance dont GET /v1/schema répond à "
+        "l'anonyme"
+    )
+    assert weaviate_fires(WEAVIATE_OPEN_IDLE), (
+        "le template exige une classe dans le dump : il raterait l'instance qui "
+        "vient d'être lancée, précisément celle qu'on trouve oubliée sur un port "
+        "ouvert"
+    )
+    assert weaviate_fires(WEAVIATE_OPEN_OLD), (
+        "le template exige des clés absentes des versions plus anciennes — "
+        "grpcMaxMessageSize est omitempty et n'a été ajouté que tard, et modules "
+        "est sérialisé vide quand aucun n'est activé — il raterait les instances "
+        "qui traînent exposées"
+    )
+    assert weaviate_fires(WEAVIATE_OPEN_REFORMATTED), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not weaviate_fires(WEAVIATE_ANONYMOUS_DISABLED), (
+        "le template déclenche sur une instance dont un autre schéma "
+        "d'authentification est configuré : le repli sur DefaultAuthentication ne "
+        "s'applique plus et le middleware anonyme refuse tout"
+    )
+    assert not weaviate_fires(WEAVIATE_BEHIND_AUTH_PROXY), (
+        "le template déclenche sur une instance entièrement gardée"
+    )
+    assert not weaviate_fires(WEAVIATE_BEHIND_PARTIAL_PROXY), (
+        "le template conclut de la seule bannière : un proxy peut n'ouvrir "
+        "/v1/meta qu'à sa supervision et garder tout le reste, auquel cas l'API "
+        "n'est pas atteignable — c'est le statut du second chemin qui l'établit"
+    )
+    assert not weaviate_fires(WEAVIATE_BEHIND_CAPTIVE_PORTAL), (
+        "le template accepte une page HTML en guise de dump : un portail captif "
+        "qui répond 200 suffirait à le faire remonter"
+    )
+    assert not weaviate_fires(WEAVIATE_META_MIRRORED), (
+        "le template conclut d'un /v1/meta servi sur les deux chemins : le dump "
+        "n'a jamais répondu, rien ne prouve qu'il répondrait"
+    )
+    assert not weaviate_fires(OTHER_MONITORING_AGENT), (
+        "le template déclenche sur une sonde de supervision qui n'est pas "
+        "Weaviate : hostname, version et modules sont les trois clés qu'écrirait "
+        "n'importe quel agent décrivant sa machine"
+    )
+    assert not weaviate_fires(OTHER_MONITORING_AGENT_MIRRORED), (
+        "le template déclenche sur la même sonde derrière un routeur qui lui "
+        "renvoie tout : elle satisfait le premier chemin sur les deux, seul le "
+        "dump du schéma l'en sépare"
+    )
+    assert not weaviate_fires(OTHER_SERVER_ALWAYS_UP), (
+        "le template déclenche sur un serveur quelconque répondant 200 à tout"
+    )
+
+    # « classes » est un mot banal : ce sont les trois clés de models.Meta,
+    # réunies, qui désignent le produit. Chacun de ces services en porte deux,
+    # donc chacun remonterait si l'une des trois était retirée de la signature.
+    assert not weaviate_fires(OTHER_ONTOLOGY_SERVICE), (
+        "le template déclenche sur un service de taxonomie qui publie ses "
+        "classes sous /v1/schema : une version ne désigne aucun produit"
+    )
+    assert not weaviate_fires(OTHER_SCHEMA_REGISTRY), (
+        "le template déclenche sur un registre de schémas qui nomme son hôte et "
+        "sa version : sans « modules », la signature n'est plus celle de "
+        "models.Meta"
+    )
+    assert not weaviate_fires(OTHER_PLUGIN_HOST), (
+        "le template déclenche sur un hôte d'extensions qui énumère ses modules "
+        "et sa version : sans « hostname », la signature n'est plus celle de "
+        "models.Meta"
+    )
+    assert not weaviate_fires(OTHER_RUNTIME_STATUS), (
+        "le template déclenche sur une page d'état qui nomme sa machine et ses "
+        "modules : sans « version », la signature n'est plus celle de models.Meta"
+    )
+
+
+def test_weaviate_reports_anonymous_access_and_claims_nothing_of_authorization():
+    """
+    La frontière que le template revendique, fixée dans les deux sens.
+
+    Une instance dont l'anonyme est authentifié mais dont l'autorisation ne lui
+    accorde rien remonte quand même, et c'est délibéré : le dump n'est pas
+    refusé mais filtré, donc son vide est indiscernable de celui d'une instance
+    neuve — sous RBAC, Filter construit une tranche vide, exactement le corps
+    d'un serveur qui n'a rien indexé. Trancher demanderait d'exiger une classe,
+    ce qui reviendrait à ne plus voir l'instance oubliée sur un port ouvert.
+
+    Le constat rapporté est donc l'accès anonyme lui-même, ce qui se tient :
+    l'autorisation est facultative et absente par défaut, configureAuthorizer
+    retombant sur DummyAuthorizer, qui accorde tout. Ce test existe pour que ce
+    choix reste un choix — si quelqu'un resserre le matcher au point de rejeter
+    ces deux scénarios, il aura du même coup rendu le template aveugle à
+    l'instance neuve, et c'est ici qu'il doit s'en apercevoir.
+    """
+    assert weaviate_fires(WEAVIATE_ADMINLIST_RESTRICTED), (
+        "le template ne remonte pas une instance dont l'anonyme est authentifié "
+        "et dont le dump rend 200 null : le corps est celui qu'écrit Filter en "
+        "écartant le principal, mais rien ne le distingue d'un serveur dont la "
+        "tranche de classes est nulle faute de classe"
+    )
+    assert weaviate_fires(WEAVIATE_RBAC_RESTRICTED), (
+        "le template ne remonte pas une instance sous RBAC dont l'anonyme n'a "
+        "aucun rôle : son dump rend 200 et une liste vide, soit exactement le "
+        "corps d'une instance neuve — le rejeter reviendrait à rater cette "
+        "dernière"
+    )
+
+    # La contrepartie de ce choix : ces deux corps doivent rester ceux d'une
+    # instance neuve, sans quoi le raisonnement ci-dessus ne tient plus.
+    assert WEAVIATE_EMPTY_SCHEMA_BODY in (
+        WEAVIATE_RBAC_RESTRICTED[WEAVIATE_SCHEMA][1],
+        WEAVIATE_FILTERED_NULL_SCHEMA_BODY,
+    ), "le scénario RBAC ne modélise plus le corps d'un dump filtré à vide"
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
