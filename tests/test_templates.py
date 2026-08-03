@@ -133,6 +133,146 @@ def test_description_impact_remediation_are_substantive(path):
 
 
 # --------------------------------------------------------------------------
+# Un produit, un constat. Deux templates qui interrogent les mêmes routes du
+# même produit déclenchent sur la même réponse : le rapport porte alors deux
+# lignes pour un seul fait, et la seconde ne renseigne personne. Le pack tient
+# déjà deux paires — les deux templates Ollama, les deux CVE Langflow — et
+# elles valent parce que chacun garde une route que l'autre n'interroge pas :
+# POST /api/pull contre GET /api/tags, POST /api/v1/validate/code contre POST
+# /api/v1/responses. Une route peut donc être commune — les deux CVE Langflow
+# lisent toutes deux /api/v1/version pour dater l'instance — mais elle ne peut
+# pas être tout ce que les deux ont. C'est cette règle que la suite vérifie ici
+# sur toutes les paires du pack, plutôt qu'à la main sur celle qu'on a en tête.
+
+URL_PLACEHOLDER = re.compile(r"^\{\{[^}]*\}\}")
+
+
+def normalise_route(method, target):
+    """
+    Rend le couple (méthode, chemin) d'une requête, hôte retiré.
+
+    `{{BaseURL}}` et `{{RootURL}}` nomment la cible, pas l'endpoint. La barre
+    finale, elle, appartient au produit — Django sert `/version/` là où FastAPI
+    sert `/version` — mais elle ne sépare pas deux routes d'un même produit :
+    deux templates qui écriraient la même à la barre près resteraient deux fois
+    la même.
+    """
+    target = URL_PLACEHOLDER.sub("", str(target).strip())
+    if not target.startswith("/"):
+        target = "/" + target
+    return str(method or "GET").upper(), target.rstrip("/") or "/"
+
+
+def request_routes(doc):
+    """
+    Les routes qu'un template interroge.
+
+    Les deux écritures du pack désignent les mêmes endpoints et doivent donc se
+    lire pareil : sous `path` la méthode est portée par le bloc et vaut GET par
+    défaut, sous `raw` chaque requête porte la sienne sur sa ligne de commande.
+    """
+    found = set()
+    for block in doc.get("http") or []:
+        for target in block.get("path") or []:
+            found.add(normalise_route(block.get("method"), target))
+        for raw in block.get("raw") or []:
+            start_line = raw.strip().splitlines()[0].split()
+            assert len(start_line) >= 2, f"requête brute illisible : {raw!r}"
+            found.add(normalise_route(start_line[0], start_line[1]))
+    return found
+
+
+def distinguishable(ours, theirs):
+    """Chacun des deux interroge-t-il une route que l'autre ignore ?"""
+    return bool(ours - theirs) and bool(theirs - ours)
+
+
+def test_no_two_templates_of_a_product_rest_on_the_same_endpoints():
+    """
+    Le couple (endpoint, produit) est ce qui identifie un constat : deux
+    templates ne peuvent pas le partager, sans quoi le second ne fait que
+    redire le premier sur la même réponse.
+    """
+    by_product = {}
+    for path in ALL:
+        doc = load(path)
+        product = ((doc.get("info") or {}).get("metadata") or {}).get("product")
+        assert product, (
+            "info.metadata.product manquant : rien ne dit alors de quel produit "
+            "le template parle, et le couple (endpoint, produit) ne peut pas "
+            f"être vérifié — {rel(path)}"
+        )
+        routes = request_routes(doc)
+        assert routes, (
+            "aucune requête HTTP lisible : le lecteur ne connaît que `path` et "
+            "`raw`, et un template dont il ne tire rien traverserait la "
+            f"vérification sans être vérifié — {rel(path)}"
+        )
+        by_product.setdefault(product, []).append((rel(path), routes))
+
+    for product, templates in sorted(by_product.items()):
+        for index, (ours, our_routes) in enumerate(templates):
+            for theirs, their_routes in templates[index + 1:]:
+                assert distinguishable(our_routes, their_routes), (
+                    f"{ours} et {theirs} couvrent {product} et aucun des deux "
+                    "n'interroge de route que l'autre ignore : "
+                    f"{sorted(our_routes)} contre {sorted(their_routes)}. Les "
+                    "deux déclenchent sur la même réponse, et deux lignes pour "
+                    "un seul fait n'en disent pas plus qu'une"
+                )
+
+
+# Les deux écritures d'une même requête, telles qu'elles cohabitent dans le
+# pack : `path` quand le bloc n'a qu'une méthode, `raw` quand elles diffèrent.
+# Un doublon peut très bien s'écrire de l'autre façon que celui qu'il double.
+DUPLICATE_UNDER_PATH = {"http": [{"path": ["{{BaseURL}}/api/v1/version",
+                                           "{{BaseURL}}/api/v1/flows"]}]}
+DUPLICATE_UNDER_RAW = {"http": [{"raw": [
+    "GET /api/v1/version HTTP/1.1\nHost: {{Hostname}}\n\n",
+    "GET /api/v1/flows/ HTTP/1.1\nHost: {{Hostname}}\n\n",
+]}]}
+
+
+def test_the_endpoint_reader_reads_both_writings_alike():
+    expected = {("GET", "/api/v1/version"), ("GET", "/api/v1/flows")}
+    assert request_routes(DUPLICATE_UNDER_PATH) == expected, (
+        "un bloc `path` sans méthode ne se lit pas comme le GET que nuclei "
+        f"émet — {sorted(request_routes(DUPLICATE_UNDER_PATH))}"
+    )
+    assert request_routes(DUPLICATE_UNDER_RAW) == expected, (
+        "un doublon écrit en `raw` passerait devant celui qu'il double, écrit "
+        f"en `path` — {sorted(request_routes(DUPLICATE_UNDER_RAW))}"
+    )
+
+
+def test_the_endpoint_check_refuses_a_duplicate_and_admits_a_route_in_common():
+    """
+    La vérification ne dit quelque chose que si elle sait refuser. Le doublon :
+    les mêmes routes des deux côtés, à l'écriture près. L'inclusion : tout ce
+    que l'un interroge, l'autre l'interroge déjà. Et la forme que le pack
+    admet, celle des deux CVE Langflow — une route en commun, mais chacun la
+    sienne par ailleurs.
+    """
+    ours = request_routes(DUPLICATE_UNDER_PATH)
+    theirs = request_routes(DUPLICATE_UNDER_RAW)
+    assert not distinguishable(ours, theirs), (
+        "deux templates qui interrogent les mêmes routes ne sont pas vus"
+    )
+
+    assert not distinguishable(ours, ours | {("POST", "/api/v1/run")}), (
+        "un template dont l'autre interroge déjà toutes les routes n'est pas vu"
+    )
+
+    assert distinguishable(
+        {("GET", "/api/v1/version"), ("POST", "/api/v1/validate/code")},
+        {("GET", "/api/v1/version"), ("POST", "/api/v1/responses")},
+    ), (
+        "la vérification refuse la paire Langflow : elle interdirait la route "
+        "de corroboration partagée, qui n'est pas le constat"
+    )
+
+
+# --------------------------------------------------------------------------
 # Endpoint partagé : plusieurs runtimes parlent le protocole OpenAI et servent
 # tous GET /v1/models. Un matcher qui se contente de la forme générique
 # {"object":"list","data":[...]} déclenche sur tous à la fois. Ces deux corps
