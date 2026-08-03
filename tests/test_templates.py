@@ -7188,6 +7188,405 @@ def test_cve_2026_55255_does_not_duplicate_its_neighbour():
         in VALID_SEVERITY
 
 
+# --------------------------------------------------------------------------
+# Label Studio pose une difficulté que le pack n'avait pas encore rencontrée :
+# la page qui porte le constat est servie identique des deux côtés de la
+# frontière. Le contrôle de user_signup est posé sur la seule branche POST —
+# « if settings.DISABLE_SIGNUP_WITHOUT_LINK is True: ... raise PermissionDenied() » —
+# donc l'instance fermée rend le formulaire et refuse l'envoi. Trouver
+# « signup-form » ne prouve donc rien, et c'est la première chose que cette
+# section refuse.
+#
+# Ce qui sépare les deux états est dans le gabarit dont la page hérite :
+# users/user_base.html enferme le sélecteur « Sign up / Log in » dans
+# « {% if not settings.DISABLE_SIGNUP_WITHOUT_LINK %} ». Les corps ci-dessous
+# transcrivent ce gabarit plutôt qu'ils ne recopient une capture, pour que la
+# différence testée soit celle de la condition et rien d'autre.
+
+LABEL_STUDIO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                     "label-studio-signup-open.yaml")
+
+LABEL_STUDIO_VERSION = "/version/"
+LABEL_STUDIO_SIGNUP = "/user/signup/"
+
+
+def label_studio_version_body(release="1.23.0", components=True):
+    """
+    Ce que rend version_page sur /version/ : collect_versions() sérialisé par
+    json.dumps(indent=2) et enveloppé de <pre> — la route choisit cette sortie
+    sur « request.path == '/version/' », JsonResponse étant réservé à
+    /api/version/.
+
+    « release », « label-studio-os-package » et « label-studio-os-backend » sont
+    posés sans condition dans le littéral de tête ; les trois suivants sont
+    chacun sous un try, d'où `components` : une installation dont les fichiers
+    version.json ne sont pas là ne doit pas faire taire le template.
+    """
+    short = ".".join(release.split(".")[:2])
+    payload = {
+        "release": release,
+        "label-studio-os-package": {
+            "version": release,
+            "short_version": short,
+            "latest_version_from_pypi": release,
+            "latest_version_upload_time": "2026-03-13T08:15:04",
+            "current_version_is_outdated": False,
+        },
+        "label-studio-os-backend": {
+            "message": "chore: release " + release,
+            "commit": "4b8f2c1d9a7e3f56c0b1d2e3f4a5b6c7d8e9f0a1",
+            "date": "2026/03/13 08:15:04",
+            "branch": "master",
+            "version": release,
+        },
+    }
+    if components:
+        payload["label-studio-frontend"] = {"version": "1.20.0"}
+        payload["dm2"] = {"version": "1.10.0"}
+        payload["label-studio-converter"] = {"version": "1.0.1"}
+    payload["edition"] = "Community"
+    return "<pre>" + json.dumps(payload, indent=2, ensure_ascii=False) + "</pre>"
+
+
+def label_studio_toggle(path, signup_open, hostname=""):
+    """
+    La div « toggle » de users/user_base.html, transcrite du gabarit.
+
+    Les deux liens sont enfermés dans « {% if not settings.DISABLE_SIGNUP_WITHOUT_LINK %} » :
+    quand la condition est fausse, Django retire le texte compris entre les
+    balises et laisse le reste, donc la div ne contient plus que du blanc. La
+    classe « active » est calculée sur request.path, et HOSTNAME — vide par
+    défaut — préfixe les deux href.
+    """
+    inner = ""
+    if signup_open:
+        inner = (
+            '\n        <a href="%s/user/signup" class="%s">Sign up</a>'
+            '\n        <a href="%s/user/login" class="%s">Log in</a>\n    '
+            % (hostname, "active" if "signup" in path else "",
+               hostname, "active" if "login" in path else "")
+        )
+    return '  <div class="toggle">\n    %s\n  </div>\n' % inner
+
+
+SIGNUP_FORM = (
+    '  <form id="signup-form"\n'
+    '        action="/user/signup/?next=%2F"\n'
+    '        method="post"\n'
+    '  >\n'
+    '    <input type="text" class="lsf-input-ls" name="email" id="email">\n'
+    '    <input type="password" class="lsf-input-ls" name="password" id="password">\n'
+    '    <button type="submit" aria-label="Create Account">Create Account</button>\n'
+    '  </form>\n'
+)
+
+LOGIN_FORM = (
+    '  <form id="login-form" action="/user/login/?next=%2F" method="post">\n'
+    '    <input type="text" class="lsf-input-ls" name="email" id="email">\n'
+    '    <input type="password" class="lsf-input-ls" name="password" id="password">\n'
+    '    <button type="submit" aria-label="Log In">Log in</button>\n'
+    '  </form>\n'
+)
+
+
+def label_studio_page(path, signup_open, form=SIGNUP_FORM, hostname=""):
+    """
+    users/user_base.html rendu autour de son bloc user_content, lui-même rempli
+    par user_signup.html ou user_login.html — les deux pages héritent du même
+    gabarit, donc du même titre et du même sélecteur.
+
+    Le <title> vient de simple.html, qu'aucune des deux ne redéfinit.
+    """
+    return (
+        '<!doctype html>\n<html lang="en">\n<head>\n'
+        '  <meta charset="utf-8">\n'
+        '  <title>Label Studio</title>\n'
+        '</head>\n<body>\n'
+        '<div class="login_page">\n'
+        '  <h1>Welcome to Label Studio Community Edition </h1>\n'
+        '  <h2>A full-fledged open source solution for data labeling</h2>\n'
+        '  <img src="/static/images/opossum_hanging.svg" height="128px" />\n'
+        + label_studio_toggle(path, signup_open, hostname)
+        + form
+        + '</div>\n</body>\n</html>\n'
+    )
+
+
+# La page servie sous le drapeau fflag_feat_front_lsdv_e_297_..._short : le
+# gabarit users/new-ui/ ne rend aucun sélecteur, donc l'état de l'inscription
+# n'y est plus lisible du dehors. Faux sur une installation par défaut.
+LABEL_STUDIO_NEW_UI_PAGE = (
+    '<!doctype html>\n<html lang="en">\n<head>\n'
+    '  <title>Label Studio</title>\n'
+    '</head>\n<body>\n'
+    '<div class="login_page_new_ui">\n'
+    '  <h3>A full-fledged open source solution for data labeling</h3>\n'
+    '  <div class="form-wrapper">\n'
+    '    <h2>Sign Up</h2>\n'
+    + SIGNUP_FORM +
+    '  </div>\n'
+    '  <div class="text-wrapper">\n'
+    '    <p class="">Already have an account?</p>\n'
+    '    <a href="/user/login/">Log in</a>\n'
+    '  </div>\n'
+    '</div>\n</body>\n</html>\n'
+)
+
+
+def label_studio_scenario(version, signup):
+    return {LABEL_STUDIO_VERSION: version, LABEL_STUDIO_SIGNUP: signup}
+
+
+LABEL_STUDIO_VERSION_OK = (200, label_studio_version_body())
+
+LABEL_STUDIO_SIGNUP_OPEN_PAGE = label_studio_page(LABEL_STUDIO_SIGNUP, True)
+LABEL_STUDIO_SIGNUP_CLOSED_PAGE = label_studio_page(LABEL_STUDIO_SIGNUP, False)
+LABEL_STUDIO_LOGIN_OPEN_PAGE = label_studio_page("/user/login/", True,
+                                                 form=LOGIN_FORM)
+
+# Une instance servie telle quelle : les versions se lisent, et le sélecteur est
+# là parce que DISABLE_SIGNUP_WITHOUT_LINK est faux par défaut.
+LABEL_STUDIO_OPEN = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK,
+    signup=(200, LABEL_STUDIO_SIGNUP_OPEN_PAGE))
+
+# La même, derrière un HOSTNAME posé : les href deviennent absolus.
+LABEL_STUDIO_OPEN_BEHIND_HOSTNAME = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK,
+    signup=(200, label_studio_page(LABEL_STUDIO_SIGNUP, True,
+                                   hostname="https://labelling.interne")))
+
+# La même, dont les fichiers version.json ne sont pas là : les trois clés sous
+# try manquent, les deux du littéral de tête restent.
+LABEL_STUDIO_OPEN_WITHOUT_COMPONENTS = label_studio_scenario(
+    version=(200, label_studio_version_body(components=False)),
+    signup=(200, LABEL_STUDIO_SIGNUP_OPEN_PAGE))
+
+# Le cas que tout le template sert à distinguer : l'inscription est fermée, et
+# la page est pourtant servie — formulaire compris, le contrôle étant sur POST.
+LABEL_STUDIO_SIGNUP_CLOSED = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK,
+    signup=(200, LABEL_STUDIO_SIGNUP_CLOSED_PAGE))
+
+# L'interface neuve, qui ne rend aucun sélecteur : rien n'y est lisible, donc
+# rien n'y est affirmé.
+LABEL_STUDIO_NEW_UI = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK,
+    signup=(200, LABEL_STUDIO_NEW_UI_PAGE))
+
+# Un mandataire n'ouvre /version/ qu'à sa supervision et garde le reste.
+LABEL_STUDIO_SIGNUP_REFUSED = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK,
+    signup=(403, "<html><body>Forbidden</body></html>"))
+
+# L'inverse : la page d'inscription est ouverte, /version/ est fermé. Le produit
+# n'est plus identifié, et le template ne conclut pas.
+LABEL_STUDIO_VERSION_REFUSED = label_studio_scenario(
+    version=(403, "<html><body>Forbidden</body></html>"),
+    signup=(200, LABEL_STUDIO_SIGNUP_OPEN_PAGE))
+
+# Un cache relaie la page qu'il détient sous le statut du refus, alors que le
+# serveur, lui, a refusé.
+LABEL_STUDIO_CACHED_UNDER_REFUSAL = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK,
+    signup=(403, LABEL_STUDIO_SIGNUP_OPEN_PAGE))
+
+# Un cache indexé sur l'hôte et non sur le chemin sert la même réponse aux deux.
+LABEL_STUDIO_VERSION_ON_ALL_PATHS = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK, signup=LABEL_STUDIO_VERSION_OK)
+LABEL_STUDIO_SIGNUP_ON_ALL_PATHS = label_studio_scenario(
+    version=(200, LABEL_STUDIO_SIGNUP_OPEN_PAGE),
+    signup=(200, LABEL_STUDIO_SIGNUP_OPEN_PAGE))
+
+# Le même cache, servant cette fois la page de connexion sous le chemin de
+# l'inscription : elle porte le même titre et le même sélecteur, et seul le
+# formulaire les sépare.
+LABEL_STUDIO_LOGIN_UNDER_SIGNUP = label_studio_scenario(
+    version=LABEL_STUDIO_VERSION_OK,
+    signup=(200, LABEL_STUDIO_LOGIN_OPEN_PAGE))
+
+# Un portail captif qui répond 200 et sa page à tout ce qu'on lui demande.
+LABEL_STUDIO_BEHIND_CAPTIVE_PORTAL = label_studio_scenario(
+    version=(200, "<html><body>Connexion requise</body></html>"),
+    signup=(200, "<html><body>Connexion requise</body></html>"))
+
+# Un serveur quelconque qui répond 200 à tout.
+LABEL_STUDIO_SERVER_ALWAYS_UP = label_studio_scenario(
+    version=(200, '{"status":"ok"}'), signup=(200, '{"status":"ok"}'))
+
+
+def label_studio_block():
+    doc = load(LABEL_STUDIO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(LABEL_STUDIO_SIGNUP) for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {LABEL_STUDIO_SIGNUP} — c'est pourtant la "
+        "page dont le constat parle, /version/ ne disant que ce que le serveur "
+        "sait de lui-même"
+    )
+    return blocks[0]
+
+
+def label_studio_requests():
+    """
+    Chemin de chaque requête, dans l'ordre déclaré : c'est cet ordre qui donne
+    son numéro à chaque body_N.
+    """
+    out = []
+    for path in label_studio_block().get("path") or []:
+        assert path.startswith("{{BaseURL}}"), f"chemin inattendu : {path!r}"
+        out.append(path[len("{{BaseURL}}"):])
+    return out
+
+
+def label_studio_responses(scenario):
+    ordered = []
+    for route in label_studio_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que Label Studio ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def label_studio_fires(scenario):
+    block = label_studio_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = label_studio_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_label_studio_probe_reads_two_pages_and_never_creates_an_account():
+    """
+    POST /user/signup/ serait la preuve définitive — on tient le compte ou on ne
+    le tient pas — mais save_user inscrit l'utilisateur dans l'organisation
+    existante et ouvre sa session : le template créerait le compte qu'il est
+    censé signaler, à l'intérieur du périmètre qu'il audite.
+    """
+    block = label_studio_block()
+
+    assert block.get("method", "GET") == "GET", (
+        "le bloc n'est pas en GET : la branche POST de user_signup est la "
+        "création de compte elle-même"
+    )
+    for forbidden in ("body", "raw"):
+        assert forbidden not in block, (
+            f"le bloc porte « {forbidden} » : la page se lit sans rien envoyer, "
+            "et tout corps posté partirait sur la route d'inscription"
+        )
+
+    assert set(label_studio_requests()) == {LABEL_STUDIO_VERSION, LABEL_STUDIO_SIGNUP}, (
+        "le template touche autre chose que les deux pages en lecture — "
+        f"{label_studio_requests()}"
+    )
+
+    assert block.get("req-condition") is True, (
+        "sans req-condition les deux réponses sont jugées séparément, et "
+        "/version/ conclurait seul alors qu'il ne dit rien de l'inscription"
+    )
+
+
+def test_label_studio_matcher_proves_signup_is_open_not_merely_that_it_is_label_studio():
+    """
+    Le cœur du template. L'instance fermée sert la même page — même titre, même
+    formulaire, même route d'action — et seule la div « toggle » les sépare.
+    """
+    assert label_studio_fires(LABEL_STUDIO_OPEN), (
+        "le template ne reconnaît pas une instance Label Studio dont "
+        "l'inscription est ouverte"
+    )
+
+    assert not label_studio_fires(LABEL_STUDIO_SIGNUP_CLOSED), (
+        "le template déclenche sur une instance dont l'inscription est fermée : "
+        "le formulaire est servi des deux côtés de la frontière, seul le "
+        "sélecteur de users/user_base.html transcrit le réglage"
+    )
+
+    # Ce qui ne doit pas faire taire le template : les variantes légitimes d'une
+    # instance ouverte.
+    for scenario, cas in (
+        (LABEL_STUDIO_OPEN_BEHIND_HOSTNAME, "HOSTNAME posé, href absolus"),
+        (LABEL_STUDIO_OPEN_WITHOUT_COMPONENTS, "sans les version.json du front"),
+    ):
+        assert label_studio_fires(scenario), (
+            f"le template rate une instance ouverte : {cas}"
+        )
+
+    # Ce sur quoi il ne doit pas conclure.
+    for scenario, cas in (
+        (LABEL_STUDIO_SIGNUP_REFUSED, "la page d'inscription est refusée"),
+        (LABEL_STUDIO_VERSION_REFUSED, "le produit n'est pas identifié"),
+        (LABEL_STUDIO_CACHED_UNDER_REFUSAL, "la page est relayée sous un refus"),
+        (LABEL_STUDIO_VERSION_ON_ALL_PATHS, "/version/ servi sur les deux chemins"),
+        (LABEL_STUDIO_SIGNUP_ON_ALL_PATHS, "la page servie sur les deux chemins"),
+        (LABEL_STUDIO_LOGIN_UNDER_SIGNUP,
+         "la page de connexion servie sous le chemin de l'inscription"),
+        (LABEL_STUDIO_BEHIND_CAPTIVE_PORTAL, "un portail captif"),
+        (LABEL_STUDIO_SERVER_ALWAYS_UP, "un serveur qui répond 200 à tout"),
+    ):
+        assert not label_studio_fires(scenario), (
+            f"le template conclut alors que {cas}"
+        )
+
+
+def test_label_studio_stays_silent_on_the_ui_that_says_nothing():
+    """
+    La frontière que le template tient plutôt qu'il ne la masque : le gabarit
+    users/new-ui/ ne rend aucun sélecteur, donc l'inscription y est ouverte ou
+    fermée sans que rien ne le dise du dehors. Se taire est le seul constat
+    honnête — déclencher sur la seule présence du formulaire signalerait aussi
+    les instances fermées.
+    """
+    assert "signup-form" in LABEL_STUDIO_NEW_UI_PAGE, (
+        "le cas de test ne dit pas ce qu'il croit dire : c'est bien la page "
+        "d'inscription qui doit être servie ici"
+    )
+    assert not label_studio_fires(LABEL_STUDIO_NEW_UI)
+
+
+def test_label_studio_extractor_reports_the_release_of_the_version_page():
+    routes = label_studio_requests()
+    extractors = label_studio_block().get("extractors") or []
+
+    assert extractors, (
+        "le template ne remonte rien à l'exploitant : signaler que "
+        "l'inscription est ouverte ne lui dit pas quelle version répond"
+    )
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "émet un résultat par extracteur qui rend quelque chose, donc la même "
+        "instance est signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("part") == f"body_{routes.index(LABEL_STUDIO_VERSION) + 1}", (
+        "l'extracteur n'est pas borné à la réponse de /version/ : sous "
+        "req-condition il serait évalué contre les deux, et la page "
+        "d'inscription n'a pas de version à rendre"
+    )
+    assert extractor.get("type") == "regex", (
+        "le corps de /version/ est du HTML autour du JSON — « <pre> » puis "
+        "json.dumps — donc un extracteur json ne rendrait rien"
+    )
+
+    patterns = extractor.get("regex") or []
+    assert patterns, "l'extracteur ne porte aucun motif"
+    group = extractor.get("group", 0)
+    for pattern in patterns:
+        found = re.search(pattern, label_studio_version_body(release="1.23.0"))
+        assert found, f"le motif ne rend rien sur la page de version : {pattern!r}"
+        assert found.group(group) == "1.23.0", (
+            "l'extracteur remonte autre chose que la version publiée : "
+            f"{found.group(group)!r}"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

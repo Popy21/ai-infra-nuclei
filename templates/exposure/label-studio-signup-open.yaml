@@ -1,0 +1,196 @@
+id: label-studio-signup-open
+
+info:
+  name: Label Studio - Open User Registration
+  author: popy21
+  severity: medium
+  description: |
+    Label Studio Community s'installe ouvert à l'inscription : base.py pose
+    « DISABLE_SIGNUP_WITHOUT_LINK = get_bool_env('DISABLE_SIGNUP_WITHOUT_LINK',
+    False) », et user_signup n'est protégé par aucun décorateur — la page
+    d'inscription est servie à l'anonyme dès que le port est publié.
+    La page servie ne suffit pourtant pas à conclure, et c'est le point du
+    template. Le contrôle de la vue est posé sur la seule branche POST — « if
+    settings.DISABLE_SIGNUP_WITHOUT_LINK is True: if not (token and organization
+    and token == organization.token): raise PermissionDenied() » — donc le GET
+    rend le même formulaire des deux côtés de la frontière : l'instance fermée
+    sert la page et refuse l'envoi. Un template qui se contenterait de trouver
+    « signup-form » signalerait donc toutes les instances, y compris celles qu'on
+    a correctement fermées.
+    Ce qui sépare les deux états est ailleurs, dans le gabarit dont la page
+    hérite. users/user_base.html enferme le sélecteur « Sign up / Log in » dans
+    « {% if not settings.DISABLE_SIGNUP_WITHOUT_LINK %} » : le réglage est
+    recopié tel quel dans le HTML, et le lien vers /user/signup n'existe à
+    l'intérieur de la div « toggle » que sur une instance ouverte. Ce bloc est
+    inchangé de la 1.11 à aujourd'hui.
+    /version/ porte l'autre moitié du constat, l'identité. version_page n'a lui
+    non plus aucun décorateur, et rend collect_versions() en clair : « release »,
+    « label-studio-os-package », « label-studio-os-backend », plus les versions
+    du frontend, de dm2 et du converter quand leurs fichiers sont là. La route
+    distingue ses deux sorties sur « request.path == '/version/' » — la page HTML
+    d'un côté, JsonResponse sur /api/version/ de l'autre — et c'est la première
+    qui est lue ici.
+    Une frontière que le template tient plutôt qu'il ne la masque : sous le
+    drapeau fflag_feat_front_lsdv_e_297_increase_oss_to_enterprise_adoption_short
+    la page vient de users/new-ui/, qui ne rend aucun sélecteur — l'état de
+    l'inscription n'y est plus lisible du dehors, et le template se tait. Ce
+    drapeau est faux sur une installation par défaut, FEATURE_FLAGS_OFFLINE
+    valant true et FEATURE_FLAGS_DEFAULT_VALUE false.
+  impact: |
+    Le compte n'attend aucune validation. proceed_registration appelle save_user,
+    qui fait « if Organization.objects.exists(): org.add_user(user) » puis pose
+    cette organisation en active_organization, et termine par login() : le
+    visiteur repart avec une session sur l'organisation existante — celle qui
+    porte le travail en cours —, pas sur une organisation neuve à lui.
+    L'organisation est la frontière de visibilité en Community, et il n'y en a
+    qu'une : ProjectListAPI rend « Project.objects.filter(organization=
+    request.user.active_organization) ». Le nouveau membre lit donc les projets
+    de l'équipe, leurs tâches et les annotations déjà produites — c'est-à-dire
+    le jeu de données étiqueté lui-même, qui est le rendu du travail —, et peut
+    en importer. OrganizationMember ne porte pas de rôle en Community : la seule
+    distinction est is_owner, « self.user.id == self.organization.created_by.id »,
+    qui ne retire rien à l'appartenance.
+    C'est ce qui borne le constat à medium plutôt qu'au-dessus. Le compte créé
+    n'est pas superutilisateur Django : /admin/ lui reste fermé, et le bloc que
+    version_page ajoute « if not CLOUD_INSTANCE and request.user.is_superuser » —
+    la totalité des réglages du serveur, secrets compris — ne lui est pas rendu.
+    Le template, de son côté, ne prouve que l'ouverture du formulaire : il ne
+    crée pas le compte, donc ne prouve pas ce que ce compte-là trouverait.
+    Un dernier point pour l'après : chaque compte porte un jeton DRF durable —
+    user_account lit « Token.objects.get(user=user) » pour l'afficher. Fermer
+    l'inscription ne le révoque pas.
+  remediation: |
+    Poser LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK=true et redémarrer. Le réglage
+    est lu dans l'environnement au démarrage et nulle part ailleurs — get_env
+    essaie « LABEL_STUDIO_ », « HEARTEX_ » puis le nom nu —, donc rien n'est
+    recopié en base et le redémarrage suffit. L'inscription reste alors possible
+    par lien d'invitation : /user/signup?token=<jeton de l'organisation>, le seul
+    couple que la branche POST accepte.
+    Contrôler depuis l'extérieur plutôt que sur la configuration : sur une
+    instance fermée, GET /user/signup/ sert encore le formulaire, mais la div
+    « toggle » du gabarit est vide. C'est cette absence qui atteste, pas celle de
+    la page.
+    /version/ n'a pas d'interrupteur : la route reste publique quelle que soit la
+    configuration. Si la version des composants ne doit pas être lisible, elle se
+    ferme sur le mandataire, avec /api/version/ qui rend la même chose en JSON.
+    Ne pas s'arrêter là si le port a été publié : Label Studio n'écoute pas en
+    local par défaut — le conteneur publie 8080 et le serveur se lie à 0.0.0.0 —
+    donc l'authentification est la seule frontière, et elle est faite pour être
+    posée devant.
+    Après une exposition, passer la liste des comptes en revue, supprimer ceux
+    qu'on n'a pas créés et réinitialiser leurs jetons d'API, qui survivent à la
+    fermeture de l'inscription. Vérifier aussi les projets et les imports : un
+    membre inscrit pendant l'ouverture a pu verser ses propres tâches dans
+    l'organisation aussi bien que lire les siennes.
+  reference:
+    - https://labelstud.io/guide/signup
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/users/views.py
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/users/templates/users/user_base.html
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/users/templates/users/user_signup.html
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/users/functions/common.py
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/core/views.py
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/core/urls.py
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/core/utils/common.py
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/core/settings/base.py
+    - https://github.com/HumanSignal/label-studio/blob/develop/label_studio/projects/api.py
+  metadata:
+    max-request: 2
+    vendor: humansignal
+    product: label-studio
+    shodan-query: http.title:"Label Studio"
+  tags: ai,ml,mlops,label-studio,exposure,signup,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # /version/ nomme le produit, et rien de plus : la route répond aussi bien sur
+  # l'instance fermée, version_page n'ayant pas de décorateur. Conclure de son
+  # seul 200 serait rapporter qu'un serveur Django est joignable. Ce qu'elle
+  # établit en revanche est l'identité, et elle l'établit par le vocabulaire de
+  # collect_versions() — deux clés qui n'appartiennent qu'à ce produit.
+  #
+  # Les chemins portent leur barre finale, celle que urls.py déclare. Un appel à
+  # /version sans barre aboutit tout de même, CommonMiddlewareAppendSlashWithout-
+  # Redirect réécrivant request.path avant de redistribuer, mais version_page
+  # choisit sa sortie sur « request.path == '/version/' » : demander le chemin
+  # canonique évite de faire dépendre la forme de la réponse d'un intergiciel.
+  #
+  # /user/signup/ porte l'autre moitié. GET, et seulement GET : le POST est la
+  # création de compte elle-même — save_user inscrit l'utilisateur dans
+  # l'organisation existante et ouvre sa session —, donc le template créerait le
+  # compte qu'il est censé signaler. La page se lit sans rien envoyer.
+  #
+  # Deux voisins écartés. /api/version/ rend le même contenu en JSON, mais la
+  # sortie HTML est celle que urls.py commente « html page » et celle qu'un
+  # exploitant reconnaît ; en lire une seule évite de compter deux fois. Et
+  # /user/login/ hérite du même gabarit, donc du même sélecteur : il dirait que
+  # l'inscription est ouverte sans qu'on ait lu la page d'inscription, et le
+  # constat revendiqué porte sur celle-ci.
+  - method: GET
+    path:
+      - "{{BaseURL}}/version/"
+      - "{{BaseURL}}/user/signup/"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, /version/ conclurait seul — or il ne
+    # dit rien de l'inscription.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'identité, prise sur le vocabulaire du dictionnaire que
+          # collect_versions() construit. Les deux clés sont posées sans
+          # condition dans le littéral de tête, là où « label-studio-frontend »,
+          # « dm2 » et « label-studio-converter » sont chacune sous un try qui
+          # peut échouer — les exiger raterait une installation dont les
+          # fichiers version.json ne sont pas là. Vérifiées sans leur valeur, et
+          # sans les deux-points : la sérialisation est indentée par json.dumps
+          # et un intermédiaire qui reformaterait n'a pas à s'y tenir.
+          - 'status_code_1 == 200 && contains(body_1, "\"label-studio-os-package\"") && contains(body_1, "\"label-studio-os-backend\"")'
+
+          # La seconde route a répondu, et c'est bien la page du produit qui est
+          # revenue. Le titre est celui de users/user_base.html, inchangé depuis
+          # la 1.11, et il porte l'édition : Enterprise sert une autre interface,
+          # et le constat ne la concerne pas. Il écarte au passage le portail
+          # captif qui répondrait 200 et sa page à tout ce qu'on lui demande.
+          - 'status_code_2 == 200 && contains(body_2, "Welcome to Label Studio Community Edition")'
+
+          # Et c'est la page d'inscription, pas celle de connexion. Les deux
+          # héritent du même gabarit, donc du même sélecteur et du même titre :
+          # sans cette ligne, un cache indexé sur l'hôte et non sur le chemin
+          # ferait conclure de /user/login/ ce qui n'a été établi nulle part. Le
+          # formulaire ne prouve rien de l'ouverture — il est servi des deux
+          # côtés de la frontière — il prouve seulement quelle page on lit.
+          - 'contains(body_2, "id=\"signup-form\"")'
+
+          # Le constat lui-même. « {% if not settings.DISABLE_SIGNUP_WITHOUT_LINK %} »
+          # n'entoure que le sélecteur : le lien vers /user/signup n'existe à
+          # l'intérieur de la div « toggle » que si l'inscription est ouverte, et
+          # sur une instance fermée le bloc ne contient que du blanc.
+          #
+          # Borné à cette div, et pas au corps entier : le formulaire de la page
+          # a pour action cette même route, et le chercher au large ferait
+          # déclencher sur l'instance fermée. \\s* absorbe les blancs que les
+          # balises de gabarit laissent derrière elles, et [^>]* traverse l'attri-
+          # but href sans pouvoir sortir de la balise — HOSTNAME, quand il est
+          # posé, y préfixe le chemin.
+          - 'regex("class=\"toggle\">\\s*<a[^>]*/user/signup\"", body_2)'
+
+    extractors:
+      # La version publiée, telle que label_studio.__version__ la pose sous
+      # « release » — le renseignement qu'un exploitant veut lire à côté du
+      # constat, et le corps étant du HTML autour du JSON, il se prend au motif
+      # plutôt qu'au chemin.
+      #
+      # Un seul extracteur, et borné à body_1 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second, ou laisser
+      # celui-ci sans part, ferait remonter deux fois la même instance.
+      - type: regex
+        part: body_1
+        name: release
+        group: 1
+        regex:
+          - '"release":\s*"([^"]+)"'
