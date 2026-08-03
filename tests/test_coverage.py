@@ -1,12 +1,14 @@
 """
 Porte de qualité de `scripts/coverage.py`.
 
-L'outil n'a d'intérêt que s'il tient deux promesses. Qu'il lise l'identifiant
+L'outil n'a d'intérêt que s'il tient trois promesses. Qu'il lise l'identifiant
 comme le fait le moteur — il ne parse pas le YAML, il lit une ligne, et c'est un
 raccourci qui doit être payé par une vérification sur le pack réel, fichier par
-fichier. Et qu'il ne signale un doublon que là où il y en a un : un rapport qui
+fichier. Qu'il ne signale un doublon que là où il y en a un : un rapport qui
 crie sur des identifiants distincts se fait ignorer au deuxième passage, et ne
-sert alors plus à rien du tout.
+sert alors plus à rien du tout. Et que le tableau du README dise le pack tel
+qu'il est — c'est la seule raison de le générer plutôt que de le tenir à la
+main, donc l'écart entre les deux est ici une erreur.
 """
 
 import importlib.util
@@ -21,6 +23,7 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "coverage.py")
 TEMPLATES_DIR = os.path.join(ROOT, "templates")
+README = os.path.join(ROOT, "README.md")
 
 
 def load_script():
@@ -276,6 +279,118 @@ def test_le_rapport_le_dit_quand_il_n_y_a_rien(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Tableau de couverture du README : il est écrit par l'outil, donc il n'a le
+# droit de dire que ce que `templates/` contient — un tableau tenu à la main
+# diverge au premier template ajouté, et un README qui ment sur son propre
+# contenu ne se relit plus.
+
+def covered_template(template_id, product, severity):
+    """Le squelette minimal que le tableau lit : identifiant, sévérité, produit."""
+    return ("id: %s\n\ninfo:\n  name: Peu importe\n  severity: %s\n"
+            "  metadata:\n    product: %s\n" % (template_id, severity, product))
+
+
+def small_pack(tmp_path):
+    root = str(tmp_path)
+    write(root, "exposure/ollama-unauthenticated-api.yaml",
+          covered_template("ollama-unauthenticated-api", "ollama", "high"))
+    write(root, "exposure/ollama-model-pull-abuse.yaml",
+          covered_template("ollama-model-pull-abuse", "ollama", "high"))
+    write(root, "cves/CVE-2026-0770.yaml",
+          covered_template("CVE-2026-0770", "langflow", "critical"))
+    # Ce qui ne porte pas d'identifiant n'est pas un template, et n'a donc pas de
+    # ligne : le tableau compte ce que nuclei chargerait, pas des fichiers.
+    write(root, "profiles/ai.yml", "info:\n  name: ai\n")
+    return root
+
+
+def test_le_tableau_range_les_templates_par_produit(tmp_path):
+    """
+    Deux templates du même produit se lisent côte à côte, et le décompte qui
+    ouvre le tableau sépare les templates des produits — trente-et-un templates
+    ne couvrent pas trente-et-un produits.
+    """
+    covered = pack_coverage.read_templates(small_pack(tmp_path))
+
+    assert [(entry.product, entry.template_id) for entry in covered] == [
+        ("langflow", "CVE-2026-0770"),
+        ("ollama", "ollama-model-pull-abuse"),
+        ("ollama", "ollama-unauthenticated-api"),
+    ]
+    assert pack_coverage.format_table(covered).startswith("3 templates, 2 produits.\n")
+
+
+def test_le_template_sans_produit_declare_se_range_sous_son_identifiant(tmp_path):
+    """
+    `metadata.product` n'est pas un champ que la porte de qualité du pack exige.
+    Une case vide se lirait comme un oubli du tableau ; l'identifiant, lui, nomme
+    le produit aussi bien que possible.
+    """
+    root = str(tmp_path)
+    write(root, "exposure/foo-exposed.yaml",
+          "id: foo-exposed\n\ninfo:\n  name: x\n  severity: high\n")
+
+    assert pack_coverage.read_templates(root)[0].product == "foo-exposed"
+
+
+def test_le_tableau_nomme_chaque_template_du_pack():
+    """
+    Amarre le tableau au pack réel : chaque fichier de `templates/` a sa ligne,
+    et la ligne pointe sur le fichier.
+    """
+    covered = pack_coverage.read_templates(TEMPLATES_DIR)
+    assert len(covered) == len(PACK), "un template du pack n'a pas sa ligne"
+
+    table = pack_coverage.format_table(covered)
+    for path in PACK:
+        template_id = os.path.splitext(os.path.basename(path))[0]
+        link = os.path.relpath(path, ROOT).replace(os.sep, "/")
+        assert "[`%s`](%s)" % (template_id, link) in table, template_id
+
+
+def test_la_ligne_porte_le_produit_et_la_severite():
+    """
+    Les deux colonnes qui font la valeur du tableau : sans elles il ne resterait
+    qu'une liste de noms de fichiers, que `ls templates/` donne déjà.
+    """
+    table = pack_coverage.format_table(pack_coverage.read_templates(TEMPLATES_DIR))
+
+    assert ("| vllm | [`vllm-unauthenticated-api`]"
+            "(templates/exposure/vllm-unauthenticated-api.yaml) | high |") in table
+
+
+def test_le_bloc_est_remplace_sans_que_le_reste_du_readme_bouge():
+    def readme(block):
+        return "# titre\n\nde la prose\n\n%s\n%s\n%s\n\nde la prose encore\n" % (
+            pack_coverage.TABLE_BEGIN, block, pack_coverage.TABLE_END)
+
+    assert pack_coverage.replace_block(readme("périmé"), "| x |") == readme("| x |")
+
+
+def test_le_readme_sans_marqueur_est_une_erreur_et_non_un_tableau_place_au_hasard():
+    with pytest.raises(ValueError):
+        pack_coverage.replace_block("# titre\n\nde la prose\n", "| x |")
+    with pytest.raises(ValueError):
+        pack_coverage.replace_block("# titre\n\n%s\n" % pack_coverage.TABLE_BEGIN, "| x |")
+
+
+def test_le_readme_du_depot_est_celui_que_le_script_ecrirait():
+    """
+    La porte. Un template ajouté sans régénérer le tableau laisse le README
+    annoncer une couverture qu'il n'a plus — c'est le seul écart que personne ne
+    voit en relisant le commit du template.
+    """
+    with open(README, encoding="utf-8") as handle:
+        text = handle.read()
+    table = pack_coverage.format_table(pack_coverage.read_templates(TEMPLATES_DIR))
+
+    assert pack_coverage.replace_block(text, table) == text, (
+        "README.md a divergé de templates/ : lancer "
+        "`python3 scripts/coverage.py --readme`"
+    )
+
+
+# --------------------------------------------------------------------------
 # Résolution de l'arbre amont : elle suit celle de nuclei, sinon l'outil compare
 # le pack à un arbre que personne n'utilise.
 
@@ -363,6 +478,42 @@ def test_quiet_ne_parle_que_pour_signaler(tmp_path, capsys):
 
     assert pack_coverage.main(["--pack", pack, "--upstream", upstream]) == 0
     assert "aucun doublon." in capsys.readouterr().out
+
+
+def test_markdown_ecrit_le_tableau_sans_reclamer_l_amont(monkeypatch, capsys):
+    """
+    Le tableau ne dit que ce que le pack porte. Le réclamer derrière un clone de
+    treize mille fichiers reviendrait à ne plus jamais le régénérer — ici l'amont
+    est délibérément introuvable, et la sortie doit tomber quand même.
+    """
+    monkeypatch.setenv(pack_coverage.NUCLEI_TEMPLATES_DIR_ENV,
+                       os.path.join(ROOT, "nulle-part"))
+
+    assert pack_coverage.main(["--markdown"]) == 0
+
+    out = capsys.readouterr().out
+    assert pack_coverage.TABLE_HEADER[0] in out
+    assert "vllm-unauthenticated-api" in out
+
+
+def test_readme_reecrit_le_tableau_perime_et_se_tait_ensuite(tmp_path, monkeypatch, capsys):
+    with open(README, encoding="utf-8") as handle:
+        attendu = handle.read()
+    copie = os.path.join(str(tmp_path), "README.md")
+    with open(copie, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(pack_coverage.replace_block(attendu, "| périmé |"))
+    monkeypatch.setattr(pack_coverage, "README_FILE", copie)
+
+    assert pack_coverage.main(["--readme"]) == 0
+    with open(copie, encoding="utf-8") as handle:
+        assert handle.read() == attendu, "le README régénéré est celui du dépôt"
+    assert "mis à jour" in capsys.readouterr().out
+
+    assert pack_coverage.main(["--readme"]) == 0
+    assert "déjà à jour" in capsys.readouterr().out, (
+        "réécrire un fichier inchangé ferait passer une exécution de contrôle "
+        "pour une modification"
+    )
 
 
 def test_le_script_s_execute_en_ligne_de_commande(tmp_path):

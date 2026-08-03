@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-Compare les identifiants du pack à ceux de `nuclei-templates`, et signale les
-doublons.
+Compare les identifiants du pack à ceux de `nuclei-templates`, signale les
+doublons, et écrit le tableau de couverture du README.
 
 Le pack est une antichambre : ce qu'il contient a vocation à être proposé en
 amont. Un template dont l'identifiant existe déjà chez projectdiscovery n'a donc
 rien à y apporter — et tant qu'il vit ici, il fait doublon au chargement, où deux
 templates portant le même `id` se disputent la même ligne de résultat.
 
+Le tableau du README répond à l'autre moitié de la question : non plus ce que
+l'amont porte déjà, mais ce que le pack couvre — un produit, un template, une
+sévérité. Il est écrit par cet outil plutôt que tenu à la main, parce qu'une
+liste manuelle diverge au premier template ajouté et qu'un README qui ment sur
+son propre contenu ne se relit plus. La suite de tests refuse le décalage.
+
 Usage :
 
     python3 scripts/coverage.py                      # amont résolu comme nuclei le résout
     python3 scripts/coverage.py --upstream CHEMIN
     python3 scripts/coverage.py --quiet              # ne parle que s'il y a un doublon
+    python3 scripts/coverage.py --markdown           # le tableau, sur la sortie standard
+    python3 scripts/coverage.py --readme             # le tableau, dans README.md
 
 Codes de sortie : 0 aucun doublon, 1 au moins un doublon, 2 arbre introuvable.
 """
@@ -26,8 +34,16 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATES_DIR = os.path.join(ROOT, "templates")
+README_FILE = os.path.join(ROOT, "README.md")
 
 TEMPLATE_SUFFIXES = (".yaml", ".yml")
+
+# Les deux marqueurs bornent ce que --readme réécrit, et rien d'autre du fichier
+# n'est touché : le README reste un texte qu'on rédige, avec un tableau qu'on
+# régénère. Ce sont des commentaires HTML, donc invisibles au rendu Markdown.
+TABLE_BEGIN = "<!-- couverture -->"
+TABLE_END = "<!-- /couverture -->"
+TABLE_HEADER = ("| Produit | Template | Sévérité |", "| --- | --- | --- |")
 
 # `id` est une clé de premier niveau, donc une ligne qui commence en colonne 0 :
 # ce qui est indenté appartient à un bloc — `info`, un matcher, le scalaire d'une
@@ -62,6 +78,7 @@ TEMPLATES_CONFIG_KEY = "nuclei-templates-directory"
 UPSTREAM_DIR_NAME = "nuclei-templates"
 
 Collision = collections.namedtuple("Collision", "pack_id upstream_id ours theirs")
+Covered = collections.namedtuple("Covered", "product template_id severity path")
 
 
 def read_id(path):
@@ -198,9 +215,98 @@ def format_report(pack, upstream, pack_dir, upstream_dir, found):
     return "\n".join(lines)
 
 
+def read_templates(pack_dir):
+    """
+    Ce que le pack couvre, un template par entrée, trié par produit puis par
+    identifiant — deux templates du même produit se lisent alors côte à côte.
+
+    Ici on parse le document, là où read_id() se contente d'une ligne : le
+    raccourci ne se justifiait que par les treize mille fichiers de l'amont, et
+    le pack en compte trente. Surtout, le tableau a besoin de ce qui vit dans
+    `info` — la sévérité, le produit — que seule une lecture du document rend
+    sans le deviner à l'indentation.
+
+    yaml n'est importé qu'ici : le rapport de doublons, lui, ne dépend que de la
+    bibliothèque standard et doit pouvoir tourner ainsi.
+    """
+    import yaml
+
+    covered = []
+    for directory, dirs, files in os.walk(pack_dir):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.endswith(TEMPLATE_SUFFIXES):
+                continue
+            path = os.path.join(directory, name)
+            with open(path, encoding="utf-8") as handle:
+                document = yaml.safe_load(handle) or {}
+            template_id = document.get("id")
+            if not template_id:
+                continue
+            info = document.get("info") or {}
+            metadata = info.get("metadata") or {}
+            covered.append(Covered(
+                # `metadata.product` n'est pas exigé par la porte de qualité du
+                # pack : à défaut, l'identifiant nomme le produit aussi bien que
+                # possible, plutôt que de laisser une case vide.
+                metadata.get("product") or template_id,
+                template_id,
+                info.get("severity") or "",
+                # Relatif à la racine, parce que c'est de là que le README lit
+                # ses liens ; et en séparateurs POSIX, parce qu'un lien Markdown
+                # écrit sous Windows doit rester cliquable ailleurs.
+                os.path.relpath(path, ROOT).replace(os.sep, "/"),
+            ))
+    covered.sort(key=lambda entry: (entry.product, entry.template_id))
+    return covered
+
+
+def format_table(covered):
+    """Le tableau de couverture, en Markdown, tel qu'il vit dans le README."""
+    products = len({entry.product for entry in covered})
+    lines = [
+        "%d template%s, %d produit%s." % (len(covered), "s" if len(covered) > 1 else "",
+                                          products, "s" if products > 1 else ""),
+        "",
+    ]
+    lines.extend(TABLE_HEADER)
+    for entry in covered:
+        lines.append("| %s | [`%s`](%s) | %s |"
+                     % (entry.product, entry.template_id, entry.path, entry.severity))
+    return "\n".join(lines)
+
+
+def replace_block(text, table):
+    """
+    Rend `text` où le bloc borné par les marqueurs porte `table`.
+
+    L'absence de marqueur est une erreur et non une invitation à écrire le
+    tableau à un endroit deviné : un README dont on ne sait pas où finit la
+    prose n'est pas un fichier qu'un outil a le droit de réécrire.
+    """
+    begin = text.find(TABLE_BEGIN)
+    end = text.find(TABLE_END, begin + len(TABLE_BEGIN)) if begin != -1 else -1
+    if begin == -1 or end == -1:
+        raise ValueError("marqueurs %s / %s introuvables" % (TABLE_BEGIN, TABLE_END))
+    return text[:begin + len(TABLE_BEGIN)] + "\n" + table + "\n" + text[end:]
+
+
+def write_readme(path, covered):
+    """Écrit le tableau dans le README, et dit s'il a changé quelque chose."""
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    updated = replace_block(text, format_table(covered))
+    if updated == text:
+        return False
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(updated)
+    return True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Signale les identifiants du pack que nuclei-templates porte déjà.",
+        description="Signale les identifiants du pack que nuclei-templates porte "
+                    "déjà, et écrit le tableau de couverture du README.",
     )
     parser.add_argument("--pack", default=TEMPLATES_DIR,
                         help="arbre du pack (défaut : %(default)s)")
@@ -208,11 +314,27 @@ def main(argv=None):
                         help="arbre de nuclei-templates (défaut : celui de nuclei)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="ne rien écrire tant qu'aucun doublon n'est trouvé")
+    parser.add_argument("--markdown", action="store_true",
+                        help="écrire le tableau de couverture sur la sortie standard")
+    parser.add_argument("--readme", action="store_true",
+                        help="écrire le tableau de couverture dans README.md")
     args = parser.parse_args(argv)
 
     if not os.path.isdir(args.pack):
         print("pack introuvable : %s" % args.pack, file=sys.stderr)
         return 2
+
+    # Le tableau ne dit que ce que le pack porte : il n'a pas besoin de l'amont,
+    # et l'exiger empêcherait de régénérer le README sans avoir cloné treize
+    # mille fichiers.
+    if args.markdown or args.readme:
+        covered = read_templates(args.pack)
+        if args.markdown:
+            print(format_table(covered))
+        if args.readme:
+            print("%s : %s" % (README_FILE, "tableau mis à jour"
+                              if write_readme(README_FILE, covered) else "déjà à jour"))
+        return 0
 
     upstream_dir = resolve_upstream(args.upstream)
     if not os.path.isdir(upstream_dir):
