@@ -19,6 +19,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/sglang-server-exposed.yaml` — serveur SGLang, `GET /get_model_info`. Sévérité high.
 - [x] `templates/exposure/xinference-exposed.yaml` — Xorbits Inference, API de gestion de modèles. Sévérité high.
 - [x] `templates/exposure/ollama-model-pull-abuse.yaml` — au-delà de la lecture : prouver que `/api/pull` est atteignable (sans déclencher de téléchargement). Sévérité high.
+- [ ] `templates/exposure/llamacpp-server-exposed.yaml` — llama.cpp (`llama-server`) : `GET /props` renvoie `default_generation_settings`, `total_slots`, `model_path`, `chat_template` et `build_info` — le chemin du modèle sur disque et le build prouvent qu'il s'agit bien de llama-server et qu'aucune clé n'est exigée (`--api-key` est facultatif, aucune authentification sans lui). Sévérité high.
 
 ## Interfaces & plateformes d'agents
 
@@ -31,6 +32,8 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/dify-exposed-console.yaml` — console Dify accessible. Sévérité high.
 - [x] `templates/exposure/litellm-proxy-no-master-key.yaml` — proxy LiteLLM sans `master_key` : `/v1/models` répond sans clé. Sévérité high.
 - [x] `templates/exposure/gradio-app-exposed.yaml` — application Gradio exposée, `GET /config` renvoie la définition de l'interface. Sévérité medium.
+- [ ] `templates/exposure/automatic1111-api-exposed.yaml` — AUTOMATIC1111 Stable Diffusion WebUI lancé avec `--api` : `GET /sdapi/v1/sd-models` renvoie un tableau JSON d'objets `{"title":...,"model_name":...,"hash":...,"sha256":...,"filename":...,"config":...}` — les chemins de checkpoints sur disque prouvent l'accès à l'API de génération, `--api-auth` valant `None` par défaut (aucune authentification). Sévérité high.
+- [ ] `templates/exposure/letta-server-unauthenticated.yaml` — Letta (ex-MemGPT), plateforme d'agents à mémoire persistante : `GET /v1/health/` renvoie `{"version":"<version letta>","status":"ok"}` et `GET /v1/agents/` renvoie la liste des `AgentState` (`id`, `name`, `agent_type`, `llm_config`, `memory`) — le middleware de mot de passe n'est monté que si `LETTA_SERVER_SECURE=true` ou `--secure`, donc rien ne protège l'instance par défaut. Sévérité high.
 
 ## Bases vectorielles
 
@@ -48,6 +51,11 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/label-studio-signup-open.yaml` — Label Studio : `GET /user/signup` sert le formulaire quand l'inscription est ouverte ; `GET /version` expose les versions des composants. Sévérité medium.
 - [x] `templates/exposure/bentoml-yatai-exposed.yaml` — BentoML : le serveur sert `GET /livez`, `/readyz` et `GET /docs.json` (schéma OpenAPI listant les endpoints d'inférence). Sévérité high.
 - [x] `templates/exposure/triton-inference-server-exposed.yaml` — NVIDIA Triton, `GET /v2/health/ready` puis index des modèles. Sévérité high.
+- [ ] `templates/exposure/aim-tracking-server-exposed.yaml` — Aim (aimhubio) : l'API est montée sous `/api` et `GET /api/projects/` renvoie `{"name":...,"path":...,"description":...,"telemetry_enabled":...,"warn_index":...,"warn_runs":...}` — le trio `telemetry_enabled` / `warn_index` / `warn_runs` est propre à Aim et le chemin du dépôt `.aim` sur le serveur fuite avec ; aucun routeur de l'app API n'a de dépendance d'authentification. Sévérité medium.
+
+## Observabilité LLM
+
+- [ ] `templates/exposure/arize-phoenix-exposed.yaml` — Arize Phoenix : `GET /arize_phoenix_version` renvoie la version en texte brut sur un chemin propre au produit, à confirmer par `GET /v1/projects` qui renvoie `{"data":[{"id":...,"name":...,"description":...}],"next_cursor":...}` — l'authentification n'est câblée que si `authentication_enabled` est activé, donc les traces LLM (prompts et réponses) sont lisibles par défaut. Sévérité high.
 
 ## CVE sans template amont
 
