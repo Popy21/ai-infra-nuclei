@@ -7727,6 +7727,95 @@ def test_label_studio_extractor_reports_the_release_of_the_version_page():
         )
 
 
+# --------------------------------------------------------------------------
+# llama.cpp expose son état sous /props, un nom aussi banal que /info : la
+# signature doit tenir aux clés propres au serveur llama-server, pas au seul
+# nom de l'endpoint. "default_generation_settings" et "total_slots" ont été
+# ajoutés en février 2024 (llama.cpp#5307, #5373) — les exiger ne rate donc
+# que des versions antérieures de plus de deux ans, pas celles qui traînent
+# exposées aujourd'hui. "model_path", "chat_template" et "build_info" sont
+# sérialisés depuis l'introduction de l'endpoint.
+
+LLAMACPP_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "llamacpp-server-exposed.yaml")
+
+# Réponse de /props sur une build récente de llama-server (tools/server/server-context.cpp).
+LLAMACPP_PROPS_BODY = (
+    '{"default_generation_settings":{"id":0,"id_task":-1,"n_ctx":4096,'
+    '"speculative":false,"is_processing":false,"params":{"n_predict":-1,'
+    '"temperature":0.800000011920929,"top_k":40,"top_p":0.949999988079071}},'
+    '"total_slots":4,"model_alias":"unknown","model_ftype":"unknown",'
+    '"model_path":"/srv/models/llama-3.1-8b-instruct.Q4_K_M.gguf",'
+    '"modalities":{"vision":false,"video":false,"audio":false},'
+    '"media_marker":"<__media__>","endpoint_slots":false,'
+    '"endpoint_props":false,"endpoint_metrics":false,"ui":true,'
+    '"chat_template":"{% for message in messages %}...{% endfor %}",'
+    '"chat_template_caps":{},"bos_token":"<|begin_of_text|>",'
+    '"eos_token":"<|eot_id|>","build_info":"b4327-8a4bad5",'
+    '"is_sleeping":false,"cors_proxy_enabled":false}'
+)
+
+# Même endpoint juste après l'ajout de total_slots (février 2024) : ni
+# modalities, ni model_ftype, ni is_sleeping n'existaient encore. Le template
+# doit continuer à reconnaître cette forme plus pauvre.
+LLAMACPP_PROPS_BODY_OLDER = (
+    '{"default_generation_settings":{"id":0,"n_ctx":2048,"n_predict":-1,'
+    '"params":{"temperature":0.8}},"total_slots":1,'
+    '"model_path":"/models/llama-2-7b-chat.Q4_K_M.gguf",'
+    '"chat_template":"{% if messages[0][\'role\'] == \'system\' %}...{% endif %}",'
+    '"build_info":"b2107-abc1234"}'
+)
+
+# Une passerelle d'inférence maison nomme aussi son modèle model_path et
+# publie un build_info, mais ne sert ni chat_template ni total_slots ni
+# default_generation_settings : ces deux clés seules ne prouvent donc rien.
+OTHER_PROPS_BODY = (
+    '{"model_path":"/models/llama-3.1-8b","build_info":"custom-gateway-1.0",'
+    '"backend":"triton","version":"1.2.0","max_batch_size":8}'
+)
+
+
+def test_llamacpp_matcher_holds_across_versions_without_becoming_generic():
+    doc = load(LLAMACPP_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/props" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /props"
+
+    block = blocks[0]
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, LLAMACPP_PROPS_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /props de llama-server"
+    )
+    assert all(word_matcher_hits(m, LLAMACPP_PROPS_BODY_OLDER)
+               for m in body_matchers), (
+        "le template exige des clés absentes des versions plus anciennes de "
+        "llama-server — il raterait les instances qui traînent exposées"
+    )
+    assert not all(word_matcher_hits(m, OTHER_PROPS_BODY) for m in body_matchers), (
+        "le template déclenche sur une passerelle d'inférence qui n'est pas "
+        "llama.cpp : model_path et build_info seuls sont des clés banales"
+    )
+    # Collisions internes au pack : les autres templates de disclosure du
+    # modèle servi ne doivent pas être revendiqués par celui-ci.
+    for other_body, other_name in (
+        (SGLANG_MODEL_INFO_BODY, "sglang"),
+        (TGI_INFO_BODY, "text-generation-inference"),
+        (LMSTUDIO_MODELS_BODY, "lmstudio"),
+        (VLLM_MODELS_BODY, "vllm"),
+    ):
+        assert not all(word_matcher_hits(m, other_body) for m in body_matchers), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

@@ -19,7 +19,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/sglang-server-exposed.yaml` — serveur SGLang, `GET /get_model_info`. Sévérité high.
 - [x] `templates/exposure/xinference-exposed.yaml` — Xorbits Inference, API de gestion de modèles. Sévérité high.
 - [x] `templates/exposure/ollama-model-pull-abuse.yaml` — au-delà de la lecture : prouver que `/api/pull` est atteignable (sans déclencher de téléchargement). Sévérité high.
-- [ ] `templates/exposure/llamacpp-server-exposed.yaml` — llama.cpp (`llama-server`) : `GET /props` renvoie `default_generation_settings`, `total_slots`, `model_path`, `chat_template` et `build_info` — le chemin du modèle sur disque et le build prouvent qu'il s'agit bien de llama-server et qu'aucune clé n'est exigée (`--api-key` est facultatif, aucune authentification sans lui). Sévérité high.
+- [x] `templates/exposure/llamacpp-server-exposed.yaml` — llama.cpp (`llama-server`) : `GET /props` renvoie `default_generation_settings`, `total_slots`, `model_path`, `chat_template` et `build_info` — le chemin du modèle sur disque et le build prouvent qu'il s'agit bien de llama-server et qu'aucune clé n'est exigée (`--api-key` est facultatif, aucune authentification sans lui). Sévérité high.
 
 ## Interfaces & plateformes d'agents
 

@@ -1,0 +1,84 @@
+id: llamacpp-server-exposed
+
+info:
+  name: llama.cpp llama-server - Exposed Inference Server
+  author: popy21
+  severity: high
+  description: |
+    llama-server, le serveur HTTP de llama.cpp, n'impose aucune authentification
+    par défaut : --api-key n'est jamais requis, et sans lui le middleware de
+    validation des clés se désactive entièrement (api_keys vide => la requête
+    passe). Le serveur écoute par défaut sur 127.0.0.1:8080, mais --host 0.0.0.0
+    ou le mappage du port du conteneur le publient sur le réseau. GET /props
+    n'est pas listé parmi les endpoints publics du serveur (/health, /v1/health,
+    /models, /v1/models) : quand --api-key est configuré, il exige la clé comme
+    les routes d'inférence. Sans elle, il répond à quiconque atteint le port.
+  impact: |
+    /props révèle le chemin du modèle sur le système de fichiers de l'hôte
+    (model_path), le template de chat Jinja2 du modèle chargé (chat_template),
+    les paramètres de génération par défaut (default_generation_settings), le
+    nombre de slots de traitement parallèle (total_slots) et la version de build
+    du serveur (build_info) — assez pour identifier précisément le déploiement et
+    cartographier l'arborescence de l'hôte. Les routes de génération sont servies
+    par le même processus sans authentification : n'importe qui consomme le
+    GPU/CPU de l'hôte, sans limite de débit ni trace d'audit.
+  remediation: |
+    Lier le serveur à 127.0.0.1 et le publier derrière un proxy qui authentifie ;
+    ne pas mapper le port 8080 du conteneur sur une interface publique. --api-key
+    (ou --api-key-file) est un jeton statique partagé : il ferme l'accès anonyme
+    mais ne remplace pas une authentification par utilisateur.
+  reference:
+    - https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+    - https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp
+    - https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-http.cpp
+  metadata:
+    max-request: 1
+    vendor: ggml-org
+    product: llama.cpp
+  tags: ai,llm,llamacpp,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/props"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Les cinq clés que le roadmap demande, prises ensemble : "model_path" +
+      # "chat_template" + "build_info" au premier niveau du même objet ne peut
+      # venir que du /props de llama-server — c'est ce triplet, plus la version
+      # de build, qui prouve le produit et non un simple proxy compatible
+      # OpenAI. "default_generation_settings" et "total_slots" existent depuis
+      # février 2024 (#5307, #5373) : les exiger ne rate donc que des versions
+      # antérieures de deux ans et plus, pas celles qui traînent exposées
+      # aujourd'hui.
+      - type: word
+        part: body
+        words:
+          - '"default_generation_settings"'
+          - '"total_slots"'
+          - '"model_path"'
+          - '"chat_template"'
+          - '"build_info"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: model_path
+        json:
+          - '.model_path'
+      - type: json
+        part: body
+        name: build_info
+        json:
+          - '.build_info'
