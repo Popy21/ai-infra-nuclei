@@ -8094,6 +8094,91 @@ def test_letta_extractor_stays_on_the_agent_list_response():
     )
 
 
+# --------------------------------------------------------------------------
+# Aim rend, sous GET /api/projects/, le schéma ProjectApiOut
+# (aim/web/api/projects/pydantic_models.py) : name, path, description,
+# telemetry_enabled, warn_index, warn_runs. Le trio telemetry_enabled /
+# warn_index / warn_runs n'appartient qu'à ce schéma — name/path/description
+# sont un vocabulaire trop banal pour signer le produit seuls.
+
+AIM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "aim-tracking-server-exposed.yaml")
+
+# Réponse de GET /api/projects/ telle que project_api() la rend
+# (aim/web/api/projects/views.py) sur un dépôt .aim sain.
+AIM_PROJECTS_BODY = (
+    '{"name":"My awesome project","path":"/home/ubuntu/experiments",'
+    '"description":"","telemetry_enabled":0,"warn_index":false,'
+    '"warn_runs":false}'
+)
+
+# Même route quand l'index ou des runs sont corrompus : warn_index/warn_runs
+# passent à true, le reste du schéma ne bouge pas.
+AIM_PROJECTS_BODY_CORRUPTED = (
+    '{"name":"My awesome project","path":"/srv/aim-repo",'
+    '"description":"team tracking","telemetry_enabled":0,'
+    '"warn_index":true,"warn_runs":true}'
+)
+
+# Une passerelle maison qui nomme aussi ses ressources name/path/description
+# sans être Aim : ce triplet seul, sans telemetry_enabled/warn_index/warn_runs,
+# ne doit pas suffire.
+AIM_OTHER_PROJECT_BODY = (
+    '{"name":"demo","path":"/data/demo","description":"generic project",'
+    '"owner":"alice","version":"2.0.0"}'
+)
+
+
+def test_aim_matcher_holds_across_states_without_becoming_generic():
+    doc = load(AIM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/projects/" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /api/projects/"
+
+    block = blocks[0]
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, AIM_PROJECTS_BODY) for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /api/projects/ d'Aim"
+    )
+    assert all(word_matcher_hits(m, AIM_PROJECTS_BODY_CORRUPTED)
+               for m in body_matchers), (
+        "le template dépend de warn_index/warn_runs à false alors que "
+        "project_api() les rend à true sur un dépôt corrompu"
+    )
+    assert not all(word_matcher_hits(m, AIM_OTHER_PROJECT_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une passerelle qui n'est pas Aim : "
+        "name, path et description seuls sont un vocabulaire trop banal "
+        "pour signer ProjectApiOut"
+    )
+
+
+def test_aim_extractor_reports_the_leaked_repo_path():
+    doc = load(AIM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/projects/" in (b.get("path") or [])]
+    extractors = blocks[0].get("extractors") or []
+    assert extractors, "aucun extracteur : la fuite de chemin n'est pas remontée"
+
+    paths = [e for e in extractors if e.get("json") == [".path"]]
+    assert paths, (
+        "aucun extracteur ne lit .path — c'est le chemin absolu du dépôt "
+        ".aim sur le système de fichiers du serveur, la fuite que le "
+        "roadmap vise au-delà du seul constat produit"
+    )
+    assert all(e.get("type") == "json" for e in extractors), (
+        "/api/projects/ rend un objet JSON : un extracteur regex n'a pas à "
+        "s'en charger"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

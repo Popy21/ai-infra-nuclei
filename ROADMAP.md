@@ -51,7 +51,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/label-studio-signup-open.yaml` — Label Studio : `GET /user/signup` sert le formulaire quand l'inscription est ouverte ; `GET /version` expose les versions des composants. Sévérité medium.
 - [x] `templates/exposure/bentoml-yatai-exposed.yaml` — BentoML : le serveur sert `GET /livez`, `/readyz` et `GET /docs.json` (schéma OpenAPI listant les endpoints d'inférence). Sévérité high.
 - [x] `templates/exposure/triton-inference-server-exposed.yaml` — NVIDIA Triton, `GET /v2/health/ready` puis index des modèles. Sévérité high.
-- [ ] `templates/exposure/aim-tracking-server-exposed.yaml` — Aim (aimhubio) : l'API est montée sous `/api` et `GET /api/projects/` renvoie `{"name":...,"path":...,"description":...,"telemetry_enabled":...,"warn_index":...,"warn_runs":...}` — le trio `telemetry_enabled` / `warn_index` / `warn_runs` est propre à Aim et le chemin du dépôt `.aim` sur le serveur fuite avec ; aucun routeur de l'app API n'a de dépendance d'authentification. Sévérité medium.
+- [x] `templates/exposure/aim-tracking-server-exposed.yaml` — Aim (aimhubio) : l'API est montée sous `/api` et `GET /api/projects/` renvoie `{"name":...,"path":...,"description":...,"telemetry_enabled":...,"warn_index":...,"warn_runs":...}` — le trio `telemetry_enabled` / `warn_index` / `warn_runs` est propre à Aim et le chemin du dépôt `.aim` sur le serveur fuite avec ; aucun routeur de l'app API n'a de dépendance d'authentification. Sévérité medium.
 
 ## Observabilité LLM
 

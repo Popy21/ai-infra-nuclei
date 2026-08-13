@@ -29,10 +29,11 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-34 templates, 31 produits.
+35 templates, 32 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
+| aim | [`aim-tracking-server-exposed`](templates/exposure/aim-tracking-server-exposed.yaml) | medium |
 | anythingllm | [`anythingllm-exposed`](templates/exposure/anythingllm-exposed.yaml) | high |
 | automatic1111-stable-diffusion-webui | [`automatic1111-api-exposed`](templates/exposure/automatic1111-api-exposed.yaml) | high |
 | bentoml | [`bentoml-yatai-exposed`](templates/exposure/bentoml-yatai-exposed.yaml) | high |

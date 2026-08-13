@@ -1,0 +1,94 @@
+id: aim-tracking-server-exposed
+
+info:
+  name: Aim (aimhubio) Tracking Server - Unauthenticated Project Disclosure
+  author: popy21
+  severity: medium
+  description: |
+    Aim monte son API FastAPI sous /api : create_app() (aim/web/api/__init__.py)
+    n'ajoute que CORSMiddleware (allow_origins=['*']) avant de faire
+    app.mount(f'{base_path}/api', api_app), puis inclut projects_router sous le
+    préfixe /projects sans qu'aucune dépendance d'authentification (Depends) ne
+    soit posée sur le routeur ni sur aucune de ses routes. GET /api/projects/
+    (project_api(), aim/web/api/projects/views.py) instancie Project() et, dès
+    que le dépôt .aim existe (project.exists()), rend directement {'name':
+    project.name, 'path': project.path, 'description': project.description,
+    'telemetry_enabled': 0, 'warn_index': index_corrupted, 'warn_runs':
+    runs_corrupted} — le schéma ProjectApiOut (pydantic_models.py). `aim up`
+    (aim/cli/up/commands.py) ne lie le serveur qu'à 127.0.0.1:43800 par défaut
+    et ne porte aucune option d'authentification ; c'est --host 0.0.0.0 ou le
+    mappage du port en conteneur qui l'expose sur le réseau.
+  impact: |
+    project.path vient de get_root_path() (aim/web/utils.py) :
+    os.getenv(AIM_UI_MOUNTED_REPO_PATH, os.getcwd()) — le chemin absolu, sur le
+    système de fichiers du serveur, du dossier depuis lequel `aim up --repo
+    <path>` a été lancé, donc l'emplacement réel du dépôt .aim qui stocke
+    l'historique d'entraînement. warn_index et warn_runs signalent en clair si
+    l'index du dépôt est corrompu (repo.is_index_corrupted()) ou si des runs
+    le sont (repo.list_corrupted_runs()), et name/description exposent
+    l'identité que l'équipe a donnée à ce projet de tracking. Le reste du
+    sous-routeur API — experiments, runs, tags, dashboards, reports — est logé
+    derrière la même absence de garde : la liste des expériences ainsi que les
+    métriques et hyperparamètres de chaque run d'entraînement y sont
+    atteignables sans identifiant.
+  remediation: |
+    Ne jamais lier `aim up` à 0.0.0.0 ni publier le port 43800 (ou le port
+    mappé du conteneur) sur une interface non maîtrisée ; le placer derrière
+    un reverse proxy qui authentifie. Aim ne porte aucun mécanisme
+    d'authentification natif ni d'option --api-key : la seule fermeture
+    possible aujourd'hui est réseau (VPN, tunnel SSH, liste de contrôle
+    d'accès du proxy).
+  reference:
+    - https://github.com/aimhubio/aim/blob/main/aim/web/api/__init__.py
+    - https://github.com/aimhubio/aim/blob/main/aim/web/api/projects/views.py
+    - https://github.com/aimhubio/aim/blob/main/aim/web/api/projects/pydantic_models.py
+    - https://github.com/aimhubio/aim/blob/main/aim/web/utils.py
+    - https://github.com/aimhubio/aim/blob/main/aim/cli/up/commands.py
+  metadata:
+    max-request: 1
+    vendor: aimhubio
+    product: aim
+  tags: ai,ml,aim,aimhubio,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/projects/"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Les trois clés que ProjectApiOut sérialise ensemble et qu'aucun autre
+      # produit du pack n'émet sous ces noms : telemetry_enabled ne relève pas
+      # du vocabulaire générique d'un endpoint /projects/, et warn_index /
+      # warn_runs nomment précisément les deux contrôles de corruption que
+      # project_api() effectue sur le dépôt .aim.
+      - type: word
+        part: body
+        words:
+          - '"telemetry_enabled"'
+          - '"warn_index"'
+          - '"warn_runs"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le chemin absolu du dépôt .aim sur l'hôte : c'est la fuite que le
+      # roadmap vise, au-delà du seul constat produit.
+      - type: json
+        part: body
+        name: repo_path
+        json:
+          - '.path'
+      - type: json
+        part: body
+        name: project_name
+        json:
+          - '.name'
