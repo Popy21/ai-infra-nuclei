@@ -7816,6 +7816,97 @@ def test_llamacpp_matcher_holds_across_versions_without_becoming_generic():
         )
 
 
+# --------------------------------------------------------------------------
+# AUTOMATIC1111 rend, sous /sdapi/v1/sd-models, un tableau d'objets
+# SDModelItem (modules/api/models.py) : title, model_name, hash, sha256,
+# filename, config. Aucune de ces clés n'est propre au produit prise seule
+# ("hash" et "filename" sont des mots de vocabulaire courant), mais les six
+# ensemble, sur le même objet, ne le sont que de ce schéma.
+
+AUTOMATIC1111_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                       "automatic1111-api-exposed.yaml")
+
+# Réponse de GET /sdapi/v1/sd-models telle que get_sd_models() la sérialise
+# (modules/api/api.py) à partir de sd_models.checkpoints_list.
+AUTOMATIC1111_SD_MODELS_BODY = (
+    '[{"title":"v1-5-pruned-emaonly.safetensors [6ce0161689]",'
+    '"model_name":"v1-5-pruned-emaonly",'
+    '"hash":"81761151",'
+    '"sha256":"6ce0161689b3853acaa03779ec93eafe75a02f4ced659bee03f50797806fa2f",'
+    '"filename":"/home/user/stable-diffusion-webui/models/Stable-diffusion/'
+    'v1-5-pruned-emaonly.safetensors",'
+    '"config":null}]'
+)
+
+# sha256 pas encore mis en cache (hashes.sha256_from_cache peut rendre None) :
+# le template ne doit pas dépendre d'une valeur non nulle.
+AUTOMATIC1111_SD_MODELS_BODY_UNHASHED = (
+    '[{"title":"sd_xl_base_1.0.safetensors",'
+    '"model_name":"sd_xl_base_1.0",'
+    '"hash":"31e35c80",'
+    '"sha256":null,'
+    '"filename":"/models/Stable-diffusion/sd_xl_base_1.0.safetensors",'
+    '"config":null}]'
+)
+
+# Une passerelle maison qui nomme aussi ses modèles "model_name" et sert un
+# "filename" et un "hash", mais pas les trois clés propres à SDModelItem
+# (title, sha256, config) : la combinaison des six ne doit pas se réduire à
+# un sous-ensemble générique.
+AUTOMATIC1111_OTHER_REGISTRY_BODY = (
+    '[{"model_name":"llama-3.1-8b","filename":"/models/llama-3.1-8b.gguf",'
+    '"hash":"abc12345","backend":"custom-gateway","version":"1.2.0"}]'
+)
+
+
+def test_automatic1111_matcher_holds_across_versions_without_becoming_generic():
+    doc = load(AUTOMATIC1111_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/sdapi/v1/sd-models" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /sdapi/v1/sd-models"
+
+    block = blocks[0]
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(word_matcher_hits(m, AUTOMATIC1111_SD_MODELS_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /sdapi/v1/sd-models "
+        "d'AUTOMATIC1111"
+    )
+    assert all(word_matcher_hits(m, AUTOMATIC1111_SD_MODELS_BODY_UNHASHED)
+               for m in body_matchers), (
+        "le template exige une valeur pour sha256, qui peut être null tant "
+        "que le hash n'a pas été calculé"
+    )
+    assert not all(word_matcher_hits(m, AUTOMATIC1111_OTHER_REGISTRY_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une passerelle qui n'est pas "
+        "AUTOMATIC1111 : model_name, filename et hash seuls sont un "
+        "sous-ensemble banal du schéma SDModelItem"
+    )
+    # Collisions internes au pack : les autres templates de disclosure du
+    # modèle servi ne doivent pas être revendiqués par celui-ci.
+    for other_body, other_name in (
+        (LLAMACPP_PROPS_BODY, "llama.cpp"),
+        (SGLANG_MODEL_INFO_BODY, "sglang"),
+        (TGI_INFO_BODY, "text-generation-inference"),
+        (LMSTUDIO_MODELS_BODY, "lmstudio"),
+        (VLLM_MODELS_BODY, "vllm"),
+        (XINFERENCE_REGISTRATIONS_BODY, "xinference"),
+    ):
+        assert not all(word_matcher_hits(m, other_body) for m in body_matchers), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

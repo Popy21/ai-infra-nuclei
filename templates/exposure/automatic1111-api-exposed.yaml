@@ -1,0 +1,92 @@
+id: automatic1111-api-exposed
+
+info:
+  name: AUTOMATIC1111 Stable Diffusion WebUI - Exposed Generation API
+  author: popy21
+  severity: high
+  description: |
+    --api monte le routeur FastAPI de modules/api/api.py (webui.py appelle
+    create_api() dès que cmd_opts.api est vrai) : sans ce drapeau, aucune des
+    routes /sdapi/v1/* n'existe, --nowebui montant le même routeur seul.
+    add_api_route() ne pose une dépendance HTTPBasic sur une route que si
+    shared.cmd_opts.api_auth est renseigné ; --api-auth vaut None par défaut, et
+    Api.__init__ ne construit alors même pas la table d'identifiants. Le port
+    Gradio (7860) écoute en 127.0.0.1 tant que --listen n'est pas passé, mais le
+    mappage du port d'un conteneur produit le même résultat qu'un --listen
+    explicite. GET /sdapi/v1/sd-models liste les checkpoints chargés — l'un des
+    rares appels de l'API à ne rien engager côté GPU.
+  impact: |
+    get_sd_models() rend, pour chaque entrée de sd_models.checkpoints_list, un
+    objet {"title","model_name","hash","sha256","filename","config"} : title et
+    filename portent le chemin du fichier de checkpoint sur le disque de l'hôte,
+    hash et sha256 identifient la version exacte du modèle chargé. Le tableau
+    n'a de valeur qu'en tant que preuve d'accès à l'API elle-même, dont la
+    surface dépasse largement /sd-models : add_api_route protège les routes une
+    à une derrière la même absence de dépendance, donc POST /sdapi/v1/txt2img
+    et /sdapi/v1/img2img génèrent des images sur le GPU de l'hôte pour
+    quiconque atteint le port, sans limite de débit ni trace d'audit, et
+    POST /sdapi/v1/options réécrit la configuration du serveur.
+  remediation: |
+    Passer --api-auth "utilisateur:motdepasse" (ou une liste séparée par des
+    virgules) — Api.add_api_route pose alors Depends(self.auth) sur chaque
+    route du routeur, /sdapi/v1/sd-models comprise. Ne pas passer --listen et ne
+    pas mapper le port 7860 d'un conteneur sur une interface publique ; à
+    défaut, placer un reverse proxy authentifiant devant. --api-auth compare les
+    identifiants en clair via HTTP Basic (compare_digest, pas de hachage) : le
+    couvrir par TLS reste nécessaire.
+  reference:
+    - https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/modules/api/api.py
+    - https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/modules/api/models.py
+    - https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/modules/cmd_args.py
+    - https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/modules/sd_models.py
+    - https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/API
+  metadata:
+    max-request: 1
+    vendor: automatic1111
+    product: automatic1111-stable-diffusion-webui
+    shodan-query: html:"stable-diffusion-webui"
+  tags: ai,ml,stable-diffusion,automatic1111,exposure,unauth,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/sdapi/v1/sd-models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Les six clés de SDModelItem (modules/api/models.py), prises ensemble :
+      # aucune autre passerelle d'inférence du pack ne sert un tableau où
+      # "sha256", "config" et "filename" décrivent le même objet que "title" et
+      # "model_name". "hash" et "config" seuls seraient trop banals ; c'est la
+      # combinaison des six qui n'appartient qu'à ce endpoint.
+      - type: word
+        part: body
+        words:
+          - '"title"'
+          - '"model_name"'
+          - '"hash"'
+          - '"sha256"'
+          - '"filename"'
+          - '"config"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: checkpoint_path
+        json:
+          - '.[0].filename'
+      - type: json
+        part: body
+        name: checkpoint_hash
+        json:
+          - '.[0].sha256'
