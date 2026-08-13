@@ -1,0 +1,152 @@
+id: letta-server-unauthenticated
+
+info:
+  name: Letta (ex-MemGPT) - Unauthenticated Agent State Disclosure
+  author: popy21
+  severity: high
+  description: |
+    Letta ne ferme pas son API par défaut, elle ne la ferme que sur demande :
+    create_application() (letta/server/rest_api/app.py) n'ajoute
+    CheckPasswordMiddleware que « if (os.getenv("LETTA_SERVER_SECURE") == "true")
+    or "--secure" in sys.argv » — la variable d'environnement doit valoir
+    exactement la chaîne "true", et sans elle ni --secure sur la ligne de
+    commande, aucun middleware d'authentification n'est monté sur l'application
+    FastAPI, dont chaque route reste alors atteignable par quiconque atteint le
+    port (8283 par défaut, exposé tel quel par l'image Docker officielle).
+    Même quand --secure est posé, la garde n'est pas totale :
+    CheckPasswordMiddleware.dispatch (letta/server/rest_api/middleware/
+    check_password.py) laisse passer sans vérifier de mot de passe toute requête
+    dont le chemin est dans {"/v1/health", "/v1/health/", "/v1/ready", ...} — les
+    sondes de vivacité et de disponibilité restent publiques par construction.
+    C'est le comportement attendu d'un healthcheck, mais il signifie que GET
+    /v1/health/ ne prouve jamais l'absence d'authentification : health.py rend
+    Health(version=__version__, status="ok"), donc {"version":"<version
+    letta>","status":"ok"}, que le mode sécurisé soit actif ou non. Ce que le
+    template en tire n'est donc que l'identification du produit et de sa
+    version, pas le constat.
+    Le constat vient de GET /v1/agents/ : list_agents() (routers/v1/agents.py)
+    est monté sous le préfixe /agents de agents_router, lui-même inclus sous
+    API_PREFIX = "/v1" (letta/constants.py) sans aucune dépendance
+    d'authentification déclarée sur la route, et n'est pas dans la liste
+    d'exception de check_password.py. Sur une instance qui n'a jamais posé
+    LETTA_SERVER_SECURE=true ni --secure — le cas par défaut d'un `docker run`
+    ou d'un `letta server` lancé tel quel — cette route répond 200 et sérialise
+    AgentState (letta/schemas/agent.py) pour chaque agent existant : id, name,
+    agent_type, llm_config et memory en sont des champs requis (Field(...)),
+    donc toujours présents dans la réponse dès qu'un agent existe.
+  impact: |
+    Chaque AgentState de la liste porte, au-delà de id/name, agent_type — l'une
+    des neuf valeurs de l'enum AgentType (memgpt_agent, memgpt_v2_agent,
+    letta_v1_agent, react_agent, workflow_agent, split_thread_agent,
+    sleeptime_agent, voice_convo_agent, voice_sleeptime_agent), qui date
+    l'architecture de l'agent — et llm_config, qui nomme le modèle et le
+    fournisseur réellement utilisés (model, model_endpoint_type,
+    model_endpoint). Le champ memory (schemas/memory.py) embarque les blocks de
+    mémoire centrale de l'agent, et Block.value (schemas/block.py) porte le
+    texte en clair de chaque bloc — persona, human, et tout bloc personnalisé —
+    c'est-à-dire la mémoire persistante que l'agent construit conversation
+    après conversation, l'argument de vente même de Letta. Le sous-ensemble
+    tool_exec_environment_variables sérialise en outre AgentEnvironmentVariable
+    (schemas/environment_variables.py) avec un champ value: str non chiffré au
+    niveau du schéma, c'est-à-dire les identifiants que l'exploitant a posés
+    pour que les outils de l'agent s'exécutent.
+    La lecture n'est que la moitié du sujet : la même absence de garde couvre
+    POST /v1/agents/{agent_id}/tools/{tool_name}/run (run_tool_for_agent),
+    qui exécute tout outil déjà attaché à l'agent en lui injectant précisément
+    ces variables d'environnement déchiffrées comme contexte d'exécution — donc
+    un appel anonyme qui tourne avec les identifiants de l'exploitant — ainsi
+    que PATCH /v1/agents/{agent_id}/core-memory/blocks/{label}, qui réécrit la
+    mémoire centrale que l'agent relit à chaque tour, et DELETE
+    /v1/agents/{agent_id}, qui efface l'agent. Aucun compte n'existe pour
+    attribuer l'un de ces appels à qui que ce soit.
+  remediation: |
+    Démarrer le serveur avec --secure, ou poser LETTA_SERVER_SECURE=true —
+    exactement cette chaîne, comparée par égalité stricte dans app.py — et fixer
+    LETTA_SERVER_PASSWORD plutôt que de laisser generate_password() choisir un
+    mot de passe aléatoire à chaque démarrage, qui ne survit pas à un redémarrage
+    et ne peut donc pas être distribué aux clients légitimes. Ce mot de passe
+    reste un secret unique partagé, à faire porter par un en-tête
+    Authorization: Bearer ou X-BARE-PASSWORD à chaque appel — ce n'est pas une
+    identité par utilisateur, et ne pas confondre un déploiement « secure » avec
+    un déploiement multi-utilisateur cloisonné. Ne jamais publier le port 8283
+    sur une interface non maîtrisée même en mode sécurisé, puisque
+    /v1/health/ et /v1/ready/ restent volontairement publics par construction.
+    Après une exposition, considérer la mémoire de chaque agent comme lue et les
+    identifiants posés dans tool_exec_environment_variables comme compromis —
+    ils circulent en clair dans la réponse — et les renouveler plutôt que de les
+    supposer intacts.
+  reference:
+    - https://docs.letta.com/guides/selfhosting/
+    - https://github.com/letta-ai/letta/blob/main/letta/server/rest_api/app.py
+    - https://github.com/letta-ai/letta/blob/main/letta/server/rest_api/middleware/check_password.py
+    - https://github.com/letta-ai/letta/blob/main/letta/server/rest_api/routers/v1/health.py
+    - https://github.com/letta-ai/letta/blob/main/letta/server/rest_api/routers/v1/agents.py
+    - https://github.com/letta-ai/letta/blob/main/letta/schemas/agent.py
+    - https://github.com/letta-ai/letta/blob/main/letta/schemas/environment_variables.py
+  metadata:
+    max-request: 2
+    vendor: letta-ai
+    product: letta
+  tags: ai,llm,agents,letta,memgpt,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /v1/health/ nomme le produit et sa version — Health(version=__version__,
+  # status="ok") — mais check_password.py l'exempte nommément du middleware de
+  # mot de passe, dans les deux branches, sécurisée ou non : un 200 ici ne prouve
+  # donc jamais l'absence d'authentification, seulement que le processus répond.
+  #
+  # GET /v1/agents/ est ce que list_agents() sert sans dépendance
+  # d'authentification et sans figurer dans l'exception de check_password.py :
+  # son 200 anonyme est le constat entier, à la différence de la sonde.
+  #
+  # En lecture seule, et strictement : le même préfixe sert POST
+  # /v1/agents/{agent_id}/tools/{tool_name}/run, qui exécuterait un outil déjà
+  # attaché avec les secrets déchiffrés de l'agent, PATCH .../core-memory/blocks
+  # qui récrirait sa mémoire centrale, et DELETE /v1/agents/{agent_id} qui
+  # l'effacerait. Signaler une exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/health/"
+      - "{{BaseURL}}/v1/agents/"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, /v1/health/ conclurait seul —
+    # or il ne dit rien de l'autorisation.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Les deux clés du schéma Health, prises avec la valeur que
+          # check_health() fixe en dur pour status : version change à chaque
+          # publication, donc n'est vérifiée que par sa présence.
+          - 'status_code_1 == 200 && contains(body_1, "\"version\"") && contains(body_1, "\"status\":\"ok\"")'
+
+          # Les trois champs requis d'AgentState qui n'appartiennent pas au
+          # vocabulaire générique d'une liste de ressources : agent_type,
+          # llm_config et memory, ensemble, ne se lisent que sur cette route.
+          - 'status_code_2 == 200 && contains(body_2, "\"agent_type\"") && contains(body_2, "\"llm_config\"") && contains(body_2, "\"memory\"")'
+
+          # Et la valeur elle-même : les neuf littéraux de l'enum AgentType
+          # (letta/schemas/agent.py) ne sont émis par aucun autre produit du
+          # pack — "memgpt_agent" porte le nom d'origine du projet. Une
+          # instance qui n'a encore aucun agent rend "[]" et ne satisfait donc
+          # aucune de ces neuf valeurs : le constat porte sur l'agent
+          # réellement exposé, pas sur la seule route atteignable.
+          - 'contains(body_2, "memgpt_agent") || contains(body_2, "memgpt_v2_agent") || contains(body_2, "letta_v1_agent") || contains(body_2, "react_agent") || contains(body_2, "workflow_agent") || contains(body_2, "split_thread_agent") || contains(body_2, "sleeptime_agent") || contains(body_2, "voice_convo_agent") || contains(body_2, "voice_sleeptime_agent")'
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses agents : c'est ce qui lui
+      # appartient dans la réponse, et le premier renseignement qu'un tiers en
+      # tire. Un seul extracteur, et borné à body_2 : sous req-condition le
+      # moteur évalue les extracteurs contre chaque réponse et émet un résultat
+      # par extracteur qui rend quelque chose, donc en ajouter un second ferait
+      # remonter deux fois la même instance.
+      - type: json
+        part: body_2
+        name: agent_name
+        json:
+          - '.[].name'

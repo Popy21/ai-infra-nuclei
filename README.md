@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-33 templates, 30 produits.
+34 templates, 31 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -49,6 +49,7 @@ amont.
 | langflow | [`CVE-2026-55255`](templates/cves/CVE-2026-55255.yaml) | high |
 | langflow | [`langflow-unauthenticated`](templates/exposure/langflow-unauthenticated.yaml) | critical |
 | langserve | [`langserve-exposed-playground`](templates/exposure/langserve-exposed-playground.yaml) | high |
+| letta | [`letta-server-unauthenticated`](templates/exposure/letta-server-unauthenticated.yaml) | high |
 | litellm | [`litellm-proxy-no-master-key`](templates/exposure/litellm-proxy-no-master-key.yaml) | high |
 | llama.cpp | [`llamacpp-server-exposed`](templates/exposure/llamacpp-server-exposed.yaml) | high |
 | lm-studio | [`lmstudio-server-exposed`](templates/exposure/lmstudio-server-exposed.yaml) | medium |

@@ -33,7 +33,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 - [x] `templates/exposure/litellm-proxy-no-master-key.yaml` — proxy LiteLLM sans `master_key` : `/v1/models` répond sans clé. Sévérité high.
 - [x] `templates/exposure/gradio-app-exposed.yaml` — application Gradio exposée, `GET /config` renvoie la définition de l'interface. Sévérité medium.
 - [x] `templates/exposure/automatic1111-api-exposed.yaml` — AUTOMATIC1111 Stable Diffusion WebUI lancé avec `--api` : `GET /sdapi/v1/sd-models` renvoie un tableau JSON d'objets `{"title":...,"model_name":...,"hash":...,"sha256":...,"filename":...,"config":...}` — les chemins de checkpoints sur disque prouvent l'accès à l'API de génération, `--api-auth` valant `None` par défaut (aucune authentification). Sévérité high.
-- [ ] `templates/exposure/letta-server-unauthenticated.yaml` — Letta (ex-MemGPT), plateforme d'agents à mémoire persistante : `GET /v1/health/` renvoie `{"version":"<version letta>","status":"ok"}` et `GET /v1/agents/` renvoie la liste des `AgentState` (`id`, `name`, `agent_type`, `llm_config`, `memory`) — le middleware de mot de passe n'est monté que si `LETTA_SERVER_SECURE=true` ou `--secure`, donc rien ne protège l'instance par défaut. Sévérité high.
+- [x] `templates/exposure/letta-server-unauthenticated.yaml` — Letta (ex-MemGPT), plateforme d'agents à mémoire persistante : `GET /v1/health/` renvoie `{"version":"<version letta>","status":"ok"}` et `GET /v1/agents/` renvoie la liste des `AgentState` (`id`, `name`, `agent_type`, `llm_config`, `memory`) — le middleware de mot de passe n'est monté que si `LETTA_SERVER_SECURE=true` ou `--secure`, donc rien ne protège l'instance par défaut. Sévérité high.
 
 ## Bases vectorielles
 

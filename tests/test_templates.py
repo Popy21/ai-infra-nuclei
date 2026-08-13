@@ -7907,6 +7907,193 @@ def test_automatic1111_matcher_holds_across_versions_without_becoming_generic():
         )
 
 
+# --------------------------------------------------------------------------
+# Letta expose /v1/health/ sans jamais le garder — check_password.py l'exempte
+# nommément du mot de passe, sécurisée ou non — et /v1/agents/ sans dépendance
+# d'authentification déclarée. Le premier ne prouve donc que le produit et sa
+# version ; c'est le second qui porte le constat, et seulement s'il rend au
+# moins un agent : une liste vide ne distingue Letta d'aucune autre API.
+
+LETTA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "letta-server-unauthenticated.yaml")
+
+# Réponse de GET /v1/health/ telle que check_health() la sérialise
+# (routers/v1/health.py) : Health(version=__version__, status="ok").
+LETTA_HEALTH_BODY = '{"version":"0.16.8","status":"ok"}'
+
+
+def letta_agent_state(agent_type="memgpt_agent", name="customer-support-bot"):
+    """
+    Une AgentState telle que list_agents() la sérialise (schemas/agent.py),
+    réduite aux champs requis que le template vérifie plus un minimum de
+    contexte réaliste.
+    """
+    return {
+        "id": "agent-3f9b2a1c-5e21-4e60-9c2e-1a2b3c4d5e6f",
+        "name": name,
+        "system": "You are Letta, the latest version of Limnal Corporation's...",
+        "agent_type": agent_type,
+        "llm_config": {
+            "model": "gpt-4o-mini",
+            "model_endpoint_type": "openai",
+            "model_endpoint": "https://api.openai.com/v1",
+            "context_window": 128000,
+        },
+        "memory": {
+            "agent_type": agent_type,
+            "blocks": [
+                {"label": "persona", "value": "I am a helpful assistant.", "limit": 5000},
+                {"label": "human", "value": "The user's name is Jane Doe.", "limit": 5000},
+            ],
+        },
+        "blocks": [],
+        "tools": [],
+        "sources": [],
+        "tags": [],
+    }
+
+
+def letta_agents_body(*agents):
+    return json.dumps(list(agents), separators=(",", ":"))
+
+
+LETTA_AGENTS_BODY = letta_agents_body(letta_agent_state())
+
+# Instance neuve : aucun agent n'a encore été créé, list_agents() rend "[]",
+# et le corps ne porte donc plus aucune des neuf valeurs de l'enum AgentType.
+LETTA_EMPTY_AGENTS_BODY = "[]"
+
+# Une passerelle maison qui emprunte le même vocabulaire ("agent_type",
+# "llm_config", "memory") sans être Letta : les trois clés seules, sans une
+# valeur de l'enum AgentType, ne doivent pas suffire.
+LETTA_OTHER_AGENT_FRAMEWORK_BODY = json.dumps([
+    {"id": "wf-1", "name": "generic-agent", "agent_type": "custom_agent",
+     "llm_config": {"model": "llama-3.1-8b"}, "memory": {"blocks": []}},
+], separators=(",", ":"))
+
+
+def letta_block():
+    doc = load(LETTA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v1/agents/" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /v1/agents/"
+    return blocks[0]
+
+
+def letta_responses(health_status=200, health_body=LETTA_HEALTH_BODY,
+                     agents_status=200, agents_body=LETTA_AGENTS_BODY):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    ordered = []
+    for path in letta_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == "/v1/health/":
+            ordered.append((health_status, health_body))
+        elif route == "/v1/agents/":
+            ordered.append((agents_status, agents_body))
+        else:
+            raise AssertionError(f"le template interroge un chemin inattendu : {route}")
+    return ordered
+
+
+def letta_fires(**kwargs):
+    block = letta_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = letta_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_letta_reads_health_then_agents_and_touches_nothing_else():
+    doc = load(LETTA_TEMPLATE)
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste des agents se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/tools/", "POST .../tools/{tool_name}/run exécuterait un "
+                            "outil déjà attaché à l'agent avec ses secrets "
+                            "déchiffrés"),
+                ("/core-memory", "PATCH .../core-memory/blocks/{label} "
+                                 "réécrirait la mémoire centrale de l'agent"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    assert letta_block().get("req-condition") is True, (
+        "sans req-condition, /v1/health/ conclurait seul — or check_password.py "
+        "l'exempte nommément du mot de passe dans les deux branches, "
+        "sécurisée ou non, donc il ne dit rien de l'autorisation"
+    )
+
+
+def test_letta_matcher_needs_a_real_agent_not_just_a_reachable_route():
+    assert letta_fires(), (
+        "le template ne reconnaît pas une instance Letta ouverte avec un "
+        "agent memgpt_agent"
+    )
+    for other_type in ("memgpt_v2_agent", "letta_v1_agent", "react_agent",
+                       "workflow_agent", "split_thread_agent", "sleeptime_agent",
+                       "voice_convo_agent", "voice_sleeptime_agent"):
+        body = letta_agents_body(letta_agent_state(agent_type=other_type))
+        assert letta_fires(agents_body=body), (
+            f"le template dépend d'un type d'agent précis alors que "
+            f"{other_type} est l'une des neuf valeurs valides de l'enum "
+            "AgentType"
+        )
+    assert not letta_fires(agents_body=LETTA_EMPTY_AGENTS_BODY), (
+        "une instance neuve sans agent rend \"[]\" : rien n'y distingue "
+        "Letta d'une autre API, le template a raison de rester silencieux"
+    )
+    assert not letta_fires(agents_body=LETTA_OTHER_AGENT_FRAMEWORK_BODY), (
+        "le template déclenche sur une passerelle qui emprunte le même "
+        "vocabulaire (agent_type, llm_config, memory) sans être Letta : les "
+        "clés seules, sans une valeur de l'enum AgentType, ne prouvent rien"
+    )
+
+
+def test_letta_health_alone_does_not_prove_the_absence_of_auth():
+    """
+    check_password.py exempte /v1/health/ du mot de passe même en mode
+    --secure : un 200 dessus ne dit donc jamais si le reste de l'API est
+    gardé. Une instance sécurisée répond 200 sur la sonde et 401 sur
+    /v1/agents/, et le template doit rester silencieux dans ce cas.
+    """
+    assert not letta_fires(agents_status=401,
+                            agents_body='{"detail":"Unauthorized"}'), (
+        "le template conclut sur la seule sonde /v1/health/, qui répond "
+        "200 que le serveur soit sécurisé ou non"
+    )
+
+
+def test_letta_extractor_stays_on_the_agent_list_response():
+    block = letta_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "un second extracteur ferait remonter deux fois la même instance "
+        "sous req-condition, qui évalue chaque extracteur contre les deux "
+        "réponses"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur doit être borné à la réponse de /v1/agents/ — la "
+        "seconde requête déclarée — puisque c'est la seule à porter des "
+        "noms d'agent"
+    )
+    assert extractor.get("type") == "json", (
+        "/v1/agents/ rend un tableau JSON : un extracteur regex n'a pas à "
+        "s'en charger"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
