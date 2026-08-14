@@ -8179,6 +8179,197 @@ def test_aim_extractor_reports_the_leaked_repo_path():
     )
 
 
+# --------------------------------------------------------------------------
+# Phoenix sert /arize_phoenix_version depuis le router nu de app.py, hors du
+# préfixe /v1 et sans dépendance : la route répond pareil que
+# PHOENIX_ENABLE_AUTH soit posé ou non, elle nomme donc le produit sans rien
+# dire de l'autorisation. C'est GET /v1/projects qui porte le constat —
+# create_v1_router() n'y accroche Depends(is_authenticated) que si
+# authentication_enabled, et is_authenticated répond 401 sitôt le drapeau posé.
+
+PHOENIX_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "arize-phoenix-exposed.yaml")
+
+# Corps de GET /arize_phoenix_version : version() rend
+# PlainTextResponse(f"{phoenix_version}"), donc la version seule, sans
+# enveloppe. Le serveur ASGI la sert telle quelle, avec un saut de ligne ou non.
+PHOENIX_VERSION_BODY = "20.2.0"
+
+# Le catch-all du SPA rend l'index React sur un chemin inconnu : c'est ce
+# qu'un hôte qui n'est pas Phoenix — ou un proxy qui avale la route — renvoie
+# sous ce même chemin, avec un 200.
+PHOENIX_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Phoenix</title>'
+    '<script type="module" src="/index.js"></script></head><body></body></html>'
+)
+
+
+def phoenix_projects_body(*projects):
+    """
+    Réponse de GET /v1/projects telle que get_projects() la sérialise :
+    GetProjectsResponseBody, un PaginatedResponseBody[Project] dont les champs
+    déclarés sont data puis next_cursor (routers/v1/utils.py). Chaque Project
+    vient de _to_project_response() : id (GlobalID relay), name, description —
+    l'ordre pydantic met les champs hérités de ProjectData en premier.
+    """
+    return json.dumps({"data": list(projects), "next_cursor": None},
+                      separators=(",", ":"))
+
+
+PHOENIX_PROJECTS_BODY = phoenix_projects_body(
+    # Le projet que la migration initiale insère sur toute instance :
+    # {"name": "default", "description": "Default project"}.
+    {"name": "default", "description": "Default project", "id": "UHJvamVjdDox"},
+    {"name": "support-copilot", "description": None, "id": "UHJvamVjdDoy"},
+)
+
+# Instance dont la liste serait vide : l'enveloppe reste, les champs de
+# ProjectData disparaissent.
+PHOENIX_EMPTY_PROJECTS_BODY = '{"data":[],"next_cursor":null}'
+
+
+def phoenix_block():
+    doc = load(PHOENIX_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v1/projects" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /v1/projects"
+    return blocks[0]
+
+
+def phoenix_responses(version_status=200, version_body=PHOENIX_VERSION_BODY,
+                      projects_status=200, projects_body=PHOENIX_PROJECTS_BODY):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    ordered = []
+    for path in phoenix_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == "/arize_phoenix_version":
+            ordered.append((version_status, version_body))
+        elif route == "/v1/projects":
+            ordered.append((projects_status, projects_body))
+        else:
+            raise AssertionError(f"le template interroge un chemin inattendu : {route}")
+    return ordered
+
+
+def phoenix_fires(**kwargs):
+    block = phoenix_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = phoenix_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_phoenix_reads_version_then_projects_and_touches_nothing_else():
+    doc = load(PHOENIX_TEMPLATE)
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste des projets se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/spans", "POST /v1/spans injecterait des traces dans un "
+                           "projet et DELETE /v1/spans/{span_identifier} en "
+                           "effacerait"),
+                ("/v1/projects/", "DELETE /v1/projects/{project_identifier} "
+                                  "supprimerait tout projet autre que "
+                                  "\"default\""),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    assert phoenix_block().get("req-condition") is True, (
+        "sans req-condition, /arize_phoenix_version conclurait seul — or la "
+        "route est déclarée hors du préfixe /v1 sur un router sans "
+        "dépendance, donc elle répond 200 que PHOENIX_ENABLE_AUTH soit posé "
+        "ou non"
+    )
+
+
+def test_phoenix_matcher_needs_a_real_project_not_just_a_reachable_route():
+    assert phoenix_fires(), (
+        "le template ne reconnaît pas une instance Phoenix ouverte qui rend "
+        "ses projets"
+    )
+    for version in ("4.0.0", "11.28.3", "20.2.0", "20.3.0.dev0"):
+        assert phoenix_fires(version_body=version), (
+            f"le template dépend d'une version précise alors que "
+            f"version() rend {version} en texte brut sur cette route"
+        )
+    assert phoenix_fires(version_body=PHOENIX_VERSION_BODY + "\n"), (
+        "le corps est détouré avant l'ancrage : un saut de ligne final ne "
+        "doit pas faire manquer la sonde"
+    )
+    assert not phoenix_fires(projects_body=PHOENIX_EMPTY_PROJECTS_BODY), (
+        "une liste vide ne porte ni name ni description : l'enveloppe "
+        "data/next_cursor seule est un vocabulaire trop banal pour signer "
+        "le produit"
+    )
+    assert not phoenix_fires(version_body=PHOENIX_SPA_BODY), (
+        "le template déclenche sur l'index du SPA que le catch-all rend sur "
+        "un chemin inconnu : le corps de /arize_phoenix_version est la "
+        "version seule, un jeton sans espace"
+    )
+    assert not phoenix_fires(version_body='{"version":"20.2.0"}'), (
+        "le template accepte une enveloppe JSON alors que version() rend une "
+        "PlainTextResponse : n'importe quelle API qui nomme sa version "
+        "passerait la sonde"
+    )
+
+
+def test_phoenix_version_alone_does_not_prove_the_absence_of_auth():
+    """
+    /arize_phoenix_version est déclarée sur le router nu de app.py, inclus
+    inconditionnellement : elle répond 200 même une fois PHOENIX_ENABLE_AUTH
+    posé. Une instance authentifiée rend donc la version puis un 401 sur
+    /v1/projects, et le template doit rester silencieux dans ce cas.
+    """
+    assert not phoenix_fires(projects_status=401,
+                             projects_body='{"detail":"Unauthorized"}'), (
+        "le template conclut sur la seule sonde de version, qui répond 200 "
+        "que l'authentification soit active ou non"
+    )
+    assert not phoenix_fires(projects_status=403,
+                             projects_body='{"detail":"The Phoenix REST API '
+                                           'is disabled in read-only mode."}'), (
+        "prevent_access_in_read_only_mode refuse tout le préfixe /v1 par un "
+        "403 : rien n'y est exposé, le template n'a pas à le signaler"
+    )
+
+
+def test_phoenix_extractor_stays_on_the_project_list_response():
+    block = phoenix_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "un second extracteur ferait remonter deux fois la même instance "
+        "sous req-condition, qui évalue chaque extracteur contre les deux "
+        "réponses"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur doit être borné à la réponse de /v1/projects — la "
+        "seconde requête déclarée — puisque c'est la seule à porter des noms "
+        "de projet ; /arize_phoenix_version ne rend que du texte brut"
+    )
+    assert extractor.get("type") == "json", (
+        "/v1/projects rend un objet JSON : un extracteur regex n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("json") == [".data[].name"], (
+        "les noms de projet sont sous data[] : ils nomment les applications "
+        "instrumentées et servent tels quels de project_identifier pour "
+        "atteindre les spans"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

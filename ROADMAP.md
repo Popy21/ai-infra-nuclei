@@ -55,7 +55,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 
 ## Observabilité LLM
 
-- [ ] `templates/exposure/arize-phoenix-exposed.yaml` — Arize Phoenix : `GET /arize_phoenix_version` renvoie la version en texte brut sur un chemin propre au produit, à confirmer par `GET /v1/projects` qui renvoie `{"data":[{"id":...,"name":...,"description":...}],"next_cursor":...}` — l'authentification n'est câblée que si `authentication_enabled` est activé, donc les traces LLM (prompts et réponses) sont lisibles par défaut. Sévérité high.
+- [x] `templates/exposure/arize-phoenix-exposed.yaml` — Arize Phoenix : `GET /arize_phoenix_version` renvoie la version en texte brut sur un chemin propre au produit, à confirmer par `GET /v1/projects` qui renvoie `{"data":[{"id":...,"name":...,"description":...}],"next_cursor":...}` — l'authentification n'est câblée que si `authentication_enabled` est activé, donc les traces LLM (prompts et réponses) sont lisibles par défaut. Sévérité high.
 
 ## CVE sans template amont
 

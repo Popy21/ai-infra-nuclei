@@ -1,0 +1,155 @@
+id: arize-phoenix-exposed
+
+info:
+  name: Arize Phoenix - Unauthenticated LLM Trace Project Disclosure
+  author: popy21
+  severity: high
+  description: |
+    Phoenix ne câble l'authentification que sur demande. create_v1_router()
+    (src/phoenix/server/api/routers/v1/__init__.py) part de
+    dependencies = [Depends(prevent_access_in_read_only_mode)] et n'ajoute
+    Depends(APIKeyHeader(...)) puis Depends(is_authenticated) que « if
+    authentication_enabled » ; le sous-routeur viewer_restricted_router qui
+    porte projects_router, spans_router et le reste reçoit de même
+    [Depends(restrict_access_by_viewers)] si et seulement si ce drapeau est
+    posé. Or authentication_enabled vient de get_env_enable_auth()
+    (src/phoenix/config.py), soit _bool_val(ENV_PHOENIX_ENABLE_AUTH, False) :
+    PHOENIX_ENABLE_AUTH vaut False tant que l'exploitant ne le pose pas. Sur un
+    déploiement par défaut, tout le préfixe /v1 ne porte donc aucune dépendance
+    d'authentification, et le serveur est déjà sur le réseau sans qu'on l'ait
+    demandé — HOST = "0.0.0.0" et PORT = 6006 sont les valeurs par défaut de
+    config.py, contrairement aux services de ce pack qui se lient à 127.0.0.1.
+    GET /arize_phoenix_version identifie le produit et rien d'autre : la route
+    est déclarée sur le router = APIRouter() nu de server/app.py, rendue par
+    version() en PlainTextResponse(f"{phoenix_version}") — donc la version en
+    texte brut, "20.2.0" — et app.include_router(router) est inconditionnel,
+    si bien qu'elle répond 200 que l'authentification soit active ou non. Le
+    constat vient de GET /v1/projects : get_projects()
+    (routers/v1/projects.py) rend GetProjectsResponseBody, un
+    PaginatedResponseBody[Project] (routers/v1/utils.py) dont les champs sont
+    data: list[Project] et next_cursor: Optional[str], chaque Project étant
+    construit par _to_project_response() avec id (un GlobalID relay), name et
+    description. Cette route répond 401 dès que l'authentification est active
+    (is_authenticated, server/bearer_auth.py), donc son 200 anonyme est la
+    preuve. La liste n'est jamais vide sur une instance installée : la
+    migration initiale (cf03bd6bae1d_init.py) insère
+    {"name": "default", "description": "Default project"} dans la table des
+    projets.
+  impact: |
+    Un projet Phoenix est le conteneur des traces LLM d'une application : c'est
+    le produit même de l'outil. La liste rendue nomme donc les applications
+    d'IA que l'équipe instrumente, et chaque nom est directement la clé de leur
+    contenu, puisque get_project_by_identifier() accepte indifféremment
+    l'identifiant ou le nom du projet — GET /v1/projects/{project_identifier}/
+    spans (routers/v1/spans.py), servi par le même routeur sans garde, rend les
+    spans de ce projet, c'est-à-dire les invites envoyées au modèle et ses
+    réponses, avec leurs attributs ; GET /v1/projects/{project_identifier}/
+    spans/otlpv1 les rend au format OTLP. Ce que l'exposition livre n'est pas
+    une métadonnée d'infrastructure mais le contenu des conversations
+    elles-mêmes, y compris ce que les utilisateurs finaux ont saisi et ce que
+    l'application leur a répondu, jusqu'aux invites système que l'exploitant
+    considère comme sa propriété.
+    L'écriture relève de la même absence de garde : POST /v1/spans et POST
+    /v1/projects/{project_identifier}/spans injectent des spans dans un projet,
+    DELETE /v1/spans/{span_identifier} en efface, et DELETE
+    /v1/projects/{project_identifier} supprime tout projet qui n'est pas le
+    projet "default" — celui-là seul est protégé, par un 403 explicite du
+    handler. Sans compte, aucun de ces appels n'est attribuable à qui que ce
+    soit.
+  remediation: |
+    Poser PHOENIX_ENABLE_AUTH=True et fixer PHOENIX_SECRET : sans le second, le
+    middleware de jeton porteur n'est pas monté du tout, la condition de
+    server/app.py étant « if authentication_enabled and secret ». Ne pas
+    compter sur le fait que le service n'est « pas publié » : la valeur par
+    défaut de HOST est 0.0.0.0, donc une instance lancée telle quelle écoute
+    déjà sur toutes les interfaces, et le port 6006 doit être fermé
+    explicitement ou placé derrière un proxy qui authentifie. Noter que
+    /arize_phoenix_version reste public même une fois l'authentification
+    active — la route est hors du préfixe /v1 et ne porte aucune dépendance —
+    donc sa réponse ne peut pas servir de contrôle de fermeture. Après une
+    exposition, considérer les traces des projets listés comme lues : elles
+    contiennent les invites et les réponses en clair, et rien dans le produit
+    ne journalise qui les a consultées.
+  reference:
+    - https://arize.com/docs/phoenix/self-hosting/features/authentication
+    - https://github.com/Arize-ai/phoenix/blob/main/src/phoenix/server/app.py
+    - https://github.com/Arize-ai/phoenix/blob/main/src/phoenix/server/api/routers/v1/__init__.py
+    - https://github.com/Arize-ai/phoenix/blob/main/src/phoenix/server/api/routers/v1/projects.py
+    - https://github.com/Arize-ai/phoenix/blob/main/src/phoenix/server/api/routers/v1/utils.py
+    - https://github.com/Arize-ai/phoenix/blob/main/src/phoenix/server/api/routers/v1/spans.py
+    - https://github.com/Arize-ai/phoenix/blob/main/src/phoenix/config.py
+  metadata:
+    max-request: 2
+    vendor: arize-ai
+    product: phoenix
+  tags: ai,llm,llmops,observability,phoenix,arize,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /arize_phoenix_version nomme le produit : le chemin est propre à
+  # Phoenix et version() rend la version en texte brut, sans enveloppe. Mais la
+  # route est déclarée sur le router nu de app.py, hors du préfixe /v1 et sans
+  # dépendance, et son include_router est inconditionnel : elle répond 200 que
+  # PHOENIX_ENABLE_AUTH soit posé ou non, donc elle ne dit rien de
+  # l'autorisation.
+  #
+  # GET /v1/projects est ce que create_v1_router() sert sans Depends(
+  # is_authenticated) tant que authentication_enabled est faux, et ce que
+  # is_authenticated refuse par un 401 sitôt le drapeau posé : son 200 anonyme
+  # est le constat entier.
+  #
+  # En lecture seule, et strictement : le même préfixe sert POST /v1/spans, qui
+  # injecterait des traces dans un projet, DELETE /v1/spans/{span_identifier},
+  # qui en effacerait, et DELETE /v1/projects/{project_identifier}, qui
+  # supprimerait tout projet autre que "default". Signaler une exposition ne
+  # demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/arize_phoenix_version"
+      - "{{BaseURL}}/v1/projects"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, la sonde de version conclurait
+    # seule — or elle répond pareil sur une instance authentifiée.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # PlainTextResponse(f"{phoenix_version}") : le corps entier est la
+          # version, un seul jeton sans espace. L'ancrage des deux bouts sur le
+          # corps détouré écarte le HTML que le catch-all du SPA rend sur un
+          # chemin inconnu, et toute enveloppe JSON. Le numéro lui-même n'est
+          # pas contraint au-delà du triplet majeur.mineur.correctif : il change
+          # à chaque publication, et les versions de développement ajoutent un
+          # suffixe.
+          - 'status_code_1 == 200 && regex("^[0-9]+\\.[0-9]+\\.[0-9]+[^\\s]*$", trim_space(body_1))'
+
+          # Les deux champs de PaginatedResponseBody, pris ensemble : data et
+          # next_cursor sont sérialisés systématiquement, next_cursor à null
+          # quand la page est la dernière.
+          - 'status_code_2 == 200 && contains(body_2, "\"data\"") && contains(body_2, "\"next_cursor\"")'
+
+          # Et au moins une entrée Project dans data : name et description sont
+          # les deux champs de ProjectData, toujours présents dès qu'un projet
+          # est rendu — description à null si elle n'a pas été renseignée. Une
+          # instance dont la liste serait vide rendrait {"data":[],
+          # "next_cursor":null} et ne les porterait pas ; le constat porte sur
+          # le projet réellement exposé, pas sur la seule route atteignable.
+          - 'contains(body_2, "\"name\"") && contains(body_2, "\"description\"")'
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses projets : ils nomment les
+      # applications d'IA instrumentées, et get_project_by_identifier() les
+      # accepte tels quels comme project_identifier, donc ils sont aussi la clé
+      # des spans. Un seul extracteur, et borné à body_2 : sous req-condition
+      # le moteur évalue les extracteurs contre chaque réponse et émet un
+      # résultat par extracteur qui rend quelque chose, donc en ajouter un
+      # second ferait remonter deux fois la même instance.
+      - type: json
+        part: body_2
+        name: project_name
+        json:
+          - '.data[].name'
