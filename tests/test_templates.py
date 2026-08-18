@@ -8571,6 +8571,345 @@ def test_librechat_extractors_report_what_the_anonymous_payload_gives_away():
     )
 
 
+# --------------------------------------------------------------------------
+# Prefect a changé la forme de sa réponse sans changer la route : un serveur 3.x
+# rend l'objet Settings imbriqué, dont les clés sont les champs du modèle, là où
+# un 2.x rend un dictionnaire plat de cent soixante clés PREFECT_*. Les deux
+# lignes traînent exposées, et un template qui n'aurait vu que la seconde raterait
+# tout le parc récent — ou l'inverse. Ces corps sont ceux que deux serveurs
+# réellement lancés ont rendus, réduits aux sections que le template regarde et
+# aux valeurs qu'un déploiement conteneurisé porte.
+#
+# L'autre moitié du travail est la frontière : chez Prefect, à la différence de
+# Phoenix, la sonde de version tombe sous la même garde que le constat. Une
+# instance dont PREFECT_SERVER_API_AUTH_STRING est posé répond 401 sur les deux
+# routes, donc le template doit se taire — reconnaître le produit n'est pas le
+# constat, et une instance correctement fermée ne se reconnaît même pas.
+
+PREFECT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "prefect-server-admin-exposed.yaml")
+
+# read_version() est annotée « -> str » : FastAPI rend la version en chaîne JSON,
+# donc le corps entier est le numéro entre guillemets.
+PREFECT_VERSION_BODY = '"3.8.3"'
+PREFECT_V2_VERSION_BODY = '"2.20.16"'
+
+# Serveur 3.x en conteneur derrière un proxy, base PostgreSQL configurée par
+# parties plutôt que par URL — le cas où l'obfuscation ne protège plus rien :
+# connection_url et password sont masqués, driver, host, port, user et name ne le
+# sont pas. server.api.host à 0.0.0.0 est la condition même de l'exposition, et
+# server.api.auth_string à null la confirme dans la réponse.
+PREFECT_SETTINGS_BODY = (
+    '{"home":"/root/.prefect","profiles_path":"/root/.prefect/profiles.toml",'
+    '"debug_mode":false,'
+    '"api":{"url":"https://prefect.interne.lan/api","auth_string":null,'
+    '"key":null,"tls_insecure_skip_verify":false,"ssl_cert_file":null,'
+    '"enable_http2":false,"request_timeout":60.0},'
+    '"ui_url":null,"silence_api_url_misconfiguration":false,'
+    '"server":{"logging_level":"WARNING","analytics_enabled":true,'
+    '"register_blocks_on_start":true,"memoize_block_auto_registration":true,'
+    '"memo_store_path":"/root/.prefect/memo_store.toml",'
+    '"api":{"auth_string":null,"host":"0.0.0.0","port":4200,"base_path":null,'
+    '"default_limit":200,"keepalive_timeout":5,'
+    '"csrf_protection_enabled":false,"csrf_token_expiration":"PT1H",'
+    '"cors_allowed_origins":"*","cors_allowed_methods":"*",'
+    '"cors_allowed_headers":"*","websocket_ping_interval":20.0,'
+    '"websocket_ping_timeout":20.0,"max_parameter_size":524288},'
+    '"database":{"connection_url":"**********",'
+    '"driver":"postgresql+asyncpg","host":"prefect-db.interne.lan",'
+    '"port":5432,"user":"prefect","name":"prefect","password":"**********",'
+    '"echo":false,"migrate_on_start":true,"timeout":10.0,'
+    '"connection_timeout":5.0,"migration_timeout":null},'
+    '"ui":{"enabled":true,"v2_enabled":true,'
+    '"api_url":"https://prefect.interne.lan/api","serve_base":"/",'
+    '"static_directory":null,"show_promotional_content":true}}}'
+)
+
+# Même route sur un 2.x, avant que la 3.0 ne restructure les réglages en modèles
+# imbriqués : un dictionnaire plat, dont les clés portent le préfixe PREFECT_.
+# Cette ligne n'a aucun réglage d'authentification à publier — elle n'en a pas —
+# et sa configuration de base tient dans une seule URL, obfusquée.
+PREFECT_V2_SETTINGS_BODY = (
+    '{"PREFECT_HOME":"/root/.prefect","PREFECT_DEBUG_MODE":false,'
+    '"PREFECT_PROFILES_PATH":"${PREFECT_HOME}/profiles.toml",'
+    '"PREFECT_API_URL":null,"PREFECT_API_KEY":"********",'
+    '"PREFECT_API_DATABASE_CONNECTION_URL":"********",'
+    '"PREFECT_API_DATABASE_PASSWORD":"********",'
+    '"PREFECT_API_BLOCKS_REGISTER_ON_START":true,'
+    '"PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION":true,'
+    '"PREFECT_MEMO_STORE_PATH":"${PREFECT_HOME}/memo_store.toml",'
+    '"PREFECT_SERVER_API_HOST":"0.0.0.0","PREFECT_SERVER_API_PORT":4200,'
+    '"PREFECT_UI_API_URL":null,"PREFECT_LOGGING_LEVEL":"INFO"}'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie : le deux-points se retrouve alors séparé de la clé par un espace.
+PREFECT_REFORMATTED_SETTINGS_BODY = json.dumps(
+    json.loads(PREFECT_SETTINGS_BODY), indent=2,
+)
+
+# Ce que rend une instance dont PREFECT_SERVER_API_AUTH_STRING est posé :
+# token_validation intercepte avant le routage, n'exempte que GET /health et GET
+# /ready, et rend ce corps en 401 sur les deux routes du routeur /admin.
+PREFECT_UNAUTHORIZED_BODY = '{"exception_message":"Unauthorized"}'
+
+# Le catch-all du SPA : sur un chemin qu'il ne sert pas, le serveur rend l'index
+# de l'interface en 200 plutôt qu'un 404.
+PREFECT_SPA_BODY = (
+    '<!DOCTYPE html><html lang="en"><head><title>Prefect Server</title>'
+    '</head><body><div id="app"></div></body></html>'
+)
+
+# Ce qui justifie d'exiger deux noms plutôt qu'un. Les champs que Settings porte
+# à sa racine sont génériques — "home", "profiles_path" et "debug_mode" ne sont
+# pas des mots de Prefect —, et un outil de la même famille les publie à
+# l'identique : dbt tient sa configuration dans un profiles.yml et nomme lui
+# aussi son répertoire. Seul "memoize_block_auto_registration", qui désigne la
+# mémoïsation de l'enregistrement automatique des blocs, appartient à Prefect et
+# à lui seul.
+PREFECT_OTHER_TOOL_WITH_PROFILES_PATH_BODY = (
+    '{"home":"/opt/dbt","profiles_path":"/opt/dbt/profiles.yml",'
+    '"debug_mode":false,"target":"prod","threads":8,'
+    '"logging_level":"INFO","partial_parse":true}'
+)
+
+# Une application quelconque expose elle aussi une console d'administration sous
+# /api/admin : le chemin ne désigne aucun produit, et la version qu'elle rend a
+# la même forme.
+PREFECT_OTHER_ADMIN_BODY = (
+    '{"instance_name":"portail interne","debug_mode":false,'
+    '"registration_enabled":true,"database":{"host":"db.interne.lan",'
+    '"port":5432,"user":"portail"},"logging_level":"INFO"}'
+)
+
+# Les deux pièges que le deux-points écarte, et qui séparent « publier un
+# réglage » de « nommer un réglage ». En prose d'abord : un service qui
+# documente les variables d'environnement de Prefect les cite dans une valeur de
+# chaîne. Puis, plus près du template, un catalogue de configuration qui les
+# porte en éléments de tableau — là les noms sont bien entre guillemets, et seul
+# le deux-points qui suit distingue une clé d'une valeur.
+PREFECT_MENTIONS_THE_NAMES_IN_A_STRING_BODY = (
+    '{"doc":"poser PREFECT_PROFILES_PATH et '
+    'PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION avant de lancer le serveur",'
+    '"service":"catalogue"}'
+)
+PREFECT_LISTS_THE_NAMES_AS_VALUES_BODY = (
+    '{"service":"catalogue de configuration","scope":"orchestration",'
+    '"documented_settings":["PREFECT_PROFILES_PATH",'
+    '"PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION","PREFECT_API_URL"]}'
+)
+
+
+def prefect_block():
+    doc = load(PREFECT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/admin/settings" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /api/admin/settings"
+    return blocks[0]
+
+
+def prefect_responses(settings_status=200, settings_body=PREFECT_SETTINGS_BODY,
+                      version_status=200, version_body=PREFECT_VERSION_BODY):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template : c'est
+    cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    ordered = []
+    for path in prefect_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == "/api/admin/settings":
+            ordered.append((settings_status, settings_body))
+        elif route == "/api/admin/version":
+            ordered.append((version_status, version_body))
+        else:
+            raise AssertionError(f"le template interroge un chemin inattendu : {route}")
+    return ordered
+
+
+def prefect_fires(**kwargs):
+    block = prefect_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = prefect_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_prefect_reads_the_admin_router_and_never_writes_to_it():
+    doc = load(PREFECT_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la configuration se lit en GET : le template ne doit rien envoyer "
+            "à une instance qu'il découvre, alors que le routeur qu'il "
+            "interroge porte des écritures juste à côté"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/admin/database", "le template appelle POST "
+                                    "/admin/database/drop ou /clear : sur un "
+                                    "serveur resté en 2.x, un confirm=True dans "
+                                    "le corps détruit ou vide la base de "
+                                    "l'ordonnanceur — le template effacerait "
+                                    "l'historique d'exécution qu'il est censé "
+                                    "protéger"),
+                ("/admin/storage", "le template touche à PUT ou DELETE "
+                                   "/api/admin/storage : il remplacerait ou "
+                                   "effacerait le bloc de stockage de résultats "
+                                   "par défaut du serveur, donc l'endroit où "
+                                   "toutes les exécutions écrivent"),
+                ("create_flow_run", "le template appelle "
+                                    "/api/deployments/{id}/create_flow_run : "
+                                    "le premier worker qui interroge la file "
+                                    "exécuterait le code du déploiement — le "
+                                    "scanner ferait tourner du code sur ce "
+                                    "qu'il audite"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_prefect_matcher_proves_the_admin_router_answers_anonymously():
+    block = prefect_block()
+
+    assert block.get("req-condition") is True, (
+        "sans req-condition les deux réponses ne partagent pas d'espace de "
+        "noms : chaque sonde conclurait seule, et /settings sans la version "
+        "tiendrait à deux noms de réglages"
+    )
+
+    # Les deux 200 sont vérifiés ici sur la forme, et non par un corps de plus.
+    # C'est délibéré : les ancrages de corps rejettent déjà tout ce qu'une
+    # instance réelle rend en erreur — le 401 de token_validation vaut
+    # {"exception_message":"Unauthorized"}, un 404 rend l'index du SPA — donc
+    # aucun scénario plausible ne sépare la condition de statut de ces
+    # ancrages, et un corps inventé pour y arriver ne prouverait rien qu'une
+    # instance ferait. Reste que le constat est que les deux routes ont
+    # *répondu* à l'anonyme : cela doit être écrit dans le matcher, pas déduit
+    # de la forme d'un corps.
+    dsl_exprs = [expr for m in (block.get("matchers") or [])
+                 if m.get("type") == "dsl" for expr in (m.get("dsl") or [])]
+    for index, route in ((1, "/api/admin/settings"), (2, "/api/admin/version")):
+        assert any(f"status_code_{index} == 200" in expr for expr in dsl_exprs), (
+            f"aucune expression n'exige status_code_{index} == 200 : le "
+            f"template ne dit pas que {route} a répondu à l'anonyme, alors que "
+            "c'est tout le constat — la configuration lue n'est un défaut que "
+            "parce que le serveur l'a rendue sans rien demander"
+        )
+
+    assert prefect_fires(), (
+        "le template ne reconnaît pas un serveur Prefect 3.x dont le routeur "
+        "/admin répond sans authentification"
+    )
+    assert prefect_fires(settings_body=PREFECT_V2_SETTINGS_BODY,
+                         version_body=PREFECT_V2_VERSION_BODY), (
+        "le template rate un serveur 2.x : sa réponse est un dictionnaire plat "
+        "de clés PREFECT_*, pas l'objet imbriqué de la 3.0, et c'est cette "
+        "ligne-là qui traîne exposée sans même avoir de réglage "
+        "d'authentification à poser"
+    )
+    assert prefect_fires(settings_body=PREFECT_REFORMATTED_SETTINGS_BODY), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    # La frontière du constat : l'authentification posée, les deux routes
+    # tombent, et le template n'a plus rien à dire.
+    assert not prefect_fires(settings_status=401,
+                             settings_body=PREFECT_UNAUTHORIZED_BODY,
+                             version_status=401,
+                             version_body=PREFECT_UNAUTHORIZED_BODY), (
+        "le template déclenche sur une instance dont "
+        "PREFECT_SERVER_API_AUTH_STRING est posé : token_validation rend 401 "
+        "sur les deux routes du routeur /admin, et le constat porte sur le 200 "
+        "anonyme, pas sur la reconnaissance du produit"
+    )
+    assert not prefect_fires(settings_status=403,
+                             settings_body="Forbidden"), (
+        "le template conclut alors qu'un proxy filtre /api/admin/settings : la "
+        "seule route qui porte la configuration n'a rien rendu"
+    )
+    assert not prefect_fires(version_status=401,
+                             version_body=PREFECT_UNAUTHORIZED_BODY), (
+        "le template conclut sur la seule réponse de /settings, sans que la "
+        "seconde route du même routeur ait corroboré"
+    )
+
+    assert not prefect_fires(settings_body=PREFECT_OTHER_ADMIN_BODY,
+                             version_body='"1.4.2"'), (
+        "le template déclenche sur une application quelconque servant une "
+        "console sous /api/admin : le chemin ne désigne aucun produit"
+    )
+    assert not prefect_fires(
+        settings_body=PREFECT_OTHER_TOOL_WITH_PROFILES_PATH_BODY,
+        version_body='"1.10.6"'), (
+        "le template tient à « profiles_path » seul, un nom que Prefect ne "
+        "possède pas : un outil qui range sa configuration dans un fichier de "
+        "profils publie les mêmes champs de racine — home, profiles_path, "
+        "debug_mode — et suffirait à le faire conclure. Le second nom exigé "
+        "doit être un mot du produit"
+    )
+    assert not prefect_fires(
+        settings_body=PREFECT_MENTIONS_THE_NAMES_IN_A_STRING_BODY), (
+        "le template se contente de trouver les noms de réglages n'importe où "
+        "dans le corps : il déclencherait sur un service qui documente les "
+        "variables d'environnement de Prefect au lieu d'en publier"
+    )
+    assert not prefect_fires(
+        settings_body=PREFECT_LISTS_THE_NAMES_AS_VALUES_BODY), (
+        "le template accepte les noms de réglages en valeurs : un catalogue de "
+        "configuration qui les liste entre guillemets suffirait à le faire "
+        "conclure, alors que le constat est qu'une instance publie ces "
+        "réglages — donc que les noms sont des clés, deux-points compris"
+    )
+    assert not prefect_fires(version_body=PREFECT_SPA_BODY), (
+        "le template accepte l'index du SPA en guise de version : le "
+        "catch-all rend cette page en 200 sur tout chemin qu'il ne sert pas"
+    )
+    assert not prefect_fires(version_body='{"version":"3.8.3"}'), (
+        "le template accepte une version sous enveloppe JSON : read_version() "
+        "est annotée « -> str » et rend le numéro nu entre guillemets, donc "
+        "une enveloppe désigne un autre produit"
+    )
+
+
+def test_prefect_extractor_reports_the_database_left_in_clear():
+    extractors = prefect_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul extracteur, sinon la même instance remonte autant de fois "
+        "sous req-condition, qui évalue chaque extracteur contre les deux "
+        "réponses"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur doit être borné à la réponse de /api/admin/settings — la "
+        "première requête déclarée — puisque c'est la seule à porter la "
+        "configuration ; /api/admin/version ne rend que le numéro"
+    )
+    assert extractor.get("type") == "json", (
+        "/api/admin/settings rend un objet JSON : un extracteur regex n'a pas "
+        "à s'en charger"
+    )
+
+    paths = extractor.get("json") or []
+    for field in ("host", "user", "name", "port", "driver"):
+        assert any(p.startswith(f".server.database.{field}") for p in paths), (
+            f"aucun chemin ne lit .server.database.{field} — connection_url et "
+            "password sont les seuls champs obfusqués de la section, donc "
+            "l'exploitant qui configure sa base par parties publie tout ce qui "
+            "la désigne, et c'est le renseignement à lire à côté du constat"
+        )
+    assert all(p.endswith(" // empty") for p in paths), (
+        "sans « // empty », ces chemins rendent null sur un serveur 2.x — dont "
+        "la réponse est plate et n'a pas de .server — et le moteur remonterait "
+        "des chaînes vides à côté du constat"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

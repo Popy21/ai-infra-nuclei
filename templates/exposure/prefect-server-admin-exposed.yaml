@@ -1,0 +1,188 @@
+id: prefect-server-admin-exposed
+
+info:
+  name: Prefect Server - Unauthenticated Admin Settings Disclosure
+  author: popy21
+  severity: high
+  description: |
+    Le routeur d'administration du serveur Prefect auto-hébergé ne porte aucune
+    dépendance d'authentification, et le serveur OSS n'en impose pas par
+    ailleurs. src/prefect/server/api/admin.py ouvre sur
+    router = PrefectRouter(prefix="/admin", tags=["Admin"]), et PrefectRouter
+    (server/utilities/server.py) n'est qu'un APIRouter qui fixe route_class et
+    déduit response_model depuis l'annotation de retour : son __init__ ne pose
+    jamais de dependencies. Au montage, create_api_app() (server/api/server.py)
+    fait « for router in API_ROUTERS: api_app.include_router(router,
+    dependencies=dependencies) », mais cette liste ne reçoit que
+    Depends(enforce_minimum_version), ajouté inconditionnellement — et
+    EnforceMinimumAPIVersion.__call__ (server/api/dependencies.py) déclare
+    x_prefect_api_version: str = Header(None) puis rend la main aussitôt sur
+    « if not request_version: return », commenté « if no version header, assume
+    latest and continue ». Une requête sans en-tête traverse donc la seule garde
+    en place. L'application d'API est montée sur /api, ou sur
+    PREFECT_SERVER_API_BASE_PATH si l'exploitant l'a déplacée.
+    GET /api/admin/settings appelle read_settings(), qui rend
+    get_current_settings() : l'objet Settings entier, que FastAPI sérialise
+    d'après l'annotation de retour prefect.settings.Settings. Les valeurs
+    marquées secrètes sont obfusquées — _ser_model(), le model_serializer de
+    PrefectBaseSettings, les remplace par une suite d'astérisques — mais tout le
+    reste de la configuration part en clair. GET /api/admin/version rend
+    prefect.__version__ sous la forme d'une chaîne JSON, soit "3.8.3" avec ses
+    guillemets, et date l'instance au correctif près.
+    Le constat porte sur le 200 anonyme, pas sur la reconnaissance du produit :
+    dès que PREFECT_SERVER_API_AUTH_STRING est posé, create_api_app() monte le
+    middleware token_validation, qui n'exempte que GET /health et GET /ready et
+    répond {"exception_message":"Unauthorized"} en 401 à tout le reste — les
+    deux routes lues ici comprises.
+  impact: |
+    La réponse est la configuration de service au complet, et ce qu'elle nomme
+    n'est pas anodin. server.database rend connection_url et password obfusqués,
+    mais driver, host, port, user et name en clair : l'exploitant qui pose
+    PREFECT_SERVER_DATABASE_HOST, _USER, _NAME et _PORT plutôt qu'une URL
+    complète publie les coordonnées de sa base PostgreSQL, et il ne manque plus
+    que le mot de passe pour l'atteindre. server.api rend host et port réels —
+    donc l'adresse d'écoute derrière le proxy —, cors_allowed_origins, qui vaut
+    "*" par défaut, et csrf_protection_enabled, qui vaut false : l'attaquant lit
+    directement quelles protections côté navigateur sont désactivées. api.url,
+    server.ui.api_url et cloud.api_url nomment les hôtes internes ; home,
+    profiles_path, server.logging et logging.config_path donnent des chemins du
+    système de fichiers et le compte sous lequel le serveur tourne. Enfin
+    server.api.auth_string à null confirme dans la réponse elle-même qu'aucune
+    authentification n'est configurée.
+    Surtout, ce préfixe /api n'est pas un îlot : create_api_app() applique la
+    même liste de dépendances à tous les routeurs d'API_ROUTERS, si bien que
+    l'API REST entière répond dans les mêmes conditions. Un anonyme lit les
+    flux, les déploiements et les exécutions — dont les paramètres, qui portent
+    souvent des identifiants —, et POST /api/deployments/{id}/create_flow_run
+    fait exécuter le code du déploiement par le premier worker qui interroge sa
+    file : sur un serveur ouvert, déclencher une exécution est une exécution de
+    code à distance par dessein. Le routeur d'administration lui-même porte des
+    écritures — PUT et DELETE /api/admin/storage remplacent ou effacent le bloc
+    de stockage de résultats par défaut — et sur les serveurs restés en 2.x il
+    porte en plus POST /admin/database/clear, /admin/database/drop et
+    /admin/database/create, qui vident ou détruisent la base pour peu qu'on
+    passe confirm=True dans le corps.
+  remediation: |
+    Poser PREFECT_SERVER_API_AUTH_STRING sur le processus serveur, au format
+    « utilisateur:motdepasse », et PREFECT_API_AUTH_STRING avec la même valeur
+    sur les clients et les workers : c'est la présence du premier qui fait
+    monter le middleware token_validation, sans quoi aucune vérification
+    d'identité n'est câblée. L'authentification basique reste un jeton partagé
+    comparé par HMAC, sans compte ni journal d'accès : elle ferme la porte, elle
+    ne dit pas qui est entré. Un serveur 2.x n'a pas ce réglage du tout — il n'y
+    a rien à y poser, et la seule fermeture possible est un proxy qui
+    authentifie en amont ou un réseau qui n'expose pas le port 4200.
+    Ne pas compter sur PREFECT_SERVER_API_BASE_PATH pour dissimuler l'API :
+    déplacer le préfixe ne retire aucune route, et la base est publiée par
+    l'interface elle-même. Ne pas compter non plus sur la valeur par défaut de
+    server.api.host, 127.0.0.1 : tout déploiement conteneurisé la passe à
+    0.0.0.0 pour être joignable, et c'est là que l'exposition commence.
+    Après une exposition, considérer la configuration comme lue : les
+    coordonnées de base de données, les hôtes internes et les chemins qu'elle
+    nomme ne sont pas révocables, et si l'API a répondu à l'anonyme sur /admin,
+    elle lui a répondu partout ailleurs — vérifier les exécutions et les
+    déploiements créés pendant la fenêtre d'exposition, et faire tourner les
+    identifiants portés par les paramètres de déploiement.
+  reference:
+    - https://docs.prefect.io/v3/advanced/security-settings
+    - https://github.com/PrefectHQ/prefect/blob/main/src/prefect/server/api/admin.py
+    - https://github.com/PrefectHQ/prefect/blob/main/src/prefect/server/api/server.py
+    - https://github.com/PrefectHQ/prefect/blob/main/src/prefect/server/api/dependencies.py
+    - https://github.com/PrefectHQ/prefect/blob/main/src/prefect/server/utilities/server.py
+    - https://github.com/PrefectHQ/prefect/blob/main/src/prefect/settings/models/root.py
+  metadata:
+    max-request: 2
+    vendor: prefecthq
+    product: prefect
+  tags: ai,ml,mlops,orchestration,prefect,exposure,unauth,misconfig
+
+http:
+  # Deux lectures du même routeur, et c'est voulu : chez Prefect la sonde de
+  # version ne joue pas le rôle qu'elle joue ailleurs. /api/admin/version est
+  # déclarée sur le même PrefectRouter(prefix="/admin") que /api/admin/settings,
+  # donc elle tombe sous le même 401 sitôt PREFECT_SERVER_API_AUTH_STRING posé.
+  # Elle ne sert pas à nommer le produit sur une instance fermée — elle n'en a
+  # pas l'occasion — mais à corroborer la première réponse et à dater l'instance :
+  # read_version() rend prefect.__version__ en chaîne JSON, un corps entier de la
+  # forme "3.8.3", ce qu'aucun /settings d'une autre application n'accompagne.
+  #
+  # En lecture seule, et strictement. Le même routeur porte PUT et DELETE
+  # /api/admin/storage, qui remplacent ou effacent le bloc de stockage de
+  # résultats par défaut du serveur, et sur une instance restée en 2.x il porte
+  # POST /admin/database/drop, qui détruit la base sur un simple confirm=True.
+  # Le préfixe /api voisin porte POST /api/deployments/{id}/create_flow_run, qui
+  # ferait exécuter le code d'un déploiement par un worker. Signaler une
+  # exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/admin/settings"
+      - "{{BaseURL}}/api/admin/version"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, chaque sonde conclurait seule, et
+    # /settings sans la version tiendrait à deux noms de réglages.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Les deux routes du routeur /admin répondent, sans en-tête
+          # d'authentification et sans X-PREFECT-API-VERSION. Sur une instance où
+          # PREFECT_SERVER_API_AUTH_STRING est posé, token_validation intercepte
+          # avant le routage et rend 401 sur les deux : ce couple de 200 est le
+          # constat, pas une simple preuve de vie.
+          - 'status_code_1 == 200 && status_code_2 == 200'
+
+          # read_version() est annotée « -> str » : FastAPI sérialise donc la
+          # version en chaîne JSON, et le corps entier vaut "3.8.3", guillemets
+          # compris. L'ancrage des deux bouts sur le corps détouré écarte toute
+          # enveloppe JSON et le HTML qu'un catch-all rendrait sur un chemin
+          # inconnu. Le numéro n'est pas contraint au-delà du triplet
+          # majeur.mineur.correctif : il change à chaque publication, et les
+          # versions de développement ajoutent un suffixe.
+          - 'regex("^\"[0-9]+\\.[0-9]+\\.[0-9]+[^\"]*\"$", trim_space(body_2))'
+
+          # Deux noms de réglages propres à Prefect, dans le corps de /settings.
+          # La casse est laissée libre parce que la forme du document a changé
+          # avec la 3.0 sans que ces noms bougent : un serveur 3.x rend un objet
+          # imbriqué dont les clés sont les champs du modèle Settings —
+          # "profiles_path" à la racine, "memoize_block_auto_registration" sous
+          # "server" —, là où un 2.x rend un dictionnaire plat de cent soixante
+          # clés PREFECT_*, dont "PREFECT_PROFILES_PATH" et
+          # "PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION". Le préfixe optionnel et
+          # (?i) couvrent les deux lignes, qui traînent exposées l'une comme
+          # l'autre. Le deux-points est exigé après la clé, avec l'espace
+          # facultatif qu'un intermédiaire qui reformate le corps insérerait :
+          # ces noms doivent désigner des réglages, pas apparaître dans une
+          # chaîne quelconque.
+          - 'regex("(?i)\"(PREFECT_)?PROFILES_PATH\"\\s*:", body_1)'
+          - 'regex("(?i)\"(PREFECT_)?MEMOIZE_BLOCK_AUTO_REGISTRATION\"\\s*:", body_1)'
+
+    extractors:
+      # Les coordonnées de la base que la réponse laisse en clair : seuls
+      # connection_url et password sont obfusqués, si bien qu'un exploitant qui
+      # configure sa base par PREFECT_SERVER_DATABASE_HOST, _PORT, _USER et
+      # _NAME publie tout ce qui la désigne. Un seul extracteur, et borné à
+      # body_1 : sous req-condition le moteur évalue les extracteurs contre
+      # chaque réponse et émet un résultat par extracteur qui rend quelque
+      # chose, donc en ajouter un second ferait remonter deux fois la même
+      # instance. Les cinq chemins tiennent dans celui-là.
+      #
+      # `// empty` sur chacun parce que ces chemins n'existent que sur un
+      # serveur 3.x : un 2.x rend un dictionnaire plat, où .server vaut null et
+      # où la traversée rend null à son tour — que le moteur convertirait en
+      # chaîne vide et remonterait telle quelle à côté du constat. `empty` ne
+      # produit rien du tout, donc l'instance 2.x est signalée sans extraction
+      # parasite. Elle n'a de toute façon rien d'équivalent à donner : sa
+      # configuration de base tient dans PREFECT_API_DATABASE_CONNECTION_URL,
+      # qui est obfusqué.
+      - type: json
+        part: body_1
+        name: database
+        json:
+          - '.server.database.driver // empty'
+          - '.server.database.host // empty'
+          - '.server.database.port // empty'
+          - '.server.database.user // empty'
+          - '.server.database.name // empty'
