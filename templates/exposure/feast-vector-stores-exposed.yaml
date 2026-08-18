@@ -1,0 +1,174 @@
+id: feast-vector-stores-exposed
+
+info:
+  name: Feast - Unauthenticated Feature Server (Vector Store Enumeration)
+  author: popy21
+  severity: high
+  description: |
+    Le serveur de features de Feast écoute sur 6566 — « feast serve » a
+    --port 6566 et --host 127.0.0.1 pour valeurs par défaut — et y sert
+    GET /v1/vector_stores, que list_vector_stores() rend en
+    {"object": "list", "data": [...]}, une entrée par feature view portant un
+    champ « vector_index ».
+    La route est déclarée avec dependencies=[Depends(inject_user_details)], et
+    c'est cette dépendance qui ne garde rien dans la configuration livrée.
+    inject_user_details() ouvre sur « sm = get_security_manager() » puis met la
+    totalité de son travail — extraction du jeton par le token_extractor, appel
+    au token_parser, et les deux HTTPException(401) qui en sortent — sous
+    « if sm is not None ». Or start_server() appelle
+    init_security_manager(auth_type=...), qui pour AuthManagerType.NONE exécute
+    no_security_manager(), lequel pose le global _sm à None. Le type
+    d'authentification vaut NONE par défaut : AuthConfig.type est un
+    Literal["oidc", "kubernetes", "no_auth"] valant « no_auth », et RepoConfig
+    l'écrit lui-même — « if "auth" not in data: self.auth["type"] =
+    AuthType.NONE.value » — quand feature_store.yaml ne porte pas de section
+    auth. La dépendance rend alors None sans avoir lu un seul en-tête.
+    Le filtrage par ressource ne rattrape pas la route : list_vector_stores()
+    appelle assert_permissions(fv, [DESCRIBE]) sur chaque entrée, et cette
+    fonction rend la ressource telle quelle dès que is_auth_necessary(sm) est
+    faux — ce qu'elle est quand sm vaut None. Chaque magasin passe donc le
+    filtre.
+    D'où deux lectures plutôt qu'une. GET /v1/vector_stores porte le constat,
+    mais son enveloppe est délibérément compatible OpenAI — « object »: « list »
+    et « data » — et plusieurs passerelles LLM servent des magasins vectoriels
+    sous ce même chemin : l'enveloppe seule ne nomme pas Feast. La seconde
+    lecture demande un identifiant que Feast ne peut pas avoir émis —
+    feature_view_to_vs_id() rend « vs_ » suivi de vingt-quatre caractères
+    hexadécimaux — et get_vector_store() attrape alors
+    FeatureViewNotFoundException pour rendre un 404 portant
+    {"error": {"message": "No vector store found with id '<identifiant>'",
+    "type": "not_found_error"}}. La phrase est propre au produit, elle renvoie
+    l'identifiant demandé, et la route qui la sert porte la même dépendance :
+    une instance dont l'authentification est configurée rend 401 sur les deux.
+    Une liste vide ne disqualifie pas le constat. VectorStoreRegistry.refresh()
+    ne retient que les feature views dont un champ porte vector_index, donc un
+    déploiement sans RAG rend {"object": "list", "data": []} — ce qui ne dit
+    rien des magasins mais dit tout du reste : la même dépendance sans effet
+    garde /get-online-features, /push, /write-to-online-store, /materialize et
+    /v1/vector_stores/{id}/search.
+  impact: |
+    Le corps nomme les feature views indexées vectoriellement — les corpus RAG
+    de l'exploitant — et l'identifiant que build_vector_store_object() leur
+    donne est précisément celui qu'attend
+    POST /v1/vector_stores/{vector_store_id}/search. Énumérer, c'est donc
+    obtenir la clé de lecture : la recherche par similarité rend les documents
+    stockés, et une requête suffisamment générique en ramène le contenu.
+    Le même serveur, sous la même dépendance sans effet, sert le reste.
+    POST /get-online-features lit n'importe quelle feature nommée, pour
+    n'importe quelle entité — c'est la table de features en clair, et sur un
+    magasin qui sert du scoring de fraude ou de la tarification, c'est le
+    modèle métier lui-même. POST /push et POST /write-to-online-store écrivent
+    dans le magasin en ligne ou hors ligne : l'anonyme choisit la valeur que
+    liront les modèles servis par cette instance, et, sur une feature view
+    indexée, le document que rendra la recherche vectorielle — un
+    empoisonnement de corpus qui n'a pas besoin de toucher au modèle.
+    POST /materialize et POST /materialize-incremental lancent une
+    matérialisation sur la plage de dates demandée, donc un travail de calcul
+    sur le magasin hors ligne, et « force » y remet à zéro l'état des feature
+    views bloquées en MATERIALIZING.
+  remediation: |
+    Poser une section auth dans feature_store.yaml — « auth: type: oidc » ou
+    « auth: type: kubernetes ». C'est elle, et elle seule, qui fait exister le
+    SecurityManager global, donc qui donne un effet à inject_user_details() :
+    sans elle le type vaut no_auth, no_security_manager() laisse _sm à None, et
+    la dépendance rend None sans lire d'en-tête. Déclarer ensuite les objets
+    Permission voulus, car un SecurityManager sans permission définie refuse
+    l'exécution.
+    Laisser --host sur 127.0.0.1, sa valeur par défaut. Le port 6566 n'a pas à
+    sortir de l'hôte : un conteneur qui le publie expose l'écriture — /push et
+    /write-to-online-store — au même titre que la lecture, et le magasin en
+    ligne est ce que les modèles servis interrogent.
+    Après une exposition, tenir pour suspect le contenu du magasin en ligne et
+    des feature views indexées : /push n'exige aucune trace d'appelant, donc
+    rien dans le magasin ne distingue une valeur poussée par le pipeline d'une
+    valeur poussée depuis l'extérieur. Rematérialiser depuis la source hors
+    ligne plutôt que de faire confiance à l'état en place.
+  reference:
+    - https://docs.feast.dev/reference/feature-servers/python-feature-server
+    - https://docs.feast.dev/getting-started/components/authz_manager
+    - https://github.com/feast-dev/feast/blob/master/sdk/python/feast/feature_server.py
+    - https://github.com/feast-dev/feast/blob/master/sdk/python/feast/permissions/server/rest.py
+    - https://github.com/feast-dev/feast/blob/master/sdk/python/feast/permissions/server/utils.py
+    - https://github.com/feast-dev/feast/blob/master/sdk/python/feast/permissions/security_manager.py
+    - https://github.com/feast-dev/feast/blob/master/sdk/python/feast/vector_store_utils.py
+  metadata:
+    max-request: 2
+    vendor: feast-dev
+    product: feast
+  tags: ai,ml,mlops,feature-store,feast,vector,rag,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /v1/vector_stores est la route de l'énumération : list_vector_stores()
+  # rend {"object": "list", "data": [...]} et le filtre par ressource qu'elle
+  # applique — assert_permissions(fv, [DESCRIBE]) — laisse tout passer tant que
+  # _sm vaut None. Mais son enveloppe est compatible OpenAI, et plusieurs
+  # passerelles LLM servent des magasins vectoriels sous exactement ce chemin :
+  # « object »: « list » et « data » ne nomment pas Feast.
+  #
+  # GET /v1/vector_stores/feast-exposure-probe nomme le produit. L'identifiant
+  # demandé ne peut pas exister — feature_view_to_vs_id() rend « vs_ » suivi de
+  # vingt-quatre caractères hexadécimaux, jamais ce libellé — donc
+  # vs_registry.resolve() lève FeatureViewNotFoundException, que le handler
+  # attrape pour rendre un 404 dont le message renvoie l'identifiant demandé.
+  # La route porte la même dépendance que la première : sur une instance dont
+  # auth.type vaut oidc ou kubernetes, inject_user_details() lève
+  # HTTPException(401) avant le handler, et les deux lectures rendent 401.
+  #
+  # En lecture seule, et strictement. Le même serveur porte
+  # POST /v1/vector_stores/{id}/search, qui interrogerait le corpus,
+  # POST /get-online-features, qui lirait les features, POST /push et
+  # POST /write-to-online-store, qui écriraient dans le magasin, et
+  # POST /materialize, qui lancerait un travail de calcul. Signaler une
+  # exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/vector_stores"
+      - "{{BaseURL}}/v1/vector_stores/feast-exposure-probe"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, l'enveloppe de la première
+    # conclurait seule — or elle est celle d'une API de magasins vectoriels
+    # compatible OpenAI, que Feast n'est pas seul à servir.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La route de l'énumération a répondu à l'anonyme, et elle a rendu
+          # l'enveloppe de list_vector_stores(). Le deux-points est exigé pour
+          # que « list » soit la valeur de la clé « object », et non un mot
+          # croisé ailleurs dans un corps quelconque ; l'espace facultatif
+          # couvre les deux sérialisations, celle de Starlette qui compacte et
+          # celle d'un intermédiaire qui réécrirait.
+          - 'status_code_1 == 200 && regex("\"object\"\\s*:\\s*\"list\"", body_1) && contains(body_1, "\"data\"")'
+
+          # Et la sonde nomme Feast. Le 404 vient de get_vector_store(), qui
+          # attrape FeatureViewNotFoundException ; la phrase est écrite dans ce
+          # handler et nulle part ailleurs. L'identifiant est exigé à part
+          # plutôt que dans la phrase — le message l'entoure d'apostrophes, que
+          # le YAML doublerait — mais les trois ancrages ensemble disent la même
+          # chose : le corps est celui du handler, et il renvoie ce que la sonde
+          # a demandé.
+          #
+          # Le statut fait le reste du travail. Une instance dont auth.type vaut
+          # oidc ou kubernetes ne rend jamais ce 404 : inject_user_details()
+          # lève HTTPException(401) avant que le handler ne s'exécute, et
+          # FastAPI sert {"detail": "Missing authentication token"}.
+          - 'status_code_2 == 404 && contains(body_2, "No vector store found with id ") && contains(body_2, "feast-exposure-probe") && contains(body_2, "\"not_found_error\"")'
+
+    extractors:
+      # Les noms que Feast donne aux magasins sont les noms des feature views
+      # indexées — donc ceux des corpus RAG de l'exploitant. Un seul extracteur,
+      # et borné à body_1 : sous req-condition le moteur évalue les extracteurs
+      # contre chaque réponse et émet un résultat par extracteur qui rend
+      # quelque chose, donc en ajouter un second ferait remonter deux fois la
+      # même instance. Une instance sans feature view indexée rend data vide et
+      # l'extracteur ne dit rien — le constat, lui, tient toujours.
+      - type: json
+        part: body_1
+        name: vector_store_name
+        json:
+          - '.data[].name'

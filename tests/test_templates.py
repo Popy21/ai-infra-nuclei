@@ -7,6 +7,7 @@ significatif : sans elle, un commit ne prouve rien.
 """
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -9185,6 +9186,323 @@ def test_torchserve_extractors_report_the_served_model_and_its_origin():
         "store ou d'une URL tierce, donc si allowed_urls a laissé passer un "
         "domaine, et c'est la moitié de la chaîne ShellTorch qui se lit sans "
         "rien envoyer"
+    )
+
+
+# --------------------------------------------------------------------------
+# Chez Feast la garde existe mais ne garde rien. GET /v1/vector_stores est
+# déclarée avec dependencies=[Depends(inject_user_details)], et
+# inject_user_details() met tout son travail — extraction du jeton, appel au
+# parser, les deux HTTPException(401) — sous « if sm is not None ». Or
+# start_server() appelle init_security_manager(), qui pour AuthManagerType.NONE
+# exécute no_security_manager() et pose _sm à None ; et le type vaut NONE par
+# défaut, RepoConfig écrivant lui-même « self.auth["type"] =
+# AuthType.NONE.value » quand feature_store.yaml ne porte pas de section auth.
+#
+# D'où la difficulté propre à ce template : l'enveloppe que rend la route est
+# délibérément compatible OpenAI — {"object": "list", "data": [...]} — et
+# plusieurs passerelles LLM servent des magasins vectoriels sous exactement ce
+# chemin. C'est la seconde lecture qui nomme Feast : un identifiant que
+# feature_view_to_vs_id() ne peut pas avoir émis fait lever
+# FeatureViewNotFoundException à vs_registry.resolve(), et get_vector_store()
+# l'attrape pour rendre un 404 dont le message renvoie l'identifiant demandé.
+
+FEAST_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                              "feast-vector-stores-exposed.yaml")
+
+# feature_view_to_vs_id(project, feature_view_name) rend « vs_ » suivi des
+# vingt-quatre premiers caractères hexadécimaux du sha256 de « projet:nom ».
+FEAST_VS_ID = re.compile(r"^vs_[0-9a-f]{24}$")
+
+
+def feast_vs_id(project, feature_view_name):
+    digest = hashlib.sha256(
+        f"{project}:{feature_view_name}".encode()).hexdigest()[:24]
+    return f"vs_{digest}"
+
+
+def feast_store_list_body(*names, project="rag_demo"):
+    """
+    Réponse de GET /v1/vector_stores telle que list_vector_stores() la
+    sérialise : JSONResponse({"object": "list", "data": permitted}), chaque
+    entrée venant de build_vector_store_object() — id, object, name, status
+    (« completed », posé en dur) et created_at. Starlette rend le JSON compact.
+    """
+    data = [{
+        "id": feast_vs_id(project, name),
+        "object": "vector_store",
+        "name": name,
+        "status": "completed",
+        "created_at": 1755500000,
+    } for name in names]
+    return json.dumps({"object": "list", "data": data}, separators=(",", ":"))
+
+
+FEAST_STORE_LIST_BODY = feast_store_list_body("document_embeddings",
+                                              "support_kb_chunks")
+
+# VectorStoreRegistry.refresh() ne retient que les feature views dont un champ
+# porte vector_index : un déploiement Feast sans RAG rend l'enveloppe et rien
+# dedans. Le constat porte sur la route qui a répondu à l'anonyme, pas sur le
+# nombre de magasins, et cette instance est tout aussi ouverte — la même
+# dépendance sans effet garde /push et /get-online-features.
+FEAST_EMPTY_STORE_LIST_BODY = '{"object":"list","data":[]}'
+
+
+def feast_not_found_body(vector_store_id):
+    """
+    Réponse de GET /v1/vector_stores/{id} sur un identifiant inconnu :
+    vs_registry.resolve() lève FeatureViewNotFoundException, que le handler
+    attrape pour rendre ce 404 — le message renvoie l'identifiant demandé.
+    """
+    return json.dumps({"error": {
+        "message": f"No vector store found with id '{vector_store_id}'",
+        "type": "not_found_error",
+    }}, separators=(",", ":"))
+
+
+# Une passerelle LLM qui sert des magasins vectoriels compatibles OpenAI sous
+# le même chemin : l'enveloppe est la même, les clés d'une entrée aussi. Rien
+# dans cette réponse ne dit Feast.
+FEAST_OPENAI_PROXY_LIST_BODY = json.dumps({
+    "object": "list",
+    "data": [{
+        "id": "vs_68ab1f2c9d3e4a5b6c7d8e9f",
+        "object": "vector_store",
+        "name": "knowledge-base",
+        "status": "completed",
+        "usage_bytes": 918273,
+        "file_counts": {"completed": 12, "total": 12},
+        "created_at": 1755500000,
+    }],
+}, separators=(",", ":"))
+
+# Ce que rend cette même passerelle sur un identifiant inconnu : un 404, sur la
+# bonne route, en JSON — mais pas la phrase du handler de Feast.
+FEAST_OPENAI_PROXY_NOT_FOUND_BODY = json.dumps({"error": {
+    "message": "Vector store not found",
+    "type": "invalid_request_error",
+}}, separators=(",", ":"))
+
+# Le 404 d'un routeur quelconque, qui renvoie lui aussi le chemin demandé :
+# l'identifiant de la sonde s'y retrouve mot pour mot, et lui seul ne prouve
+# rien.
+FEAST_GENERIC_NOT_FOUND_BODY = (
+    "<!doctype html><html><head><title>404</title></head><body>"
+    "<pre>Cannot GET /v1/vector_stores/feast-exposure-probe</pre>"
+    "</body></html>"
+)
+
+# L'index d'une application servie sur le même hôte, que le catch-all d'un
+# proxy rend sur un chemin inconnu.
+FEAST_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Feature platform</title>'
+    '</head><body><div id="root"></div></body></html>'
+)
+
+# Ce que rend une instance dont feature_store.yaml porte « auth: type: oidc »
+# ou « type: kubernetes » : _sm existe, inject_user_details() lève
+# HTTPException(401) avant le handler, et FastAPI sert le détail.
+FEAST_UNAUTHORIZED_BODY = '{"detail":"Missing authentication token"}'
+
+
+def feast_block():
+    doc = load(FEAST_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v1/vector_stores" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /v1/vector_stores"
+    return blocks[0]
+
+
+def feast_probe_id():
+    """
+    L'identifiant que la sonde demande, lu dans le template plutôt que réécrit
+    ici : c'est lui que le handler renvoie dans son message, donc la fixture
+    doit suivre le chemin déclaré et non l'inverse.
+    """
+    probes = [p.split("/v1/vector_stores/", 1)[1]
+              for p in (feast_block().get("path") or [])
+              if "/v1/vector_stores/" in p]
+    assert len(probes) == 1, (
+        "le template doit interroger exactement une route "
+        "/v1/vector_stores/{id} : c'est elle qui nomme le produit, et deux "
+        f"sondes en feraient deux constats — {probes}"
+    )
+    return probes[0]
+
+
+def feast_responses(list_status=200, list_body=FEAST_STORE_LIST_BODY,
+                    probe_status=404, probe_body=None):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    if probe_body is None:
+        probe_body = feast_not_found_body(feast_probe_id())
+    ordered = []
+    for path in feast_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == "/v1/vector_stores":
+            ordered.append((list_status, list_body))
+        elif route.startswith("/v1/vector_stores/"):
+            ordered.append((probe_status, probe_body))
+        else:
+            raise AssertionError(f"le template interroge un chemin inattendu : {route}")
+    return ordered
+
+
+def feast_fires(**kwargs):
+    block = feast_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = feast_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_feast_reads_the_store_index_and_touches_nothing_else():
+    doc = load(FEAST_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'index des magasins se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre, alors que le même serveur "
+            "porte l'écriture dans le magasin juste à côté"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/search", "POST /v1/vector_stores/{id}/search interrogerait "
+                            "le corpus et en rendrait les documents — lire le "
+                            "contenu n'est pas signaler l'exposition"),
+                ("/push", "POST /push écrirait dans le magasin en ligne ou "
+                          "hors ligne, donc dans ce que liront les modèles "
+                          "servis par cette instance"),
+                ("write-to-online-store", "POST /write-to-online-store "
+                                          "écrirait dans le magasin en ligne"),
+                ("/materialize", "POST /materialize lancerait un travail de "
+                                 "calcul sur le magasin hors ligne de ce "
+                                 "qu'on audite"),
+                ("/get-online-features", "POST /get-online-features lirait "
+                                         "les valeurs de features, ce que le "
+                                         "constat n'exige pas"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    assert feast_block().get("req-condition") is True, (
+        "sans req-condition, l'index conclurait seul — or son enveloppe "
+        "{\"object\": \"list\", \"data\": [...]} est celle d'une API de "
+        "magasins vectoriels compatible OpenAI, que Feast n'est pas seul à "
+        "servir sous ce chemin"
+    )
+
+
+def test_feast_probe_asks_for_an_id_feast_could_never_have_minted():
+    """
+    La sonde ne vaut que si l'identifiant demandé est introuvable par
+    construction : feature_view_to_vs_id() rend « vs_ » suivi de vingt-quatre
+    caractères hexadécimaux, donc tout libellé hors de cette forme fait lever
+    FeatureViewNotFoundException quel que soit le contenu du registre. Un
+    identifiant qui aurait cette forme pourrait, lui, désigner un magasin réel :
+    le handler rendrait 200 et le template ne conclurait jamais.
+    """
+    probe = feast_probe_id()
+    assert not FEAST_VS_ID.match(probe), (
+        f"la sonde demande {probe!r}, qui a la forme d'un identifiant que "
+        "feature_view_to_vs_id() peut émettre : sur l'instance où il désigne "
+        "un magasin, get_vector_store() rend 200 et le constat est perdu"
+    )
+
+    dsl = [expr for m in (feast_block().get("matchers") or [])
+           for expr in (m.get("dsl") or [])]
+    assert any(f'"{probe}"' in expr for expr in dsl), (
+        f"le chemin demande {probe!r} mais aucune expression ne l'exige dans "
+        "le corps : le message du handler renvoie l'identifiant demandé, et "
+        "sans cet ancrage le chemin peut dériver du matcher sans que rien ne "
+        "le signale — le template resterait muet sur toute instance"
+    )
+
+
+def test_feast_matcher_needs_the_product_not_an_openai_shaped_store_list():
+    assert feast_fires(), (
+        "le template ne reconnaît pas une instance Feast ouverte qui rend ses "
+        "magasins vectoriels"
+    )
+    assert feast_fires(list_body=FEAST_EMPTY_STORE_LIST_BODY), (
+        "le template exige un magasin dans l'index : VectorStoreRegistry ne "
+        "retient que les feature views portant un champ vector_index, donc un "
+        "déploiement Feast sans RAG rend data vide — et il est tout aussi "
+        "ouvert, la même dépendance sans effet gardant /push et "
+        "/get-online-features"
+    )
+
+    assert not feast_fires(list_body=FEAST_OPENAI_PROXY_LIST_BODY,
+                           probe_body=FEAST_OPENAI_PROXY_NOT_FOUND_BODY), (
+        "le template conclut sur l'enveloppe compatible OpenAI : une "
+        "passerelle LLM qui sert des magasins vectoriels sous ce même chemin "
+        "remonterait comme une instance Feast"
+    )
+    assert not feast_fires(probe_body=FEAST_GENERIC_NOT_FOUND_BODY), (
+        "le template se contente de retrouver l'identifiant de la sonde dans "
+        "le corps : tout routeur qui renvoie le chemin demandé dans son 404 "
+        "passerait, alors que la phrase « No vector store found with id » est "
+        "écrite dans get_vector_store() et nulle part ailleurs"
+    )
+    assert not feast_fires(probe_status=200,
+                           probe_body=feast_not_found_body(feast_probe_id())), (
+        "le template se passe du statut de la sonde : un document qui cite le "
+        "message d'erreur de Feast — une page d'aide, un catalogue d'API — "
+        "suffirait à le faire conclure"
+    )
+    assert not feast_fires(list_body=FEAST_SPA_BODY,
+                           probe_status=200, probe_body=FEAST_SPA_BODY), (
+        "le template déclenche sur l'index d'une application quelconque servie "
+        "en 200 sur ces chemins"
+    )
+
+
+def test_feast_instance_with_an_auth_manager_is_not_reported():
+    """
+    Une section auth dans feature_store.yaml fait exister le SecurityManager
+    global, et inject_user_details() lève alors HTTPException(401) avant le
+    handler. Les deux lectures rendent 401 : rien n'est exposé, et le template
+    doit rester muet.
+    """
+    assert not feast_fires(list_status=401, list_body=FEAST_UNAUTHORIZED_BODY,
+                           probe_status=401,
+                           probe_body=FEAST_UNAUTHORIZED_BODY), (
+        "le template signale une instance dont auth.type vaut oidc ou "
+        "kubernetes : inject_user_details() y refuse toute requête sans jeton"
+    )
+    assert not feast_fires(list_status=401,
+                           list_body=FEAST_UNAUTHORIZED_BODY), (
+        "le template conclut sur la seule sonde de reconnaissance : elle nomme "
+        "le produit, mais le constat est que l'index des magasins a répondu à "
+        "l'anonyme"
+    )
+
+
+def test_feast_extractor_stays_on_the_store_index_response():
+    block = feast_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "sous req-condition le moteur évalue les extracteurs contre chaque "
+        "réponse et émet un résultat par extracteur qui rend quelque chose : "
+        f"{len(extractors)} extracteurs feraient remonter autant de fois la "
+        "même instance"
+    )
+    extractor = extractors[0]
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 : seul l'index des magasins "
+        f"porte des noms à lire — part={extractor.get('part')!r}"
+    )
+    assert extractor.get("json") == [".data[].name"], (
+        "l'extracteur ne lit pas .data[].name — build_vector_store_object() y "
+        "recopie le nom de la feature view indexée, donc celui du corpus RAG "
+        "de l'exploitant, et c'est le renseignement que la réponse donne"
     )
 
 

@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-39 templates, 36 produits.
+40 templates, 37 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -41,6 +41,7 @@ amont.
 | clearml-server | [`clearml-server-exposed`](templates/exposure/clearml-server-exposed.yaml) | high |
 | comfyui | [`comfyui-unauthenticated`](templates/exposure/comfyui-unauthenticated.yaml) | high |
 | dify | [`dify-exposed-console`](templates/exposure/dify-exposed-console.yaml) | high |
+| feast | [`feast-vector-stores-exposed`](templates/exposure/feast-vector-stores-exposed.yaml) | high |
 | flowise | [`flowise-unauthenticated-api`](templates/exposure/flowise-unauthenticated-api.yaml) | critical |
 | gradio | [`gradio-app-exposed`](templates/exposure/gradio-app-exposed.yaml) | medium |
 | jupyter_server | [`jupyter-no-token`](templates/exposure/jupyter-no-token.yaml) | critical |
