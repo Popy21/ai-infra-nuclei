@@ -8370,6 +8370,207 @@ def test_phoenix_extractor_stays_on_the_project_list_response():
     )
 
 
+# --------------------------------------------------------------------------
+# Même piège que chez Open WebUI, et le code de LibreChat le documente lui-même :
+# index.js monte /api/config derrière optionalJwtAuth et non requireJwtAuth, et
+# le commentaire de buildPreLoginPayload() prévient que « Any field added here is
+# readable by anonymous callers of GET /api/config ». Reconnaître le produit,
+# c'est donc reconnaître une instance correctement fermée aussi bien qu'une
+# instance ouverte : le constat tient à la valeur de registrationEnabled seule.
+# La signature produit doit par ailleurs traverser les versions — la charge utile
+# a gagné appleLoginEnabled et samlLoginEnabled, perdu checkBalance et
+# instanceProjectId depuis la 0.7.5 — et les configurations, JSON.stringify
+# effaçant toute clé qui vaut directement une variable d'environnement non posée.
+
+LIBRECHAT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "librechat-open-registration.yaml")
+
+# Instance récente, ALLOW_REGISTRATION laissé à la valeur que porte le .env.example
+# que la documentation fait recopier. Ni OpenID, ni SAML, ni turnstile configurés :
+# openidImageUrl, samlLabel, samlImageUrl et turnstile valent undefined et
+# JSON.stringify les efface.
+LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY = (
+    '{"appTitle":"LibreChat","discordLoginEnabled":false,'
+    '"facebookLoginEnabled":false,"githubLoginEnabled":false,'
+    '"googleLoginEnabled":true,"appleLoginEnabled":false,'
+    '"openidLoginEnabled":false,"openidLabel":"Continue with OpenID",'
+    '"openidAutoRedirect":false,"samlLoginEnabled":false,'
+    '"serverDomain":"https://chat.interne.lan","emailLoginEnabled":true,'
+    '"registrationEnabled":true,"socialLoginEnabled":false,'
+    '"emailEnabled":false,"passwordResetEnabled":false,"ldap":{"enabled":false},'
+    '"socialLogins":["google","facebook","openid","github","discord","saml"]}'
+)
+
+# Même route sur une 0.7.5, avant que buildPreLoginPayload() n'isole les champs
+# pré-connexion : ni appleLoginEnabled, ni samlLoginEnabled, ni ldap, mais
+# checkBalance et instanceProjectId, qui ont depuis quitté la charge utile
+# anonyme. Le template doit toujours la reconnaître — ce sont ces instances-là
+# qui traînent exposées.
+LIBRECHAT_OLD_CONFIG_REGISTRATION_OPEN_BODY = (
+    '{"appTitle":"LibreChat",'
+    '"socialLogins":["google","facebook","openid","github","discord"],'
+    '"discordLoginEnabled":false,"facebookLoginEnabled":false,'
+    '"githubLoginEnabled":false,"googleLoginEnabled":false,'
+    '"openidLoginEnabled":false,"openidLabel":"Continue with OpenID",'
+    '"serverDomain":"http://localhost:3080","emailLoginEnabled":true,'
+    '"registrationEnabled":true,"socialLoginEnabled":false,'
+    '"emailEnabled":false,"passwordResetEnabled":false,"checkBalance":false,'
+    '"showBirthdayIcon":false,"helpAndFaqURL":"https://librechat.ai",'
+    '"sharedLinksEnabled":true,"publicSharedLinksEnabled":false,'
+    '"instanceProjectId":"6672b7d0e1e0a2c3d4e5f601"}'
+)
+
+# Instance à laquelle l'exploitant a tout branché : OpenID avec son image, SAML
+# avec son libellé, turnstile, une longueur de mot de passe imposée. Les clés
+# conditionnelles apparaissent, la signature ne doit pas s'en trouver changée.
+LIBRECHAT_FULLY_CONFIGURED_OPEN_BODY = (
+    '{"appTitle":"Assistant interne","discordLoginEnabled":true,'
+    '"facebookLoginEnabled":false,"githubLoginEnabled":true,'
+    '"googleLoginEnabled":true,"appleLoginEnabled":true,'
+    '"openidLoginEnabled":true,"openidLabel":"Connexion SSO",'
+    '"openidImageUrl":"https://sso.interne.lan/logo.png",'
+    '"openidAutoRedirect":false,"samlLoginEnabled":false,'
+    '"samlLabel":"SAML","samlImageUrl":"https://sso.interne.lan/saml.png",'
+    '"serverDomain":"https://chat.interne.lan","emailLoginEnabled":true,'
+    '"registrationEnabled":true,"socialLoginEnabled":true,'
+    '"emailEnabled":true,"passwordResetEnabled":true,"minPasswordLength":12,'
+    '"ldap":{"enabled":false},'
+    '"socialLogins":["google","github","discord"],'
+    '"turnstile":{"siteKey":"0x4AAAAAAA"}}'
+)
+
+# Même produit, même route, inscription fermée comme il se doit. Le template ne
+# doit pas déclencher : sinon il remonte toute instance LibreChat vivante.
+LIBRECHAT_CONFIG_REGISTRATION_CLOSED_BODY = (
+    LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY
+    .replace('"registrationEnabled":true', '"registrationEnabled":false')
+)
+
+# La frontière que le template tient plutôt qu'il ne la masque : registrationEnabled
+# vaut « !ldap?.enabled && isEnabled(ALLOW_REGISTRATION) », donc il passe à false
+# dès que LDAP est configuré — alors que validateRegistration, seul contrôle de
+# POST /api/auth/register, ne lit qu'ALLOW_REGISTRATION. Le template ne rapporte
+# que ce que la réponse établit, et cette réponse-là n'établit rien.
+LIBRECHAT_LDAP_CONFIG_BODY = (
+    LIBRECHAT_CONFIG_REGISTRATION_CLOSED_BODY
+    .replace('"ldap":{"enabled":false}', '"ldap":{"enabled":true,"username":true}')
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. La même instance ouverte, réindentée : le template doit encore la
+# reconnaître.
+LIBRECHAT_REFORMATTED_REGISTRATION_OPEN_BODY = json.dumps(
+    json.loads(LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY), indent=2,
+)
+
+# Une application quelconque publie elle aussi son état d'inscription sous
+# /api/config : « registrationEnabled » ne désigne aucun produit.
+LIBRECHAT_OTHER_APP_CONFIG_BODY = (
+    '{"appTitle":"portail interne","version":"3.4.1",'
+    '"registrationEnabled":true,"emailLoginEnabled":true,'
+    '"passwordResetEnabled":false}'
+)
+
+
+def librechat_config_block():
+    doc = load(LIBRECHAT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/config" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /api/config"
+    return blocks[0]
+
+
+def test_librechat_probe_never_creates_an_account():
+    doc = load(LIBRECHAT_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'état de l'inscription se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "/register" not in path, (
+                "le template appelle POST /api/auth/register : il créerait le "
+                "compte qu'il est censé signaler, et sur une instance dont la "
+                "base est vide registerUser() accorderait ADMIN à ce compte — "
+                "le scanner prendrait la main sur ce qu'il audite"
+            )
+
+
+def test_librechat_matcher_proves_registration_is_open_not_merely_that_it_is_librechat():
+    block = librechat_config_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "suffirait à faire remonter une instance correctement fermée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert all(body_matcher_hits(m, LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une réponse /api/config de LibreChat dont "
+        "l'inscription est ouverte"
+    )
+    assert all(body_matcher_hits(m, LIBRECHAT_OLD_CONFIG_REGISTRATION_OPEN_BODY)
+               for m in body_matchers), (
+        "le template exige des clés absentes de la charge utile de la 0.7.5 — "
+        "appleLoginEnabled, samlLoginEnabled ou ldap — il raterait les "
+        "instances qui traînent exposées"
+    )
+    assert all(body_matcher_hits(m, LIBRECHAT_FULLY_CONFIGURED_OPEN_BODY)
+               for m in body_matchers), (
+        "le template rate une instance dont les fournisseurs sont tous câblés : "
+        "les clés conditionnelles ne changent pas ce que la signature exige"
+    )
+    assert all(body_matcher_hits(m, LIBRECHAT_REFORMATTED_REGISTRATION_OPEN_BODY)
+               for m in body_matchers), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not all(body_matcher_hits(m, LIBRECHAT_CONFIG_REGISTRATION_CLOSED_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une instance dont l'inscription est fermée : "
+        "/api/config est servi à l'anonyme par dessein, reconnaître LibreChat ne "
+        "prouve rien"
+    )
+    assert not all(body_matcher_hits(m, LIBRECHAT_LDAP_CONFIG_BODY)
+                   for m in body_matchers), (
+        "le template conclut sur une instance LDAP, dont registrationEnabled "
+        "vaut false : la réponse n'établit pas que POST /api/auth/register "
+        "accepterait, et le constat ne porte que sur ce qu'elle établit"
+    )
+    assert not all(body_matcher_hits(m, LIBRECHAT_OTHER_APP_CONFIG_BODY)
+                   for m in body_matchers), (
+        "le template déclenche sur une application quelconque servant "
+        "/api/config : registrationEnabled et emailLoginEnabled sont des clés "
+        "banales"
+    )
+
+
+def test_librechat_extractors_report_what_the_anonymous_payload_gives_away():
+    extractors = librechat_config_block().get("extractors") or []
+    assert extractors, "aucun extracteur : la réponse n'est pas exploitée"
+    assert all(e.get("type") == "json" for e in extractors), (
+        "/api/config rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+
+    paths = {p for e in extractors for p in (e.get("json") or [])}
+    assert ".emailEnabled" in paths, (
+        "aucun extracteur ne lit .emailEnabled — c'est checkEmailConfig() tel "
+        "que la réponse le publie, et à false registerUser() pose emailVerified "
+        "à true : il n'y a rien entre le formulaire et la session"
+    )
+    assert ".appTitle" in paths, (
+        "aucun extracteur ne lit .appTitle — APP_TITLE nomme l'instance, et "
+        "c'est le renseignement qu'un exploitant veut lire à côté du constat"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

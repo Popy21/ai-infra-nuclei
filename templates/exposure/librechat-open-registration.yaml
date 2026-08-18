@@ -1,0 +1,192 @@
+id: librechat-open-registration
+
+info:
+  name: LibreChat - Open User Registration
+  author: popy21
+  severity: medium
+  description: |
+    LibreChat est l'interface multi-modèles que l'on pose devant OpenAI,
+    Anthropic, Azure ou un runtime local, et la seule frontière qu'elle oppose au
+    réseau est son écran de connexion. GET /api/config est en dehors de cette
+    frontière, par dessein et non par oubli : api/server/index.js monte la route
+    « app.use('/api/config', preAuthTenantMiddleware, optionalJwtAuth,
+    routes.config) » — optionalJwtAuth, pas requireJwtAuth —, et le handler
+    branche sur « if (!req.user) » pour rendre la charge utile que construit
+    buildPreLoginPayload(). Le code dit lui-même ce que cela implique, en
+    commentaire de cette fonction : « Any field added here is readable by
+    anonymous callers of GET /api/config ». Ces champs sont ceux dont les pages
+    de connexion, d'inscription et de réinitialisation ont besoin avant toute
+    authentification, et ils nomment donc l'ensemble des fournisseurs câblés —
+    discordLoginEnabled, facebookLoginEnabled, githubLoginEnabled,
+    googleLoginEnabled, appleLoginEnabled, openidLoginEnabled avec son
+    openidLabel, samlLoginEnabled, ldap.enabled, emailLoginEnabled — plus
+    serverDomain, c'est-à-dire DOMAIN_SERVER, l'URL canonique que l'exploitant a
+    configurée.
+    Un 200 sur cette route ne prouve donc rien : elle répond pareil sur une
+    instance correctement fermée, et elle répondait déjà sans aucun intergiciel
+    en 0.7.5 — « app.use('/api/config', routes.config) ». C'est la valeur d'un
+    seul champ qui fait le constat, registrationEnabled, posé par
+    « !ldap?.enabled && isEnabled(process.env.ALLOW_REGISTRATION) ».
+    isEnabled() ne reconnaît que la chaîne « true », donc une variable absente
+    vaut faux — mais le fichier que la documentation fait recopier en .env porte
+    « ALLOW_REGISTRATION=true » en clair, et c'est cette valeur-là qui tourne sur
+    la plupart des installations. Le même fichier pose HOST=localhost ; le
+    docker-compose.yml officiel, lui, force « HOST=0.0.0.0 » dans
+    l'environnement du conteneur et publie « ${PORT}:${PORT} ».
+    Une frontière que le template tient plutôt qu'il ne la masque : le champ vaut
+    faux dès que LDAP est configuré, alors que validateRegistration, le seul
+    contrôle que traverse POST /api/auth/register, ne lit que
+    ALLOW_REGISTRATION. Sur une instance LDAP dont cette variable est restée à
+    « true », l'interface masque l'inscription, la route l'accepte encore, et le
+    template se tait — il ne rapporte que ce que la réponse établit.
+  impact: |
+    Le compte créé n'attend rien. registerUser() (api/server/services/
+    AuthService.js) n'envoie de courriel de vérification que si checkEmailConfig()
+    est vrai, c'est-à-dire si un service SMTP complet est configuré ; sinon la
+    branche « else » exécute « updateUser(newUserId, { emailVerified: true }) »
+    et le compte est utilisable immédiatement. L'état de cette configuration se
+    lit dans la même réponse, sous emailEnabled : à false, il n'y a aucune étape
+    de validation entre le formulaire et la session.
+    Ce que la session atteint est le budget de l'exploitant. Les clés des
+    fournisseurs vivent côté serveur, dans le .env : le compte parle aux modèles
+    configurés — donc consomme le quota OpenAI, Anthropic ou Azure de
+    l'organisation, ou le GPU de la machine quand le point de terminaison est
+    local — et avec eux les agents, l'import de fichiers vers la base RAG et les
+    outils câblés. Il n'y a pas de limite de dépense par défaut : balance n'est
+    active que si l'exploitant l'a posée.
+    C'est ce qui borne le constat à medium plutôt qu'au-dessus. Le rôle attribué
+    est SystemRoles.USER, pas ADMIN : le nouveau venu ne lit pas les
+    conversations des autres. Une seule exception, et elle est hors de portée du
+    template — « isFirstRegisteredUser = !tenantId && (await countUsers()) === 0 »
+    accorde ADMIN au tout premier compte —, mais /api/config ne publie aucun
+    compteur d'utilisateurs, donc rien dans la réponse ne dit si la base est
+    vide. Le template prouve l'ouverture du formulaire, il ne crée pas le compte,
+    donc il ne prouve pas ce que ce compte-là trouverait.
+  remediation: |
+    Poser ALLOW_REGISTRATION=false dans le .env et redémarrer. La variable est
+    lue dans l'environnement et nulle part ailleurs — rien n'est recopié en base,
+    contrairement à d'autres interfaces de ce pack —, donc le redémarrage suffit
+    et le contrôle se refait de l'extérieur : sur une instance fermée,
+    GET /api/config rend « "registrationEnabled":false ». L'inscription reste
+    alors possible par invitation, checkInviteUser posant req.invite avant
+    validateRegistration.
+    Fermer le formulaire ne referme pas la route : /api/config reste servie à
+    l'anonyme quelle que soit la configuration, donc l'inventaire des
+    fournisseurs d'authentification et DOMAIN_SERVER restent lisibles. Si cela
+    n'est pas acceptable, la seule frontière est en amont, sur le mandataire.
+    Ne pas compter sur le fait que le service n'est « pas publié » : le
+    docker-compose.yml officiel pose HOST=0.0.0.0 et publie le port 3080 sur
+    l'hôte, quelle que soit la valeur de HOST dans le .env.
+    Après une exposition, passer la liste des comptes en revue et supprimer ceux
+    qu'on n'a pas créés — fermer l'inscription ne révoque aucune session déjà
+    ouverte. Vérifier aussi la consommation chez les fournisseurs de modèles sur
+    la période : c'est là que se lit l'usage d'un compte qu'on n'avait pas prévu.
+  reference:
+    - https://www.librechat.ai/docs/configuration/dotenv
+    - https://www.librechat.ai/docs/configuration/authentication
+    - https://github.com/danny-avila/LibreChat/blob/main/api/server/routes/config.js
+    - https://github.com/danny-avila/LibreChat/blob/main/api/server/index.js
+    - https://github.com/danny-avila/LibreChat/blob/main/api/server/routes/auth.js
+    - https://github.com/danny-avila/LibreChat/blob/main/api/server/middleware/validateRegistration.js
+    - https://github.com/danny-avila/LibreChat/blob/main/api/server/services/AuthService.js
+    - https://github.com/danny-avila/LibreChat/blob/main/api/server/services/Config/ldap.js
+    - https://github.com/danny-avila/LibreChat/blob/main/.env.example
+    - https://github.com/danny-avila/LibreChat/blob/main/docker-compose.yml
+  metadata:
+    max-request: 1
+    vendor: librechat
+    product: librechat
+    shodan-query: http.title:"LibreChat"
+  tags: ai,llm,librechat,exposure,signup,misconfig
+
+http:
+  # /api/config, et rien d'autre. Les trois voisins qui viennent à l'esprit sont
+  # écartés, chacun pour une raison propre :
+  #
+  # - POST /api/auth/register serait la preuve définitive — on tient le compte ou
+  #   on ne le tient pas — mais le template créerait le compte qu'il est censé
+  #   signaler. Et sur une instance dont la base est vide, registerUser()
+  #   accorderait ADMIN à ce compte-là : le scanner prendrait la main sur ce
+  #   qu'il audite.
+  # - La page d'accueil ne dit rien. Le lien « Sign up » est rendu côté client à
+  #   partir de cette même réponse : la coquille HTML est identique que
+  #   l'inscription soit ouverte ou fermée.
+  # - GET /api/user décrit le compte courant et répond 401 sans jeton, comme tout
+  #   ce qui passe par requireJwtAuth : il prouve que LibreChat est là, jamais
+  #   que l'inscription est ouverte.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/config"
+
+    matchers-condition: and
+    matchers:
+      # res.status(200).send(payload) sur un objet : express sérialise en JSON et
+      # pose le type de contenu.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # La signature produit. Ces trois clés sont sérialisées par toutes les
+      # versions — elles étaient déjà dans la charge utile de la 0.7.5, avant que
+      # buildPreLoginPayload() ne l'isole — et c'est leur voisinage qui désigne
+      # LibreChat : une application qui publie à la fois l'ordre de ses boutons
+      # de connexion sociale, l'état de son fournisseur Discord et son propre nom
+      # de domaine serveur n'est pas une application quelconque.
+      #
+      # Les clés voisines du même bloc sont écartées parce qu'aucune ne traverse
+      # les versions ni les configurations. appleLoginEnabled et samlLoginEnabled
+      # sont absents de la charge utile de la 0.7.5 ; openidImageUrl, samlLabel et
+      # turnstile valent directement une variable d'environnement, donc
+      # JSON.stringify les efface quand elle n'est pas posée ; checkBalance et
+      # instanceProjectId, présents en 0.7.5, ont depuis quitté la charge utile
+      # anonyme. Les exiger raterait précisément les instances anciennes, celles
+      # qui traînent exposées.
+      - type: word
+        part: body
+        words:
+          - '"socialLogins"'
+          - '"serverDomain"'
+          - '"discordLoginEnabled"'
+        condition: and
+
+      # Le constat lui-même, séparé de la signature. La route est publique par
+      # dessein : sans cette condition le template déclencherait sur toute
+      # instance LibreChat vivante, y compris celles dont l'inscription est
+      # correctement fermée. Une expression plutôt qu'un mot pour ne pas dépendre
+      # de la sérialisation compacte du serveur, qu'un intermédiaire peut
+      # reformater.
+      - type: regex
+        part: body
+        regex:
+          - '"registrationEnabled"\s*:\s*true'
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le nom affiché de l'instance — APP_TITLE, souvent celui de l'équipe ou du
+      # service qui l'exploite.
+      - type: json
+        part: body
+        name: app_title
+        json:
+          - '.appTitle'
+
+      # checkEmailConfig() tel que la réponse le publie. À false, registerUser()
+      # n'envoie aucun courriel de vérification et pose emailVerified à true : il
+      # n'y a alors rien entre le formulaire et la session.
+      - type: json
+        part: body
+        name: email_verification
+        json:
+          - '.emailEnabled'
+
+      # DOMAIN_SERVER, l'URL canonique que l'exploitant a configurée — elle nomme
+      # souvent l'hôte réel quand l'instance est atteinte par son adresse IP.
+      - type: json
+        part: body
+        name: server_domain
+        json:
+          - '.serverDomain'
