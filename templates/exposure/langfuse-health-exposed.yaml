@@ -1,0 +1,149 @@
+id: langfuse-health-exposed
+
+info:
+  name: Langfuse - Unauthenticated Health Endpoint Version Disclosure
+  author: popy21
+  severity: medium
+  description: |
+    Sous /api/public/, Langfuse ne monte aucun intergiciel d'authentification :
+    chaque handler écrit le sien. pages/api/public/projects/index.ts le montre
+    en clair — un commentaire « CHECK AUTH », puis
+    ApiAuthService.verifyAuthHeaderAndReturnScope(req.headers.authorization) et
+    un 401 dès que validKey est faux. pages/api/public/health.ts n'a pas ce
+    bloc : le handler enchaîne runMiddleware(req, res, cors), telemetry(), puis
+    runHealthCheck(), et rend « res.status(result.isHealthy ? 200 : 503).json({
+    status: result.status, version: result.version}) ». Le seul intergiciel
+    appliqué est donc celui d'origine croisée — cors = Cors({origin: true,
+    credentials: false}), qui pose des en-têtes et ne refuse rien —, et aucune
+    clé n'est lue nulle part sur ce chemin.
+    Les deux valeurs rendues se déduisent du code plutôt qu'elles ne
+    s'observent. runHealthCheck() (features/public-api/server/health-service.ts)
+    ne pose isHealthy: true qu'à son dernier return, « {isHealthy: true, status:
+    "OK", version} » ; tout autre chemin rend isHealthy: false, donc un 503, sous
+    « Database not available », « No traces within the last 3 minutes »,
+    « Couldn't fetch recent events » ou « Health check failed ». Sur un 200,
+    status vaut « OK » et rien d'autre. Et version vient de
+    VERSION.replace("v", ""), la constante du dépôt — « v4.12.0 » en tête de la
+    branche principale —, donc le triplet nu, privé de son v.
+    Cette forme ne date pas de la 4 : la 2.95.0 comme la 3.x rendaient déjà
+    « res.status(200).json({status: "OK", version: VERSION.replace("v", "")}) »
+    depuis le même fichier, sans plus de contrôle d'accès. Le constat porte sur
+    cette route seule — les routes voisines du même préfixe refusent bien
+    l'anonyme —, et c'est ce qui borne la sévérité à medium.
+  impact: |
+    Ce que la route livre est la version exacte de l'instance, et c'est la clé de
+    lecture des avis du produit, qui se publient en intervalles de versions.
+    GHSA-94hf-6gqq-pj69 (CVE-2025-64504) vaut « >=2.70.0, <2.95.11 » et
+    « >=2.70.0, <3.124.1 » et laisse énumérer les membres et les invitations
+    d'une autre organisation de la même instance ; GHSA-2524-j966-gfgh
+    (CVE-2026-41487) vaut « >= 3.68.0, < 3.167.0 » et rend à un utilisateur de
+    rôle « member » la clé d'API en clair du fournisseur LLM configuré. Les deux
+    demandent un compte — l'anonyme ne les déclenche pas —, mais il n'a plus à
+    deviner : il lit le numéro et sait, avant d'ouvrir le moindre compte sur une
+    instance dont l'inscription serait libre, si l'effort a une cible.
+    Les deux paramètres de la même route font en outre travailler l'instance sans
+    qu'aucun compte soit demandé. failIfDatabaseUnavailable=true fait exécuter
+    « SELECT 1 » sur Postgres par prisma.$queryRaw et bascule la réponse en 503
+    « Database not available » si la base ne répond pas : c'est un oracle anonyme
+    sur l'état de la base. failIfNoRecentEvents=true interroge ClickHouse sur les
+    trois dernières minutes — la table events_core en mode events_only, les
+    tables traces et observations sinon — et rend 503 « No traces within the last
+    3 minutes » quand rien n'est arrivé : c'est un oracle anonyme sur l'activité,
+    donc sur le fait qu'une application d'IA en production alimente réellement
+    cette instance, et à quelles heures. /api/public/ready, servi par le même
+    préfixe et écrit de la même façon, rend exactement la même charge utile.
+  remediation: |
+    Il n'y a pas de réglage à poser, et il n'y en a pas à demander : cette route
+    est la sonde que la documentation d'auto-hébergement fait interroger pour la
+    santé et la disponibilité du conteneur web, donc elle doit rester atteignable
+    depuis l'orchestrateur. La fermeture est celle du réseau — ne pas publier le
+    port 3000 du conteneur web sur une interface publique, et quand un proxy le
+    publie, lui faire refuser /api/public/health et /api/public/ready pour ne
+    laisser passer que ce que l'application sert à ses utilisateurs.
+    Tenir ensuite la version pour connue de quiconque a atteint la route, et lire
+    les avis du dépôt en conséquence : mettre à jour est ce qui retire à
+    l'appelant le renseignement qu'il vient d'obtenir. Vérifier au passage que
+    l'inscription n'est pas laissée ouverte sur l'instance — AUTH_DISABLE_SIGNUP
+    —, puisque c'est ce que le numéro de version sert à évaluer, et que les avis
+    cités demandent un compte pour aller plus loin.
+  reference:
+    - https://langfuse.com/self-hosting/configuration/health-readiness-endpoints
+    - https://github.com/langfuse/langfuse/blob/main/web/src/pages/api/public/health.ts
+    - https://github.com/langfuse/langfuse/blob/main/web/src/features/public-api/server/health-service.ts
+    - https://github.com/langfuse/langfuse/blob/main/web/src/features/public-api/server/cors.ts
+    - https://github.com/langfuse/langfuse/blob/main/web/src/pages/api/public/projects/index.ts
+    - https://github.com/langfuse/langfuse/security/advisories/GHSA-94hf-6gqq-pj69
+    - https://github.com/langfuse/langfuse/security/advisories/GHSA-2524-j966-gfgh
+  metadata:
+    max-request: 1
+    vendor: langfuse
+    product: langfuse
+  tags: ai,llm,llmops,observability,langfuse,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et sans paramètre. La route en accepte deux, et tous deux
+  # font travailler l'instance : failIfDatabaseUnavailable=true déclenche un
+  # « SELECT 1 » sur Postgres, failIfNoRecentEvents=true une paire de requêtes
+  # ClickHouse sur les trois dernières minutes. Ni l'un ni l'autre n'apprendrait
+  # au template ce que le chemin nu lui dit déjà, et un scanner n'a pas à faire
+  # interroger la base de ce qu'il audite pour signaler une exposition.
+  #
+  # Rien d'autre n'est demandé non plus. Le même préfixe porte POST
+  # /api/public/ingestion, qui écrirait des traces dans le projet, et l'ensemble
+  # des routes de lecture du produit — /api/public/traces, /api/public/sessions —
+  # qui rendent les invites et les réponses des modèles. Toutes exigent la clé
+  # Basic que verifyAuthHeaderAndReturnScope() réclame : elles sont fermées, et
+  # c'est ce qui fait que le constat s'arrête à cette route-ci.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/public/health"
+
+    matchers-condition: and
+    matchers:
+      # Le statut n'est pas une commodité : c'est lui qui sépare l'instance qui
+      # va bien de celle qui rend le même couple de clés en 503 — « Database not
+      # available », « No traces within the last 3 minutes », « Couldn't fetch
+      # recent events », « Health check failed ». Le handler ne rend 200 que sur
+      # result.isHealthy, et runHealthCheck() ne le pose qu'à son dernier return.
+      - type: status
+        status:
+          - 200
+
+      # Des expressions plutôt que des mots, pour trois raisons distinctes.
+      #
+      # Le deux-points d'abord, avec ses espaces facultatives : res.json()
+      # sérialise compact, mais un intermédiaire qui réindente ce qu'il relaie
+      # écrirait « "status": "OK" » — et surtout ces noms doivent désigner des
+      # clés, pas apparaître en valeurs dans le catalogue d'un tiers qui
+      # documenterait l'API de Langfuse.
+      #
+      # La valeur de status ensuite, exigée à « OK » et à cette casse : sur un
+      # 200 c'est la seule que le code puisse écrire, et la plupart des sondes de
+      # santé d'autres produits répondent « ok », « UP » ou « healthy ».
+      #
+      # La forme de version enfin. VERSION.replace("v", "") ôte le v du
+      # « v4.12.0 » de la constante : la valeur est le triplet nu, ce qui écarte
+      # les API qui nomment leur version « v1 », « 1.0 » ou un condensé git.
+      #
+      # Et le corps entier tenu pour un objet plat : la charge utile n'a que ces
+      # deux champs, tous deux scalaires, donc aucune accolade intérieure. Cet
+      # ancrage écarte d'un coup l'index d'un SPA rendu en 200 par un catch-all,
+      # la page d'un portail captif, et le document plus riche d'un tiers qui
+      # porterait ces deux clés quelque part dans une sous-structure — sans pour
+      # autant compter les champs, qu'une version ultérieure pourrait augmenter.
+      - type: regex
+        part: body
+        regex:
+          - '"status"\s*:\s*"OK"'
+          - '"version"\s*:\s*"[0-9]+\.[0-9]+\.[0-9]+[^"]*"'
+          - '^\s*\{[^{}]*\}\s*$'
+        condition: and
+
+    extractors:
+      # Le renseignement même : le numéro que l'appelant anonyme obtient, et
+      # celui qui se compare aux intervalles des avis du dépôt.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'

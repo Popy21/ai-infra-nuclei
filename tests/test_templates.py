@@ -9506,6 +9506,234 @@ def test_feast_extractor_stays_on_the_store_index_response():
     )
 
 
+# --------------------------------------------------------------------------
+# Chez Langfuse, l'authentification du préfixe /api/public/ est écrite handler par
+# handler — projects/index.ts pose « CHECK AUTH »,
+# ApiAuthService.verifyAuthHeaderAndReturnScope() puis un 401 — et health.ts est
+# celui qui n'a pas ce bloc : il n'applique que le middleware CORS avant de rendre
+# {status, version}. La difficulté du template n'est donc pas de trouver la route,
+# elle est de ne pas confondre cette charge utile avec la sonde de santé de
+# n'importe quel autre service. Trois faits du code la séparent, et il faut les
+# trois : status ne peut valoir que « OK » sur un 200, version est le triplet privé
+# de son v par VERSION.replace("v", ""), et le corps n'a que ces champs scalaires.
+
+LANGFUSE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "langfuse-health-exposed.yaml")
+
+
+def langfuse_health_body(version="4.12.0", status="OK"):
+    """
+    Réponse de GET /api/public/health telle que le handler la sérialise :
+    res.status(...).json({status: result.status, version: result.version}),
+    donc un objet à deux champs, écrit compact et dans cet ordre.
+    """
+    return json.dumps({"status": status, "version": version},
+                      separators=(",", ":"))
+
+
+LANGFUSE_HEALTH_BODY = langfuse_health_body()
+
+# Ce que rend la même route quand runHealthCheck() pose isHealthy: false. Les
+# deux clés y sont, la version aussi : seul le statut HTTP les sépare de
+# l'instance saine, et ces corps-là ne sont pas des expositions à signaler
+# différemment — c'est la même route, déjà couverte par le cas sain.
+LANGFUSE_UNHEALTHY_BODIES = (
+    langfuse_health_body(status="Database not available"),
+    langfuse_health_body(status="No traces within the last 3 minutes"),
+    langfuse_health_body(status="Couldn't fetch recent events"),
+    langfuse_health_body(status="Health check failed"),
+)
+
+# La sonde de santé d'un service quelconque : même forme, même semver, mais
+# aucune de ces valeurs n'est celle que health-service.ts écrit.
+LANGFUSE_OTHER_HEALTH_BODY = '{"status":"ok","version":"1.4.2"}'
+LANGFUSE_OTHER_UP_BODY = '{"status":"UP","version":"4.12.0"}'
+
+# Une API qui nomme sa version avec le v que VERSION.replace("v", "") retire.
+LANGFUSE_V_PREFIXED_BODY = '{"status":"OK","version":"v4.12.0"}'
+
+# Un document plus riche qui porte les deux clés dans une sous-structure : c'est
+# la forme qu'ont les sondes de santé composites (Spring Actuator et consorts),
+# et rien n'y désigne Langfuse.
+LANGFUSE_COMPOSITE_HEALTH_BODY = (
+    '{"status":"OK","components":{"db":{"status":"OK","version":"16.4.0"}}}'
+)
+
+# L'index d'une application servie sur le même hôte, que le catch-all d'un proxy
+# rend en 200 sur un chemin qu'il ne connaît pas.
+LANGFUSE_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Langfuse</title></head>'
+    '<body><div id="__next"></div></body></html>'
+)
+
+# Refus d'un proxy placé devant l'instance pour fermer ce que le produit ne ferme
+# pas : la route ne répond plus à l'anonyme, il n'y a rien à signaler.
+LANGFUSE_PROXY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+
+def langfuse_health_block():
+    doc = load(LANGFUSE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.startswith("{{BaseURL}}/api/public/health")
+                     for p in (b.get("path") or []))]
+    assert blocks, "le template ne vise pas GET /api/public/health"
+    return blocks[0]
+
+
+def langfuse_fires(status=200, body=LANGFUSE_HEALTH_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint.
+    """
+    block = langfuse_health_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_langfuse_probe_reads_the_bare_route_and_never_makes_the_instance_work():
+    doc = load(LANGFUSE_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la sonde de santé se lit en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre, alors que le même préfixe "
+            "porte POST /api/public/ingestion, qui écrirait des traces dans le "
+            "projet"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("failIfDatabaseUnavailable", "le handler exécuterait "
+                                              "« SELECT 1 » sur le Postgres de "
+                                              "l'instance auditée"),
+                ("failIfNoRecentEvents", "le handler interrogerait ClickHouse "
+                                         "sur les trois dernières minutes — "
+                                         "deux requêtes sur les tables de "
+                                         "traces de l'exploitant"),
+                ("/ingestion", "POST /api/public/ingestion écrirait des "
+                               "événements dans le projet"),
+                ("/traces", "GET /api/public/traces rendrait les invites "
+                            "envoyées aux modèles et leurs réponses — lire le "
+                            "contenu n'est pas signaler l'exposition"),
+                ("/sessions", "GET /api/public/sessions rendrait les "
+                              "conversations des utilisateurs finaux"),
+                ("/observations", "GET /api/public/observations rendrait le "
+                                  "détail des appels aux modèles"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = langfuse_health_block().get("path") or []
+    assert paths == ["{{BaseURL}}/api/public/health"], (
+        "le constat tient à une seule lecture, sur le chemin nu : les deux "
+        "paramètres que la route accepte font travailler l'instance sans rien "
+        f"apprendre de plus au template — {paths}"
+    )
+
+
+def test_langfuse_matcher_needs_the_health_payload_not_any_health_endpoint():
+    assert langfuse_fires(), (
+        "le template ne reconnaît pas une instance Langfuse dont la sonde de "
+        "santé répond à l'anonyme"
+    )
+    for version in ("2.95.11", "3.124.1", "4.12.0", "4.13.0-rc.1"):
+        assert langfuse_fires(body=langfuse_health_body(version=version)), (
+            f"le template dépend d'une version précise alors que le handler "
+            f"rend VERSION.replace(\"v\", \"\") — ici {version} — et que la "
+            "forme de la réponse n'a pas bougé depuis la 2.95.0"
+        )
+    assert langfuse_fires(body='{\n  "status": "OK",\n  "version": "4.12.0"\n}'), (
+        "le template exige la sérialisation compacte de res.json() : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer la sonde"
+    )
+    assert langfuse_fires(
+        body='{"status":"OK","version":"4.12.0","commit":"a1b2c3d"}'), (
+        "le template compte les champs : une version ultérieure qui ajouterait "
+        "un scalaire à la charge utile le rendrait muet, alors que la route "
+        "resterait exactement aussi ouverte"
+    )
+
+    assert not langfuse_fires(body=LANGFUSE_OTHER_HEALTH_BODY), (
+        "le template déclenche sur la sonde de santé de n'importe quel "
+        "service : health-service.ts écrit « OK » et cette casse-là, or "
+        "« ok » est ce qu'écrivent la plupart des autres"
+    )
+    assert not langfuse_fires(body=LANGFUSE_OTHER_UP_BODY), (
+        "le template se passe de la valeur de status : « UP » n'est pas un "
+        "statut que runHealthCheck() puisse rendre, sur aucun de ses chemins"
+    )
+    assert not langfuse_fires(body=LANGFUSE_V_PREFIXED_BODY), (
+        "le template accepte une version préfixée d'un v, que "
+        "VERSION.replace(\"v\", \"\") retire précisément : la valeur rendue "
+        "est le triplet nu"
+    )
+    assert not langfuse_fires(body=LANGFUSE_COMPOSITE_HEALTH_BODY), (
+        "le template retrouve ses deux clés au fond d'un document composite : "
+        "la charge utile de health.ts n'a que deux champs scalaires, donc "
+        "aucune accolade intérieure"
+    )
+    assert not langfuse_fires(body=LANGFUSE_SPA_BODY), (
+        "le template déclenche sur l'index d'une application rendu en 200 par "
+        "le catch-all d'un proxy sur un chemin qu'il ne connaît pas"
+    )
+
+
+def test_langfuse_instance_that_does_not_answer_the_anonymous_is_not_reported():
+    """
+    Deux façons de ne rien avoir à signaler, et le template doit rester muet sur
+    les deux. Le 503 d'abord : runHealthCheck() rend le même couple de clés,
+    version comprise, sur chacun de ses chemins d'échec — seul le statut sépare
+    l'instance saine, et un template qui s'en passerait remonterait quatre fois
+    la même route. Le refus d'un proxy ensuite : c'est la seule fermeture que le
+    produit permette, puisqu'il ne prévoit aucun réglage pour cette route.
+    """
+    for body in LANGFUSE_UNHEALTHY_BODIES:
+        assert not langfuse_fires(status=503, body=body), (
+            "le template conclut sur le seul corps : le handler rend "
+            f"« {body} » en 503, avec la version, et le 200 est ce qui "
+            "distingue le dernier return de runHealthCheck() de tous les autres"
+        )
+
+    assert not langfuse_fires(status=401, body=LANGFUSE_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà la route à "
+        "l'anonyme"
+    )
+    assert not langfuse_fires(status=404, body=LANGFUSE_HEALTH_BODY), (
+        "le template se passe du statut : un intermédiaire qui rend la charge "
+        "utile d'une autre instance sous un 404 le ferait conclure"
+    )
+
+
+def test_langfuse_extractor_reports_the_version_the_anonymous_caller_obtains():
+    block = langfuse_health_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement — le numéro de version — et "
+        f"{len(extractors)} extracteurs feraient remonter autant de fois la "
+        "même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant le seul contenu du "
+        "constat, et ce qui se compare aux intervalles des avis du dépôt : "
+        "« >=2.70.0, <2.95.11 » pour GHSA-94hf-6gqq-pj69, « >= 3.68.0, "
+        "< 3.167.0 » pour GHSA-2524-j966-gfgh"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

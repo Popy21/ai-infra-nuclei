@@ -58,7 +58,7 @@ produit, vérifie dans la documentation officielle avant d'écrire — mieux vau
 ## Observabilité LLM
 
 - [x] `templates/exposure/arize-phoenix-exposed.yaml` — Arize Phoenix : `GET /arize_phoenix_version` renvoie la version en texte brut sur un chemin propre au produit, à confirmer par `GET /v1/projects` qui renvoie `{"data":[{"id":...,"name":...,"description":...}],"next_cursor":...}` — l'authentification n'est câblée que si `authentication_enabled` est activé, donc les traces LLM (prompts et réponses) sont lisibles par défaut. Sévérité high.
-- [ ] `templates/exposure/langfuse-health-exposed.yaml` — Langfuse (observabilité LLM auto-hébergée) : `GET /api/public/health` renvoie `{"status":...,"version":...}`. Vérifié dans `web/src/pages/api/public/health.ts` : le handler n'applique que le middleware CORS, aucun contrôle d'authentification — la version de l'instance est donc lisible par un appelant anonyme. Matcher sur la présence conjointe de `status` et `version` sur ce chemin propre au produit. Sévérité medium.
+- [x] `templates/exposure/langfuse-health-exposed.yaml` — Langfuse (observabilité LLM auto-hébergée) : `GET /api/public/health` renvoie `{"status":...,"version":...}`. Vérifié dans `web/src/pages/api/public/health.ts` : le handler n'applique que le middleware CORS, aucun contrôle d'authentification — la version de l'instance est donc lisible par un appelant anonyme. Matcher sur la présence conjointe de `status` et `version` sur ce chemin propre au produit. Sévérité medium.
 ## CVE sans template amont
 
 - [x] `templates/cves/CVE-2026-0770.yaml` — Langflow, présent au catalogue CISA KEV, aucun template amont. Vérifier l'avis avant d'écrire le matcher.
