@@ -8910,6 +8910,284 @@ def test_prefect_extractor_reports_the_database_left_in_clear():
     )
 
 
+# --------------------------------------------------------------------------
+# Chez TorchServe le constat ne tient pas au corps seul : il tient aussi à la
+# question posée. ApiUtils.getModelList() ne pose nextPageToken que dans la
+# branche « else » de « if (pageToken + limit > keys.size()) », donc au limit par
+# défaut de cent une instance qui sert trois modèles rend {"models":[…]} sans
+# jeton de pagination. Le template qui interrogerait /models nu ne lirait jamais
+# la clé sur laquelle il conclut ; limit=1 est la seule borne qui tienne pour
+# toute instance portant au moins un modèle.
+#
+# L'autre moitié est la frontière. Depuis la 0.11.1, l'autorisation par jeton est
+# imposée par défaut : ce template ne signale pas un défaut du produit mais une
+# instance dont le jeton a été retiré. Et l'instance qui refuse ne rend pas 401 —
+# InvalidKeyException hérite de ModelException, que channelRead0() attrape en
+# BAD_REQUEST — donc le refus est un 400 servi en application/json sur la bonne
+# route, que seul le statut sépare d'une réponse.
+
+TORCHSERVE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "torchserve-management-api-open.yaml")
+
+# Ce que rend GET /models?limit=1 sur une instance dont le jeton est retiré.
+# NettyUtils sérialise par JsonUtils.GSON_PRETTY : indentation de deux espaces,
+# deux-points suivi d'une espace. Le jeton vaut String.valueOf(pageToken + limit),
+# donc « "1" » après la première page.
+TORCHSERVE_MODELS_BODY = (
+    '{\n'
+    '  "nextPageToken": "1",\n'
+    '  "models": [\n'
+    '    {\n'
+    '      "modelName": "densenet161",\n'
+    '      "modelUrl": "densenet161.mar"\n'
+    '    }\n'
+    '  ]\n'
+    '}'
+)
+
+# Même route sur une instance dont allowed_urls est resté à la valeur livrée :
+# le modèle a été tiré d'une URL, et modelUrl la garde. C'est la ligne que le
+# template doit signaler en premier, pas celle qu'il doit rater.
+TORCHSERVE_REMOTE_MODEL_BODY = TORCHSERVE_MODELS_BODY.replace(
+    '"densenet161.mar"', '"https://modeles.interne.lan/densenet161.mar"',
+)
+
+# Le serveur sérialise en pretty-print, mais un intermédiaire peut recompacter le
+# corps qu'il relaie : le deux-points se retrouve alors collé à la clé.
+TORCHSERVE_COMPACT_MODELS_BODY = json.dumps(
+    json.loads(TORCHSERVE_MODELS_BODY), separators=(",", ":"),
+)
+
+# Instance vivante et tout aussi ouverte, mais qui ne sert encore aucun modèle :
+# last vaut 0, la branche « else » pose quand même nextPageToken, et models reste
+# vide. Il n'y a alors rien à nommer — ni modèle servi, ni origine d'archive — et
+# le template n'a pas de constat à porter.
+TORCHSERVE_EMPTY_INDEX_BODY = (
+    '{\n'
+    '  "nextPageToken": "0",\n'
+    '  "models": []\n'
+    '}'
+)
+
+# La même instance, interrogée sans borne : au limit par défaut de cent,
+# « 100 > 1 » est vrai, last retombe à la taille de l'index et nextPageToken
+# n'est jamais posé. C'est la réponse que lirait un template qui viserait /models
+# nu — et elle ne porte pas la clé sur laquelle celui-ci conclut.
+TORCHSERVE_DEFAULT_LIMIT_BODY = (
+    '{\n'
+    '  "models": [\n'
+    '    {\n'
+    '      "modelName": "densenet161",\n'
+    '      "modelUrl": "densenet161.mar"\n'
+    '    }\n'
+    '  ]\n'
+    '}'
+)
+
+# Ce que rend une instance dont le jeton est en place : checkTokenAuthorization()
+# lève InvalidKeyException, sendError() en fait un ErrorResponse, et le statut est
+# 400 — pas 401. Même route, même content-type, même forme de corps JSON.
+TORCHSERVE_TOKEN_REFUSED_BODY = (
+    '{\n'
+    '  "code": 400,\n'
+    '  "type": "InvalidKeyException",\n'
+    '  "message": "Token Authorization failed. Token either incorrect, '
+    'expired, or not provided correctly"\n'
+    '}'
+)
+
+# Une autre passerelle de modèles pagine sous le même nom et nomme ses entrées
+# de la même façon, mais son jeton est un curseur opaque là où
+# setNextPageToken() reçoit String.valueOf(int) : le rang de la page suivante,
+# en chiffres.
+TORCHSERVE_OTHER_REGISTRY_BODY = (
+    '{\n'
+    '  "nextPageToken": "Q2c9PWFiYw",\n'
+    '  "models": [\n'
+    '    {\n'
+    '      "modelName": "resnet50",\n'
+    '      "modelUrl": "s3://modeles/resnet50"\n'
+    '    }\n'
+    '  ]\n'
+    '}'
+)
+
+# Le piège que le deux-points écarte : un catalogue qui documente les champs de
+# l'API de TorchServe les porte entre guillemets, en valeurs. Les noms y sont
+# tous, et aucun ne désigne une clé.
+TORCHSERVE_CATALOGUE_BODY = (
+    '{\n'
+    '  "service": "catalogue interne",\n'
+    '  "documented_fields": ["nextPageToken", "modelName", "modelUrl"],\n'
+    '  "upstream": "torchserve"\n'
+    '}'
+)
+
+
+def torchserve_models_block():
+    doc = load(TORCHSERVE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.startswith("{{BaseURL}}/models")
+                     for p in (b.get("path") or []))]
+    assert blocks, "le template ne vise pas GET /models"
+    return blocks[0]
+
+
+def torchserve_fires(status=200, body=TORCHSERVE_MODELS_BODY,
+                     content_type="application/json"):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint.
+    """
+    block = torchserve_models_block()
+    header = "HTTP/1.1 %d\r\nContent-Type: %s\r\n" % (status, content_type)
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, header))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_torchserve_probe_bounds_the_page_and_never_registers_a_model():
+    doc = load(TORCHSERVE_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : le template ne doit rien envoyer à "
+            "une instance qu'il découvre, alors que le routeur qu'il interroge "
+            "porte l'enregistrement de modèle juste à côté"
+        )
+        for path in (block.get("path") or []):
+            assert "url=" not in path, (
+                "le template appelle POST /models?url= : TorchServe tirerait "
+                "l'archive .mar de l'URL demandée et en importerait le handler "
+                "Python — le scanner exécuterait du code sur ce qu'il audite, "
+                "et c'est exactement la chaîne ShellTorch"
+            )
+            assert "min_worker" not in path and "set-default" not in path, (
+                "le template touche à PUT /models/{nom} : il remettrait à zéro "
+                "les workers d'un modèle servi, ou changerait la version par "
+                "défaut — arrêter le service qu'on audite n'est pas le signaler"
+            )
+
+    paths = torchserve_models_block().get("path") or []
+    assert all("limit=1" in path for path in paths), (
+        "la sonde n'impose pas limit=1, et sans cette borne il n'y a rien à "
+        "reconnaître : getModelList() ne pose nextPageToken que si "
+        "pageToken + limit ne dépasse pas le nombre de modèles, donc au limit "
+        "par défaut de cent une instance qui en sert moins ne l'émet jamais. "
+        "Toute valeur plus haute retombe sur les instances qui servent moins "
+        "de modèles qu'elle"
+    )
+
+
+def test_torchserve_matcher_needs_a_served_model_not_a_reachable_route():
+    block = torchserve_models_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon le statut ou la "
+        "signature suffirait seul, et le refus par jeton — 400 en "
+        "application/json sur la même route — remonterait comme une réponse"
+    )
+
+    # Le 200 est exigé ici sur la forme, et non par un corps de plus. C'est
+    # délibéré : le refus par jeton ne porte aucune des clés que le corps doit
+    # nommer, donc les ancrages l'écartent déjà, et un corps inventé pour
+    # séparer la condition de statut de ces ancrages ne prouverait rien qu'une
+    # instance ferait. Reste que le constat est que la route a *répondu* à
+    # l'anonyme : cela doit être écrit dans le template, pas déduit de la forme
+    # d'un corps — la route existe sur toute instance, et c'est le statut qui
+    # dit si elle a servi ou refusé.
+    assert any(200 in (m.get("status") or [])
+               for m in (block.get("matchers") or [])
+               if m.get("type") == "status"), (
+        "aucun matcher n'exige un 200 : le template ne dit pas que "
+        "GET /models?limit=1 a répondu à l'anonyme, alors que c'est tout le "
+        "constat — l'inventaire lu n'est un défaut que parce que le serveur "
+        "l'a rendu sans jeton"
+    )
+
+    assert torchserve_fires(), (
+        "le template ne reconnaît pas la réponse que rend GET /models?limit=1 "
+        "sur une instance dont l'autorisation par jeton a été retirée"
+    )
+    assert torchserve_fires(body=TORCHSERVE_REMOTE_MODEL_BODY), (
+        "le template rate l'instance dont le modèle a été tiré d'une URL — "
+        "allowed_urls y admet donc un domaine tiers, et c'est la ligne la plus "
+        "exposée du parc"
+    )
+    assert torchserve_fires(body=TORCHSERVE_COMPACT_MODELS_BODY), (
+        "le template dépend du pretty-print de GSON_PRETTY : un intermédiaire "
+        "qui recompacte le corps le mettrait en défaut"
+    )
+
+    # La frontière du constat : le jeton en place, la route répond, mais elle
+    # refuse — et un 400 n'est pas un 401, donc rien ne le distingue d'une
+    # réponse hors du statut et du corps.
+    assert not torchserve_fires(status=400,
+                                body=TORCHSERVE_TOKEN_REFUSED_BODY), (
+        "le template déclenche sur une instance dont l'autorisation par jeton "
+        "est en place : TokenAuthorizationHandler rend InvalidKeyException, que "
+        "channelRead0() sert en 400 — le constat porte sur la réponse anonyme, "
+        "pas sur la reconnaissance du produit"
+    )
+    assert not torchserve_fires(body=TORCHSERVE_EMPTY_INDEX_BODY), (
+        "le template conclut sur un index vide : nextPageToken y est posé — "
+        "last vaut 0 — mais aucun modèle n'est nommé, donc la réponse ne dit "
+        "ni ce qui est servi ni d'où l'archive vient"
+    )
+    assert not torchserve_fires(body=TORCHSERVE_DEFAULT_LIMIT_BODY), (
+        "le template se passe de nextPageToken et tiendrait aux seules clés de "
+        "ModelItem : il conclurait sur ce que rend /models nu, où la clé de "
+        "pagination est absente, et perdrait l'enveloppe qui signe "
+        "ListModelsResponse"
+    )
+    assert not torchserve_fires(body=TORCHSERVE_OTHER_REGISTRY_BODY), (
+        "le template accepte un curseur de pagination opaque : "
+        "setNextPageToken() reçoit String.valueOf(int), donc le jeton de "
+        "TorchServe est le rang de la page suivante, écrit en chiffres — une "
+        "autre passerelle de modèles pagine sous le même nom"
+    )
+    assert not torchserve_fires(body=TORCHSERVE_CATALOGUE_BODY), (
+        "le template accepte ces noms en valeurs : un catalogue qui documente "
+        "les champs de l'API de TorchServe suffirait à le faire conclure, "
+        "alors que le constat est qu'une instance les rend comme clés"
+    )
+    assert not torchserve_fires(content_type="text/html"), (
+        "le template se passe du content-type : une page servie en 200 par un "
+        "portail captif qui cite ces noms passerait pour un inventaire"
+    )
+
+
+def test_torchserve_extractors_report_the_served_model_and_its_origin():
+    extractors = torchserve_models_block().get("extractors") or []
+    assert extractors, "aucun extracteur : la réponse n'est pas exploitée"
+    assert all(e.get("type") == "json" for e in extractors), (
+        "/models rend un objet JSON : un extracteur regex n'a pas à s'en charger"
+    )
+
+    paths = {p for e in extractors for p in (e.get("json") or [])}
+    assert ".models[].modelName" in paths, (
+        "aucun extracteur ne lit le nom du modèle servi — c'est ce que "
+        "l'exploitant expose, et le premier renseignement que la réponse donne"
+    )
+    assert ".models[].modelUrl" in paths, (
+        "aucun extracteur ne lit modelUrl — il dit si l'archive vient du model "
+        "store ou d'une URL tierce, donc si allowed_urls a laissé passer un "
+        "domaine, et c'est la moitié de la chaîne ShellTorch qui se lit sans "
+        "rien envoyer"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

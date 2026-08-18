@@ -1,0 +1,174 @@
+id: torchserve-management-api-open
+
+info:
+  name: TorchServe - Unauthenticated Management API
+  author: popy21
+  severity: critical
+  description: |
+    L'API de gestion de TorchServe écoute sur le port 8081 — ConfigManager rend
+    « http://127.0.0.1:8081 » à défaut de management_address — et GET /models y
+    est servi par ManagementRequestHandler.handleListModels(), qui appelle
+    ApiUtils.getModelList() sans autre condition que la méthode.
+    Le constat ne porte pas sur un défaut du produit. Depuis la 0.11.1, publiée
+    le 18 juillet 2024, TokenAuthorization.init() active l'autorisation par
+    jeton sauf si disable_token_authorization est posé dans config.properties,
+    --disable-token-auth sur la ligne de commande, ou
+    TS_DISABLE_TOKEN_AUTHORIZATION dans l'environnement ; en amont du routage,
+    TokenAuthorizationHandler lit l'en-tête Authorization de chaque requête de
+    gestion avant de passer la main. Une réponse anonyme sur cette route désigne
+    donc une instance dont le jeton a été retiré, ou une version antérieure à
+    cette publication — pas une installation laissée telle quelle.
+    L'instance qui refuse ne rend pas 401, et c'est ce qui interdit de conclure
+    sur le statut. checkTokenAuthorization() lève InvalidKeyException, qui hérite
+    de ModelException, et channelRead0() attrape « BadRequestException |
+    ModelException | DownloadArchiveException » en BAD_REQUEST : le refus est un
+    400 portant {"code": 400, "type": "InvalidKeyException", "message": "Token
+    Authorization failed. Token either incorrect, expired, or not provided
+    correctly"}. Un template qui attendrait un 401 pour marquer la frontière la
+    manquerait, et un template qui se contenterait d'un statut prendrait ce
+    refus — 400, corps JSON, sur la bonne route — pour une réponse.
+    Le paramètre limit n'est pas une commodité. getModelList() ne pose
+    nextPageToken que dans la branche « else » de « if (pageToken + limit >
+    keys.size()) » : avec le limit par défaut de cent, une instance qui sert
+    moins de cent modèles ne l'émet jamais. limit=1 est la seule borne qui tienne
+    pour toute instance portant au moins un modèle, et la réponse porte alors les
+    deux moitiés du constat — nextPageToken, que ListModelsResponse est seul à
+    nommer ainsi à côté de modelName et modelUrl, et la première entrée de
+    ModelItem, donc un modèle réellement servi.
+  impact: |
+    La réponse nomme les modèles servis et, par modelUrl, dit d'où chacun vient :
+    un chemin dans le model store, ou l'URL depuis laquelle l'archive a été
+    tirée. C'est le renseignement ; le risque est ailleurs, et c'est que la même
+    porte porte l'écriture.
+    POST /models?url=... enregistre une archive .mar prise à l'URL demandée, et
+    DEFAULT_TS_ALLOWED_URLS vaut « file://.*|http(s)?://.* » : la liste blanche
+    livrée admet tout http, tout https et tout file. Or une .mar embarque son
+    propre handler Python, que le serveur décompresse et importe pour servir le
+    modèle — enregistrer un modèle est exécuter du code sous le compte du
+    serveur. C'est la chaîne ShellTorch (CVE-2023-43654, CVSS 9.8), qui joignait
+    cette validation d'URL au management_address livré sur 0.0.0.0 dans les
+    images de conteneur, et qui vaut pour les versions 0.3.0 à 0.8.1.
+    Sur une instance postérieure à la 0.11.1, l'enregistrement demande en plus
+    enable_model_api, qui vaut false à défaut : POST et DELETE /models rendent
+    alors 405 « Requested method is not allowed, please refer to API document. ».
+    Ce second verrou ne referme pas le routeur pour autant, parce que
+    handleScaleModel() n'en dépend pas — le même anonyme met les workers d'un
+    modèle à zéro par PUT /models/{nom}?min_worker=0, ce qui suffit à arrêter le
+    service, ou les monte assez haut pour saturer les GPU. PUT
+    /models/{nom}/{version}/set-default change la version servie, et GET
+    /models/{nom} décrit le modèle : ses workers, leurs identifiants de
+    processus, le périphérique qu'ils occupent et le handler qu'ils chargent.
+    Enfin le port de gestion est rarement seul : l'instance qui l'a ouvert sert
+    l'inférence sur 8080 dans les mêmes conditions, jeton compris.
+  remediation: |
+    Ne pas poser disable_token_authorization, --disable-token-auth ni
+    TS_DISABLE_TOKEN_AUTHORIZATION : c'est ce réglage, et lui seul, qui retire la
+    garde. Le jeton de gestion est écrit dans key_file.json à côté du processus,
+    à présenter en « Authorization: Bearer <jeton> » ; il se renouvelle sur
+    /token?type=management, du même port, présenté avec la clé d'API.
+    Laisser enable_model_api à false, restreindre allowed_urls au dépôt d'où les
+    modèles viennent réellement — la valeur livrée admet toute URL http, https ou
+    file —, et laisser management_address sur 127.0.0.1. Le port 8081 n'a pas à
+    sortir de l'hôte : un conteneur qui le publie l'expose entièrement, et c'est
+    par là que la chaîne ShellTorch est passée.
+    Ne rien attendre d'un correctif. Le dépôt pytorch/serve est archivé depuis le
+    7 août 2025, en lecture seule, sans publication de sécurité à venir, et la
+    dernière version est la 0.12.0 du 30 septembre 2024 : la fermeture est le
+    jeton et le réseau, pas une mise à jour.
+    Après une exposition, tenir les modèles enregistrés pour suspects — comparer
+    l'inventaire de GET /models au model store attendu, chercher les archives
+    tirées d'une URL tierce — et faire tourner les secrets que les handlers
+    lisent, clés d'API et jetons d'accès au stockage : un handler importé par le
+    serveur les lit comme le ferait le code légitime.
+  reference:
+    - https://github.com/pytorch/serve/blob/master/docs/management_api.md
+    - https://github.com/pytorch/serve/blob/master/docs/token_authorization_api.md
+    - https://github.com/pytorch/serve/blob/master/frontend/server/src/main/java/org/pytorch/serve/util/ApiUtils.java
+    - https://github.com/pytorch/serve/blob/master/frontend/server/src/main/java/org/pytorch/serve/http/TokenAuthorizationHandler.java
+    - https://github.com/pytorch/serve/blob/master/frontend/server/src/main/java/org/pytorch/serve/http/api/rest/ManagementRequestHandler.java
+    - https://github.com/pytorch/serve/releases/tag/v0.11.1
+    - https://www.oligo.security/blog/shelltorch-torchserve-ssrf-vulnerability-cve-2023-43654
+  metadata:
+    max-request: 1
+    vendor: pytorch
+    product: torchserve
+  tags: ai,ml,mlops,model-serving,torchserve,pytorch,exposure,unauth,rce,misconfig
+
+http:
+  # Une seule lecture, et elle porte tout le constat : sur le port de gestion,
+  # GET /models tombe sous TokenAuthorizationHandler comme le reste du routeur.
+  # Il n'y a donc pas de sonde à lui adjoindre pour nommer le produit — une
+  # instance correctement fermée ne se reconnaît pas, elle rend le même 400 sur
+  # chaque route de gestion, et corroborer sur une seconde route ne dirait rien
+  # que celle-ci ne dise déjà.
+  #
+  # limit=1 est exigé par le serveur, pas par le scanner. getModelList() ne pose
+  # nextPageToken que si pageToken + limit ne dépasse pas le nombre de modèles :
+  # au limit par défaut de cent, une instance qui en sert trois rend
+  # {"models":[...]} sans jeton de pagination, et le constat de la roadmap
+  # n'aurait rien à lire. limit=1 tient pour toute instance portant au moins un
+  # modèle, et c'est la seule borne dans ce cas — toute valeur plus haute retombe
+  # sur les instances qui servent moins de modèles qu'elle.
+  #
+  # En lecture seule, et strictement. Le même préfixe porte POST /models?url=,
+  # qui enregistre une archive .mar prise à l'URL demandée et en importe le
+  # handler Python — la chaîne ShellTorch —, PUT /models/{nom}, qui remet à zéro
+  # les workers d'un modèle servi, et DELETE /models/{nom}, qui le retire.
+  # Signaler une exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/models?limit=1"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Les trois clés de ListModelsResponse et de son ModelItem, prises
+      # ensemble. Des expressions plutôt que des mots pour deux raisons.
+      #
+      # Le deux-points d'abord : NettyUtils sérialise par GSON_PRETTY, donc le
+      # serveur écrit « "modelUrl": "…" » avec l'espace, mais un intermédiaire
+      # qui recompacte le corps l'ôterait ; et surtout ces noms doivent désigner
+      # des clés, pas apparaître en valeurs dans le catalogue d'un tiers qui
+      # documenterait l'API de TorchServe.
+      #
+      # La forme de nextPageToken ensuite. setNextPageToken() reçoit
+      # String.valueOf(int) : le jeton est le rang de la page suivante, écrit en
+      # chiffres et entre guillemets. L'exiger ainsi sépare cette route des
+      # nombreuses API qui paginent sous le même nom avec un curseur opaque.
+      - type: regex
+        part: body
+        regex:
+          - '"nextPageToken"\s*:\s*"[0-9]+"'
+          - '"modelName"\s*:'
+          - '"modelUrl"\s*:'
+        condition: and
+
+      # Le refus a le même content-type et la même route : c'est le statut qui
+      # l'écarte. Une instance dont le jeton est en place rend 400 et
+      # {"code": 400, "type": "InvalidKeyException", …}, InvalidKeyException
+      # héritant de ModelException, que channelRead0() attrape en BAD_REQUEST.
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Ce que l'exploitant sert, et c'est le premier renseignement qu'un tiers
+      # tire de la réponse.
+      - type: json
+        part: body
+        name: model_name
+        json:
+          - '.models[].modelName'
+
+      # D'où l'archive vient : un chemin du model store, ou l'URL depuis
+      # laquelle elle a été tirée — auquel cas allowed_urls a laissé passer un
+      # domaine, et la question de savoir lequel se pose immédiatement.
+      - type: json
+        part: body
+        name: model_url
+        json:
+          - '.models[].modelUrl'
