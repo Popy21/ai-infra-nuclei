@@ -9734,6 +9734,263 @@ def test_langfuse_extractor_reports_the_version_the_anonymous_caller_obtains():
     )
 
 
+# --------------------------------------------------------------------------
+# Chez Hayhooks il n'y a pas de garde à contourner : create_app() monte
+# RequestIdMiddleware puis CORSMiddleware, et inclut ensuite status_router,
+# draw_router, deploy_router, undeploy_router et openai_router sans passer de
+# dependencies= — aucune route ne déclare de Depends(), et settings.py ne porte
+# aucun réglage de clé ni de jeton sous son préfixe hayhooks_. La difficulté du
+# template est donc entièrement de reconnaissance : status_all() rend
+# « StatusResponse(status="Up!", pipelines=registry.get_names()) », et cette
+# charge utile ressemble à la sonde de santé de n'importe quel ordonnanceur de
+# pipelines. Trois faits du code la séparent — le point d'exclamation du « Up! »
+# écrit en dur, le pluriel de pipelines suivi de son tableau, qui distingue la
+# route de sa voisine /status/{pipeline_name}, et la platitude d'un objet dont
+# aucun champ n'est un objet.
+
+HAYHOOKS_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "hayhooks-status-exposed.yaml")
+
+
+def hayhooks_status_body(*pipelines):
+    """
+    Réponse de GET /status telle que FastAPI sérialise le StatusResponse que
+    status_all() construit : deux champs, dans l'ordre de déclaration du modèle,
+    écrits compact.
+    """
+    return json.dumps({"status": "Up!", "pipelines": list(pipelines)},
+                      separators=(",", ":"))
+
+
+HAYHOOKS_STATUS_BODY = hayhooks_status_body("chat_with_website", "rag_qa")
+
+# registry.get_names() rend une liste vide tant qu'aucun pipeline n'est déployé
+# — c'est l'état d'un serveur qu'on vient de lancer sans pipelines_dir. Le
+# constat ne change pas d'un iota : le même routeur nu répond, et POST
+# /deploy_files y écrit puis importe un pipeline_wrapper.py.
+HAYHOOKS_EMPTY_STATUS_BODY = hayhooks_status_body()
+
+# Ce que rend la route voisine GET /status/{pipeline_name} : le même « Up! »,
+# mais PipelineStatusResponse nomme son second champ « pipeline », au singulier,
+# et lui donne une chaîne. Ce n'est pas l'inventaire, et ce n'est pas ce que le
+# template interroge.
+HAYHOOKS_SINGLE_PIPELINE_BODY = json.dumps({"status": "Up!",
+                                            "pipeline": "rag_qa"},
+                                           separators=(",", ":"))
+
+# La sonde de santé d'un ordonnanceur de pipelines quelconque : même forme, même
+# clé au pluriel, mais aucune de ces valeurs n'est celle que status_all() écrit.
+HAYHOOKS_OTHER_HEALTH_BODY = '{"status":"up","pipelines":["etl_nightly"]}'
+HAYHOOKS_OTHER_UP_BODY = '{"status":"UP","pipelines":[]}'
+
+# Le schéma que la même instance sert sur /openapi.json : le « Up! » y est, mot
+# pour mot, dans la description du champ, et « pipelines » y est nommé — mais
+# comme propriété, donc suivi d'un objet.
+HAYHOOKS_OPENAPI_SCHEMA_BODY = (
+    '{"StatusResponse":{"properties":{"status":{"type":"string","description":'
+    '"The current status of the system, \'Up!\' when operational"},"pipelines":'
+    '{"items":{"type":"string"},"type":"array","description":"List of all '
+    'available pipeline names"}},"type":"object"}}'
+)
+
+# Un tableau de supervision qui agrège la réponse de Hayhooks sous une clé à
+# lui : les deux clés y sont, avec leurs valeurs exactes, mais ce n'est pas
+# l'instance qui a répondu.
+HAYHOOKS_COMPOSITE_BODY = (
+    '{"hayhooks":{"status":"Up!","pipelines":["rag_qa"]},"checked_at":0}'
+)
+
+# L'index d'une application servie sur le même hôte, que le catch-all d'un proxy
+# rend en 200 sur un chemin qu'il ne connaît pas.
+HAYHOOKS_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Hayhooks</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# Refus d'un proxy placé devant l'instance pour fermer ce que le produit ne
+# ferme pas : la route ne répond plus à l'anonyme, il n'y a rien à signaler.
+HAYHOOKS_PROXY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+
+def hayhooks_status_block():
+    doc = load(HAYHOOKS_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/status" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /status"
+    return blocks[0]
+
+
+def hayhooks_fires(status=200, body=HAYHOOKS_STATUS_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même
+    si le bloc n'a pas à en dépendre.
+    """
+    block = hayhooks_status_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_hayhooks_probe_reads_the_status_route_and_never_deploys():
+    doc = load(HAYHOOKS_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : sur ce routeur, la méthode POST est "
+            "précisément celle qui déploie — /deploy_files écrit un "
+            "pipeline_wrapper.py sur le disque de l'instance auditée et "
+            "l'importe"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/deploy", "POST /deploy_files et POST /deploy-yaml font "
+                            "écrire puis charger du code Python fourni dans le "
+                            "corps de la requête — le scanner prendrait la main "
+                            "sur ce qu'il audite"),
+                ("/undeploy", "POST /undeploy/{nom} retire le pipeline du "
+                              "registre, ferme ses routes et efface ses "
+                              "fichiers du disque"),
+                ("/draw", "GET /draw/{nom} fait rendre le graphe d'un pipeline "
+                          "de l'exploitant, ce qui ne dit rien de plus que "
+                          "/status sur l'ouverture du routeur"),
+                ("/chat/completions", "les routes compatibles OpenAI font "
+                                      "tourner un modèle aux frais de "
+                                      "l'exploitant"),
+                ("/run", "POST /{nom}/run exécute le pipeline nommé"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = hayhooks_status_block().get("path") or []
+    assert paths == ["{{BaseURL}}/status"], (
+        "le constat tient à une seule lecture, sur le chemin nu : "
+        "/status/{pipeline_name} demanderait un nom qu'on n'a pas encore, et "
+        f"n'apprendrait rien que l'inventaire ne dise déjà — {paths}"
+    )
+
+
+def test_hayhooks_matcher_needs_the_status_payload_not_any_pipeline_server():
+    assert hayhooks_fires(), (
+        "le template ne reconnaît pas une instance Hayhooks dont /status répond "
+        "à l'anonyme"
+    )
+    assert hayhooks_fires(
+        body='{\n  "status": "Up!",\n  "pipelines": [\n    "rag_qa"\n  ]\n}'), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer la route"
+    )
+    assert hayhooks_fires(
+        body='{"status":"Up!","pipelines":["rag_qa"],"version":"0.12.0"}'), (
+        "le template compte les champs : une version ultérieure qui ajouterait "
+        "un scalaire à la charge utile le rendrait muet, alors que le routeur "
+        "resterait exactement aussi ouvert"
+    )
+
+    assert not hayhooks_fires(body=HAYHOOKS_SINGLE_PIPELINE_BODY), (
+        "le template se contente du « Up! » : PipelineStatusResponse le rend "
+        "aussi sur /status/{pipeline_name}, et c'est le pluriel de pipelines "
+        "suivi de son tableau qui dit qu'on lit l'inventaire complet"
+    )
+    assert not hayhooks_fires(body=HAYHOOKS_OTHER_HEALTH_BODY), (
+        "le template déclenche sur la sonde de santé de n'importe quel "
+        "ordonnanceur de pipelines : status_all() écrit « Up! » avec son point "
+        "d'exclamation, or « up » est ce qu'écrivent la plupart des autres"
+    )
+    assert not hayhooks_fires(body=HAYHOOKS_OTHER_UP_BODY), (
+        "le template se passe de la casse et du point d'exclamation, qui sont "
+        "pourtant écrits en dur dans le handler"
+    )
+    assert not hayhooks_fires(body=HAYHOOKS_OPENAPI_SCHEMA_BODY), (
+        "le template retrouve ses deux noms dans le schéma que la même instance "
+        "sert sur /openapi.json : le « Up! » y est en description et "
+        "« pipelines » y est une propriété, donc suivie d'un objet et non d'un "
+        "tableau"
+    )
+    assert not hayhooks_fires(body=HAYHOOKS_COMPOSITE_BODY), (
+        "le template retrouve ses deux clés au fond d'un document composite : "
+        "la charge utile de StatusResponse n'a que deux champs, dont aucun "
+        "n'est un objet, donc aucune accolade intérieure"
+    )
+    assert not hayhooks_fires(body=HAYHOOKS_SPA_BODY), (
+        "le template déclenche sur l'index d'une application rendu en 200 par "
+        "le catch-all d'un proxy sur un chemin qu'il ne connaît pas"
+    )
+
+
+def test_hayhooks_reports_an_instance_that_serves_no_pipeline_yet():
+    """
+    Le tableau vide n'est pas un cas dégradé, c'est le cas nu. registry
+    .get_names() ne rend rien tant qu'aucun pipeline n'est déployé, et ce qui
+    est signalé n'est pas l'inventaire mais le fait que le routeur réponde à
+    l'anonyme — POST /deploy_files, du même routeur et sans plus de garde, écrit
+    puis importe un pipeline_wrapper.py. Une instance vide est celle sur
+    laquelle cette route a le plus à prendre.
+    """
+    assert hayhooks_fires(body=HAYHOOKS_EMPTY_STATUS_BODY), (
+        "le template exige un pipeline déjà déployé pour conclure : il tait "
+        "alors les instances fraîchement lancées, qui sont tout aussi ouvertes "
+        "et dont le registre n'attend qu'un premier dépôt anonyme"
+    )
+
+
+def test_hayhooks_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    status_all() n'a pas de branche d'échec : ni HTTPException, ni statut
+    explicite, donc la charge utile ne peut sortir de l'application que sous un
+    200. Exiger ce 200 n'écarterait rien que le corps n'écarte déjà, et ferait
+    manquer l'instance dont un intermédiaire réécrit le statut. Le constat est
+    la charge utile, et elle seule.
+    """
+    block = hayhooks_status_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : c'est le « Up! » conjoint au "
+        "tableau de pipelines qui nomme le produit, aucun des deux seul"
+    )
+
+    assert not hayhooks_fires(status=401, body=HAYHOOKS_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà la route à "
+        "l'anonyme — c'est la seule fermeture possible, puisque le produit "
+        "n'offre aucun réglage d'authentification"
+    )
+
+
+def test_hayhooks_extractor_reports_the_pipelines_the_anonymous_caller_enumerates():
+    block = hayhooks_status_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement — les noms des pipelines "
+        f"déployés — et {len(extractors)} extracteurs feraient remonter autant "
+        "de fois la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".pipelines[]"], (
+        "l'extracteur ne lit pas .pipelines[] — c'est pourtant tout le contenu "
+        "du constat, et ce qui nomme les routes servies : un pipeline déployé "
+        "sous « x » ouvre POST /x/run"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

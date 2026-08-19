@@ -1,0 +1,159 @@
+id: hayhooks-status-exposed
+
+info:
+  name: Hayhooks - Unauthenticated Pipeline Status and Deploy API
+  author: popy21
+  severity: high
+  description: |
+    Hayhooks déploie des pipelines et des agents Haystack en API REST, et
+    l'application qu'il construit n'a aucune notion d'appelant. create_app()
+    (src/hayhooks/server/app.py) monte deux intergiciels et deux seulement —
+    app.add_middleware(RequestIdMiddleware), qui pose un identifiant de corrélation
+    dans les journaux, puis app.add_middleware(CORSMiddleware, ...), qui écrit des
+    en-têtes d'origine croisée et ne refuse aucune requête de même origine — avant
+    d'inclure les routeurs les uns après les autres : status_router, draw_router,
+    deploy_router, undeploy_router, openai_router, dashboard_router. Aucun
+    include_router() ne reçoit de dependencies=, aucune route de ces fichiers ne
+    déclare de Depends(), et src/hayhooks/settings.py ne porte aucun réglage de
+    clé d'API, de jeton ni de mot de passe sous son préfixe hayhooks_ : il n'y a
+    pas de garde à activer, il n'y en a pas.
+    Le constat se lit sur GET /status, servi par status_all()
+    (src/hayhooks/server/routers/status.py), qui rend littéralement
+    « StatusResponse(status="Up!", pipelines=registry.get_names()) » — donc
+    {"status":"Up!","pipelines":["<nom de pipeline>", ...]}, l'inventaire des
+    pipelines effectivement déployés sur l'instance. Les deux valeurs sont écrites
+    dans le code : le « Up! » à point d'exclamation est une constante du handler,
+    et le pluriel de pipelines sépare cette route de sa voisine
+    /status/{pipeline_name}, qui rend {"status":"Up!","pipeline":"<nom>"} au
+    singulier et sans tableau.
+    La réponse ne prouve pas seulement que la route est atteignable : elle prouve
+    que l'application entière l'est, puisque le même appelant anonyme, passé par
+    les mêmes intergiciels, atteint aussi deploy_router. Le tableau peut être vide
+    sans rien changer au constat — une instance qui ne sert encore aucun pipeline
+    est exactement aussi ouverte, et c'est même l'état d'où l'on part pour en
+    déposer un.
+  impact: |
+    Le renseignement d'abord : les noms des pipelines déployés sont ceux des
+    routes que l'instance sert, puisque le déploiement d'un pipeline nommé « x »
+    ouvre POST /x/run. Les nommer, c'est nommer la surface d'appel — et chaque
+    appel consomme les clés de modèle de l'exploitant, que le pipeline porte dans
+    sa configuration.
+    Le risque ensuite, et il est ailleurs. POST /deploy_files
+    (routers/deploy.py) prend un PipelineFilesRequest dont la validation exige la
+    clé « pipeline_wrapper.py » dans le dictionnaire files : le corps de la
+    requête est du code Python, que le serveur écrit sur disque puis charge comme
+    module pour servir le pipeline. Déployer, ici, c'est exécuter — sous le compte
+    du processus Hayhooks, avec ses variables d'environnement, donc ses clés
+    d'API de fournisseurs de modèles et ses accès aux magasins de documents. Rien
+    dans le fichier ne conditionne cette route, ni jeton, ni liste blanche
+    d'origine, ni réglage à poser : c'est le premier appel anonyme qui prend la
+    main. POST /deploy-yaml fait le même travail depuis une définition YAML.
+    Le reste du routeur suit. POST /undeploy/{pipeline_name} « removes a pipeline
+    from the registry, removes its API routes and deletes its files from disk »,
+    d'après sa propre description : l'anonyme qui vient de lire l'inventaire sur
+    /status a les noms qu'il faut pour retirer un à un les services que
+    l'exploitant fait tourner, fichiers compris. openai_router expose enfin les
+    pipelines en API compatible OpenAI — /v1/models, les complétions de
+    conversation, le dépôt de fichiers —, ce qui fait de l'instance un relais de
+    modèle gratuit pour qui l'a trouvée.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à poser : le produit n'en propose
+    aucun, et le seul intergiciel de contrôle monté par create_app() est celui
+    d'origine croisée, qui ne filtre rien d'autre que les appels de navigateur.
+    La fermeture est donc entièrement en amont de l'application.
+    Laisser host sur sa valeur par défaut — « localhost », settings.py — et ne pas
+    publier le port 1416 du conteneur sur une interface publique. Quand l'instance
+    doit être atteinte depuis un autre hôte, la placer derrière un proxy qui
+    exige une authentification sur tout le préfixe, et non sur les seules routes
+    dont on se méfie : /status, /deploy_files, /deploy-yaml, /undeploy/*, /draw/*,
+    le tableau de bord et les routes compatibles OpenAI passent par le même
+    routeur nu.
+    Vérifier au passage les réglages d'origine croisée, dont le module lui-même
+    dit qu'ils sont permissifs par défaut — check_cors_settings() avertit
+    l'exploitant que cors_allow_origins vaut « * » — pour qu'une page tierce
+    ouverte par un poste du réseau interne ne serve pas de relais vers l'instance.
+    Après une exposition, tenir les pipelines pour suspects : comparer
+    l'inventaire de GET /status aux pipelines attendus, chercher dans le
+    pipelines_dir un pipeline_wrapper.py qui n'a pas été déposé par l'équipe, et
+    faire tourner les secrets que le processus porte — un module importé par le
+    serveur les lit comme le ferait le code légitime.
+  reference:
+    - https://github.com/deepset-ai/hayhooks/blob/main/src/hayhooks/server/routers/status.py
+    - https://github.com/deepset-ai/hayhooks/blob/main/src/hayhooks/server/app.py
+    - https://github.com/deepset-ai/hayhooks/blob/main/src/hayhooks/server/routers/deploy.py
+    - https://github.com/deepset-ai/hayhooks/blob/main/src/hayhooks/server/routers/undeploy.py
+    - https://github.com/deepset-ai/hayhooks/blob/main/src/hayhooks/settings.py
+    - https://docs.haystack.deepset.ai/docs/hayhooks
+  metadata:
+    max-request: 1
+    vendor: deepset
+    product: hayhooks
+  tags: ai,llm,haystack,hayhooks,deepset,pipeline,exposure,unauth,rce,misconfig
+
+http:
+  # Une seule lecture, et c'est la moins coûteuse du routeur. status_all() ne
+  # touche que le registre en mémoire — registry.get_names() — là où /draw/{nom}
+  # ferait rendre le graphe d'un pipeline et où les routes compatibles OpenAI
+  # feraient tourner un modèle aux frais de l'exploitant.
+  #
+  # En lecture seule, et strictement. Le même routeur nu porte POST
+  # /deploy_files, dont le corps contient un pipeline_wrapper.py que le serveur
+  # écrit puis importe — déployer est exécuter —, POST /deploy-yaml, et POST
+  # /undeploy/{nom}, qui retire un pipeline du registre et efface ses fichiers du
+  # disque. C'est précisément ce que le constat signale ; ce n'est pas ce qu'un
+  # scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/status"
+
+    matchers-condition: and
+    matchers:
+      # Des expressions plutôt que des mots, pour trois raisons distinctes.
+      #
+      # Le deux-points d'abord, avec ses espaces facultatives : FastAPI sérialise
+      # compact, mais un intermédiaire qui réindente ce qu'il relaie écrirait
+      # « "status": "Up!" » — et surtout ces noms doivent désigner des clés, pas
+      # apparaître en valeurs dans le catalogue d'un tiers qui documenterait
+      # l'API de Hayhooks.
+      #
+      # La valeur de status ensuite, exigée à « Up! » et à cette casse : c'est la
+      # constante que status_all() écrit, point d'exclamation compris, et le bang
+      # est ce qui la sépare des « up », « UP » et « ok » que rendent les sondes
+      # de santé de tous les autres produits.
+      #
+      # Le pluriel de pipelines enfin, suivi de son crochet ouvrant. La route
+      # voisine /status/{pipeline_name} rend le même « Up! » sous
+      # {"status":"Up!","pipeline":"<nom>"} : c'est le tableau, et lui seul, qui
+      # dit qu'on lit l'inventaire complet. Le crochet écarte du même geste le
+      # schéma OpenAPI de l'instance, qui nomme bien cette propriété mais la fait
+      # suivre d'un objet.
+      #
+      # Le tableau est admis vide, et ce n'est pas une concession. Le constat est
+      # que /status répond à l'anonyme, donc que le routeur entier lui répond, et
+      # une instance qui ne sert encore aucun pipeline est exactement celle sur
+      # laquelle POST /deploy_files a le plus à prendre. Les noms sont le
+      # renseignement, pas la preuve — c'est l'extracteur qui les porte.
+      #
+      # Et le corps entier tenu pour un objet plat à un seul tableau de chaînes :
+      # la charge utile de StatusResponse n'a que ces deux champs, dont aucun
+      # n'est un objet, donc aucune accolade intérieure. Cet ancrage écarte d'un
+      # coup l'index d'un SPA rendu en 200 par un catch-all et le document
+      # composite d'une supervision qui agrégerait la réponse de Hayhooks sous
+      # une clé à elle — sans compter les champs, qu'une version ultérieure
+      # pourrait augmenter.
+      - type: regex
+        part: body
+        regex:
+          - '"status"\s*:\s*"Up!"'
+          - '"pipelines"\s*:\s*\['
+          - '^\s*\{[^{}]*\}\s*$'
+        condition: and
+
+    extractors:
+      # Les pipelines déployés, et par eux les routes que l'instance sert : le
+      # déploiement d'un pipeline nommé « x » ouvre POST /x/run.
+      - type: json
+        part: body
+        name: pipeline
+        json:
+          - '.pipelines[]'
