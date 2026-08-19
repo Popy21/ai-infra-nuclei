@@ -1,0 +1,177 @@
+id: dagster-webserver-exposed
+
+info:
+  name: Dagster Webserver - Unauthenticated Server Info and GraphQL Exposure
+  author: popy21
+  severity: high
+  description: |
+    Le webserver de Dagster sert l'interface de l'orchestrateur et l'API GraphQL
+    qui la nourrit, et l'application qu'il construit n'a aucune notion
+    d'appelant. create_asgi_app() (dagster_webserver/graphql.py) rend
+    « Starlette(routes=self.build_routes(), middleware=self.build_middleware()) »
+    et rien d'autre ; DagsterWebserver.build_middleware()
+    (dagster_webserver/webserver.py) rend « [Middleware(
+    DagsterTracedCounterMiddleware)] », un intergiciel qui compte les appels
+    tracés et pose l'en-tête x-dagster-call-counts sur la réponse — il ne refuse
+    rien. Aucun Route() de build_routes() ne reçoit de dependencies=, aucun
+    endpoint ne déclare de Depends(), et make_security_headers() n'écrit que des
+    en-têtes de durcissement navigateur — Cache-Control, Feature-Policy,
+    Referrer-Policy, X-Content-Type-Options — auxquels s'ajoute une CSP à nonce.
+    Ce sont des protections de la page rendue, pas un contrôle d'accès.
+    Le constat se lit sur GET /server_info, servi par webserver_info_endpoint(),
+    dont la signature dit déjà tout : « async def webserver_info_endpoint(self,
+    _request: Request) » — le souligné devant le paramètre marque une requête
+    dont le corps de la fonction ne lit rien, ni en-tête, ni cookie, ni contexte.
+    Le handler rend littéralement « JSONResponse({"dagster_webserver_version":
+    __version__, "dagster_version": dagster_version, "dagster_graphql_version":
+    dagster_graphql_version}) », donc un objet plat à trois versions.
+    build_routes() lie ce même handler à deux chemins, Route("/server_info", ...)
+    et Route("/dagit_info", ...), le second étant l'alias hérité de dagit que le
+    décorateur @deprecated(breaking_version="2.0") de la méthode annonce comme
+    retiré à la 2.0.
+    Le produit ne prévoit rien à activer : la documentation d'auto-hébergement,
+    « Running Dagster locally », range « Authentication or web security features
+    (dg dev does not include these) » parmi ce qui manque au mode de
+    développement et renvoie à un déploiement de production — lequel ne fournit
+    pas non plus d'authentification applicative, mais suppose une couche en
+    amont. La seule défense native est le réseau : --host vaut
+    DEFAULT_WEBSERVER_HOST, « 127.0.0.1 » (dagster_webserver/cli.py), et il faut
+    l'ouvrir à la main pour que l'instance sorte de la machine.
+  impact: |
+    Le renseignement d'abord. Les trois paquets sortent en verrou — dagster,
+    dagster-graphql et dagster-webserver publient le même numéro le même jour, et
+    ce numéro vaut 1.13.18 en tête de branche — donc le trio date l'instance au
+    correctif près, sans qu'aucun compte soit demandé.
+    Le risque ensuite, et il est ailleurs. Le même appelant anonyme, passé par le
+    même intergiciel unique, atteint Route("/graphql", ...) en GET comme en POST
+    et sa WebSocketRoute jumelle. Le schéma de mutation de dagster-graphql
+    (schema/roots/mutation.py) y expose launchRun et launchPipelineExecution,
+    tous deux câblés sur GrapheneLaunchRunMutation, ainsi que launchRunReexecution
+    : lancer un run, c'est faire exécuter les ops de l'exploitant par ses propres
+    code locations, avec une configuration de run choisie par l'appelant — donc
+    avec les ressources, les identifiants d'entrepôt et les clés d'API que ces
+    ressources portent. Les mutations voisines allument et éteignent schedules et
+    sensors, ce qui suffit à arrêter une production sans rien exécuter soi-même.
+    Le reste du routeur suit, et se lit en GET. /download_debug/{run_id:str} rend
+    un DebugRunPayload gzippé — le run, ses événements et sa configuration ;
+    /logs/{path:path} rend la sortie capturée des steps, c'est-à-dire ce que le
+    code de l'exploitant a écrit sur stdout et stderr pendant l'exécution ;
+    /notebook rend un notebook du dépôt. Et trois routes POST —
+    /report_asset_materialization/{asset_key:path}, /report_asset_check/{...},
+    /report_asset_observation/{...} — laissent écrire des événements dans le
+    journal de l'instance, donc mentir à l'orchestrateur sur l'état des assets
+    qu'il pilote.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à poser : le produit n'en propose
+    aucun, et sa propre documentation le dit. La fermeture est entièrement en
+    amont de l'application.
+    Laisser --host sur sa valeur par défaut — « 127.0.0.1 » — et ne pas publier
+    le port 3000 du conteneur sur une interface publique. Quand l'instance doit
+    être atteinte depuis un autre hôte, la placer derrière un proxy qui exige une
+    authentification sur tout le préfixe, et non sur les seules routes dont on se
+    méfie : /server_info, /dagit_info, /graphql, /download_debug/*, /logs/*,
+    /notebook et les trois routes report_asset_* passent par le même routeur nu.
+    Ne pas prendre --read-only pour une fermeture. Le drapeau « turns off all
+    mutations such as launching runs and turning schedules on/off », d'après sa
+    propre aide, ce qui retire à l'anonyme le lancement de run — mais il laisse
+    ouvertes les requêtes GraphQL de lecture, /download_debug et /logs, donc
+    l'historique des runs, leur configuration et la sortie du code. C'est une
+    réduction de surface, pas un contrôle d'accès.
+    Après une exposition, tenir l'instance pour suspecte : comparer l'historique
+    des runs à ce que l'équipe a lancé, vérifier l'état des schedules et des
+    sensors, chercher dans le journal d'événements des matérialisations d'assets
+    qu'aucun run n'explique, et faire tourner les secrets que les code locations
+    portent dans leurs ressources — un run lancé par l'appelant les lit comme le
+    ferait un run légitime.
+  reference:
+    - https://github.com/dagster-io/dagster/blob/master/python_modules/dagster-webserver/dagster_webserver/webserver.py
+    - https://github.com/dagster-io/dagster/blob/master/python_modules/dagster-webserver/dagster_webserver/graphql.py
+    - https://github.com/dagster-io/dagster/blob/master/python_modules/dagster-webserver/dagster_webserver/cli.py
+    - https://github.com/dagster-io/dagster/blob/master/python_modules/dagster-graphql/dagster_graphql/schema/roots/mutation.py
+    - https://docs.dagster.io/deployment/oss/deployment-options/running-dagster-locally
+    - https://docs.dagster.io/guides/operate/webserver
+  metadata:
+    max-request: 1
+    vendor: dagster
+    product: dagster-webserver
+  tags: ai,ml,mlops,orchestration,dagster,pipeline,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la seule route du serveur qui ne touche à rien.
+  # webserver_info_endpoint() ignore jusqu'à sa requête — « _request », souligné
+  # compris — et rend trois constantes de module : ni instance, ni base, ni code
+  # location n'est sollicitée pour répondre.
+  #
+  # En lecture seule, et strictement. Le même routeur nu porte /graphql, dont le
+  # schéma expose launchRun et launchPipelineExecution — lancer un run fait
+  # exécuter les ops de l'exploitant, avec ses ressources et donc ses secrets —,
+  # /download_debug/{run_id} et /logs/{path}, qui rendent la configuration d'un
+  # run et la sortie de son code, et les trois routes POST report_asset_*, qui
+  # écrivent dans le journal d'événements de l'instance. C'est précisément ce que
+  # le constat signale ; ce n'est pas ce qu'un scanner a le droit de faire pour
+  # l'établir.
+  #
+  # Le chemin nu, enfin. build_routes() lie webserver_info_endpoint() à deux
+  # Route() — /server_info et /dagit_info, l'alias hérité de dagit que
+  # @deprecated(breaking_version="2.0") condamne — et les deux rendent le même
+  # corps, octet pour octet : les interroger tous deux ferait remonter la même
+  # instance deux fois pour un seul fait. On garde celui qui survit à la 2.0.
+  # (Une instance lancée avec --path-prefix monte tout l'arbre sous ce préfixe ;
+  # c'est alors à {{BaseURL}} de le porter.)
+  - method: GET
+    path:
+      - "{{BaseURL}}/server_info"
+
+    matchers-condition: and
+    matchers:
+      # Des expressions plutôt que des mots, pour trois raisons distinctes.
+      #
+      # Le deux-points d'abord, avec ses espaces facultatives : JSONResponse
+      # sérialise compact, mais un intermédiaire qui réindente ce qu'il relaie
+      # écrirait « "dagster_version": "1.13.18" » — et surtout ces noms doivent
+      # désigner des clés, pas apparaître en valeurs dans le catalogue d'un tiers
+      # qui documenterait l'API de Dagster.
+      #
+      # Les deux noms exigés ensuite, et ce couple-là précisément.
+      # dagster_graphql_version seul ne sépare pas ce serveur de son ancêtre :
+      # dagit_info_endpoint(), jusqu'à la 1.2, rendait déjà le même champ à côté
+      # de dagster_version — mais nommait le troisième « dagit_version ». C'est
+      # dagster_webserver_version qui date le renommage. Mais il ne suffit pas
+      # non plus : ce nom-là est celui d'un paquet, et un paquet s'épingle — les
+      # valeurs d'un chart et les routes de build-info en portent la version,
+      # plate et chiffrée comme la vraie charge utile. C'est donc le couple, et
+      # lui seul, qui dit que l'instance a répondu d'elle-même, celle dont
+      # /graphql accepte les mutations de lancement.
+      #
+      # La valeur enfin, tenue pour une version et pas davantage. Une
+      # distribution publiée écrit un numéro PEP 440 — 1.13.18 en tête de
+      # branche, 1.3.14 pour la première version du paquet renommé — mais une
+      # installation depuis les sources rend « 1!0+dev », que version.py porte en
+      # dur. Exiger un triplet tairait la seconde, qui est tout aussi ouverte ;
+      # exiger un premier caractère chiffré écarte la chaîne vide, le null et la
+      # phrase de description sans rien promettre de plus.
+      #
+      # Et le corps entier tenu pour un objet plat : la charge utile n'a que ces
+      # trois champs, tous scalaires, donc aucune accolade intérieure. Cet
+      # ancrage écarte d'un coup l'index de l'interface rendu en 200 par le
+      # catch-all Route("/{path:path}", index_html_endpoint) du serveur lui-même,
+      # et le document d'une supervision qui agrégerait la réponse de Dagster
+      # sous une clé à elle — sans pour autant compter les champs, qu'une version
+      # ultérieure pourrait augmenter.
+      - type: regex
+        part: body
+        regex:
+          - '"dagster_webserver_version"\s*:\s*"[0-9][^"]*"'
+          - '"dagster_graphql_version"\s*:\s*"[0-9][^"]*"'
+          - '^\s*\{[^{}]*\}\s*$'
+        condition: and
+
+    extractors:
+      # La version du composant exposé, et par elle la date du dernier correctif
+      # appliqué : les trois paquets sortent en verrou, donc ce seul numéro situe
+      # aussi bien dagster que dagster-graphql.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.dagster_webserver_version'

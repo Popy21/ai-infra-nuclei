@@ -9991,6 +9991,289 @@ def test_hayhooks_extractor_reports_the_pipelines_the_anonymous_caller_enumerate
     )
 
 
+# --------------------------------------------------------------------------
+# Chez Dagster il n'y a pas de garde à contourner : create_asgi_app() rend un
+# Starlette dont la liste de middleware se réduit à DagsterTracedCounterMiddleware
+# — un compteur d'appels qui pose x-dagster-call-counts et ne refuse rien —, aucun
+# Route() de build_routes() ne reçoit de dependencies=, et
+# webserver_info_endpoint() ignore jusqu'à sa requête, dont le paramètre s'écrit
+# « _request ». La difficulté du template est donc entièrement de reconnaissance :
+# la charge utile est un objet de trois numéros de version, et c'est la forme
+# qu'ont les routes d'information de la moitié des serveurs du pack. Trois faits
+# du code la séparent — le nom dagster_webserver_version, que le renommage de
+# dagit a introduit à la 1.3.14, le nom dagster_graphql_version qui l'accompagne,
+# et la platitude d'un objet dont aucun champ n'est un objet.
+
+DAGSTER_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "dagster-webserver-exposed.yaml")
+
+
+def dagster_info_body(version="1.13.18"):
+    """
+    Réponse de GET /server_info telle que webserver_info_endpoint() la
+    sérialise : trois champs, dans l'ordre où le handler les écrit, compact. Les
+    trois paquets sortent en verrou, donc le même numéro les trois fois.
+    """
+    return json.dumps({"dagster_webserver_version": version,
+                       "dagster_version": version,
+                       "dagster_graphql_version": version},
+                      separators=(",", ":"))
+
+
+DAGSTER_INFO_BODY = dagster_info_body()
+
+# Une installation depuis les sources : version.py porte « 1!0+dev » en dur, et
+# dagster comme dagster-graphql font de même. L'instance est exactement aussi
+# ouverte que celle qui sert une version publiée.
+DAGSTER_SOURCE_CHECKOUT_BODY = dagster_info_body("1!0+dev")
+
+# Ce que rendait dagit_info_endpoint() jusqu'à la 1.2, sur /dagit_info : deux des
+# trois clés y sont, mot pour mot, mais le composant s'appelait encore dagit et
+# son serveur ne portait pas les routes report_asset_* d'aujourd'hui.
+DAGSTER_LEGACY_DAGIT_BODY = json.dumps({"dagit_version": "1.2.7",
+                                        "dagster_version": "1.2.7",
+                                        "dagster_graphql_version": "1.2.7"},
+                                       separators=(",", ":"))
+
+# La route d'information d'un service quelconque : même forme, même semver, mais
+# aucun de ces noms n'est celui que le handler écrit.
+DAGSTER_OTHER_INFO_BODY = '{"version":"1.13.18","api_version":"1.13.18"}'
+
+# L'inventaire de versions d'un déploiement — les valeurs d'un chart, la route de
+# build-info d'une plateforme — qui épingle le paquet dagster-webserver parmi
+# d'autres. Le nom y est bien une clé, la valeur bien un numéro, et le document
+# bien plat : seul dagster_graphql_version, que le handler écrit toujours à côté,
+# sépare l'instance qui répond d'elle-même de ce qu'un tiers écrit sur elle.
+DAGSTER_PINNED_VERSIONS_BODY = (
+    '{"dagster_webserver_version":"1.13.18","chart_version":"1.13.18",'
+    '"image_tag":"1.13.18-py3.11"}'
+)
+
+# Un catalogue tiers qui documente l'API de Dagster : les deux noms y sont, mais
+# comme valeurs — ce ne sont pas les clés d'une réponse d'instance.
+DAGSTER_CATALOGUE_BODY = (
+    '{"endpoint":"/server_info","fields":"dagster_webserver_version,'
+    'dagster_version,dagster_graphql_version"}'
+)
+
+# Un tableau de supervision qui agrège la réponse de Dagster sous une clé à lui :
+# les trois clés y sont, avec leurs valeurs exactes, mais ce n'est pas l'instance
+# qui a répondu.
+DAGSTER_COMPOSITE_BODY = (
+    '{"dagster":{"dagster_webserver_version":"1.13.18","dagster_version":'
+    '"1.13.18","dagster_graphql_version":"1.13.18"},"checked_at":0}'
+)
+
+# L'index de l'interface, que le serveur rend lui-même en 200 sur n'importe quel
+# chemin qu'il ne connaît pas — Route("/{path:path}", index_html_endpoint).
+DAGSTER_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Dagster</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# Refus d'un proxy placé devant l'instance pour fermer ce que le produit ne ferme
+# pas : la route ne répond plus à l'anonyme, il n'y a rien à signaler.
+DAGSTER_PROXY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+
+def dagster_info_block():
+    doc = load(DAGSTER_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/server_info" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /server_info"
+    return blocks[0]
+
+
+def dagster_fires(status=200, body=DAGSTER_INFO_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même si
+    le bloc n'a pas à en dépendre.
+    """
+    block = dagster_info_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_dagster_probe_reads_the_info_route_and_never_reaches_graphql():
+    doc = load(DAGSTER_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les versions se lisent en GET : sur ce routeur, la méthode POST est "
+            "celle de /graphql, dont le schéma porte launchRun, et celle des "
+            "trois routes report_asset_*, qui écrivent dans le journal "
+            "d'événements de l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/graphql", "launchRun et launchPipelineExecution y feraient "
+                             "exécuter les ops de l'exploitant par ses code "
+                             "locations, avec les secrets que ses ressources "
+                             "portent — le scanner prendrait la main sur ce "
+                             "qu'il audite"),
+                ("/report_asset", "les trois routes report_asset_* écrivent des "
+                                  "événements dans le journal de l'instance, "
+                                  "donc mentent à l'orchestrateur sur l'état de "
+                                  "ses assets"),
+                ("/download_debug", "la route rend un DebugRunPayload gzippé — "
+                                    "le run, ses événements et sa configuration "
+                                    "—, ce qui est lire le contenu et non "
+                                    "signaler l'exposition"),
+                ("/logs", "la route rend la sortie capturée des steps, donc ce "
+                          "que le code de l'exploitant a écrit sur stdout et "
+                          "stderr"),
+                ("/notebook", "la route rend un notebook du dépôt de "
+                              "l'exploitant"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = dagster_info_block().get("path") or []
+    assert paths == ["{{BaseURL}}/server_info"], (
+        "le constat tient à une seule lecture, sur le chemin nu : build_routes() "
+        "lie webserver_info_endpoint() à /server_info et à /dagit_info, l'alias "
+        "hérité que @deprecated(breaking_version=\"2.0\") condamne, et les deux "
+        "rendent le même corps octet pour octet — les interroger tous deux ferait "
+        f"remonter la même instance deux fois pour un seul fait — {paths}"
+    )
+
+
+def test_dagster_matcher_needs_the_version_trio_not_any_info_route():
+    assert dagster_fires(), (
+        "le template ne reconnaît pas une instance Dagster dont /server_info "
+        "répond à l'anonyme"
+    )
+    for version in ("1.3.14", "1.9.9", "1.13.18", "1.14.0rc0"):
+        assert dagster_fires(body=dagster_info_body(version)), (
+            f"le template dépend d'une version précise — ici {version} — alors "
+            "que le handler rend la constante du paquet et que la forme de la "
+            "réponse n'a pas bougé depuis le renommage de dagit"
+        )
+    assert dagster_fires(
+        body='{\n  "dagster_webserver_version": "1.13.18",\n'
+             '  "dagster_version": "1.13.18",\n'
+             '  "dagster_graphql_version": "1.13.18"\n}'), (
+        "le template exige la sérialisation compacte de JSONResponse : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer la route"
+    )
+    assert dagster_fires(
+        body='{"dagster_webserver_version":"1.13.18","dagster_version":"1.13.18",'
+             '"dagster_graphql_version":"1.13.18","dagster_shared_version":'
+             '"1.13.18"}'), (
+        "le template compte les champs : une version ultérieure qui ajouterait "
+        "un scalaire à la charge utile le rendrait muet, alors que le routeur "
+        "resterait exactement aussi ouvert"
+    )
+
+    assert not dagster_fires(body=DAGSTER_LEGACY_DAGIT_BODY), (
+        "le template se contente de dagster_graphql_version : "
+        "dagit_info_endpoint() le rendait déjà, à côté de dagster_version, "
+        "jusqu'à la 1.2 — c'est dagster_webserver_version qui date le renommage "
+        "et nomme le serveur d'aujourd'hui"
+    )
+    assert not dagster_fires(body=DAGSTER_OTHER_INFO_BODY), (
+        "le template déclenche sur la route d'information de n'importe quel "
+        "service : ce sont les deux noms de clés, et eux seuls, qui nomment le "
+        "produit"
+    )
+    assert not dagster_fires(body=DAGSTER_PINNED_VERSIONS_BODY), (
+        "le template se contente de dagster_webserver_version : le nom d'un "
+        "paquet épinglé se retrouve dans l'inventaire de versions d'un "
+        "déploiement, plat et chiffré comme la vraie charge utile — c'est "
+        "dagster_graphql_version, que le handler écrit toujours à côté, qui dit "
+        "que l'instance a répondu d'elle-même"
+    )
+    assert not dagster_fires(body=DAGSTER_CATALOGUE_BODY), (
+        "le template retrouve ses deux noms là où ils sont des valeurs et non "
+        "des clés : c'est ce que le deux-points de l'expression doit écarter"
+    )
+    assert not dagster_fires(body=DAGSTER_COMPOSITE_BODY), (
+        "le template retrouve ses clés au fond d'un document composite : la "
+        "charge utile de webserver_info_endpoint() n'a que trois champs, tous "
+        "scalaires, donc aucune accolade intérieure"
+    )
+    assert not dagster_fires(body=DAGSTER_SPA_BODY), (
+        "le template déclenche sur l'index de l'interface, que le serveur rend "
+        "lui-même en 200 sur tout chemin inconnu — Route(\"/{path:path}\", "
+        "index_html_endpoint) est la dernière route de build_routes()"
+    )
+
+
+def test_dagster_reports_an_instance_installed_from_source():
+    """
+    Le numéro n'est pas le constat, il n'en est que le contenu. version.py porte
+    « 1!0+dev » tant que le paquet n'est pas publié, et dagster comme
+    dagster-graphql font de même : une instance lancée depuis les sources rend
+    trois fois cette chaîne, qui n'est pas un triplet. Elle sert pourtant le même
+    /graphql, avec les mêmes mutations de lancement.
+    """
+    assert dagster_fires(body=DAGSTER_SOURCE_CHECKOUT_BODY), (
+        "le template exige un numéro de version publié pour conclure : il tait "
+        "alors les instances installées depuis les sources, dont le routeur est "
+        "exactement aussi nu"
+    )
+
+
+def test_dagster_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    webserver_info_endpoint() n'a pas de branche d'échec : ni HTTPException, ni
+    statut explicite passé à JSONResponse, donc la charge utile ne peut sortir de
+    l'application que sous un 200. Exiger ce 200 n'écarterait rien que le corps
+    n'écarte déjà, et ferait manquer l'instance dont un intermédiaire réécrit le
+    statut. Le constat est la charge utile, et elle seule.
+    """
+    block = dagster_info_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : c'est "
+        "dagster_webserver_version conjoint à dagster_graphql_version qui nomme "
+        "le produit, aucun des deux seul"
+    )
+
+    assert not dagster_fires(status=401, body=DAGSTER_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà la route à "
+        "l'anonyme — c'est la seule fermeture possible, puisque le produit "
+        "n'offre aucun réglage d'authentification"
+    )
+
+
+def test_dagster_extractor_reports_the_version_the_anonymous_caller_obtains():
+    block = dagster_info_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "les trois paquets sortent en verrou et portent le même numéro : "
+        f"{len(extractors)} extracteurs feraient remonter trois fois le même "
+        "renseignement sur la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".dagster_webserver_version"], (
+        "l'extracteur ne lit pas .dagster_webserver_version — c'est pourtant la "
+        "version du composant exposé, celle qui date le dernier correctif "
+        "appliqué, et le seul des trois champs qui nomme ce composant-là"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
