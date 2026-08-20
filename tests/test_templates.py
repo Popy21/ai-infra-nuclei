@@ -10628,6 +10628,414 @@ def test_tei_extractor_reports_the_model_the_anonymous_caller_learns():
     )
 
 
+# --------------------------------------------------------------------------
+# Infinity sert /models, l'endpoint le plus banal du protocole OpenAI : vLLM, LM
+# Studio et l'API d'OpenAI elle-même rendent au même nom la même forme
+# {"data":[…],"object":"list"}. Il n'y a pas davantage de garde à contourner —
+# create_server() (libs/infinity_emb/infinity_emb/infinity_server.py) ouvre par
+# « route_dependencies = [] » et ne pose validate_token que dans un « if api_key:
+# », or MANAGER.api_key vaut la chaîne vide. La difficulté du template est donc
+# entièrement de reconnaissance, et elle est triple : ne revendiquer aucun des
+# autres serveurs compatibles OpenAI que le pack couvre déjà, ne pas dépendre
+# d'un champ que toutes les versions n'écrivent pas, et surtout ne pas
+# transcrire le handler plutôt que le fil.
+#
+# Ce dernier point est le piège du produit, et il se lit dans deux fichiers à la
+# fois. _models() construit dict(id=…, stats=…, capabilities=…, backend=…,
+# embedding_dtype=…, dtype=…, revision=…, lengths_via_tokenize=…, device=…) —
+# neuf clés. Mais la route déclare « response_model=OpenAIModelInfo », et
+# ModelInfo (fastapi_schemas/pymodels.py) n'en déclare que sept : id, stats,
+# object, owned_by, created, backend, capabilities. pydantic étant en extra
+# « ignore » par défaut, FastAPI retire les cinq autres avant de sérialiser, et
+# le schéma que le produit publie lui-même (docs/assets/openapi.json) le
+# confirme : embedding_dtype, dtype, revision, lengths_via_tokenize et device ne
+# sont dans aucune des deux définitions. Un matcher qui les exigerait serait muet
+# sur toutes les instances.
+
+INFINITY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "infinity-embedding-server-exposed.yaml")
+
+# Les cinq clés que _models() pose et que response_model retire avant le fil.
+INFINITY_KEYS_FILTERED_BY_RESPONSE_MODEL = ("embedding_dtype", "dtype", "revision",
+                                            "lengths_via_tokenize", "device")
+
+
+def infinity_model_entry(model_id="michaelfeil/bge-small-en-v1.5",
+                         capabilities=("embed",), backend="torch"):
+    """
+    Une entrée de data telle que pydantic sérialise ModelInfo : les champs dans
+    l'ordre de déclaration, et eux seuls.
+
+    capabilities se retire pour dire les versions antérieures à la 0.0.40 — la
+    0.0.36 ne le porte pas encore. Une instance qui ne l'écrit pas n'est pas moins
+    ouverte pour autant.
+    """
+    entry = {"id": model_id,
+             "stats": {"queue_fraction": 0.0,
+                       "queue_absolute": 0,
+                       "results_pending": 0,
+                       "batch_size": 32},
+             "object": "model",
+             "owned_by": "infinity",
+             "created": 1755600000,
+             "backend": backend}
+    if capabilities is not None:
+        entry["capabilities"] = list(capabilities)
+    return entry
+
+
+def infinity_models_body(*entries):
+    """Réponse de GET /models, telle qu'ORJSONResponse la rend : compacte."""
+    if not entries:
+        entries = (infinity_model_entry(),)
+    return json.dumps({"data": list(entries), "object": "list"},
+                      separators=(",", ":"))
+
+
+INFINITY_MODELS_BODY = infinity_models_body()
+
+# AsyncEngineArray sert autant de moteurs que --model-id a été répété, et chacun
+# porte ses propres capacités : c'est l'inventaire que l'appelant anonyme obtient.
+INFINITY_MULTI_MODEL_BODY = infinity_models_body(
+    infinity_model_entry(),
+    infinity_model_entry(model_id="mixedbread-ai/mxbai-rerank-base-v1",
+                         capabilities=("embed", "rerank"), backend="optimum"),
+    infinity_model_entry(model_id="acme/finetune-v3",
+                         capabilities=("classify",), backend="ctranslate2"),
+)
+
+# Une instance antérieure à la 0.0.40 : ModelInfo n'y déclare pas encore
+# capabilities. Ses routes sont exactement aussi nues.
+INFINITY_MODELS_BODY_NO_CAPABILITIES = infinity_models_body(
+    infinity_model_entry(capabilities=None))
+
+# Une instance antérieure à la 0.0.31 : OpenAIModelInfo y déclare « data:
+# ModelInfo », un objet et non un tableau. Le reste de la charge utile est
+# identique, et la route est tout aussi ouverte.
+INFINITY_SINGLE_ENTRY_BODY = json.dumps(
+    {"data": infinity_model_entry(capabilities=None), "object": "list"},
+    separators=(",", ":"))
+
+# Ce que le template ne doit surtout pas exiger : les cinq clés que le handler
+# pose et que « response_model=OpenAIModelInfo » retire. Ce corps-là ne sort
+# d'aucune instance — il sert à prouver que le matcher ne les réclame pas.
+INFINITY_HANDLER_KEYS_BODY = json.dumps(
+    {"data": [dict(infinity_model_entry(),
+                   embedding_dtype="float32", dtype="float16", revision=None,
+                   lengths_via_tokenize=False, device="cuda")],
+     "object": "list"},
+    separators=(",", ":"))
+
+# Une passerelle d'inférence maison : elle ouvre elle aussi sur data, nomme un
+# propriétaire et publie même une file — mais son owned_by n'est pas « infinity »
+# et son stats n'est pas l'objet à quatre clés du handler.
+INFINITY_OTHER_GATEWAY_BODY = (
+    '{"data":[{"id":"bge-small","object":"model","owned_by":"acme-platform",'
+    '"backend":"triton","stats":"queue_fraction=0.0"}],"object":"list",'
+    '"results_pending":0}'
+)
+
+# Le schéma que la même instance sert sur {url_prefix}/openapi.json : tous les
+# noms de champs y sont, mot pour mot, jusqu'au const « infinity » d'owned_by —
+# mais comme propriétés d'un document qui s'ouvre sur la version d'OpenAPI.
+INFINITY_OPENAPI_SCHEMA_BODY = (
+    '{"openapi":"3.1.0","info":{"title":"Infinity Embedding API"},'
+    '"components":{"schemas":{"ModelInfo":{"properties":{"id":{"type":'
+    '"string"},"stats":{"type":"object","title":"Stats"},"owned_by":{"type":'
+    '"string","enum":["infinity"],"const":"infinity","default":"infinity"},'
+    '"capabilities":{"type":"array"}},"required":["id","stats"]}}}}'
+)
+
+# Un catalogue tiers qui documente l'API d'Infinity : les noms y sont, mais comme
+# valeurs — ce ne sont pas les clés d'une réponse d'instance.
+INFINITY_CATALOGUE_BODY = (
+    '{"endpoint":"/models","owned_by":"infinity",'
+    '"fields":"data,stats,queue_fraction,results_pending,owned_by"}'
+)
+
+# Un tableau de supervision qui agrège la réponse d'Infinity sous une clé à lui :
+# la charge utile y est entière, avec ses valeurs exactes, mais ce n'est pas
+# l'instance qui a répondu.
+INFINITY_COMPOSITE_BODY = '{"infinity":%s,"checked_at":0}' % INFINITY_MODELS_BODY
+
+# L'index d'une application servie sur le même hôte, que le catch-all d'un proxy
+# rend en 200 sur un chemin qu'il ne connaît pas.
+INFINITY_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Embeddings</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# Ce que l'intergiciel rend quand INFINITY_API_KEY est posé : HTTPException(401,
+# detail="Unauthorized"), donc le corps par défaut de FastAPI.
+INFINITY_UNAUTHORIZED_BODY = '{"detail":"Unauthorized"}'
+
+
+def infinity_models_block():
+    doc = load(INFINITY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/models" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /models"
+    return blocks[0]
+
+
+def infinity_fires(status=200, body=INFINITY_MODELS_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre de
+    statut est tenu ici pour que les cas d'un intermédiaire se disent, même si le
+    bloc n'a pas à en dépendre.
+    """
+    block = infinity_models_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_infinity_probe_reads_the_models_route_and_never_runs_the_model():
+    doc = load(INFINITY_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : sur ce serveur, toutes les routes "
+            "d'inférence sont en POST — /embeddings, /rerank, /classify, "
+            "/embeddings_image et /embeddings_audio — et chacune ferait tourner "
+            "le modèle aux frais de l'exploitant"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/embeddings", "POST /embeddings fait calculer des vecteurs sur "
+                                "le GPU de l'instance auditée, et ses entrées "
+                                "multimodales font en plus sortir un "
+                                "« await session.get(img_url) » de l'hôte"),
+                ("/rerank", "POST /rerank fait réordonner des documents par le "
+                            "modèle de l'exploitant"),
+                ("/classify", "POST /classify fait classer une entrée par le "
+                              "modèle de l'exploitant"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = infinity_models_block().get("path") or []
+    assert paths == ["{{BaseURL}}/models"], (
+        "le constat tient à une seule lecture, sur le chemin nu : la route est "
+        "écrite f\"{url_prefix}/models\" et MANAGER.url_prefix vaut \"\" par "
+        "défaut, tandis que /health et /metrics — les seules autres routes en "
+        "GET — sont montés hors de route_dependencies, donc répondent avec ou "
+        f"sans clé et ne prouvent rien — {paths}"
+    )
+
+
+def test_infinity_matcher_needs_the_load_telemetry_not_any_openai_models_list():
+    assert infinity_fires(), (
+        "le template ne reconnaît pas une instance Infinity dont /models répond "
+        "à l'anonyme"
+    )
+    assert infinity_fires(
+        body=json.dumps(json.loads(INFINITY_MODELS_BODY), indent=2)), (
+        "le template exige la sérialisation compacte d'ORJSONResponse : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer la route"
+    )
+    assert infinity_fires(body=INFINITY_MULTI_MODEL_BODY), (
+        "le template ne reconnaît qu'un déploiement à un seul moteur : "
+        "AsyncEngineArray en sert autant que --model-id a été répété, et c'est "
+        "l'inventaire complet que l'anonyme obtient"
+    )
+
+    assert not infinity_fires(body=INFINITY_OTHER_GATEWAY_BODY), (
+        "le template déclenche sur une passerelle d'inférence maison : elle "
+        "ouvre elle aussi sur data et publie une file, mais son owned_by n'est "
+        "pas le Literal[\"infinity\"] du produit et son stats n'est pas un objet"
+    )
+    assert not infinity_fires(body=INFINITY_OPENAPI_SCHEMA_BODY), (
+        "le template retrouve ses noms dans le schéma que la même instance sert "
+        "sur {url_prefix}/openapi.json : ils y sont des propriétés, et le "
+        "document s'ouvre sur la version d'OpenAPI et non sur data"
+    )
+    assert not infinity_fires(body=INFINITY_CATALOGUE_BODY), (
+        "le template retrouve ses noms là où ils sont des valeurs et non des "
+        "clés : c'est ce que le deux-points des expressions doit écarter"
+    )
+    assert not infinity_fires(body=INFINITY_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ouverture sur data qui dit que l'instance a répondu "
+        "d'elle-même"
+    )
+    assert not infinity_fires(body=INFINITY_SPA_BODY), (
+        "le template déclenche sur l'index d'une application rendu en 200 par le "
+        "catch-all d'un proxy sur un chemin qu'il ne connaît pas"
+    )
+
+    # Collisions internes au pack : les autres serveurs qui publient leur modèle
+    # ne doivent pas être revendiqués par celui-ci. Les trois premiers rendent la
+    # même forme {"data":[…],"object":"list"} au même nom de route.
+    for other_body, other_name in (
+        (VLLM_MODELS_BODY, "vllm"),
+        (OTHER_OPENAI_API_BODY, "l'API d'OpenAI"),
+        (LMSTUDIO_MODELS_BODY, "lmstudio"),
+        (LLAMACPP_PROPS_BODY, "llama.cpp"),
+        (SGLANG_MODEL_INFO_BODY, "sglang"),
+        (TEI_INFO_BODY, "text-embeddings-inference"),
+        (TGI_INFO_BODY, "text-generation-inference"),
+        (XINFERENCE_REGISTRATIONS_BODY, "xinference"),
+    ):
+        assert not infinity_fires(body=other_body), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_infinity_matcher_rests_on_the_wire_payload_not_on_the_handler_keys():
+    """
+    Le piège du produit, et la seule chose qu'on ne peut pas lire dans _models()
+    seul. Le handler pose neuf clés par modèle ; la route déclare
+    « response_model=OpenAIModelInfo » et ModelInfo n'en déclare que sept, donc
+    pydantic — en extra « ignore » par défaut — retire les cinq restantes avant
+    que FastAPI ne sérialise. Le schéma publié par le produit lui-même
+    (docs/assets/openapi.json) ne connaît qu'id, stats, object, owned_by, created,
+    backend et capabilities.
+
+    Un matcher écrit sur le corps du handler exigerait embedding_dtype, device ou
+    lengths_via_tokenize : il serait alors muet sur toutes les instances du monde,
+    sans qu'aucun test de reconnaissance ne le dise — la charge utile qui les
+    porte n'existe pas.
+    """
+    written = "\n".join(
+        expression
+        for matcher in (infinity_models_block().get("matchers") or [])
+        for expression in (matcher.get("regex") or []) + (matcher.get("words") or [])
+    )
+    for key in INFINITY_KEYS_FILTERED_BY_RESPONSE_MODEL:
+        assert key not in written, (
+            f"le matcher réclame {key} : _models() la pose bien, mais ModelInfo "
+            "ne la déclare pas et response_model la retire — aucune instance "
+            "n'écrit cette clé sur le fil, et le template serait muet partout"
+        )
+
+    assert infinity_fires(body=INFINITY_HANDLER_KEYS_BODY), (
+        "le template compte les champs : une version ultérieure qui déclarerait "
+        "dans ModelInfo l'une des clés aujourd'hui filtrées le rendrait muet, "
+        "alors que les routes resteraient exactement aussi nues"
+    )
+
+
+def test_infinity_matcher_holds_across_versions_and_across_capabilities():
+    """
+    Deux façons de rater des instances tout aussi ouvertes. Par le haut, un champ
+    récent : capabilities n'est entré dans ModelInfo qu'après la 0.0.36. Par le
+    bas, la forme du conteneur : OpenAIModelInfo déclarait « data: ModelInfo » —
+    un objet — jusqu'à la 0.0.31, où il est devenu « data: list[ModelInfo] ». Le
+    quatuor de stats, lui, est posé dans le même ordre depuis la 0.0.20.
+    """
+    assert infinity_fires(body=INFINITY_MODELS_BODY_NO_CAPABILITIES), (
+        "le template exige capabilities, que ModelInfo ne déclare qu'après la "
+        "0.0.36 — il tairait les instances qui traînent exposées depuis cette "
+        "ligne, dont les routes sont exactement aussi nues"
+    )
+    assert infinity_fires(body=INFINITY_SINGLE_ENTRY_BODY), (
+        "le template exige que data soit un tableau : OpenAIModelInfo y "
+        "déclarait un objet unique jusqu'à la 0.0.31, et cette instance-là sert "
+        "le même /embeddings sans clé"
+    )
+
+    for capabilities in (("embed",), ("embed", "rerank"), ("classify",),
+                         ("image_embed", "audio_embed", "embed")):
+        body = infinity_models_body(infinity_model_entry(capabilities=capabilities))
+        assert infinity_fires(body=body), (
+            "le template dépend des capacités déclarées "
+            f"({', '.join(capabilities)}) : capabilities est un set[str], donc "
+            "un tableau dont l'ordre ne se prédit pas, et /models répond de la "
+            "même façon quelle qu'en soit la composition"
+        )
+
+
+def test_infinity_and_vllm_templates_do_not_claim_each_other_s_models_route():
+    """
+    Les deux produits parlent le protocole OpenAI et rendent la même forme
+    {"data":[…],"object":"list"} au même nom de route. Les chemins interrogés
+    diffèrent — /models contre /v1/models —, mais rien n'empêche de lancer
+    Infinity avec --url-prefix /v1, et une instance remonterait alors deux fois
+    sous deux noms de produit. C'est donc aux matchers de les séparer.
+    """
+    doc = load(VLLM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v1/models" in (b.get("path") or [])]
+    assert blocks, "le template vLLM ne vise plus GET /v1/models"
+    vllm_body_matchers = [m for m in (blocks[0].get("matchers") or [])
+                          if m.get("part") == "body"]
+    assert vllm_body_matchers, "le template vLLM ne vérifie plus le corps"
+
+    assert not all(body_matcher_hits(m, INFINITY_MODELS_BODY)
+                   for m in vllm_body_matchers), (
+        "le template vLLM déclenche sur le /models d'Infinity : les deux charges "
+        "utiles partagent data et owned_by, et c'est la valeur « vllm » conjointe "
+        "à max_model_len qui doit les séparer"
+    )
+    assert not infinity_fires(body=VLLM_MODELS_BODY), (
+        "le template déclenche sur le /v1/models de vLLM, déjà couvert par son "
+        "propre template : owned_by y vaut « vllm » et la ModelCard n'a pas de "
+        "stats"
+    )
+
+
+def test_infinity_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    _models() n'a pas de branche d'échec : il parcourt app.engine_array et rend
+    « dict(data=data) », donc la charge utile ne peut sortir de l'application que
+    sous un 200. Exiger ce 200 n'écarterait rien que le corps n'écarte déjà, et
+    ferait manquer l'instance dont un intermédiaire réécrit le statut. Le constat
+    est la charge utile, et elle seule.
+    """
+    block = infinity_models_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : c'est l'objet stats conjoint "
+        "au Literal owned_by qui nomme le produit, aucun des deux seul"
+    )
+
+    assert not infinity_fires(status=401, body=INFINITY_UNAUTHORIZED_BODY), (
+        "le template signale une instance lancée avec INFINITY_API_KEY : "
+        "validate_token lève alors HTTPException(401, detail=\"Unauthorized\") "
+        "sur /models, et il n'y a rien à signaler"
+    )
+
+
+def test_infinity_extractor_reports_the_models_the_anonymous_caller_enumerates():
+    block = infinity_models_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement qui vaille d'être remonté — "
+        f"l'inventaire des modèles servis — et {len(extractors)} extracteurs "
+        "feraient remonter autant de fois la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".data[].id"], (
+        "l'extracteur ne parcourt pas .data[].id — c'est pourtant l'inventaire "
+        "que l'appelant anonyme obtient, et celui que les routes d'inférence du "
+        "même processus le laissent faire tourner ; s'arrêter à .data[0].id "
+        "tairait les autres moteurs d'un AsyncEngineArray, et le champ vaut le "
+        "served_model_name qu'EngineArgs remplit par les deux derniers segments "
+        "du chemin des poids"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

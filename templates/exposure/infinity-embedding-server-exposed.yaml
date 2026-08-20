@@ -1,0 +1,179 @@
+id: infinity-embedding-server-exposed
+
+info:
+  name: Infinity Embedding Server - Unauthenticated Model Inventory Exposure
+  author: popy21
+  severity: medium
+  description: |
+    Infinity sert des embeddings, du réordonnancement et de la classification
+    derrière une API compatible OpenAI. Sa garde n'existe que si on la demande, et
+    le code le dit en trois lignes : create_server()
+    (libs/infinity_emb/infinity_emb/infinity_server.py) ouvre par
+    « route_dependencies = [] », ne définit validate_token et ne l'y ajoute que
+    dans un « if api_key: … route_dependencies.append(Depends(validate_token)) »,
+    et pose ensuite « dependencies=route_dependencies » sur chacune de ses routes.
+    Or api_key vaut « MANAGER.api_key », c'est-à-dire
+    _optional_infinity_var("api_key", default="") : la chaîne vide, donc fausse.
+    Tant qu'INFINITY_API_KEY ou --api-key n'est pas passé, la liste reste vide et
+    les routes portent une liste de dépendances vide — il n'y a pas de contrôle à
+    contourner, il n'y en a pas.
+    Le handler du constat ne consulte rien non plus : _models() parcourt
+    app.engine_array et rend « dict(data=data) », sans en-tête, sans cookie, sans
+    corps. Ce qui sort sur le fil est ce que « response_model=OpenAIModelInfo »
+    laisse passer, et pydantic filtre : le handler construit bien des clés
+    embedding_dtype, dtype, revision, lengths_via_tokenize et device, mais
+    ModelInfo ne les déclare pas et FastAPI les retire avant sérialisation — le
+    schéma publié par le produit lui-même (docs/assets/openapi.json) ne connaît
+    que id, stats, object, owned_by, created, backend et capabilities. C'est cette
+    charge utile-là que le template lit, et non celle du code du handler.
+    Deux de ces champs nomment le produit à eux seuls. owned_by est un
+    Literal["infinity"], donc la chaîne « infinity » et rien d'autre, là où vLLM
+    écrit « vllm » et l'API d'OpenAI « openai ». Et stats est un objet — aucun
+    autre serveur compatible OpenAI n'en ajoute un à /models — dont les quatre
+    clés sont posées dans cet ordre par le handler depuis la 0.0.20 :
+    queue_fraction, queue_absolute, results_pending, batch_size.
+    Le défaut de liaison, enfin, va dans le mauvais sens : MANAGER.host vaut
+    « 0.0.0.0 » et MANAGER.port « 7997 » (libs/infinity_emb/infinity_emb/env.py).
+    L'instance sort de la machine dès le premier lancement, sans qu'aucun réglage
+    soit touché.
+  impact: |
+    Le renseignement d'abord, et il est double. L'inventaire : chaque entrée de
+    data nomme un modèle servi par son served_model_name, que EngineArgs remplit
+    par « "/".join(self.model_name_or_path.split("/")[-2:]) » — l'identifiant
+    HuggingFace pour un modèle public, mais les deux derniers segments du chemin
+    de fichiers pour des poids privés ou affinés, ce qui renseigne sur
+    l'arborescence de l'hôte. À côté, backend donne le moteur d'inférence
+    (torch, ctranslate2, optimum, neuron) et capabilities énumère parmi embed,
+    rerank, classify, image_embed et audio_embed — c'est-à-dire exactement
+    lesquelles des routes POST du même processus répondront à l'appelant.
+    La charge ensuite, et c'est ce que stats ajoute de particulier : queue_fraction
+    donne le taux de remplissage de la file, queue_absolute et results_pending son
+    contenu au moment de la lecture, batch_size la taille de lot du moteur. Un
+    appelant anonyme lit donc la saturation de l'instance en temps réel, sur une
+    route qui ne coûte rien et qu'il peut interroger en boucle : de quoi savoir si
+    le GPU est libre, ou choisir le moment où une charge supplémentaire fera le
+    plus de tort.
+    Le coût enfin. La même liste de dépendances vide est posée sur POST
+    /embeddings, /rerank, /classify, /embeddings_image et /embeddings_audio : le
+    GPU de l'hôte travaille pour qui l'atteint, par lots de max_client_batch_size
+    entrées (2048 par défaut), sans limite de débit, sans quota et sans trace
+    attribuable à un appelant. Les entrées multimodales vont plus loin qu'un
+    calcul : resolve_from_img_url() fait « await session.get(img_url) », donc
+    l'instance émet des requêtes HTTP sortantes vers les URL que l'appelant lui
+    donne, et rend le motif de l'échec dans son message d'erreur.
+    Ce qui borne le constat, et le tient à medium : le serveur ne conserve ni les
+    entrées ni les sorties, il n'y a donc pas d'historique d'un tiers à lire, pas
+    d'exécution de code à obtenir et rien à écrire dans l'état de l'exploitant. Ce
+    qui est en jeu est l'inventaire des modèles, la télémétrie de charge, et la
+    consommation anonyme du backend.
+  remediation: |
+    Poser INFINITY_API_KEY (ou --api-key sur la commande v2), en sachant ce qu'il
+    ferme et ce qu'il laisse. L'intergiciel est un HTTPBearer(auto_error=False)
+    suivi d'une comparaison « credential.credentials != api_key » : un jeton
+    statique partagé, sans identité d'appelant, dont la rotation demande un
+    redémarrage. Il ne couvre par ailleurs que les routes qui portent
+    route_dependencies : /health, /metrics — que Instrumentator().expose(app)
+    monte à part —, « / » qui redirige vers redirect_slash (« /docs » par défaut),
+    et {url_prefix}/docs comme {url_prefix}/openapi.json, passés à FastAPI() en
+    docs_url et openapi_url, restent ouverts avec ou sans clé. La sous-commande v1
+    refuse d'ailleurs api_key et lève « api_key is not supported in `v1` » : une
+    instance restée en v1 ne peut pas être fermée par ce moyen.
+    La fermeture réelle est celle du réseau. Passer INFINITY_HOST à 127.0.0.1,
+    puisque le défaut « 0.0.0.0 » est précisément l'exposition, et ne pas publier
+    le port 7997 du conteneur sur une interface publique. Quand l'instance doit
+    être atteinte depuis un autre hôte, la placer derrière un proxy qui
+    authentifie tout le préfixe, et ne pas activer INFINITY_PERMISSIVE_CORS, qui
+    pose sinon allow_origins=["*"] avec allow_credentials=True.
+    Après une exposition, tenir pour connus les served_model_name rendus par
+    /models — donc, pour des poids privés, les deux derniers segments de leur
+    chemin — ainsi que le moteur et les capacités de chaque instance : seule une
+    remise en question du déploiement les retire à l'appelant. Mesurer au passage
+    ce qui a été consommé sur les compteurs de /metrics, qui comptent les requêtes
+    servies sans distinguer l'anonyme du légitime.
+  reference:
+    - https://github.com/michaelfeil/infinity/blob/main/libs/infinity_emb/infinity_emb/infinity_server.py
+    - https://github.com/michaelfeil/infinity/blob/main/libs/infinity_emb/infinity_emb/fastapi_schemas/pymodels.py
+    - https://github.com/michaelfeil/infinity/blob/main/libs/infinity_emb/infinity_emb/env.py
+    - https://github.com/michaelfeil/infinity/blob/main/docs/assets/openapi.json
+    - https://michaelfeil.eu/infinity/latest/cli_v2/
+  metadata:
+    max-request: 1
+    vendor: michaelfeil
+    product: infinity
+  tags: ai,llm,embeddings,infinity,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la seule route gardée qui ne fasse rien tourner.
+  # _models() parcourt app.engine_array et lit engine.overload_status() : des
+  # compteurs déjà en mémoire, ni tokenizer, ni backend, ni GPU.
+  #
+  # En lecture seule, et strictement. Le même processus porte POST /embeddings,
+  # /rerank, /classify, /embeddings_image et /embeddings_audio, toutes avec la
+  # même liste de dépendances vide — chacune ferait travailler le modèle aux frais
+  # de l'exploitant, et les deux dernières feraient en plus sortir une requête
+  # HTTP de l'instance auditée. C'est ce que le constat signale ; ce n'est pas ce
+  # qu'un scanner a le droit de faire pour l'établir.
+  #
+  # Le chemin nu, enfin : la route est écrite f"{url_prefix}/models" et
+  # MANAGER.url_prefix vaut "" par défaut. /health et /metrics — les seules autres
+  # routes en GET — sont montés hors de route_dependencies, donc répondent avec ou
+  # sans clé et ne prouvent rien.
+  - method: GET
+    path:
+      - "{{BaseURL}}/models"
+
+    matchers-condition: and
+    matchers:
+      # Des expressions plutôt que des mots, pour quatre raisons distinctes.
+      #
+      # L'ancrage d'abord. /models est l'endpoint le plus banal du protocole
+      # OpenAI — vLLM, LM Studio, l'API d'OpenAI elle-même et toute passerelle qui
+      # s'y aligne le servent —, et la charge utile n'est pas plate : stats est un
+      # objet, donc l'ancrage « aucune accolade intérieure » qu'emploient les
+      # templates voisins ne s'applique pas ici. Ce qu'on tient à la place, c'est
+      # le début du document : pydantic sérialise les champs d'un modèle dans
+      # l'ordre de déclaration et data ouvre OpenAIModelInfo. Exiger que le corps
+      # commence par cette clé dit que l'instance a répondu d'elle-même, et écarte
+      # le document d'une supervision qui agrégerait sa réponse sous une clé à
+      # elle.
+      #
+      # Le deux-points ensuite, avec ses espaces facultatives : FastAPI rend cette
+      # route en ORJSONResponse, donc compact, mais un intermédiaire qui réindente
+      # ce qu'il relaie écrirait « "owned_by": "infinity" » — et surtout ces noms
+      # doivent désigner des clés, pas apparaître en valeurs dans le catalogue
+      # d'un tiers qui documenterait l'API.
+      #
+      # Le owned_by ensuite, tenu pour ce qu'il est : un Literal["infinity"], donc
+      # la seule valeur que ce champ puisse prendre, et le nom du produit écrit
+      # par le produit. vLLM écrit « vllm » au même endroit, l'API d'OpenAI
+      # « openai », et le pack couvre déjà le premier par son propre template.
+      #
+      # Le stats enfin, et c'est lui qui sépare Infinity de tout le reste :
+      # personne d'autre n'ajoute un objet de télémétrie à une liste de modèles.
+      # On exige qu'il en soit un et qu'il s'ouvre sur queue_fraction — l'ordre du
+      # dict littéral du handler —, puis results_pending, le nom qu'Infinity donne
+      # à results_absolute et qui n'appartient à aucune spécification publique. Le
+      # quatuor est posé dans cet ordre depuis la 0.0.20 ; capabilities, lui, est
+      # délibérément absent d'ici — il n'est entré dans ModelInfo qu'après la
+      # 0.0.36, et l'exiger tairait les instances antérieures, dont les routes
+      # sont exactement aussi nues.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"data"\s*:'
+          - '"stats"\s*:\s*\{\s*"queue_fraction"\s*:'
+          - '"results_pending"\s*:\s*[0-9]+'
+          - '"owned_by"\s*:\s*"infinity"'
+        condition: and
+
+    extractors:
+      # Les modèles que l'appelant anonyme apprend, et par eux ce que les routes
+      # d'inférence du même processus le laissent faire tourner. Le parcours du
+      # tableau plutôt que sa première entrée : AsyncEngineArray sert autant de
+      # moteurs que --model-id a été répété, et n'en nommer qu'un tairait les
+      # autres.
+      - type: json
+        part: body
+        name: served_model_name
+        json:
+          - '.data[].id'
