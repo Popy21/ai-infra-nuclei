@@ -1,0 +1,162 @@
+id: text-embeddings-inference-exposed
+
+info:
+  name: HuggingFace Text Embeddings Inference - Unauthenticated Model Info Exposure
+  author: popy21
+  severity: medium
+  description: |
+    Chez Text Embeddings Inference — le pendant « embeddings » de Text Generation
+    Inference, du même éditeur — la garde n'existe que si on la demande. run()
+    (router/src/http/server.rs) construit « let mut routes = Router::new()
+    .route("/info", get(get_model_info)) », y ajoute /embed, /embed_all,
+    /embed_sparse, /predict, /rerank, /similarity, /tokenize, /decode, /embeddings
+    et /v1/embeddings, puis ne monte l'intergiciel d'autorisation que dans un
+    « if let Some(api_key) = api_key { … routes = routes.layer(
+    axum::middleware::from_fn(auth)); } ». Le drapeau --api-key est un
+    Option<String> sans valeur par défaut (router/src/main.rs) et sa propre aide le
+    dit : « By default the server responds to every request. » Tant qu'il n'est pas
+    passé, aucune couche n'est posée sur ces routes — il n'y a pas de contrôle à
+    contourner, il n'y en a pas.
+    Le handler du constat ne consulte rien : « async fn get_model_info(info:
+    Extension<Info>) -> Json<Info> { Json(info.0) } » — ni en-tête, ni cookie, ni
+    corps. Il rend la struct Info de router/src/lib.rs, dont serde écrit les champs
+    dans l'ordre de déclaration : model_id, model_sha, model_dtype,
+    served_model_name, model_type, puis les paramètres du routeur —
+    max_concurrent_requests, max_input_length, max_batch_tokens,
+    max_batch_requests, max_client_batch_size, auto_truncate, tokenization_workers
+    — et enfin version, sha, docker_label. model_type est un enum étiqueté à
+    l'extérieur et mis en minuscules (#[serde(rename_all = "lowercase")]), donc un
+    objet à une seule clé : « embedding », « classifier » ou « reranker ».
+    C'est ce que le template lit, et ce qui le sépare du /info de TGI déjà couvert
+    par le pack : le routeur de génération écrit validation_workers, max_best_of et
+    max_total_tokens, et n'a pas de champ model_type ; celui d'embeddings écrit
+    tokenization_workers, auto_truncate et max_client_batch_size.
+    Le défaut de liaison, enfin, va dans le mauvais sens : --hostname vaut
+    « 0.0.0.0 » et --port « 3000 » (router/src/main.rs). L'instance sort de la
+    machine dès le premier lancement, sans qu'aucun réglage soit touché.
+  impact: |
+    Le renseignement d'abord. model_id nomme le modèle servi, model_sha en donne la
+    révision exacte, model_dtype la précision de chargement, et version, sha,
+    docker_label datent la construction du routeur — de quoi identifier l'instance
+    au commit près sans qu'aucun compte soit demandé. Et model_type porte davantage
+    qu'une étiquette : sur un déploiement de classification ou de réordonnancement,
+    la variante « classifier » ou « reranker » embarque un ClassifierModel, donc les
+    tables id2label et label2id complètes. Ce sont les classes de l'exploitant —
+    catégories de modération, libellés d'intention, classes de routage —, c'est-à-
+    dire de la configuration métier et non une fiche de modèle publique.
+    Le coût ensuite. Le même routeur nu, sans clé et sans couche, sert POST /embed,
+    /embed_all, /embed_sparse, /predict, /rerank, /similarity, /tokenize, /decode,
+    /embeddings et /v1/embeddings, plus « / » et « /invocations » que run() câble
+    selon le model_type. L'appelant anonyme fait donc tourner le GPU de l'hôte, par
+    lots de max_client_batch_size entrées (32 par défaut) et jusqu'à
+    max_concurrent_requests requêtes en vol (512 par défaut) : aucune limite de
+    débit, aucun quota, aucune trace attribuable à un appelant. Le CORS ne s'y
+    oppose pas non plus — « let allow_origin = allow_origin.unwrap_or(
+    AllowOrigin::any()) » tant que --cors-allow-origin n'est pas passé.
+    Ce qui borne le constat, et le tient à medium : le routeur ne conserve ni les
+    entrées ni les sorties, il n'y a donc pas d'historique d'un tiers à lire, pas
+    d'exécution de code à obtenir et rien à écrire dans l'état de l'exploitant. Ce
+    qui est en jeu est l'empreinte, la table de libellés quand le modèle classe, et
+    la consommation anonyme du backend.
+  remediation: |
+    Poser --api-key, en sachant ce qu'il ferme. L'intergiciel compose « Bearer
+    <clé> » et compare l'en-tête Authorization à cette chaîne entière, octet pour
+    octet : c'est un jeton statique partagé, sans identité d'appelant, et le faire
+    tourner demande un redémarrage. Il ne couvre par ailleurs que le routeur
+    « routes » : /health, /ping, /metrics et « / » en GET sont montés dans
+    public_routes, et /docs et /api-doc/openapi.json sont fusionnés dans
+    l'application en dehors de routes — les uns comme les autres restent ouverts,
+    clé ou pas.
+    La fermeture réelle est celle du réseau. Passer --hostname 127.0.0.1, puisque le
+    défaut « 0.0.0.0 » est précisément l'exposition, et ne pas publier le port 3000
+    du conteneur sur une interface publique. Quand l'instance doit être atteinte
+    depuis un autre hôte, la placer derrière un proxy qui authentifie tout le
+    préfixe, et restreindre --cors-allow-origin, qui vaut sinon n'importe quelle
+    origine.
+    Après une exposition, tenir pour connus model_id, model_sha et — si le modèle
+    classe ou réordonne — les tables id2label et label2id que /info a rendues :
+    seule une remise en question du déploiement les retire à l'appelant. Mesurer au
+    passage ce qui a été consommé sur les compteurs de /metrics, qui comptent les
+    requêtes servies sans distinguer l'anonyme du légitime.
+  reference:
+    - https://github.com/huggingface/text-embeddings-inference/blob/main/router/src/lib.rs
+    - https://github.com/huggingface/text-embeddings-inference/blob/main/router/src/http/server.rs
+    - https://github.com/huggingface/text-embeddings-inference/blob/main/router/src/main.rs
+    - https://huggingface.co/docs/text-embeddings-inference/cli_arguments
+    - https://huggingface.co/docs/text-embeddings-inference/quick_tour
+  metadata:
+    max-request: 1
+    vendor: huggingface
+    product: text-embeddings-inference
+  tags: ai,llm,embeddings,tei,huggingface,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la seule route du routeur gardé qui ne fasse rien
+  # tourner. get_model_info() rend une Extension<Info> construite au démarrage : ni
+  # tokenizer, ni backend, ni GPU n'est sollicité pour répondre.
+  #
+  # En lecture seule, et strictement. Le même routeur nu porte POST /embed,
+  # /embed_all, /embed_sparse, /predict, /rerank, /similarity, /tokenize, /decode,
+  # /embeddings et /v1/embeddings, plus « / » et « /invocations » câblés selon le
+  # model_type — toutes font travailler le modèle aux frais de l'exploitant. C'est
+  # précisément ce que le constat signale ; ce n'est pas ce qu'un scanner a le droit
+  # de faire pour l'établir.
+  #
+  # Le chemin nu, enfin : .route("/info", get(get_model_info)) n'a pas d'alias, et
+  # /health, /ping et /metrics — les seules autres routes en GET — sont dans
+  # public_routes, donc répondent avec ou sans clé et ne prouvent rien.
+  - method: GET
+    path:
+      - "{{BaseURL}}/info"
+
+    matchers-condition: and
+    matchers:
+      # Des expressions plutôt que des mots, pour quatre raisons distinctes.
+      #
+      # L'ancrage d'abord. /info est un nom d'endpoint banal — Spring Boot
+      # Actuator, passerelles d'inférence maison — et la charge utile de TEI n'est
+      # pas plate : model_type est un objet, donc l'ancrage « aucune accolade
+      # intérieure » qu'emploient les templates voisins ne s'applique pas ici. Ce
+      # qu'on tient à la place, c'est le début du document : serde écrit les champs
+      # d'une struct dans l'ordre de déclaration et model_id ouvre Info depuis la
+      # 0.6. Exiger que le corps commence par cette clé dit que l'instance a
+      # répondu d'elle-même, et écarte le document d'une supervision qui agrégerait
+      # sa réponse sous une clé à elle.
+      #
+      # Le deux-points ensuite, avec ses espaces facultatives : axum sérialise
+      # compact, mais un intermédiaire qui réindente ce qu'il relaie écrirait
+      # « "model_id": "…" » — et surtout ces noms doivent désigner des clés, pas
+      # apparaître en valeurs dans le catalogue d'un tiers qui documenterait l'API.
+      #
+      # Le model_type ensuite, tenu pour ce qu'il est : un enum étiqueté à
+      # l'extérieur et mis en minuscules, donc un objet à une clé unique parmi
+      # trois. TGI, dont le pack couvre déjà le /info, n'a aucun champ de ce nom ;
+      # une passerelle maison qui écrirait « "model_type":"embedding" » ne rend pas
+      # un objet et ne passe pas non plus.
+      #
+      # Les paramètres du routeur enfin. tokenization_workers est le nom que TEI
+      # écrit là où TGI écrit validation_workers ; max_client_batch_size les nomme
+      # tous deux et corrobore sans distinguer. Le troisième membre du trio propre
+      # à TEI, auto_truncate, est délibérément absent d'ici : il n'est entré dans
+      # Info qu'au cours de la ligne 1.2 — la 1.2.0 ne le porte pas, la 1.2.3 oui —
+      # et l'exiger tairait les instances antérieures, dont le routeur est
+      # exactement aussi nu.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"model_id"\s*:'
+          - '"model_type"\s*:\s*\{\s*"(?:embedding|classifier|reranker)"\s*:'
+          - '"tokenization_workers"\s*:\s*[0-9]+'
+          - '"max_client_batch_size"\s*:\s*[0-9]+'
+        condition: and
+
+    extractors:
+      # Le modèle que l'appelant anonyme apprend, et par lui ce que sert le backend
+      # qu'il peut faire tourner. served_model_name le redirait le plus souvent —
+      # main.rs le remplit par « args.served_model_name.unwrap_or_else(||
+      # args.model_id.clone()) » — et n'existe que depuis la 1.9.
+      - type: json
+        part: body
+        name: model_id
+        json:
+          - '.model_id'

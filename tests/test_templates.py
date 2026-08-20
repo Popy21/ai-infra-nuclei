@@ -10274,6 +10274,360 @@ def test_dagster_extractor_reports_the_version_the_anonymous_caller_obtains():
     )
 
 
+# --------------------------------------------------------------------------
+# Text Embeddings Inference sert le même nom de route que son grand frère TGI,
+# dont le pack couvre déjà le /info : deux templates sur GET /info, et deux
+# charges utiles qui ouvrent toutes deux sur « model_id ». Chez TEI il n'y a pas
+# davantage de garde à contourner — run() (router/src/http/server.rs) monte
+# .route("/info", get(get_model_info)) sur un Router nu, et ne pose la couche
+# d'autorisation que dans un « if let Some(api_key) = api_key », or --api-key est
+# un Option<String> sans valeur par défaut. La difficulté du template est donc
+# entièrement de reconnaissance, et elle est double : ne pas revendiquer le
+# routeur de génération, et ne pas dépendre d'un champ que toutes les versions
+# n'écrivent pas. Trois faits du code la tranchent — l'ouverture du document sur
+# model_id, que serde écrit en premier depuis la 0.6, le model_type que TGI n'a
+# pas et que #[serde(rename_all = "lowercase")] rend en objet à une clé unique,
+# et le nom tokenization_workers là où TGI écrit validation_workers.
+
+TEI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "text-embeddings-inference-exposed.yaml")
+
+
+def tei_info_body(model_type=None, served_model_name="thenlper/gte-base",
+                  auto_truncate=True, version="1.9.3"):
+    """
+    Réponse de GET /info telle qu'axum sérialise la struct Info : les champs dans
+    l'ordre de déclaration de router/src/lib.rs, compact.
+
+    Deux champs se retirent pour dire les versions plus anciennes.
+    served_model_name est entré à la 1.9 — la 1.8.1 ne le porte pas — et
+    auto_truncate au cours de la ligne 1.2, absent en 1.2.0 et présent en 1.2.3.
+    Une instance qui ne les écrit pas n'est pas moins ouverte pour autant.
+    """
+    payload = {"model_id": "thenlper/gte-base",
+               "model_sha": "fca14538aa9956a46526bd1d0d11d69e19b5a101",
+               "model_dtype": "float16"}
+    if served_model_name is not None:
+        payload["served_model_name"] = served_model_name
+    payload["model_type"] = model_type or {"embedding": {"pooling": "cls"}}
+    payload.update({"max_concurrent_requests": 512,
+                    "max_input_length": 512,
+                    "max_batch_tokens": 16384,
+                    "max_batch_requests": None,
+                    "max_client_batch_size": 32})
+    if auto_truncate is not None:
+        payload["auto_truncate"] = auto_truncate
+    payload.update({"tokenization_workers": 8,
+                    "version": version,
+                    "sha": None,
+                    "docker_label": None})
+    return json.dumps(payload, separators=(",", ":"))
+
+
+TEI_INFO_BODY = tei_info_body()
+
+# Une 1.8.x, puis une 1.1.x : ni l'une ni l'autre n'écrit served_model_name, et la
+# seconde n'écrit pas non plus auto_truncate. Le routeur qu'elles servent est
+# exactement aussi nu que celui d'aujourd'hui.
+TEI_INFO_BODY_1_8 = tei_info_body(served_model_name=None, version="1.8.1")
+TEI_INFO_BODY_1_1 = tei_info_body(served_model_name=None, auto_truncate=None,
+                                  version="1.1.0")
+
+# Les deux autres variantes de ModelType. Sur un classifieur comme sur un
+# réordonnanceur, l'enum embarque un ClassifierModel : les tables id2label et
+# label2id complètes, donc les classes de l'exploitant, rendues à l'anonyme.
+TEI_CLASSIFIER_INFO_BODY = tei_info_body(model_type={"classifier": {
+    "id2label": {"0": "safe", "1": "toxic", "2": "spam"},
+    "label2id": {"safe": 0, "toxic": 1, "spam": 2}}})
+TEI_RERANKER_INFO_BODY = tei_info_body(model_type={"reranker": {
+    "id2label": {"0": "LABEL"}, "label2id": {"LABEL": 0}}})
+
+# Une passerelle d'inférence maison : elle ouvre elle aussi sur model_id, nomme un
+# model_type et compte ses lots — mais son model_type est une chaîne et non l'objet
+# à une clé que rend l'enum étiqueté à l'extérieur, et personne d'autre que TEI
+# n'écrit tokenization_workers.
+TEI_OTHER_GATEWAY_BODY = (
+    '{"model_id":"thenlper/gte-base","model_type":"embedding",'
+    '"backend":"triton","version":"1.2.0","max_client_batch_size":8,'
+    '"workers":4}'
+)
+
+# Le schéma que la même instance sert sur /api-doc/openapi.json : tous les noms de
+# champs d'Info y sont, mot pour mot, mais comme propriétés d'un document qui
+# s'ouvre sur la version d'OpenAPI.
+TEI_OPENAPI_SCHEMA_BODY = (
+    '{"openapi":"3.0.3","info":{"title":"Text Embeddings Inference"},'
+    '"components":{"schemas":{"Info":{"properties":{"model_id":{"type":'
+    '"string","example":"thenlper/gte-base"},"model_type":{"$ref":'
+    '"#/components/schemas/ModelType"},"tokenization_workers":{"type":'
+    '"integer","example":4},"max_client_batch_size":{"type":"integer",'
+    '"example":32}},"type":"object"}}}}'
+)
+
+# Un catalogue tiers qui documente l'API de TEI : les noms y sont, mais comme
+# valeurs — ce ne sont pas les clés d'une réponse d'instance.
+TEI_CATALOGUE_BODY = (
+    '{"endpoint":"/info","fields":"model_id,model_type,tokenization_workers,'
+    'max_client_batch_size"}'
+)
+
+# Un tableau de supervision qui agrège la réponse de TEI sous une clé à lui : la
+# charge utile y est entière, avec ses valeurs exactes, mais ce n'est pas
+# l'instance qui a répondu.
+TEI_COMPOSITE_BODY = '{"tei":%s,"checked_at":0}' % TEI_INFO_BODY
+
+# L'index d'une application servie sur le même hôte, que le catch-all d'un proxy
+# rend en 200 sur un chemin qu'il ne connaît pas.
+TEI_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Embeddings</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+
+def tei_info_block():
+    doc = load(TEI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/info" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /info"
+    return blocks[0]
+
+
+def tei_fires(status=200, body=TEI_INFO_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre de
+    statut est tenu ici pour que les cas d'un intermédiaire se disent, même si le
+    bloc n'a pas à en dépendre.
+    """
+    block = tei_info_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_tei_probe_reads_the_info_route_and_never_runs_the_model():
+    doc = load(TEI_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'empreinte se lit en GET : sur ce routeur, toutes les routes "
+            "d'inférence sont en POST — /embed, /embed_all, /embed_sparse, "
+            "/predict, /rerank, /similarity, /tokenize, /decode, /embeddings et "
+            "/v1/embeddings — et chacune ferait tourner le modèle aux frais de "
+            "l'exploitant"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/embed", "POST /embed, /embed_all et /embed_sparse font "
+                           "calculer des vecteurs sur le GPU de l'instance "
+                           "auditée"),
+                ("/predict", "POST /predict fait classer une entrée par le "
+                             "modèle de l'exploitant"),
+                ("/rerank", "POST /rerank fait réordonner des documents par le "
+                            "modèle de l'exploitant"),
+                ("/similarity", "POST /similarity enchaîne deux passes du modèle "
+                                "pour comparer des entrées"),
+                ("/tokenize", "POST /tokenize fait travailler le tokenizer de "
+                              "l'instance sur une entrée fournie"),
+                ("/decode", "POST /decode fait rendre du texte à partir "
+                            "d'identifiants de jetons fournis"),
+                ("/invocations", "la route Sagemaker est câblée par run() sur "
+                                 "predict, rerank ou embed selon le model_type — "
+                                 "c'est la même inférence sous un autre nom"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = tei_info_block().get("path") or []
+    assert paths == ["{{BaseURL}}/info"], (
+        "le constat tient à une seule lecture, sur le chemin nu : "
+        ".route(\"/info\", get(get_model_info)) n'a pas d'alias, et /health, "
+        "/ping et /metrics — les seules autres routes en GET — sont montées dans "
+        "public_routes, donc répondent avec ou sans clé et ne prouvent rien — "
+        f"{paths}"
+    )
+
+
+def test_tei_matcher_needs_the_router_parameters_not_any_info_route():
+    assert tei_fires(), (
+        "le template ne reconnaît pas une instance TEI dont /info répond à "
+        "l'anonyme"
+    )
+    assert tei_fires(body=json.dumps(json.loads(TEI_INFO_BODY), indent=2)), (
+        "le template exige la sérialisation compacte d'axum : un intermédiaire "
+        "qui réindente ce qu'il relaie ferait manquer la route"
+    )
+    assert tei_fires(
+        body=TEI_INFO_BODY[:-1] + ',"dense_path":null}'), (
+        "le template compte les champs : une version ultérieure qui en "
+        "ajouterait un le rendrait muet, alors que le routeur resterait "
+        "exactement aussi ouvert"
+    )
+
+    assert not tei_fires(body=TEI_OTHER_GATEWAY_BODY), (
+        "le template déclenche sur une passerelle d'inférence maison : elle "
+        "ouvre elle aussi sur model_id et compte ses lots, mais son model_type "
+        "est une chaîne et non l'objet à une clé que rend l'enum de TEI, et elle "
+        "n'écrit pas tokenization_workers"
+    )
+    assert not tei_fires(body=OTHER_INFO_BODY), (
+        "le template déclenche sur la route d'information de n'importe quelle "
+        "passerelle qui nomme son modèle model_id"
+    )
+    assert not tei_fires(body=ACTUATOR_INFO_BODY), (
+        "le template déclenche sur un /info sans rapport avec l'inférence"
+    )
+    assert not tei_fires(body=TEI_OPENAPI_SCHEMA_BODY), (
+        "le template retrouve ses noms dans le schéma que la même instance sert "
+        "sur /api-doc/openapi.json : ils y sont des propriétés, et le document "
+        "s'ouvre sur la version d'OpenAPI et non sur model_id"
+    )
+    assert not tei_fires(body=TEI_CATALOGUE_BODY), (
+        "le template retrouve ses noms là où ils sont des valeurs et non des "
+        "clés : c'est ce que le deux-points des expressions doit écarter"
+    )
+    assert not tei_fires(body=TEI_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ouverture sur model_id qui dit que l'instance a "
+        "répondu d'elle-même"
+    )
+    assert not tei_fires(body=TEI_SPA_BODY), (
+        "le template déclenche sur l'index d'une application rendu en 200 par le "
+        "catch-all d'un proxy sur un chemin qu'il ne connaît pas"
+    )
+
+    # Collisions internes au pack : les autres templates de disclosure du modèle
+    # servi ne doivent pas être revendiqués par celui-ci.
+    for other_body, other_name in (
+        (LLAMACPP_PROPS_BODY, "llama.cpp"),
+        (SGLANG_MODEL_INFO_BODY, "sglang"),
+        (LMSTUDIO_MODELS_BODY, "lmstudio"),
+        (VLLM_MODELS_BODY, "vllm"),
+        (XINFERENCE_REGISTRATIONS_BODY, "xinference"),
+        (AUTOMATIC1111_SD_MODELS_BODY, "automatic1111"),
+    ):
+        assert not tei_fires(body=other_body), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_tei_matcher_holds_across_versions_and_across_model_types():
+    """
+    Deux façons de rater des instances tout aussi ouvertes. Par le haut, un champ
+    récent : served_model_name n'est entré dans Info qu'à la 1.9, auto_truncate
+    qu'au cours de la ligne 1.2. Par le côté, la variante de ModelType : run()
+    câble « / » et « /invocations » sur predict, rerank ou embed selon elle, mais
+    /info répond de la même façon dans les trois cas.
+    """
+    for body, version in ((TEI_INFO_BODY_1_8, "1.8.1"),
+                          (TEI_INFO_BODY_1_1, "1.1.0")):
+        assert tei_fires(body=body), (
+            f"le template exige un champ que la {version} n'écrit pas — il "
+            "tairait les instances qui traînent exposées depuis cette ligne, "
+            "dont le routeur est exactement aussi nu"
+        )
+
+    for body, variant in ((TEI_CLASSIFIER_INFO_BODY, "classifier"),
+                          (TEI_RERANKER_INFO_BODY, "reranker")):
+        assert tei_fires(body=body), (
+            f"le template ne reconnaît que la variante embedding : sur un "
+            f"déploiement {variant}, /info rend en plus les tables id2label et "
+            "label2id, donc les classes de l'exploitant — c'est le cas où il y a "
+            "le plus à dire, pas le moins"
+        )
+
+
+def test_tei_and_tgi_templates_do_not_claim_each_other_s_info_route():
+    """
+    Les deux produits de HuggingFace servent le même chemin, et le pack porte donc
+    deux templates sur GET /info. La règle « un produit, un constat » ne les
+    sépare pas — elle ne compare que les templates d'un même metadata.product —,
+    donc c'est aux matchers de le faire : chacun doit rester muet sur la charge
+    utile de l'autre, faute de quoi une seule instance remonterait deux fois sous
+    deux noms de produit.
+    """
+    doc = load(TGI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/info" in (b.get("path") or [])]
+    assert blocks, "le template TGI ne vise plus GET /info"
+    tgi_body_matchers = [m for m in (blocks[0].get("matchers") or [])
+                         if m.get("part") == "body"]
+    assert tgi_body_matchers, "le template TGI ne vérifie plus le corps"
+
+    assert not all(body_matcher_hits(m, TEI_INFO_BODY) for m in tgi_body_matchers), (
+        "le template TGI déclenche sur le /info de TEI : les deux charges utiles "
+        "partagent model_id et max_concurrent_requests, et c'est max_best_of "
+        "conjoint à validation_workers qui doit les séparer"
+    )
+    assert not tei_fires(body=TGI_INFO_BODY), (
+        "le template déclenche sur le /info de TGI, déjà couvert par son propre "
+        "template : la charge utile du routeur de génération ouvre elle aussi "
+        "sur model_id et porte max_client_batch_size — seuls le model_type, "
+        "qu'elle n'a pas, et tokenization_workers, là où elle écrit "
+        "validation_workers, les séparent"
+    )
+
+
+def test_tei_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    get_model_info() n'a pas de branche d'échec : « Json(info.0) » sur une
+    Extension construite au démarrage, donc la charge utile ne peut sortir de
+    l'application que sous un 200. Exiger ce 200 n'écarterait rien que le corps
+    n'écarte déjà, et ferait manquer l'instance dont un intermédiaire réécrit le
+    statut. Le constat est la charge utile, et elle seule.
+    """
+    block = tei_info_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : c'est le model_type conjoint "
+        "à tokenization_workers qui nomme le produit, aucun des deux seul"
+    )
+
+    assert not tei_fires(status=401, body=""), (
+        "le template signale une instance lancée avec --api-key : l'intergiciel "
+        "de run() rend alors « Err(StatusCode::UNAUTHORIZED) » sur /info, donc "
+        "un corps vide, et il n'y a rien à signaler"
+    )
+
+
+def test_tei_extractor_reports_the_model_the_anonymous_caller_learns():
+    block = tei_info_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement qui vaille d'être remonté — le "
+        f"modèle servi — et {len(extractors)} extracteurs feraient remonter "
+        "autant de fois la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".model_id"], (
+        "l'extracteur ne lit pas .model_id — c'est pourtant le modèle que "
+        "l'appelant anonyme apprend, et celui que les routes d'inférence du même "
+        "routeur nu le laissent faire tourner ; served_model_name le redirait le "
+        "plus souvent, main.rs le remplissant par "
+        "« args.served_model_name.unwrap_or_else(|| args.model_id.clone()) », et "
+        "n'existe que depuis la 1.9"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
