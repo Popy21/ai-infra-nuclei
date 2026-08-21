@@ -11036,6 +11036,323 @@ def test_infinity_extractor_reports_the_models_the_anonymous_caller_enumerates()
     )
 
 
+# --------------------------------------------------------------------------
+# NeMo Guardrails rend sur /v1/rails/configs la charge utile la plus pauvre du
+# pack : « [{"id": config_id} for config_id in config_ids] », donc un tableau
+# d'objets à une seule clé. Il n'y a pas de version à lire, pas de nom de
+# produit écrit dans la réponse, pas de télémétrie — rien qu'une liste de noms
+# de dossiers. La reconnaissance ne peut donc tenir qu'à deux choses : le chemin
+# propre au produit, et la forme entière du corps.
+#
+# Cette forme est exactement ce qui la sépare d'une liste de ressources
+# quelconque. get_rails_configs() ne déclare pas de response_model, donc FastAPI
+# sérialise littéralement ce que le handler construit, et le handler ne
+# construit qu'une clé. Une API qui rendrait la même liste avec un name ou un
+# enabled à côté n'est pas ce serveur.
+#
+# Le piège du produit est ailleurs, et il est de calendrier. GET /v1/health rend
+# « {"status":"pass"} » sous le type de média application/health+json, que
+# personne d'autre n'écrit : c'est le témoin le plus net qui soit. Mais ce
+# handler n'existe que sur la branche develop — il est absent d'api.py dans
+# chaque tag publié jusqu'à la v0.23.0 incluse, qui est la dernière version sur
+# PyPI. Un template qui s'y appuierait serait muet sur la totalité des instances
+# déployées aujourd'hui.
+
+NEMO_GUARDRAILS_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                        "nemo-guardrails-server-exposed.yaml")
+
+
+def nemo_guardrails_configs_body(*config_ids):
+    """Réponse de GET /v1/rails/configs, telle que FastAPI la sérialise : compacte."""
+    return json.dumps([{"id": config_id} for config_id in config_ids],
+                      separators=(",", ":"))
+
+
+# Mode multi-configuration, la forme que la documentation du produit montre
+# elle-même au curl. Le handler ne pose qu'une clé par entrée.
+NEMO_GUARDRAILS_CONFIGS_BODY = nemo_guardrails_configs_body(
+    "content_safety", "jailbreak_detection", "topic_safety")
+
+# Mode mono-configuration : le handler court-circuite os.listdir() et rend
+# « [{"id": app.single_config_id}] », c'est-à-dire le nom du dossier racine.
+NEMO_GUARDRAILS_SINGLE_CONFIG_BODY = nemo_guardrails_configs_body("content_safety")
+
+# Serveur lancé sans --config et sans dossier ./config local : rails_config_path
+# reste utils.get_examples_data_path("bots"), donc les bots d'exemple livrés avec
+# le paquet. C'est le cas d'un `nemoguardrails server` tapé tel quel.
+NEMO_GUARDRAILS_BUNDLED_BOTS_BODY = nemo_guardrails_configs_body(
+    "abc", "abc_v2", "hello_world")
+
+# Un dossier qui ne porte aucune configuration valide : la route répond, mais
+# n'énumère rien et ne nomme aucun produit.
+NEMO_GUARDRAILS_NO_CONFIG_BODY = "[]"
+
+# Une API quelconque qui rend une liste de ressources identifiées : elle nomme
+# elle aussi un id, mais jamais seul. C'est ce que la forme entière doit écarter.
+NEMO_GUARDRAILS_OTHER_ID_LIST_BODY = (
+    '[{"id":"content_safety","name":"Content Safety","enabled":true},'
+    '{"id":"topic_safety","name":"Topic Safety","enabled":false}]'
+)
+
+# Le schéma que la même instance sert sur /openapi.json : le chemin y figure mot
+# pour mot, et « id » aussi — mais comme propriétés d'un document qui s'ouvre sur
+# la version d'OpenAPI.
+NEMO_GUARDRAILS_OPENAPI_SCHEMA_BODY = (
+    '{"openapi":"3.1.0","info":{"title":"Guardrails Server API",'
+    '"version":"0.1.0"},"paths":{"/v1/rails/configs":{"get":{"summary":'
+    '"Get List of available rails configurations.","operationId":'
+    '"get_rails_configs_v1_rails_configs_get","responses":{"200":'
+    '{"description":"Successful Response","content":{"application/json":'
+    '{"schema":{"items":{"properties":{"id":{"type":"string"}}}}}}}}}}}}'
+)
+
+# Un tableau de supervision qui agrège la réponse sous une clé à lui : la charge
+# utile y est entière, avec ses valeurs exactes, mais ce n'est pas l'instance qui
+# a répondu.
+NEMO_GUARDRAILS_COMPOSITE_BODY = (
+    '{"nemo-guardrails":%s,"checked_at":0}' % NEMO_GUARDRAILS_CONFIGS_BODY)
+
+# La console chainlit montée sur /chat, vers laquelle GET / redirige, telle qu'un
+# catch-all la rendrait en 200 sur un chemin qu'il ne connaît pas.
+NEMO_GUARDRAILS_CHAT_UI_BODY = (
+    '<!doctype html><html lang="en"><head><title>Chat</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# Ce qu'un FastAPI rend sur un chemin qu'il ne sert pas — donc ce qu'une instance
+# antérieure à l'apparition de la route rendrait ici.
+NEMO_GUARDRAILS_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+
+def nemo_guardrails_block():
+    doc = load(NEMO_GUARDRAILS_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v1/rails/configs" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /v1/rails/configs"
+    return blocks[0]
+
+
+def nemo_guardrails_matcher_expressions():
+    """Tout ce que les matchers du bloc écrivent, mots et expressions confondus."""
+    return "\n".join(
+        expression
+        for matcher in (nemo_guardrails_block().get("matchers") or [])
+        for expression in (matcher.get("regex") or []) + (matcher.get("words") or [])
+    )
+
+
+def nemo_guardrails_fires(body=NEMO_GUARDRAILS_CONFIGS_BODY, status=200,
+                          headers="content-type: application/json"):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint.
+
+    `body_matcher_hits` porte la sémantique de `word` comme de `regex` sans rien
+    savoir du sujet qu'on lui donne : elle sert donc aussi bien la part `header`,
+    où nuclei présente les en-têtes de la réponse comme une chaîne. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même si
+    le bloc n'a pas à en dépendre.
+    """
+    block = nemo_guardrails_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, headers))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_nemo_guardrails_probe_reads_the_configs_route_and_never_runs_the_rails():
+    doc = load(NEMO_GUARDRAILS_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : sur ce serveur, tout ce qui fait "
+            "travailler l'exploitant est en POST — /v1/chat/completions et "
+            "/v1/checks — et le routeur nu les sert à l'anonyme comme le reste"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/chat/completions", "POST /v1/chat/completions fait tourner le "
+                                      "LLM de la configuration demandée, dont la "
+                                      "clé d'API vient de l'environnement de "
+                                      "l'exploitant et dont la consommation lui "
+                                      "est facturée"),
+                ("/checks", "POST /v1/checks fait passer une entrée choisie par "
+                            "l'appelant à travers les rails de l'exploitant"),
+                ("/models", "GET /v1/models fait interroger le fournisseur de "
+                            "modèles configuré depuis l'instance auditée"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = nemo_guardrails_block().get("path") or []
+    assert paths == ["{{BaseURL}}/v1/rails/configs"], (
+        "le constat tient à une seule lecture, sur le chemin nu : la route est "
+        "écrite en dur dans le décorateur, et une instance lancée avec --prefix "
+        f"monte l'arbre entier sous ce préfixe, que {{{{BaseURL}}}} porte — {paths}"
+    )
+
+
+def test_nemo_guardrails_matcher_needs_the_configs_payload_not_any_list_of_ids():
+    assert nemo_guardrails_fires(), (
+        "le template ne reconnaît pas une instance dont /v1/rails/configs "
+        "énumère ses configurations pour l'anonyme"
+    )
+    assert nemo_guardrails_fires(body=NEMO_GUARDRAILS_SINGLE_CONFIG_BODY), (
+        "le template exige plusieurs entrées : en mode mono-configuration le "
+        "handler rend « [{\"id\": app.single_config_id}] », et cette instance-là "
+        "sert le même /v1/chat/completions sans clé"
+    )
+    assert nemo_guardrails_fires(body=NEMO_GUARDRAILS_BUNDLED_BOTS_BODY), (
+        "le template ne reconnaît pas le serveur lancé sans --config, dont "
+        "rails_config_path reste celui des bots d'exemple du paquet — c'est "
+        "pourtant le `nemoguardrails server` tapé tel quel"
+    )
+    assert nemo_guardrails_fires(
+        body=json.dumps(json.loads(NEMO_GUARDRAILS_CONFIGS_BODY), indent=2)), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer la route"
+    )
+
+    assert not nemo_guardrails_fires(body=NEMO_GUARDRAILS_NO_CONFIG_BODY), (
+        "le template déclenche sur « [] » : un dossier sans configuration "
+        "valide n'énumère rien, ne nomme aucun produit, et ce tableau vide est "
+        "la réponse la plus banale du web"
+    )
+    assert not nemo_guardrails_fires(body=NEMO_GUARDRAILS_OTHER_ID_LIST_BODY), (
+        "le template déclenche sur une liste de ressources identifiées "
+        "quelconque : le handler écrit « {\"id\": config_id} » et rien d'autre, "
+        "donc c'est l'objet à clé unique qui nomme le produit, pas la présence "
+        "d'un id"
+    )
+    assert not nemo_guardrails_fires(body=NEMO_GUARDRAILS_OPENAPI_SCHEMA_BODY), (
+        "le template retrouve son chemin et sa clé dans le schéma que la même "
+        "instance sert sur /openapi.json : ils y sont des propriétés, et le "
+        "document est un objet là où la route rend un tableau"
+    )
+    assert not nemo_guardrails_fires(body=NEMO_GUARDRAILS_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur les deux crochets qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not nemo_guardrails_fires(body=NEMO_GUARDRAILS_CHAT_UI_BODY,
+                                     headers="content-type: text/html"), (
+        "le template déclenche sur la console chainlit montée sur /chat, qu'un "
+        "catch-all rendrait en 200 sur un chemin qu'il ne connaît pas"
+    )
+    assert not nemo_guardrails_fires(body=NEMO_GUARDRAILS_NOT_FOUND_BODY,
+                                     status=404), (
+        "le template déclenche sur le « {\"detail\":\"Not Found\"} » d'un "
+        "FastAPI qui ne sert pas ce chemin"
+    )
+
+    # Collisions internes au pack : aucun des autres serveurs couverts ne doit
+    # être revendiqué par celui-ci.
+    for other_body, other_name in (
+        (VLLM_MODELS_BODY, "vllm"),
+        (OTHER_OPENAI_API_BODY, "l'API d'OpenAI"),
+        (LMSTUDIO_MODELS_BODY, "lmstudio"),
+        (INFINITY_MODELS_BODY, "infinity"),
+        (TEI_INFO_BODY, "text-embeddings-inference"),
+        (TGI_INFO_BODY, "text-generation-inference"),
+        (LETTA_AGENTS_BODY, "letta"),
+    ):
+        assert not nemo_guardrails_fires(body=other_body), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_nemo_guardrails_matcher_does_not_rest_on_the_unreleased_health_route():
+    """
+    Le seul point qu'on ne peut pas lire dans api.py seul, et il se paierait
+    cher. GET /v1/health rend « {"status":"pass"} » sous le type de média
+    application/health+json — une signature que personne d'autre n'écrit, et
+    qu'il serait tentant d'exiger en corroboration.
+
+    Mais ce handler n'existe que sur la branche develop : api.py ne le porte dans
+    aucun tag publié, ni à la v0.23.0 — la dernière version sur PyPI — ni dans
+    aucune de celles d'avant. Un matcher qui en dépendrait, ou une seconde
+    requête qui l'exigerait sous req-condition, rendrait le template muet sur la
+    totalité des instances déployées aujourd'hui, dont les routes sont
+    exactement aussi nues.
+
+    La charge utile de /v1/rails/configs, elle, est écrite mot pour mot de la
+    même façon depuis la v0.8.0 : c'est sur elle seule que le constat tient.
+    """
+    doc = load(NEMO_GUARDRAILS_TEMPLATE)
+    for block in (doc.get("http") or []):
+        for path in (block.get("path") or []):
+            assert "health" not in path, (
+                f"le template interroge {path} : /v1/health et /healthz "
+                "n'existent que sur develop, et aucune version publiée ne les "
+                "sert"
+            )
+
+    written = nemo_guardrails_matcher_expressions()
+    for absent, why in (
+        ("health", "le type de média application/health+json ne sort que d'une "
+                   "instance construite depuis develop"),
+        ('"pass"', "« {\"status\":\"pass\"} » est le corps de /v1/health, que "
+                   "nulle version publiée ne rend"),
+    ):
+        assert absent not in written, (
+            f"le matcher réclame {absent!r} : {why}, et le template serait muet "
+            "sur toutes les instances déployées"
+        )
+
+
+def test_nemo_guardrails_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    get_rails_configs() n'a pas de branche d'échec : il rend une liste, donc la
+    charge utile ne peut sortir de l'application que sous un 200. Exiger ce 200
+    n'écarterait rien que le corps n'écarte déjà, et ferait manquer l'instance
+    dont un intermédiaire réécrit le statut.
+    """
+    block = nemo_guardrails_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : la réponse ne porte ni "
+        "version ni nom de produit, et c'est la forme entière du corps, jointe "
+        "au type de média, qui la nomme — aucun des deux seul"
+    )
+
+
+def test_nemo_guardrails_extractor_reports_the_configs_the_anonymous_caller_enumerates():
+    block = nemo_guardrails_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement qui vaille d'être remonté — "
+        f"les configurations de garde-fous chargées — et {len(extractors)} "
+        "extracteurs feraient remonter autant de fois la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un tableau JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".[].id"], (
+        "l'extracteur ne parcourt pas .[].id — ce sont pourtant les config_id "
+        "que l'appelant anonyme énumère, et ceux qu'il peut ensuite citer à "
+        "POST /v1/chat/completions ; s'arrêter à .[0].id tairait les autres "
+        "politiques du mode multi-configuration"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

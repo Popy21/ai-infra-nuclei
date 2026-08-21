@@ -1,0 +1,200 @@
+id: nemo-guardrails-server-exposed
+
+info:
+  name: NVIDIA NeMo Guardrails Server - Unauthenticated Rails Configuration Enumeration
+  author: popy21
+  severity: high
+  description: |
+    NeMo Guardrails place ses garde-fous devant un LLM, et le serveur qui les
+    applique n'a lui-même aucune notion d'appelant. L'application est construite
+    par « app = GuardrailsApp(title="Guardrails Server API", …) »
+    (nemoguardrails/server/api.py), et GuardrailsApp est une sous-classe de
+    FastAPI dont le __init__ n'ajoute que des attributs d'état —
+    default_config_id, rails_config_path, disable_chat_ui, auto_reload,
+    stop_signal, single_config_mode, single_config_id, loop, task — sans toucher
+    ni aux dépendances ni au routeur. Le seul intergiciel monté sans condition
+    est « app.add_middleware(ExceptionMiddleware, handlers={Exception:
+    internal_error_handler}) », qui transforme une exception en réponse ; le
+    second, CORSMiddleware, n'est ajouté que derrière ENABLE_CORS, lu dans
+    NEMO_GUARDRAILS_SERVER_ENABLE_CORS et faux par défaut. Aucun décorateur de
+    route ne porte de dependencies=, aucun handler ne déclare de Depends(), et
+    aucun schéma de sécurité n'est défini nulle part dans le module.
+    Le constat se lit sur GET /v1/rails/configs, et sa signature dit déjà tout :
+    « async def get_rails_configs() » ne prend aucun paramètre — pas même la
+    Request que ses voisines reçoivent —, donc ni en-tête ni cookie ne sont
+    seulement atteignables depuis le corps de la fonction. En mono-configuration
+    elle rend « [{"id": app.single_config_id}] » ; sinon elle liste les
+    sous-dossiers de app.rails_config_path qui portent un fichier de
+    configuration et rend « [{"id": config_id} for config_id in config_ids] ». La
+    route ne déclare pas de response_model, donc ce que FastAPI sérialise est
+    exactement cela : un tableau JSON dont chaque élément est un objet à une
+    seule clé, id. C'est la charge utile que la documentation du produit montre
+    elle-même au curl, « [{"id": "content_safety"}, {"id":
+    "jailbreak_detection"}, {"id": "topic_safety"}] ».
+    Le produit ne prévoit rien à activer, et son défaut de liaison va dans le
+    mauvais sens : la sous-commande server (nemoguardrails/cli/__init__.py)
+    n'expose que --port, --config, --default-config-id, --verbose,
+    --disable-chat-ui, --auto-reload et --prefix, puis appelle
+    « uvicorn.run(server_app, port=port, log_level="info", host="0.0.0.0") » —
+    l'adresse d'écoute est écrite dans l'appel, ce n'est pas une option. Une
+    instance lancée telle quelle sort de la machine sur le port 8000 sans qu'un
+    réglage ait été touché, et sans --config ni dossier ./config local,
+    rails_config_path reste utils.get_examples_data_path("bots"), les bots
+    d'exemple livrés avec le paquet.
+  impact: |
+    L'énumération d'abord. Chaque id est le nom d'un sous-dossier que
+    l'exploitant a choisi, et ces noms disent ce que l'instance garde :
+    content_safety, jailbreak_detection, topic_safety, llama_guard sont ceux que
+    la documentation elle-même met en exemple. En mono-configuration, l'id est le
+    nom du dossier racine. L'appelant anonyme apprend donc quelles politiques
+    existent — et, plus utile pour lui, quels config_id il peut citer dans les
+    routes suivantes.
+    Le coût ensuite, et c'est là que la sévérité se joue. Le même routeur nu
+    porte POST /v1/chat/completions, qui fait tourner le LLM de la configuration
+    demandée. Les modèles sont déclarés côté serveur, dans la section models du
+    config.yml, et leur clé vient de l'environnement de l'exploitant
+    (NVIDIA_API_KEY pour les modèles hébergés de build.nvidia.com, que le guide
+    de démarrage fait exporter avant de lancer le serveur). Chaque complétion
+    anonyme est donc facturée à l'exploitant, sans quota, sans limite de débit et
+    sans compte à qui l'attribuer — et le config_id à citer est précisément ce
+    que /v1/rails/configs vient de donner.
+    POST /v1/checks, entré à la 0.23.0, fait passer les messages de l'appelant
+    par les seules rails, sans génération, et rend le statut du rail qui a
+    tranché : l'instance devient un oracle gratuit sur les garde-fous eux-mêmes,
+    de quoi mesurer hors ligne ce que la politique de l'exploitant bloque
+    réellement avant de s'en servir ailleurs. GET /v1/models interroge le
+    fournisseur configuré et rend sa liste de modèles, en relayant l'en-tête
+    Authorization de l'appelant. GET /v1/challenges rend les défis de red teaming
+    enregistrés sur l'instance. Et quand chainlit est installé et que ni
+    --disable-chat-ui ni NEMO_GUARDRAILS_DISABLE_CHAT_UI ne sont posés, une
+    console de discussion est montée sur /chat, vers laquelle GET / redirige :
+    une interface utilisable au navigateur sur le même port ouvert.
+    Ce qui borne le constat : le serveur ne rend le contenu d'aucune
+    configuration, ne divulgue pas les clés d'API qu'il utilise et n'offre pas
+    d'exécution de code. L'écriture, elle, reste conditionnelle — le fil de
+    conversation d'un thread_id n'est lu et complété que si l'exploitant a
+    enregistré un DataStore par register_datastore(), ce que la ligne de commande
+    ne fait pas. Ce qui est en jeu est l'inventaire des politiques et la
+    consommation anonyme du LLM de l'exploitant.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à poser : le produit n'en propose
+    aucun, et aucune route n'en porte la trace. La fermeture est entièrement en
+    amont de l'application.
+    Elle ne peut pas non plus se faire par l'adresse d'écoute, puisque
+    « host="0.0.0.0" » est écrit dans l'appel à uvicorn.run() et que la
+    sous-commande server n'a pas d'option pour le changer. Ce qui reste est la
+    publication du port : ne pas exposer le 8000 sur une interface publique, et
+    dans un conteneur le lier explicitement à la boucle locale
+    (« -p 127.0.0.1:8000:8000 ») plutôt que de le publier tel quel. Quand
+    l'instance doit être atteinte depuis un autre hôte, la placer derrière un
+    proxy qui authentifie tout le préfixe — et non les seules routes dont on se
+    méfie : /v1/rails/configs, /v1/chat/completions, /v1/checks, /v1/models,
+    /v1/challenges, « / » et /chat passent tous par le même routeur nu. --prefix
+    ne garde rien, il déplace l'arbre entier sous un chemin.
+    Ne pas activer NEMO_GUARDRAILS_SERVER_ENABLE_CORS sans poser
+    NEMO_GUARDRAILS_SERVER_ALLOWED_ORIGINS : la valeur par défaut est « * », et
+    _add_cors_middleware() la pose avec allow_credentials=True. Ne pas prendre
+    --disable-chat-ui pour une fermeture non plus — il retire la console, pas
+    l'API, donc c'est une réduction de surface et pas un contrôle d'accès. Et
+    laisser --auto-reload au développement, comme la documentation le demande.
+    Après une exposition, tenir les config_id rendus pour connus, puisqu'ils
+    nomment les politiques en place. Mesurer surtout ce qui a été consommé chez
+    le fournisseur de modèles déclaré dans les configurations : les complétions
+    servies à l'anonyme y sont indiscernables des légitimes, et c'est le seul
+    endroit où elles laissent une trace.
+  reference:
+    - https://github.com/NVIDIA/NeMo-Guardrails/blob/develop/nemoguardrails/server/api.py
+    - https://github.com/NVIDIA/NeMo-Guardrails/blob/develop/nemoguardrails/cli/__init__.py
+    - https://github.com/NVIDIA/NeMo-Guardrails/blob/develop/docs/run-rails/using-fastapi-server/list-guardrail-configs.mdx
+    - https://github.com/NVIDIA/NeMo-Guardrails/blob/develop/docs/run-rails/using-fastapi-server/run-guardrails-server.mdx
+    - https://github.com/NVIDIA/NeMo-Guardrails/blob/develop/docs/run-rails/using-fastapi-server/overview.mdx
+  metadata:
+    max-request: 1
+    vendor: nvidia
+    product: nemo-guardrails
+  tags: ai,llm,guardrails,nemo-guardrails,nvidia,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la seule route du serveur qui ne fasse rien
+  # tourner. get_rails_configs() ne prend aucun paramètre et ne fait qu'un
+  # os.listdir() sur rails_config_path : ni LLM, ni rail, ni fournisseur n'est
+  # sollicité pour répondre.
+  #
+  # En lecture seule, et strictement. Le même routeur nu porte POST
+  # /v1/chat/completions, qui ferait tourner le LLM de la configuration demandée
+  # aux frais de l'exploitant, et POST /v1/checks, qui ferait passer une entrée
+  # choisie par l'appelant à travers les rails de l'exploitant. C'est précisément
+  # ce que le constat signale ; ce n'est pas ce qu'un scanner a le droit de faire
+  # pour l'établir.
+  #
+  # Le chemin nu, enfin. La route est écrite « /v1/rails/configs » en dur dans le
+  # décorateur ; une instance lancée avec --prefix monte tout l'arbre sous ce
+  # préfixe, et c'est alors à {{BaseURL}} de le porter.
+  #
+  # GET /v1/health n'est délibérément pas interrogé, bien qu'il soit le témoin le
+  # plus net du produit — il rend « {"status":"pass"} » sous le type de média
+  # application/health+json, que personne d'autre n'écrit. Mais ce handler
+  # n'existe que sur la branche develop : il est absent de api.py dans chaque
+  # version publiée jusqu'à la 0.23.0 incluse, la dernière sur PyPI. L'exiger
+  # rendrait le template muet sur la totalité des instances déployées
+  # aujourd'hui, dont les routes sont exactement aussi nues.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/rails/configs"
+
+    matchers-condition: and
+    matchers:
+      # FastAPI pose ce type sur la réponse qu'il sérialise lui-même. Le refus,
+      # lui, ne vient pas de la même plume : un proxy d'authentification ou un
+      # portail captif placé devant répond en HTML ou en texte. Cette ligne
+      # écarte surtout celui qui rendrait 200 et une page à tout ce qu'on lui
+      # demande.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Une seule expression, parce que la charge utile n'a qu'une forme et que
+      # c'est cette forme entière qui la nomme.
+      #
+      # Le corps est tenu pour un tableau et rien d'autre : la route ne déclare
+      # pas de response_model, donc ce que FastAPI sérialise est littéralement la
+      # liste que rend le handler. L'ancrage sur les deux crochets écarte d'un
+      # coup l'index de la console chainlit montée sur /chat, le schéma que la
+      # même instance sert sur /openapi.json — où « /v1/rails/configs » et « id »
+      # figurent tous deux, mais dans un objet qui s'ouvre sur la version
+      # d'OpenAPI —, le « {"detail":"Not Found"} » d'un FastAPI qui ne connaît
+      # pas ce chemin, et le document d'une supervision qui agrégerait la réponse
+      # sous une clé à elle.
+      #
+      # Chaque élément est tenu pour un objet dont id est la seule clé, parce que
+      # le handler écrit exactement « {"id": config_id} ». C'est ce qui sépare
+      # cette réponse de n'importe quelle API qui rendrait une liste de
+      # ressources identifiées : celles-là nomment aussi un id, mais jamais seul.
+      # Ne pas compter les entrées, en revanche : leur nombre est celui des
+      # dossiers de l'exploitant, et le mode mono-configuration n'en rend qu'une.
+      #
+      # Au moins une entrée, enfin, et c'est délibéré : un serveur dont le
+      # dossier ne porte aucune configuration valide rend « [] », qui n'énumère
+      # rien et ne nomme aucun produit. Le constat porte sur les politiques
+      # réellement exposées, pas sur la seule route atteignable.
+      #
+      # Les espaces facultatives partout : FastAPI sérialise compact, mais un
+      # intermédiaire qui réindente ce qu'il relaie écrirait « "id": "…" » sur
+      # plusieurs lignes.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\[\s*\{\s*"id"\s*:\s*"[^"]+"\s*\}(\s*,\s*\{\s*"id"\s*:\s*"[^"]+"\s*\})*\s*\]\s*$'
+
+    extractors:
+      # Les configurations que l'appelant anonyme énumère, et par elles les
+      # config_id qu'il peut citer à POST /v1/chat/completions. Le parcours du
+      # tableau plutôt que sa première entrée : le mode multi-configuration en
+      # rend autant que le dossier porte de sous-dossiers valides, et n'en nommer
+      # qu'un tairait les autres politiques.
+      - type: json
+        part: body
+        name: config_id
+        json:
+          - '.[].id'
