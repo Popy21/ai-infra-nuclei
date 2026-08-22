@@ -11684,6 +11684,440 @@ def test_marqo_extractor_reports_the_indexes_the_anonymous_caller_enumerates():
     )
 
 
+# --------------------------------------------------------------------------
+# Kedro-Viz est le cas où le défaut de liaison est correct — DEFAULT_HOST vaut
+# "127.0.0.1" et « kedro viz run » en part —, donc l'exposition vient d'un
+# « --host 0.0.0.0 » posé à la main. Le routeur, lui, est nu : APIRouter(
+# prefix="/api", …) sans dependencies=, aucun Depends() dans les handlers, et
+# une application qui n'ajoute qu'un StaticFiles et des en-têtes de réponse.
+#
+# Ce qui rend ce template particulier est la route qui le nomme.
+# save_api_responses_to_fs() écrit api/main, api/nodes/*, api/pipelines/* et
+# api/run-status — mais pas api/metadata —, et create_api_app_from_file(), qui
+# sert une instance --load-file, redéclare les mêmes routes sans /api/metadata.
+# Un site produit par « kedro viz build » rend donc /api/main et rien d'autre du
+# constat : c'est une publication choisie, sans POST /api/deploy ni lecture du
+# projet à chaud, et le template doit rester muet dessus. C'est l'exigence de
+# /api/metadata qui l'y oblige, pas une intention écrite quelque part.
+
+KEDRO_VIZ_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "kedro-viz-exposed.yaml")
+
+
+def kedro_viz_metadata_body(*packages, has_missing_dependencies=False):
+    """
+    Réponse de /api/metadata telle qu'ORJSONResponse la sérialise : compacte, et
+    dans l'ordre de déclaration de MetadataAPIResponse puis de
+    PackageCompatibility.
+    """
+    return json.dumps({
+        "has_missing_dependencies": has_missing_dependencies,
+        "package_compatibilities": [
+            {"package_name": name, "package_version": version,
+             "is_compatible": compatible}
+            for name, version, compatible in packages
+        ],
+    }, separators=(",", ":"))
+
+
+def kedro_viz_main_body(*node_names, pipelines=("__default__", "data_science")):
+    """
+    Réponse de /api/main : GraphAPIResponse, dans l'ordre nodes, edges, layers,
+    tags, pipelines, modular_pipelines, selected_pipeline.
+    """
+    return json.dumps({
+        "nodes": [
+            {"id": "%08x" % (index + 0x6ab908b8), "name": name, "tags": [],
+             "pipelines": list(pipelines), "type": "task",
+             "modular_pipelines": ["data_science"], "node_extras": None,
+             "parameters": {"test_size": 0.2},
+             "full_name": "data_science.%s" % name}
+            for index, name in enumerate(node_names)
+        ],
+        "edges": [{"source": "d7b83b05", "target": "6ab908b8"}],
+        "layers": ["primary"],
+        "tags": [{"id": "nightly", "name": "nightly"}],
+        "pipelines": [{"id": name, "name": name} for name in pipelines],
+        "modular_pipelines": {
+            "__root__": {"id": "__root__", "name": "Root", "inputs": [],
+                         "outputs": [], "children": [
+                             {"id": "data_science", "type": "modularPipeline"}]},
+        },
+        "selected_pipeline": pipelines[0],
+    }, separators=(",", ":"))
+
+
+KEDRO_VIZ_METADATA_BODY = kedro_viz_metadata_body(("fsspec", "2024.6.1", True))
+KEDRO_VIZ_MAIN_BODY = kedro_viz_main_body("split_data_node", "train_model_node")
+
+# Une instance lancée en mode lite : le drapeau bascule, et c'est une instance
+# exposée comme une autre.
+KEDRO_VIZ_LITE_METADATA_BODY = kedro_viz_metadata_body(
+    ("fsspec", "0.0.0", False), has_missing_dependencies=True)
+
+# Les versions qui déclaraient deux paquets dans PACKAGE_REQUIREMENTS — la forme
+# que le json_schema_extra du modèle montre encore.
+KEDRO_VIZ_TWO_PACKAGES_METADATA_BODY = kedro_viz_metadata_body(
+    ("fsspec", "2024.6.1", True), ("kedro-datasets", "4.0.0", True))
+
+# La liste de compatibilité vide : les deux noms de champ sont là, mais le
+# triplet qui nomme le produit n'y est pas.
+KEDRO_VIZ_NO_PACKAGE_METADATA_BODY = kedro_viz_metadata_body()
+
+# Un projet dont le pipeline sélectionné ne porte aucun nœud : la route répond,
+# mais il n'y a pas de graphe à divulguer.
+KEDRO_VIZ_EMPTY_GRAPH_BODY = kedro_viz_main_body()
+
+# Ce qu'un FastAPI rend sur un chemin qu'il ne sert pas — donc ce que rendent le
+# site statique de « kedro viz build » et l'instance --load-file sur
+# /api/metadata, qu'aucun des deux ne déclare.
+KEDRO_VIZ_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# La seule branche d'échec de la route : le handler journalise puis rend ce
+# corps sous un 500.
+KEDRO_VIZ_METADATA_FAILURE_BODY = '{"message":"Failed to get app metadata"}'
+
+# Ce qu'un proxy placé devant l'instance rend quand il authentifie le préfixe.
+KEDRO_VIZ_PROXY_UNAUTHORIZED_BODY = (
+    '<html><head><title>401 Authorization Required</title></head>'
+    '<body><center><h1>401 Authorization Required</h1></center></body></html>'
+)
+
+# Le catch-all de l'interface : sur un chemin qu'il ne sert pas, le serveur rend
+# index.html en 200 plutôt qu'un 404.
+KEDRO_VIZ_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Kedro-Viz</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# Un tableau de supervision qui agrège les deux réponses sous une clé à lui : les
+# charges utiles y sont entières, mais ce n'est pas l'instance qui a répondu.
+KEDRO_VIZ_COMPOSITE_METADATA_BODY = (
+    '{"kedro_viz":%s,"checked_at":0}' % KEDRO_VIZ_METADATA_BODY)
+KEDRO_VIZ_COMPOSITE_MAIN_BODY = (
+    '{"kedro_viz":%s,"checked_at":0}' % KEDRO_VIZ_MAIN_BODY)
+
+# Une autre API de graphe, qui rend elle aussi des nœuds et des arêtes : c'est la
+# forme la plus banale du web, et ce sont modular_pipelines et selected_pipeline
+# qui l'en séparent.
+KEDRO_VIZ_OTHER_GRAPH_BODY = (
+    '{"nodes":[{"id":"n1","name":"extract","type":"task"},'
+    '{"id":"n2","name":"load","type":"task"}],'
+    '"edges":[{"source":"n1","target":"n2"}],"layers":[],"tags":[]}'
+)
+
+# Le pire de ce genre : une réponse qui satisfait tout ce que le template attend
+# de /api/main sauf un champ. Chacune isole l'expression qui la refuse — sans
+# quoi l'une des deux pourrait tomber du template sans que rien ne le dise.
+# Celle qui perd l'arbre garde le modular_pipelines de ses nœuds, qui est une
+# liste : c'est l'accolade, et elle seule, qui vise le champ de premier niveau.
+KEDRO_VIZ_GRAPH_WITHOUT_TREE_BODY = json.dumps(
+    {key: value for key, value in json.loads(KEDRO_VIZ_MAIN_BODY).items()
+     if key != "modular_pipelines"}, separators=(",", ":"))
+KEDRO_VIZ_GRAPH_WITHOUT_SELECTION_BODY = json.dumps(
+    {key: value for key, value in json.loads(KEDRO_VIZ_MAIN_BODY).items()
+     if key != "selected_pipeline"}, separators=(",", ":"))
+
+# La même réponse, mais dont modular_pipelines n'est que le champ de nœud — une
+# liste, pas l'arbre de premier niveau.
+KEDRO_VIZ_NODE_LEVEL_MODULAR_BODY = (
+    '{"nodes":[{"id":"6ab908b8","name":"split_data_node","tags":[],'
+    '"pipelines":["__default__"],"type":"task","modular_pipelines":'
+    '["data_science"]}],"edges":[],"layers":[],"tags":[],'
+    '"pipelines":[{"id":"__default__","name":"__default__"}],'
+    '"selected_pipeline":"__default__"}'
+)
+
+
+def kedro_viz_block():
+    doc = load(KEDRO_VIZ_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/metadata" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/metadata — c'est pourtant la seule "
+        "route que save_api_responses_to_fs() n'écrit pas et que "
+        "create_api_app_from_file() ne déclare pas, donc la seule qui distingue "
+        "un serveur qui lit le projet à chaud d'un site statique publié"
+    )
+    return blocks[0]
+
+
+def kedro_viz_responses(metadata_status=200, metadata_body=KEDRO_VIZ_METADATA_BODY,
+                        main_status=200, main_body=KEDRO_VIZ_MAIN_BODY):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template : c'est
+    cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    ordered = []
+    for path in kedro_viz_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == "/api/metadata":
+            ordered.append((metadata_status, metadata_body))
+        elif route == "/api/main":
+            ordered.append((main_status, main_body))
+        else:
+            raise AssertionError(f"le template interroge un chemin inattendu : {route}")
+    return ordered
+
+
+def kedro_viz_fires(**kwargs):
+    block = kedro_viz_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = kedro_viz_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_kedro_viz_probe_reads_the_graph_and_never_deploys_nor_opens_a_node():
+    doc = load(KEDRO_VIZ_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : la seule route de l'arbre qui écrive "
+            "quoi que ce soit est POST /api/deploy, et le routeur nu la sert à "
+            "l'anonyme comme le reste"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/deploy", "POST /api/deploy appelle "
+                            "DeployerFactory.create_deployer(...).deploy(...) et "
+                            "ferait écrire le site dans un compartiment nommé "
+                            "par l'appelant, avec les identifiants cloud de "
+                            "l'hôte"),
+                ("/nodes", "GET /api/nodes/{node_id} rend le code du nœud, le "
+                           "chemin du fichier sur la machine, les paramètres et "
+                           "un aperçu du jeu de données — c'est ce que le "
+                           "constat protège, pas ce qui l'établit"),
+                ("/run-status", "GET /api/run-status rend les erreurs et les "
+                                "horodatages de la dernière exécution du projet"),
+                ("/pipelines", "GET /api/pipelines/{registered_pipeline_id} "
+                               "redit le graphe que /api/main donne déjà, "
+                               "pipeline par pipeline"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = kedro_viz_block().get("path") or []
+    assert paths == ["{{BaseURL}}/api/metadata", "{{BaseURL}}/api/main"], (
+        "le constat tient à deux lectures, sur les chemins nus et dans cet "
+        "ordre : le préfixe « /api » est écrit dans l'APIRouter et chaque route "
+        "dans son décorateur, et la signature du produit doit précéder le "
+        f"graphe qu'elle qualifie — {paths}"
+    )
+
+
+def test_kedro_viz_matcher_needs_the_graph_not_just_the_metadata_pair():
+    block = kedro_viz_block()
+    assert block.get("req-condition") is True, (
+        "sans req-condition les deux réponses ne partagent pas d'espace de "
+        "noms : la signature de /api/metadata conclurait seule, or elle nomme "
+        "le produit sans dire que le graphe sort"
+    )
+
+    assert kedro_viz_fires(), (
+        "le template ne reconnaît pas une instance dont /api/main rend le "
+        "graphe du projet à l'anonyme"
+    )
+    assert kedro_viz_fires(metadata_body=KEDRO_VIZ_LITE_METADATA_BODY), (
+        "le template exige has_missing_dependencies faux : une instance lancée "
+        "en mode lite le met à vrai et reste exposée au même titre"
+    )
+    assert kedro_viz_fires(metadata_body=KEDRO_VIZ_TWO_PACKAGES_METADATA_BODY), (
+        "le template contraint le nombre d'entrées de package_compatibilities, "
+        "qui est celui de PACKAGE_REQUIREMENTS et a déjà changé d'une version "
+        "à l'autre"
+    )
+    assert kedro_viz_fires(main_body=kedro_viz_main_body("split_data_node")), (
+        "le template exige plusieurs nœuds : un projet qui n'en porte qu'un "
+        "sert le même /api/nodes/{node_id} sans rien demander"
+    )
+    assert kedro_viz_fires(
+        metadata_body=json.dumps(json.loads(KEDRO_VIZ_METADATA_BODY), indent=2),
+        main_body=json.dumps(json.loads(KEDRO_VIZ_MAIN_BODY), indent=2)), (
+        "le template exige la sérialisation compacte d'ORJSONResponse : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+    # La frontière du constat : le site statique et l'instance --load-file
+    # servent /api/main, mais aucun des deux ne déclare /api/metadata.
+    assert not kedro_viz_fires(metadata_status=404,
+                               metadata_body=KEDRO_VIZ_NOT_FOUND_BODY), (
+        "le template déclenche sur un site produit par « kedro viz build » ou "
+        "sur une instance --load-file : ni save_api_responses_to_fs() ni "
+        "create_api_app_from_file() ne servent /api/metadata, et une "
+        "publication choisie qui ne porte ni POST /api/deploy ni la lecture du "
+        "projet à chaud n'est pas le constat"
+    )
+    assert not kedro_viz_fires(metadata_status=500,
+                               metadata_body=KEDRO_VIZ_METADATA_FAILURE_BODY), (
+        "le template déclenche sur la branche d'échec du handler, qui ne rend "
+        "ni le drapeau ni la liste de compatibilité"
+    )
+    assert not kedro_viz_fires(metadata_status=401,
+                               metadata_body=KEDRO_VIZ_PROXY_UNAUTHORIZED_BODY,
+                               main_status=401,
+                               main_body=KEDRO_VIZ_PROXY_UNAUTHORIZED_BODY), (
+        "le template déclenche sur une instance placée derrière un proxy qui "
+        "authentifie le préfixe /api"
+    )
+    assert not kedro_viz_fires(main_status=401,
+                               main_body=KEDRO_VIZ_PROXY_UNAUTHORIZED_BODY), (
+        "le template conclut alors que le plan de données ne répond plus : "
+        "c'est /api/main qui porte la preuve, pas la signature du produit"
+    )
+    assert not kedro_viz_fires(metadata_body=KEDRO_VIZ_SPA_BODY,
+                               main_body=KEDRO_VIZ_SPA_BODY), (
+        "le template déclenche sur la page d'accueil qu'un catch-all rend en "
+        "200 sur un chemin qu'il ne connaît pas"
+    )
+    # Le document composite, et une réponse à la fois : les deux corps ont leur
+    # ancrage, et les éprouver ensemble laisserait l'un des deux tomber sans que
+    # rien ne le dise.
+    assert not kedro_viz_fires(metadata_body=KEDRO_VIZ_COMPOSITE_METADATA_BODY), (
+        "le template retrouve la signature entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture de /api/metadata qui dit "
+        "que l'instance a répondu d'elle-même, et non une supervision qui "
+        "agrégerait sa réponse sous une clé à elle"
+    )
+    assert not kedro_viz_fires(main_body=KEDRO_VIZ_COMPOSITE_MAIN_BODY), (
+        "le template retrouve le graphe entier au fond d'un document composite : "
+        "c'est l'ancrage sur l'ouverture de /api/main qui dit que l'instance a "
+        "répondu d'elle-même"
+    )
+
+    # Le graphe vide : la route répond, mais il n'y a rien à divulguer.
+    assert not kedro_viz_fires(main_body=KEDRO_VIZ_EMPTY_GRAPH_BODY), (
+        "le template déclenche sur « {\"nodes\":[], … } » : un projet dont le "
+        "pipeline sélectionné ne porte aucun nœud ne livre ni nom de fonction, "
+        "ni jeu de données, ni chemin de machine"
+    )
+
+    # La liste de compatibilité vide : les deux noms de champ ne suffisent pas.
+    assert not kedro_viz_fires(metadata_body=KEDRO_VIZ_NO_PACKAGE_METADATA_BODY), (
+        "le template conclut sur les seuls noms has_missing_dependencies et "
+        "package_compatibilities : c'est le triplet package_name / "
+        "package_version / is_compatible qui nomme le produit, et "
+        "get_package_compatibilities() en rend toujours au moins un"
+    )
+
+    # Une autre API de graphe : nœuds et arêtes sont la forme la plus banale du
+    # web, et ce sont les deux champs propres à Kedro qui l'en séparent.
+    assert not kedro_viz_fires(main_body=KEDRO_VIZ_OTHER_GRAPH_BODY), (
+        "le template déclenche sur n'importe quelle API qui rend des nœuds et "
+        "des arêtes : modular_pipelines et selected_pipeline sont ce qui "
+        "désigne GraphAPIResponse"
+    )
+    assert not kedro_viz_fires(main_body=KEDRO_VIZ_NODE_LEVEL_MODULAR_BODY), (
+        "le template accepte le modular_pipelines d'une entrée de nodes, qui "
+        "est une liste : le champ de premier niveau est l'arbre "
+        "ModularPipelinesTreeAPIResponse, donc un dictionnaire, et c'est lui "
+        "que l'accolade vise"
+    )
+    assert not kedro_viz_fires(main_body=KEDRO_VIZ_GRAPH_WITHOUT_TREE_BODY), (
+        "le template n'exige plus l'arbre des pipelines modulaires — la notion "
+        "propre à Kedro — et se contente alors des nœuds, des arêtes et d'un "
+        "champ de sélection, que n'importe quelle API de graphe peut rendre"
+    )
+    assert not kedro_viz_fires(main_body=KEDRO_VIZ_GRAPH_WITHOUT_SELECTION_BODY), (
+        "le template n'exige plus selected_pipeline, le dernier champ de "
+        "GraphAPIResponse et celui qui nomme le pipeline servi : sans lui la "
+        "signature du graphe tient au seul mot modular_pipelines"
+    )
+
+    # Collisions internes au pack : aucun des autres services couverts ne doit
+    # être revendiqué par celui-ci, à commencer par les ordonnanceurs voisins.
+    for other_body, other_name in (
+        (DAGSTER_INFO_BODY, "dagster"),
+        (HAYHOOKS_STATUS_BODY, "hayhooks"),
+        (TEI_INFO_BODY, "text-embeddings-inference"),
+        (INFINITY_MODELS_BODY, "infinity"),
+        (MARQO_INDEXES_BODY, "marqo"),
+    ):
+        assert not kedro_viz_fires(metadata_body=other_body, main_body=other_body), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_kedro_viz_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    /api/main n'a pas de branche d'échec — il rend GraphAPIResponse, que FastAPI
+    ne peut sortir que sous un 200 — et /api/metadata n'en a qu'une, qui rend
+    « {"message":"Failed to get app metadata"} » et que les corps écartent déjà.
+    Exiger le 200 n'écarterait donc rien de plus, et ferait manquer l'instance
+    dont un intermédiaire réécrit le statut.
+    """
+    block = kedro_viz_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : les deux handlers ne rendent leur "
+        "charge utile que sous un 200, donc ce matcher n'écarte rien et "
+        "n'ajoute qu'un risque de silence"
+    )
+
+    written = "\n".join(expr for m in (block.get("matchers") or [])
+                        if m.get("type") == "dsl"
+                        for expr in (m.get("dsl") or []))
+    assert "status_code_" not in written, (
+        "une expression dsl porte le statut : le constat doit tenir aux deux "
+        "charges utiles, pas au code de réponse"
+    )
+
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "dsl":
+            assert matcher.get("condition") == "and", (
+                "les expressions doivent toutes devoir passer : la signature "
+                "nomme sans constater, le graphe constate sans nommer, et "
+                "aucune des deux ne conclut seule"
+            )
+
+    # Le template ne conclut toujours pas quand la preuve manque, quel que soit
+    # le statut que l'intermédiaire renvoie.
+    assert not kedro_viz_fires(main_status=200,
+                               main_body=KEDRO_VIZ_PROXY_UNAUTHORIZED_BODY), (
+        "un proxy qui rend sa page de refus en 200 suffit à faire conclure le "
+        "template : c'est le corps de /api/main qui porte la preuve"
+    )
+    assert not kedro_viz_fires(metadata_status=200,
+                               metadata_body=KEDRO_VIZ_NOT_FOUND_BODY), (
+        "un site statique dont le serveur rend son 404 en 200 fait conclure le "
+        "template : c'est le corps de /api/metadata qui distingue le serveur "
+        "vivant de la publication"
+    )
+
+
+def test_kedro_viz_extractor_reports_the_registered_pipelines():
+    block = kedro_viz_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement borné qui vaille d'être "
+        f"remonté — les pipelines enregistrés du projet — et {len(extractors)} "
+        "extracteurs feraient remonter autant de fois la même instance sous "
+        "req-condition. Les versions de paquets de /api/metadata sont celles de "
+        "l'environnement, pas celles du projet ; elles ne font pas le constat"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à la réponse de /api/main : sous "
+        "req-condition le moteur l'évalue contre chaque réponse, et "
+        "/api/metadata n'a pas de pipeline à donner"
+    )
+    assert extractor.get("json") == [".pipelines[].id"], (
+        "l'extracteur ne parcourt pas .pipelines[].id — ce sont pourtant les "
+        "noms que l'exploitant a enregistrés, et le {registered_pipeline_id} "
+        "que réclame ensuite GET /api/pipelines/{registered_pipeline_id} ; "
+        "s'arrêter à .selected_pipeline tairait les autres pipelines du projet"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

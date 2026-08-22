@@ -1,0 +1,237 @@
+id: kedro-viz-exposed
+
+info:
+  name: Kedro-Viz - Unauthenticated Pipeline Graph Exposure
+  author: popy21
+  severity: medium
+  description: |
+    Kedro-Viz dessine le graphe d'un projet Kedro — ses nœuds, ses jeux de
+    données, ses pipelines — et le sert depuis un FastAPI qui ne connaît pas la
+    notion d'appelant. Le routeur est construit par « router = APIRouter(
+    prefix="/api", responses={404: {"model": APINotFoundResponse}}) »
+    (package/kedro_viz/api/rest/router.py) : le seul argument autre que le
+    préfixe déclare un schéma pour la documentation, il n'y a pas de
+    dependencies=. Aucun des décorateurs qui suivent — /main,
+    /nodes/{node_id}, /pipelines/{registered_pipeline_id}, /version,
+    /run-status, /metadata, et le POST /deploy — n'en porte non plus, et aucun
+    handler ne déclare de Depends(). L'application qui monte ce routeur
+    (package/kedro_viz/api/apps.py) est un FastAPI nu : « app.include_router(
+    rest_router) », un StaticFiles sur /assets, et un seul intergiciel
+    possible, celui qui pose les en-têtes de sécurité quand ADD_SECURITY_HEADERS
+    vaut true — des en-têtes de réponse, pas un contrôle d'accès. run_server()
+    finit sur « uvicorn.run(app, host=host, port=port, log_config=None) », sans
+    rien ajouter au passage.
+    Le défaut de liaison, lui, est correct, et c'est ce qui distingue ce
+    template de la plupart de ses voisins : DEFAULT_HOST vaut "127.0.0.1"
+    (package/kedro_viz/constants.py) et l'option --host de « kedro viz run » en
+    part. L'exposition vient donc d'un geste et non d'un oubli — le
+    « --host 0.0.0.0 » qu'il faut poser pour qu'un conteneur serve autre chose
+    que lui-même, et qui publie ici l'arbre entier puisqu'il n'y a rien derrière
+    lui.
+    Deux lectures l'établissent, et elles ne disent pas la même chose. GET
+    /api/metadata rend MetadataAPIResponse, dont les deux champs sont déclarés
+    dans cet ordre : « has_missing_dependencies: bool = False » et
+    « package_compatibilities: List[PackageCompatibility] = [] »
+    (package/kedro_viz/api/rest/responses/metadata.py), où PackageCompatibility
+    porte exactement package_name, package_version et is_compatible
+    (package/kedro_viz/models/metadata.py). Ce couple n'appartient qu'à
+    Kedro-Viz, et get_package_compatibilities() rend une entrée par paquet de
+    PACKAGE_REQUIREMENTS — fsspec au minimum — que le paquet soit installé ou
+    non. Il dit surtout que le serveur lit le projet à chaud :
+    save_api_responses_to_fs() n'écrit que api/main, api/nodes/*, api/pipelines/*
+    et api/run-status (package/kedro_viz/api/rest/responses/save_responses.py),
+    donc ni un site statique produit par « kedro viz build » ni une instance
+    lancée avec --load-file, dont l'application est créée par
+    create_api_app_from_file(), ne servent /api/metadata.
+    GET /api/main porte le constat : il rend GraphAPIResponse — nodes, edges,
+    layers, tags, pipelines, modular_pipelines, selected_pipeline —, c'est-à-dire
+    le graphe entier du projet, lu chez l'exploitant.
+  impact: |
+    Le graphe d'abord, parce que ce sont les noms de l'exploitant. Chaque entrée
+    de nodes porte un id, un name, un type et ses pipelines ; un DataNode ajoute
+    son layer et son dataset_type
+    (« kedro_datasets.pandas.csv_dataset.CSVDataset »), un TaskNode son
+    full_name, que le modèle décrit comme le nom Kedro interne, namespace et
+    suffixe de hachage compris. Les noms de fonctions, de jeux de données et de
+    pipelines d'un projet interne disent ce que la maison traite — et
+    selected_pipeline comme pipelines[].id donnent le
+    {registered_pipeline_id} que réclame ensuite le reste de l'arbre.
+    Le détail ensuite, et c'est là que la lecture cesse d'être un plan. GET
+    /api/nodes/{node_id} rend TaskNodeMetadataAPIResponse, dont les champs sont
+    code — le fragment de code du nœud —, filepath — le chemin du fichier sur la
+    machine de l'exploitant —, parameters, run_command et preview. Sur un nœud de
+    données, DataNodeMetadataAPIResponse rend filepath, type, run_command,
+    preview et stats, l'aperçu étant un échantillon du jeu de données lui-même,
+    servi quand le dataset le supporte. Le source du projet, l'arborescence de la
+    machine, les paramètres et un extrait des données se lisent donc nœud par
+    nœud, à partir des id que /api/main vient de livrer.
+    GET /api/run-status rend le dernier état d'exécution — statut, durée et
+    erreur par nœud, nom et taille par jeu de données, run_id et horodatages du
+    pipeline —, donc les messages d'échec du projet tels qu'ils sont tombés.
+    Et POST /api/deploy, sur le même routeur nu, prend un DeployerConfiguration
+    — platform, endpoint, bucket_name, is_all_previews_enabled — et appelle
+    « DeployerFactory.create_deployer(...).deploy(...) ». Quand l'hôte porte des
+    identifiants AWS, Azure ou GCP dans son environnement, un appelant anonyme
+    fait donc écrire le site, aperçus de données compris s'il pose le drapeau,
+    dans un compartiment qu'il nomme lui-même.
+    Ce qui borne le constat, et fixe la sévérité à medium : rien ici ne fait
+    tourner de modèle, n'exécute de code choisi par l'appelant, ni ne modifie le
+    projet visualisé. Ce qui est en jeu est une divulgation — plan du projet,
+    source des nœuds, chemins de la machine, paramètres, extraits de données — et
+    une écriture sortante conditionnée aux identifiants de l'hôte.
+  remediation: |
+    Il n'y a pas d'authentification à activer : le produit n'en propose aucune et
+    aucune route n'en porte la trace. Ce qui se règle est l'adresse d'écoute,
+    puis la publication du port.
+    Ne pas poser « --host 0.0.0.0 » sur une machine dont le port est joignable :
+    le défaut DEFAULT_HOST = "127.0.0.1" est correct, et « kedro viz run » le
+    reprend tel quel. Dans un conteneur, où l'écoute sur 0.0.0.0 est la condition
+    pour que le port soit servi du tout, lier explicitement la publication à la
+    boucle locale — « -p 127.0.0.1:4141:4141 » — plutôt que de publier le 4141
+    sur toutes les interfaces.
+    Quand l'instance doit être atteinte depuis un autre hôte, la placer derrière
+    un proxy qui authentifie le préfixe /api entier, et non les seules routes
+    dont on se méfie : /api/main, /api/nodes/{node_id}, /api/run-status et
+    POST /api/deploy passent par le même routeur nu. Ne pas prendre
+    ADD_SECURITY_HEADERS pour une fermeture — il ajoute des en-têtes de réponse.
+    Quand le graphe n'a pas besoin d'être vivant, publier un site statique par
+    « kedro viz build » plutôt que de laisser tourner le serveur : il n'écrit que
+    api/main, api/nodes/*, api/pipelines/* et api/run-status, donc il ne porte ni
+    POST /api/deploy ni la lecture du projet à chaud. Ce n'est pas une fermeture
+    — le graphe reste lisible — mais la surface devient celle qu'on a choisi de
+    publier.
+    Après une exposition, tenir le graphe pour lu, et avec lui le source des
+    nœuds et les chemins de la machine, puisque /api/nodes/{node_id} était ouvert
+    au même titre. Vérifier surtout, chez le fournisseur cloud dont l'hôte porte
+    les identifiants, qu'aucun compartiment n'a été écrit depuis cette machine :
+    POST /api/deploy ne laisse de trace que là.
+  reference:
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/api/rest/router.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/api/rest/responses/metadata.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/models/metadata.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/api/rest/responses/pipelines.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/api/rest/responses/nodes.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/api/rest/responses/save_responses.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/api/apps.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/launchers/cli/run.py
+    - https://github.com/kedro-org/kedro-viz/blob/main/package/kedro_viz/constants.py
+  metadata:
+    max-request: 2
+    vendor: kedro-org
+    product: kedro-viz
+  tags: ai,ml,mlops,pipeline,kedro,kedro-viz,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et leur séparation est le sujet du template.
+  #
+  # GET /api/metadata nomme le produit et dit que le serveur lit le projet à
+  # chaud : MetadataAPIResponse ne porte que has_missing_dependencies et
+  # package_compatibilities, et ce couple n'appartient qu'à Kedro-Viz. C'est
+  # aussi la seule route de l'arbre que save_api_responses_to_fs() n'écrit pas —
+  # un site produit par « kedro viz build » et une instance lancée avec
+  # --load-file, dont create_api_app_from_file() redéclare les routes une à une,
+  # servent /api/main mais pas celle-ci. Les écarter est délibéré : un site
+  # statique est une publication choisie, il ne porte ni POST /api/deploy ni la
+  # lecture du projet de l'exploitant, et ce n'est donc pas le même constat.
+  #
+  # GET /api/main porte la preuve : GraphAPIResponse rend le graphe entier du
+  # projet — nodes, edges, layers, tags, pipelines, modular_pipelines,
+  # selected_pipeline —, donc l'état lu chez l'exploitant. D'où l'ordre des deux
+  # chemins, le produit d'abord, ce qu'il livre ensuite.
+  #
+  # En lecture seule, et strictement. Le même routeur nu porte POST /api/deploy,
+  # qui ferait écrire le site dans un compartiment nommé par l'appelant avec les
+  # identifiants cloud de l'hôte ; GET /api/nodes/{node_id}, qui rend le code du
+  # nœud, le chemin du fichier sur la machine, les paramètres et un aperçu du jeu
+  # de données ; GET /api/run-status, qui rend les erreurs de la dernière
+  # exécution. Ce sont eux que le constat signale — les lire pour l'établir
+  # reviendrait à faire sortir ce qu'on prétend protéger. /api/main s'arrête aux
+  # noms et aux types, et c'est cette lecture-là qui suffit.
+  #
+  # Les chemins nus, enfin : le préfixe "/api" est écrit dans l'APIRouter et
+  # chaque route dans son décorateur, l'application n'en connaît pas d'autre.
+  # GET /api/version est délibérément laissé de côté — il rend la version
+  # installée et la dernière publiée sur PyPI, ce qui date l'instance sans rien
+  # dire de son ouverture, et une route de version est ce qu'un proxy laisse
+  # passer le plus volontiers.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/metadata"
+      - "{{BaseURL}}/api/main"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, la signature de /api/metadata conclurait
+    # seule — or elle nomme le produit, elle ne dit pas que le graphe sort.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La signature du produit, ancrée sur l'ouverture du corps détouré et
+          # tenue au couple entier. Les deux champs sont déclarés dans cet ordre
+          # dans MetadataAPIResponse, et pydantic sérialise dans l'ordre de
+          # déclaration ; l'ancrage dit que l'instance a répondu d'elle-même, et
+          # écarte le document d'une supervision qui agrégerait la charge utile
+          # sous une clé à elle. La valeur booléenne est acceptée dans les deux
+          # sens : has_missing_dependencies vaut true sur une instance lancée en
+          # mode lite, et c'est une instance comme une autre.
+          - 'regex("^\\{\\s*\"has_missing_dependencies\"\\s*:\\s*(true|false)\\s*,\\s*\"package_compatibilities\"\\s*:\\s*\\[", trim_space(body_1))'
+
+          # L'entrée de compatibilité, et c'est elle qui nomme vraiment le
+          # produit. PackageCompatibility déclare package_name, package_version
+          # et is_compatible dans cet ordre, et ce triplet ne se lit nulle part
+          # ailleurs. Exiger au moins une entrée ne coûte rien :
+          # get_package_compatibilities() en rend une par paquet de
+          # PACKAGE_REQUIREMENTS — fsspec au minimum — y compris quand le paquet
+          # est absent, auquel cas la version vaut "0.0.0". Les deux noms de
+          # champ de l'expression précédente, seuls, seraient une forme trop
+          # nue pour porter un constat.
+          - 'regex("\\{\\s*\"package_name\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"package_version\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"is_compatible\"\\s*:\\s*(true|false)\\s*\\}", body_1)'
+
+          # Le graphe, ancré de la même façon : nodes est le premier champ de
+          # GraphAPIResponse. Au moins un nœud, et c'est délibéré — un projet
+          # dont le pipeline est vide rend « {"nodes":[], … } », qui ne divulgue
+          # rien et ne vaut pas d'être remonté. L'ancrage écarte au passage la
+          # page d'accueil qu'un catch-all rendrait en 200 sur un chemin qu'il
+          # ne connaît pas.
+          - 'regex("^\\{\\s*\"nodes\"\\s*:\\s*\\[\\s*\\{", trim_space(body_2))'
+
+          # L'arbre des pipelines modulaires, et l'accolade compte. Chaque nœud
+          # de nodes porte lui aussi un champ modular_pipelines, mais c'est une
+          # liste ; le champ de premier niveau, lui, est le
+          # ModularPipelinesTreeAPIResponse, donc un dictionnaire. Exiger
+          # l'accolade vise le sommet de la réponse et non une entrée du
+          # tableau — et le pipeline modulaire est la notion propre à Kedro.
+          - 'regex("\"modular_pipelines\"\\s*:\\s*\\{", body_2)'
+
+          # Le dernier champ de GraphAPIResponse, qui nomme le pipeline servi.
+          # Avec les trois précédents il sépare le graphe de Kedro-Viz de
+          # n'importe quelle API qui rendrait des nœuds et des arêtes.
+          - 'regex("\"selected_pipeline\"\\s*:\\s*\"", body_2)'
+
+          # Pas de matcher de statut, et c'est délibéré : /api/main n'a pas de
+          # branche d'échec et rend GraphAPIResponse, que FastAPI ne peut sortir
+          # que sous un 200 ; /api/metadata n'en a qu'une, qui rend
+          # « {"message":"Failed to get app metadata"} » sous un 500, et que les
+          # corps écartent déjà. Exiger le 200 n'écarterait rien de plus et
+          # ferait manquer l'instance dont un intermédiaire réécrit le statut.
+
+    extractors:
+      # Les pipelines enregistrés du projet : ce sont les noms de l'exploitant,
+      # et le {registered_pipeline_id} que réclame ensuite GET
+      # /api/pipelines/{registered_pipeline_id}. Les noms de nœuds diraient
+      # davantage, mais un projet réel en porte des centaines et le rapport en
+      # serait noyé ; les pipelines se comptent sur une main.
+      #
+      # Un seul extracteur, et borné à body_2 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second sur
+      # /api/metadata ferait remonter deux fois la même instance. Les versions de
+      # paquets qu'on y lirait ne sont d'ailleurs pas le constat : elles sont
+      # celles de l'environnement, pas celles du projet.
+      - type: json
+        part: body_2
+        name: pipeline
+        json:
+          - '.pipelines[].id'

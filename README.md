@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-47 templates, 44 produits.
+48 templates, 45 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -48,6 +48,7 @@ amont.
 | hayhooks | [`hayhooks-status-exposed`](templates/exposure/hayhooks-status-exposed.yaml) | high |
 | infinity | [`infinity-embedding-server-exposed`](templates/exposure/infinity-embedding-server-exposed.yaml) | medium |
 | jupyter_server | [`jupyter-no-token`](templates/exposure/jupyter-no-token.yaml) | critical |
+| kedro-viz | [`kedro-viz-exposed`](templates/exposure/kedro-viz-exposed.yaml) | medium |
 | kubeflow-pipelines | [`kubeflow-pipelines-exposed`](templates/exposure/kubeflow-pipelines-exposed.yaml) | high |
 | label-studio | [`label-studio-signup-open`](templates/exposure/label-studio-signup-open.yaml) | medium |
 | langflow | [`CVE-2026-0770`](templates/cves/CVE-2026-0770.yaml) | critical |
