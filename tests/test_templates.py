@@ -11353,6 +11353,337 @@ def test_nemo_guardrails_extractor_reports_the_configs_the_anonymous_caller_enum
     )
 
 
+# --------------------------------------------------------------------------
+# Marqo pose la question que tout le pack pose, mais en clair : à quoi sert de
+# reconnaître un produit ? Sa racine rend « {"message": "Welcome to Marqo",
+# "version": …} », une phrase écrite dans le handler mot pour mot depuis la
+# 0.1.0, et c'est tout ce qu'un template de détection regarde en amont. Or cette
+# bannière répond aussi bien derrière un proxy qui authentifie le reste de
+# l'arbre : elle nomme, elle ne constate rien. Le constat est ailleurs —
+# get_indexes() interroge index_management.get_all_indexes() et rend
+# « {'results': [{'indexName': index.name} for index in indexes]} », donc l'état
+# du moteur lu chez l'exploitant. Le template doit tenir aux deux à la fois, et
+# se taire dès que la seconde route ne répond pas.
+#
+# Le piège du produit est de casse. Jusqu'à la 1.5, get_indexes() passait par
+# tensor_search.get_indexes(), qui écrivait « {'index_name': ix} » : la graphie
+# chameau est la forme de fil du produit depuis la 2.0, et c'est elle qui
+# distingue la réponse de celle de n'importe quel moteur de recherche.
+
+MARQO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "marqo-unauthenticated.yaml")
+
+
+def marqo_root_body(version="2.13.0"):
+    """Réponse de root(), telle que FastAPI la sérialise : compacte."""
+    return json.dumps({"message": "Welcome to Marqo", "version": version},
+                      separators=(",", ":"))
+
+
+def marqo_indexes_body(*index_names):
+    """Réponse de get_indexes() depuis la 2.0 : un dictionnaire à clé unique."""
+    return json.dumps({"results": [{"indexName": name} for name in index_names]},
+                      separators=(",", ":"))
+
+
+MARQO_ROOT_BODY = marqo_root_body()
+MARQO_INDEXES_BODY = marqo_indexes_body("catalogue-produits", "tickets-support")
+
+# Une instance qui n'a pas encore d'index : la route répond, mais n'énumère rien.
+# Le tableau vide est la réponse la plus banale du web, et il ne prouve aucun
+# accès en lecture au moteur — il n'y a rien à lire.
+MARQO_NO_INDEX_BODY = marqo_indexes_body()
+
+# La graphie de la branche 1.x, arrêtée fin 2023 et qui exigeait un marqo-os à
+# côté : tensor_search.get_indexes() écrivait « {'index_name': ix} ».
+MARQO_LEGACY_INDEXES_BODY = (
+    '{"results":[{"index_name":"catalogue-produits"},'
+    '{"index_name":"tickets-support"}]}'
+)
+
+# Ce qu'un proxy placé devant l'instance rend sur /indexes quand il n'expose que
+# la racine : la bannière répond, le plan de données non.
+MARQO_PROXY_UNAUTHORIZED_BODY = (
+    '<html><head><title>401 Authorization Required</title></head>'
+    '<body><center><h1>401 Authorization Required</h1></center></body></html>'
+)
+
+# Ce qu'un FastAPI rend sur un chemin qu'il ne sert pas — donc ce que rendrait
+# une pile qui n'est pas Marqo mais dont la racine aurait été recopiée.
+MARQO_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Un tableau de supervision qui agrège la réponse sous une clé à lui : la charge
+# utile y est entière, avec ses valeurs exactes, mais ce n'est pas l'instance qui
+# a répondu.
+MARQO_COMPOSITE_INDEXES_BODY = (
+    '{"marqo":%s,"checked_at":0}' % MARQO_INDEXES_BODY)
+
+# Les deux façons de citer le produit sans l'être, et que l'ancrage sur la clé
+# message doit écarter : un inventaire qui recopie la requête Shodan du template
+# de détection amont, et une console qui affiche la bannière sous un nom à elle.
+MARQO_BANNER_QUOTED_IN_PROSE_BODY = (
+    '{"service":"inventaire","note":"la requete shodan vaut '
+    'http.html:\\"Welcome to Marqo\\" et suffit a lister le parc"}'
+)
+MARQO_BANNER_UNDER_ANOTHER_KEY_BODY = (
+    '{"product":"Marqo","banner":"Welcome to Marqo","state":"up"}'
+)
+
+# Le catch-all d'une interface : sur un chemin qu'il ne sert pas, le serveur rend
+# sa page d'accueil en 200 plutôt qu'un 404.
+MARQO_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Marqo</title></head>'
+    '<body><div id="app"></div></body></html>'
+)
+
+
+def marqo_block():
+    doc = load(MARQO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/indexes" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /indexes — la bannière de la racine est "
+        "déjà tout ce qu'un template de détection regarde, et elle répond "
+        "derrière un proxy qui authentifie le reste de l'arbre"
+    )
+    return blocks[0]
+
+
+def marqo_responses(root_status=200, root_body=MARQO_ROOT_BODY,
+                    indexes_status=200, indexes_body=MARQO_INDEXES_BODY):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template : c'est
+    cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    ordered = []
+    for path in marqo_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == "/":
+            ordered.append((root_status, root_body))
+        elif route == "/indexes":
+            ordered.append((indexes_status, indexes_body))
+        else:
+            raise AssertionError(f"le template interroge un chemin inattendu : {route}")
+    return ordered
+
+
+def marqo_fires(**kwargs):
+    block = marqo_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = marqo_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_marqo_probe_reads_the_two_routes_and_never_runs_the_engine():
+    doc = load(MARQO_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : sur cette API tout ce qui fait "
+            "travailler ou écrire l'exploitant est en POST ou en DELETE, et le "
+            "routeur nu les sert à l'anonyme comme le reste"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/search", "POST /indexes/{index}/search fait tourner le "
+                            "modèle d'embedding de l'exploitant et rend les "
+                            "documents que le template est censé protéger"),
+                ("/embed", "POST /indexes/{index}/embed vectorise ce qu'on lui "
+                           "donne, donc occupe le GPU de l'hôte, et sur un "
+                           "index à média fait sortir une requête HTTP de "
+                           "l'instance auditée vers l'URL demandée"),
+                ("/documents", "les routes de documents lisent le corpus quand "
+                               "elles ne le réécrivent pas : POST "
+                               "/indexes/{index}/documents remplace ce que la "
+                               "recherche citera ensuite"),
+                ("/models", "DELETE /models éjecte le modèle chargé, et lire "
+                            "GET /models ne prouve rien de plus que /indexes"),
+                ("/upgrade", "POST /upgrade fait migrer l'application Vespa de "
+                             "l'exploitant"),
+                ("/rollback", "POST /rollback et /rollback-vespa font revenir "
+                              "l'exploitant à un état antérieur"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = marqo_block().get("path") or []
+    assert paths == ["{{BaseURL}}/", "{{BaseURL}}/indexes"], (
+        "le constat tient à deux lectures, sur les chemins nus et dans cet "
+        "ordre : les deux routes sont écrites en dur dans leur décorateur, "
+        "l'application ne connaît pas de préfixe, et la bannière doit précéder "
+        f"la preuve — {paths}"
+    )
+
+
+def test_marqo_matcher_needs_the_index_enumeration_not_just_the_banner():
+    block = marqo_block()
+    assert block.get("req-condition") is True, (
+        "sans req-condition les deux réponses ne partagent pas d'espace de "
+        "noms : la bannière conclurait seule, et c'est exactement ce qu'un "
+        "template de détection fait déjà en amont"
+    )
+
+    assert marqo_fires(), (
+        "le template ne reconnaît pas une instance dont /indexes énumère ses "
+        "index pour l'anonyme"
+    )
+    assert marqo_fires(indexes_body=marqo_indexes_body("index-unique")), (
+        "le template exige plusieurs index : une instance qui n'en porte qu'un "
+        "sert le même /indexes/{index}/search sans rien demander"
+    )
+    assert marqo_fires(root_body=json.dumps(json.loads(MARQO_ROOT_BODY), indent=2),
+                       indexes_body=json.dumps(json.loads(MARQO_INDEXES_BODY),
+                                               indent=2)), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+    assert marqo_fires(root_body=marqo_root_body("2.0.0")), (
+        "le template contraint le numéro de version, qui change à chaque "
+        "publication — la bannière ne doit tenir qu'à la phrase du handler"
+    )
+
+    # La frontière du constat, et c'est elle qui sépare ce template du template
+    # de détection amont : la bannière seule ne dit rien.
+    assert not marqo_fires(indexes_status=401,
+                           indexes_body=MARQO_PROXY_UNAUTHORIZED_BODY), (
+        "le template déclenche sur une instance placée derrière un proxy qui "
+        "n'expose que la racine : la bannière répond toujours, mais le plan de "
+        "données ne répond plus, et c'est lui qui porte le constat"
+    )
+    assert not marqo_fires(indexes_status=404,
+                           indexes_body=MARQO_NOT_FOUND_BODY), (
+        "le template déclenche sur le « {\"detail\":\"Not Found\"} » d'une "
+        "application qui ne sert pas /indexes"
+    )
+    assert not marqo_fires(indexes_body=MARQO_SPA_BODY), (
+        "le template déclenche sur la page d'accueil qu'un catch-all rend en "
+        "200 sur un chemin qu'il ne connaît pas"
+    )
+    assert not marqo_fires(indexes_body=MARQO_COMPOSITE_INDEXES_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+    # Le tableau vide : la route répond, mais il n'y a rien à énumérer, donc
+    # rien qui prouve un accès en lecture au moteur.
+    assert not marqo_fires(indexes_body=MARQO_NO_INDEX_BODY), (
+        "le template déclenche sur « {\"results\":[]} » : une instance sans "
+        "index n'a rien à livrer à l'appelant anonyme, et ce tableau vide est "
+        "trop banal pour porter un constat de sévérité haute"
+    )
+
+    # La graphie, et ce qu'il en coûterait d'accepter les deux.
+    assert not marqo_fires(indexes_body=MARQO_LEGACY_INDEXES_BODY), (
+        "le template confirme sur « index_name » : c'est la graphie de la "
+        "branche 1.x, arrêtée fin 2023, et c'est surtout le nom que tout "
+        "moteur de recherche donne à ses index — la casse chameau est la forme "
+        "de fil du produit depuis la 2.0"
+    )
+
+    # La bannière doit être la valeur du champ message, pas un mot qui traîne.
+    assert not marqo_fires(root_body=MARQO_BANNER_QUOTED_IN_PROSE_BODY), (
+        "le template trouve la phrase du produit n'importe où dans le corps : "
+        "il déclencherait sur un inventaire qui recopie la requête Shodan du "
+        "template de détection amont"
+    )
+    assert not marqo_fires(root_body=MARQO_BANNER_UNDER_ANOTHER_KEY_BODY), (
+        "le template accepte la bannière sous une clé quelconque : root() "
+        "l'écrit sous « message », et une console qui l'affiche sous un nom à "
+        "elle n'est pas l'instance"
+    )
+
+    # Collisions internes au pack : aucun des autres serveurs couverts ne doit
+    # être revendiqué par celui-ci.
+    for other_body, other_name in (
+        (VLLM_MODELS_BODY, "vllm"),
+        (LMSTUDIO_MODELS_BODY, "lmstudio"),
+        (INFINITY_MODELS_BODY, "infinity"),
+        (XINFERENCE_REGISTRATIONS_BODY, "xinference"),
+        (TEI_INFO_BODY, "text-embeddings-inference"),
+        (TGI_INFO_BODY, "text-generation-inference"),
+        (SGLANG_MODEL_INFO_BODY, "sglang"),
+    ):
+        assert not marqo_fires(root_body=other_body, indexes_body=other_body), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_marqo_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Ni root() ni get_indexes() n'ont de branche d'échec : ils rendent un
+    dictionnaire, que FastAPI ne peut sortir que sous un 200. Exiger ce 200
+    n'écarterait rien que les corps n'écartent déjà — un 401 de proxy rend du
+    HTML, un 404 rend « {"detail":"Not Found"} » — et ferait manquer l'instance
+    dont un intermédiaire réécrit le statut.
+    """
+    block = marqo_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : les deux handlers ne rendent "
+        "leur charge utile que sur un 200, donc ce matcher n'écarte rien et "
+        "n'ajoute qu'un risque de silence"
+    )
+
+    written = "\n".join(expr for m in (block.get("matchers") or [])
+                        if m.get("type") == "dsl"
+                        for expr in (m.get("dsl") or []))
+    assert "status_code_" not in written, (
+        "une expression dsl porte le statut : le constat doit tenir aux deux "
+        "charges utiles, pas au code de réponse"
+    )
+
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "dsl":
+            assert matcher.get("condition") == "and", (
+                "les expressions doivent toutes devoir passer : la bannière "
+                "nomme sans constater, l'énumération constate sans nommer, et "
+                "aucune des deux ne conclut seule"
+            )
+
+    # Le template ne conclut toujours pas si l'énumération manque, quel que soit
+    # le statut que l'intermédiaire renvoie.
+    assert not marqo_fires(indexes_status=200,
+                           indexes_body=MARQO_PROXY_UNAUTHORIZED_BODY), (
+        "un proxy qui rend sa page de refus en 200 suffit à faire conclure le "
+        "template : c'est le corps de /indexes qui porte la preuve"
+    )
+
+
+def test_marqo_extractor_reports_the_indexes_the_anonymous_caller_enumerates():
+    block = marqo_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement qui vaille d'être remonté — "
+        f"les index que l'exploitant a nommés — et {len(extractors)} "
+        "extracteurs feraient remonter autant de fois la même instance sous "
+        "req-condition. La version se lit de toute façon sur la racine, que "
+        "l'instance soit fermée ou non ; elle ne fait pas partie du constat"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à la réponse de /indexes : sous "
+        "req-condition le moteur l'évalue contre chaque réponse, et la bannière "
+        "n'a pas d'index à donner"
+    )
+    assert extractor.get("json") == [".results[].indexName"], (
+        "l'extracteur ne parcourt pas .results[].indexName — ce sont pourtant "
+        "les noms que l'exploitant a choisis, et le {index_name} que réclame "
+        "ensuite tout le reste de l'arbre ; s'arrêter à .results[0].indexName "
+        "tairait les autres index de l'instance"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

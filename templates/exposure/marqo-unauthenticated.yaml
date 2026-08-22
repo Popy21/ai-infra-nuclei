@@ -1,0 +1,195 @@
+id: marqo-unauthenticated
+
+info:
+  name: Marqo - Unauthenticated Index Enumeration
+  author: popy21
+  severity: high
+  description: |
+    Marqo est un moteur de recherche tensorielle qui embarque son propre modèle
+    d'embedding : il indexe le texte et les images, les vectorise lui-même, et
+    range le résultat dans Vespa. Son API n'a jamais eu de garde. L'application
+    est construite par « FastAPI(title="Marqo", version=version.get_version()) »,
+    sans argument dependencies ; les deux seuls intergiciels montés dessus sont
+    TelemetryMiddleware et StatsDMiddleware, qui mesurent ; et route_class vaut
+    MarqoCustomRoute, dont get_route_handler() ne fait qu'entourer le handler
+    d'origine d'un try/except qui journalise puis relève l'erreur. Aucun
+    décorateur de route ne porte de dépendance : le « Depends(get_config) » qui
+    revient partout injecte l'objet de configuration du processus, pas une
+    identité d'appelant. Il n'y a pas de contrôle à contourner, il n'y en a pas —
+    et le README du dépôt annonce depuis 2026 que le projet libre est déprécié et
+    ne recevra plus de mise à jour, donc aucun correctif ne viendra le poser.
+    Le défaut de liaison va dans le mauvais sens. run_marqo.sh lance
+    « uvicorn api:app --host "$MARQO_HOST" --port 8882 » avec
+    MARQO_HOST=${MARQO_HOST:-"0.0.0.0"}, et la ligne était écrite en dur
+    « --host 0.0.0.0 » jusqu'à la 2.13 incluse. L'instance sort de la machine dès
+    le premier lancement.
+    Deux lectures suffisent à l'établir, et elles ne disent pas la même chose.
+    root() rend littéralement « {"message": "Welcome to Marqo", "version":
+    version.get_version()} » — cette phrase est écrite dans le handler mot pour
+    mot depuis la 0.1.0, elle nomme le produit et rien d'autre. Mais elle ne
+    prouve rien : c'est une bannière, elle répondrait aussi bien à travers un
+    proxy qui authentifie le reste de l'arbre, et c'est déjà tout ce qu'un
+    template de détection en amont regarde. get_indexes(), lui, interroge
+    index_management.get_all_indexes() puis rend « {'results': [{'indexName':
+    index.name} for index in indexes]} » : c'est l'état du moteur, lu chez
+    l'exploitant. Son énumération anonyme est le constat entier.
+  impact: |
+    Les noms d'index d'abord, parce que ce sont ceux que l'exploitant a choisis :
+    un index nommé d'après un client, un produit ou un projet interne renseigne
+    avant qu'on ait lu une ligne. Mais l'énumération n'est que le témoin — elle
+    donne le {index_name} que réclame tout le reste de l'arbre, qui est nu au
+    même titre.
+    Le corpus ensuite. POST /indexes/{index}/search rend les documents
+    correspondants avec leurs champs, et Marqo range le texte source à côté du
+    vecteur : ce qui alimente la recherche — fiches produit, tickets,
+    documentation, contrats — se tire requête par requête, sans inversion.
+    GET /indexes/{index}/documents/{id} lit un document nommé, et son paramètre
+    expose_facets en rend les embeddings. GET /indexes/{index}/settings donne le
+    modèle, ses dimensions et le découpage appliqué ; GET /indexes/{index}/stats
+    rend numberOfDocuments, numberOfVectors et le taux d'occupation mémoire et
+    disque du backend ; GET /models nomme les modèles chargés et GET /device/cpu
+    décrit la machine.
+    L'écriture au même endroit. POST /indexes/{index}/documents ajoute ou
+    remplace des documents — donc réécrit ce que la recherche citera ensuite,
+    c'est-à-dire empoisonne les réponses sans jamais toucher au modèle —, POST
+    /indexes/{index}/documents/delete-batch en supprime, DELETE /indexes/{index}
+    détruit l'index entier, et DELETE /models éjecte le modèle chargé.
+    Le coût enfin, et il est double. POST /indexes/{index}/embed vectorise ce
+    qu'on lui donne : le GPU ou le CPU de l'hôte travaille pour qui l'atteint,
+    sans quota et sans trace attribuable. Et sur un index à média, la requête
+    porte un mediaDownloadHeaders : l'instance va chercher elle-même l'URL que
+    l'appelant nomme, avec les en-têtes qu'il choisit — elle devient un relais de
+    requêtes vers ce qu'elle peut joindre.
+  remediation: |
+    Il n'y a rien à activer dans le serveur : le projet libre n'a pas
+    d'authentification, il est déprécié, et son README dit qu'il n'en recevra
+    pas. La fermeture est celle du réseau, et elle seule.
+    Poser MARQO_HOST à 127.0.0.1 sur les versions qui lisent cette variable, et
+    ne pas publier le port 8882 du conteneur sur une interface publique — sur une
+    2.13 ou antérieure, où run_marqo.sh écrit « --host 0.0.0.0 » en dur, la
+    publication du port est le seul levier qui reste. Quand l'instance doit être
+    atteinte depuis un autre hôte, la placer derrière un proxy qui authentifie
+    l'arbre entier et non la seule racine : c'est GET /indexes qui porte le
+    constat, pas la bannière. Vérifier la fermeture sur /indexes pour cette
+    raison même.
+    Vespa, qui stocke les documents et les vecteurs, se ferme au même titre : une
+    instance Marqo isolée devant un Vespa joignable ne protège rien.
+    Après une exposition, tenir le corpus pour lu — le texte source est stocké en
+    clair à côté du vecteur — et son contenu pour incertain plutôt qu'intact,
+    puisque les verbes d'écriture étaient ouverts au même titre que ceux de
+    lecture. GET /indexes/{index}/stats donne numberOfDocuments : un décompte qui
+    ne correspond pas à ce qui a été indexé est la trace d'une écriture qu'on n'a
+    pas demandée.
+  reference:
+    - https://github.com/marqo-ai/marqo/blob/mainline/components/marqo/src/marqo/tensor_search/api.py
+    - https://github.com/marqo-ai/marqo/blob/2.13.0/src/marqo/tensor_search/api.py
+    - https://github.com/marqo-ai/marqo/blob/mainline/components/marqo/src/marqo/api/route.py
+    - https://github.com/marqo-ai/marqo/blob/mainline/components/marqo/run_marqo.sh
+    - https://github.com/marqo-ai/marqo/blob/2.13.0/run_marqo.sh
+    - https://github.com/marqo-ai/marqo/blob/1.5.0/src/marqo/tensor_search/tensor_search.py
+  metadata:
+    max-request: 2
+    vendor: marqo-ai
+    product: marqo
+  tags: ai,vectordb,marqo,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et leur séparation est le sujet même du template.
+  #
+  # GET / nomme le produit : root() rend « {"message": "Welcome to Marqo",
+  # "version": version.get_version()} », et cette phrase est écrite dans le
+  # handler mot pour mot depuis la 0.1.0. Elle ne prouve rien pour autant — une
+  # bannière répond aussi bien à travers un proxy qui authentifie le reste de
+  # l'arbre, et la reconnaître seule ferait remonter les instances correctement
+  # placées.
+  #
+  # GET /indexes porte le constat : get_indexes() interroge
+  # index_management.get_all_indexes(), donc lit l'état du moteur chez
+  # l'exploitant, et son énumération anonyme dit que le plan de données répond
+  # sans identité d'appelant. D'où l'ordre des deux chemins, le produit d'abord,
+  # la preuve ensuite.
+  #
+  # En lecture seule, et strictement. Le même arbre porte POST
+  # /indexes/{index}/search et POST /indexes/{index}/embed, qui feraient tourner
+  # le modèle aux frais de l'exploitant et, sur un index à média, sortir une
+  # requête HTTP de l'instance auditée vers l'URL demandée ; POST
+  # /indexes/{index}/documents, qui réécrirait le corpus ; DELETE
+  # /indexes/{index} et POST /indexes/{index}/documents/delete-batch, qui le
+  # détruiraient ; DELETE /models, qui éjecterait le modèle chargé. Signaler une
+  # exposition ne demande d'en toucher aucun.
+  #
+  # Les chemins nus, enfin : les deux routes sont écrites en dur dans leur
+  # décorateur, l'application ne connaît pas de préfixe, et /health comme /memory
+  # sont montés include_in_schema=False sans plus de garde — donc ils répondent
+  # avec ou sans proxy devant, et ne prouvent rien.
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+      - "{{BaseURL}}/indexes"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, la bannière conclurait seule — or c'est
+    # exactement ce qu'un template de détection fait déjà en amont, et ce qu'une
+    # instance fermée par un proxy sert encore.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La phrase du produit, tenue pour ce qu'elle est : la valeur du champ
+          # message, pas un mot qui traîne. L'exiger à cette place écarte le
+          # catalogue d'un tiers qui documenterait l'API, la requête Shodan
+          # recopiée dans une page, et la console d'un intermédiaire qui citerait
+          # le produit. Le deux-points et les espaces facultatives couvrent
+          # l'instance dont un proxy réindente ce qu'il relaie ; FastAPI, lui,
+          # sérialise compact.
+          - 'regex("\"message\"\\s*:\\s*\"Welcome to Marqo\"", body_1)'
+
+          # L'enveloppe de l'énumération, ancrée sur le début du corps détouré.
+          # get_indexes() rend un dictionnaire à clé unique, donc la réponse
+          # s'ouvre sur results et sur le tableau : exiger cette ouverture dit
+          # que l'instance a répondu d'elle-même, et écarte le document d'une
+          # supervision qui agrégerait sa réponse sous une clé à elle, comme la
+          # page HTML d'un portail captif ou d'un proxy qui répondrait 200 à tout.
+          - 'regex("^\\{\\s*\"results\"\\s*:\\s*\\[", trim_space(body_2))'
+
+          # La confirmation, et c'est elle qui sépare l'accès en lecture d'un
+          # port qui répond. « indexName » est le nom que le handler écrit —
+          # « {'indexName': index.name} » —, en casse chameau au milieu d'une API
+          # qui parle autrement partout ailleurs, et sa présence dit qu'au moins
+          # un index a été énuméré. Un tableau vide ne conclut donc pas : une
+          # instance sans index n'a rien à livrer à l'appelant anonyme, et le
+          # « {"results":[]} » qu'elle rend est une réponse trop banale pour
+          # porter un constat de sévérité haute.
+          #
+          # La casse chameau est aussi ce qui date l'instance : jusqu'à la 1.5,
+          # get_indexes() passait par tensor_search.get_indexes(), qui écrivait
+          # « {'index_name': ix} ». Accepter les deux graphies reviendrait à
+          # confirmer sur « index_name », que tout moteur de recherche écrit ;
+          # la branche 1.x s'est arrêtée fin 2023 et exigeait un marqo-os à côté,
+          # là où « indexName » est la forme de fil du produit depuis la 2.0.
+          - 'regex("\"indexName\"\\s*:\\s*\"", body_2)'
+
+          # Pas de matcher de statut, et c'est délibéré : ni root() ni
+          # get_indexes() n'ont de branche d'échec — ils rendent un dictionnaire,
+          # que FastAPI ne peut sortir que sous un 200. Exiger ce 200 n'écarterait
+          # rien que les corps n'écartent déjà, et ferait manquer l'instance dont
+          # un intermédiaire réécrit le statut.
+
+    extractors:
+      # Les noms que l'exploitant a donnés à ses index : c'est ce qui lui
+      # appartient dans la réponse, le premier renseignement qu'un tiers en tire,
+      # et le {index_name} que réclame ensuite tout le reste de l'arbre.
+      #
+      # Un seul extracteur, et borné à body_2 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second sur la
+      # bannière — la version, par exemple — ferait remonter deux fois la même
+      # instance. La version se lit de toute façon sur GET /, que l'instance soit
+      # fermée ou non ; elle ne fait pas partie du constat.
+      - type: json
+        part: body_2
+        name: index
+        json:
+          - '.results[].indexName'
