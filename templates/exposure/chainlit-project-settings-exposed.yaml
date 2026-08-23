@@ -1,0 +1,227 @@
+id: chainlit-project-settings-exposed
+
+info:
+  name: Chainlit - Unauthenticated Project Settings Exposure
+  author: popy21
+  severity: medium
+  description: |
+    Chainlit sert une interface de chat LLM — ou d'agent — depuis « chainlit run
+    app.py », et son authentification n'existe que si l'application la déclare.
+    get_current_user() ouvre sur « if not require_login(): return None »
+    (backend/chainlit/auth/__init__.py), et require_login() n'est vrai que dans
+    quatre cas : la variable d'environnement CHAINLIT_CUSTOM_AUTH, un
+    password_auth_callback, un header_auth_callback, ou un oauth_callback
+    accompagné d'au moins un fournisseur configuré. Une application qui ne
+    déclare aucun de ces rappels — le cas de tout démarrage rapide, et de toute
+    démonstration — fait donc rendre None à la dépendance, et
+    « UserParam = Annotated[GenericUser, Depends(get_current_user)] » laisse
+    passer l'appelant anonyme sans que rien ne lui soit demandé.
+    GET /project/settings est la route où cela se constate. Son handler
+    project_settings (backend/chainlit/server.py) porte current_user: UserParam
+    et ne le lit que pour le transmettre aux rappels set_chat_profiles,
+    set_starters et set_starter_categories ; il ne le compare à rien. Il rend
+    ensuite une JSONResponse dont les clés sont, dans l'ordre : ui, features,
+    userEnv, maskUserEnv, dataPersistence, threadResumable, threadSharing,
+    markdown, chatProfiles, starters, starterCategories, debugUrl. Quand un
+    rappel d'authentification existe, la même dépendance passe par
+    authenticate_user(), decode_jwt() lève sur le jeton absent, et la route rend
+    401 « Invalid authentication token » — sans un octet de la configuration. Le
+    document servi est donc à lui seul le constat, et il n'y a pas d'état
+    intermédiaire à interpréter.
+    La racine ne dirait pas cela. Le routeur finit sur
+    « @router.get("/{full_path:path}") », qui rend la coquille HTML de
+    l'interface en 200 sur n'importe quel chemin — protégée ou non, existante ou
+    non. S'y accrocher reviendrait à signaler toute instance Chainlit vivante.
+    Le défaut de liaison, lui, est correct : DEFAULT_HOST vaut "127.0.0.1" et
+    DEFAULT_PORT 8000 (backend/chainlit/config.py), et l'exposition vient du
+    geste qui les remplace — le « --host 0.0.0.0 » de la ligne de commande, ou
+    la variable CHAINLIT_HOST, que pose toute image qui publie un port.
+  impact: |
+    Le document est la configuration entière de l'application, et il se lit dans
+    l'ordre où il compromet.
+    userEnv nomme les variables d'environnement que l'application réclame à
+    l'utilisateur — c'est-à-dire les clés d'API qu'elle attend de lui pour
+    fonctionner. Ce sont les noms, jamais les valeurs, mais ils disent quel
+    fournisseur de modèle est branché derrière, et load_user_env()
+    (backend/chainlit/socket.py) refuse la connexion tant qu'ils ne sont pas
+    tous fournis : la liste est donc aussi le mode d'emploi de la session.
+    ui rend UISettings entier — name, description, github, custom_css,
+    custom_js, logo_file_url, header_links —, donc le nom du projet interne et
+    les ressources que la page charge ; features rend FeaturesSettings entier,
+    c'est-à-dire ce que l'instance accepte : unsafe_allow_html, le dépôt de
+    fichiers, l'audio, le partage de fils, et l'état du sous-objet mcp.
+    chatProfiles et starters portent les noms de l'exploitant : un profil
+    nomme le plus souvent le modèle servi, une amorce la question type du
+    métier. dataPersistence dit qu'une couche de données conserve les
+    conversations, threadResumable qu'on peut les reprendre, et debugUrl est
+    l'URL de débogage que le fournisseur de persistance construit quand
+    l'instance tourne en mode debug.
+    Ce qui coûte vraiment n'est pourtant pas la lecture, c'est ce que le 200
+    énonce. require_login() est le même appel que consulte connect()
+    (backend/chainlit/socket.py) : la connexion websocket n'est authentifiée que
+    « if require_login() ». Un document servi à l'anonyme dit donc que la
+    session de chat s'ouvre elle aussi sans identité — et avec elle on_message,
+    c'est-à-dire le modèle configuré, exécuté sur le matériel de l'exploitant ou
+    sur son quota chez le fournisseur, sans limite de débit ni notion
+    d'appelant. C'est le même verrou absent, constaté sur la route qui se lit
+    sans rien déclencher.
+    La sévérité reste medium parce que le constat n'est pas à lui seul une
+    faute : une démonstration Chainlit publique est un déploiement légitime et
+    courant, là où une API Ollama ou vLLM ouverte ne l'est jamais. Ce que le
+    template établit, c'est que la configuration et le back-end de chat
+    répondent sans identifiant — à l'exploitant de dire s'il l'a voulu.
+  remediation: |
+    Déclarer un rappel d'authentification avant de publier le port :
+    @cl.password_auth_callback, @cl.header_auth_callback, ou @cl.oauth_callback
+    accompagné d'un fournisseur configuré. C'est le seul geste qui ferme la
+    route, puisque c'est require_login() qu'elle consulte. Poser au passage
+    CHAINLIT_AUTH_SECRET — ensure_jwt_secret() refuse de démarrer sans lui dès
+    que l'authentification est requise, et « chainlit create-secret » le génère.
+    Sinon garder l'écoute sur 127.0.0.1, qui est le défaut, plutôt que de poser
+    « --host 0.0.0.0 » ou CHAINLIT_HOST. Dans un conteneur, où l'écoute sur
+    0.0.0.0 est la condition pour que le port soit servi, lier la publication à
+    la boucle locale — « -p 127.0.0.1:8000:8000 » — et placer devant un proxy
+    qui authentifie. Ce proxy doit couvrir le montage websocket /ws/socket.io
+    autant que les routes HTTP : c'est là que le modèle tourne, et fermer
+    /project/settings seul ne fermerait que le constat.
+    Restreindre allow_origins tant qu'on y est. Le config.toml généré porte
+    « allow_origins = ["*"] », et le middleware CORS est monté avec
+    allow_credentials=True : n'importe quelle page visitée par un navigateur
+    peut donc lire le même document et atteindre les mêmes routes.
+    Après une exposition, tenir la configuration pour lue — noms des variables
+    d'environnement réclamées, profils, amorces, ressources chargées — et
+    considérer que la session de chat a pu être ouverte autant de fois qu'on
+    voulait. Vérifier la consommation chez le fournisseur de modèle sur la
+    période, c'est le seul endroit où l'abus laisse une trace chiffrée.
+  reference:
+    - https://github.com/Chainlit/chainlit/blob/main/backend/chainlit/server.py
+    - https://github.com/Chainlit/chainlit/blob/main/backend/chainlit/auth/__init__.py
+    - https://github.com/Chainlit/chainlit/blob/main/backend/chainlit/auth/jwt.py
+    - https://github.com/Chainlit/chainlit/blob/main/backend/chainlit/socket.py
+    - https://github.com/Chainlit/chainlit/blob/main/backend/chainlit/config.py
+    - https://github.com/Chainlit/chainlit/blob/main/backend/chainlit/cli/__init__.py
+    - https://docs.chainlit.io/authentication/overview
+  metadata:
+    max-request: 1
+    vendor: chainlit
+    product: chainlit
+  tags: ai,llm,chainlit,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur le chemin nu. Le routeur est construit par
+  # « APIRouter(prefix=config.run.root_path) » et root_path est vide tant que
+  # --root-path n'est pas posé, donc la route s'écrit telle qu'elle est
+  # déclarée. Aucun paramètre n'est envoyé : language a pour défaut "en-US" et
+  # chat_profile est optionnel, si bien qu'un GET nu suffit — et qu'un language
+  # hors du motif ferait rendre 422 par Pydantic sans rien apprendre.
+  #
+  # Rien d'autre n'est demandé, et le même routeur explique pourquoi. POST
+  # /project/action appellerait un rappel d'action de l'application, POST
+  # /project/file écrirait dans le répertoire de session, POST /mcp lui ferait
+  # ouvrir une connexion vers un serveur MCP, et le montage /ws/socket.io ferait
+  # tourner le modèle — c'est l'abus que le constat signale, pas ce qui
+  # l'établit. GET /auth/config rendrait bien requireLogin en toutes lettres,
+  # mais c'est une route de configuration d'écran de connexion : elle dit qu'il
+  # n'y a pas de rappel déclaré sans montrer que la configuration sort.
+  - method: GET
+    path:
+      - "{{BaseURL}}/project/settings"
+
+    matchers-condition: and
+    matchers:
+      # Quatre expressions, et le corps entier doit les porter. Des expressions
+      # plutôt que des mots pour deux raisons : Starlette sérialise compact
+      # — separators=(",", ":") —, mais un intermédiaire qui réindente ce qu'il
+      # relaie écrirait « "userEnv": [ », et ces noms doivent désigner des clés
+      # et non apparaître en valeurs dans le catalogue d'un tiers qui
+      # documenterait l'API de Chainlit.
+      #
+      # Elles tiennent toutes aux clés que la route sérialise depuis la 1.0, et
+      # c'est délibéré. maskUserEnv et threadSharing datent de la 2.8,
+      # starterCategories de la 2.10, starters et debugUrl de la 1.1 : s'y
+      # appuyer raterait les instances anciennes, qui sont précisément celles
+      # qui traînent exposées. Le sous-objet features.mcp, souvent cité comme
+      # le témoin du produit, est plus récent encore et vaut « enabled: false »
+      # par défaut.
+      - type: regex
+        part: body
+        regex:
+          # L'ancrage, et il tient à un fait du handler : le dictionnaire passé
+          # à JSONResponse déclare ui en premier, et json.dumps sérialise dans
+          # l'ordre d'insertion. La première clé du document est donc
+          # nécessairement "ui", et sa valeur un objet — UISettings a un champ
+          # name obligatoire. Cet ancrage dit que l'instance a répondu
+          # d'elle-même : il écarte la supervision qui agrégerait la charge
+          # utile sous une clé à elle, la coquille HTML que le catch-all
+          # « /{full_path:path} » rend en 200 sur un chemin inconnu, et le
+          # « {"detail":"Invalid authentication token"} » d'une instance dont un
+          # rappel d'authentification est déclaré.
+          - '^\s*\{\s*"ui"\s*:\s*\{'
+
+          # Les variables d'environnement réclamées à l'utilisateur, sous leurs
+          # deux formes. user_env est déclaré « Optional[List[str]] = None »
+          # dans ProjectSettings, donc null quand rien ne le pose, mais le
+          # config.toml généré écrit « user_env = [] » : exiger le tableau
+          # seul raterait les applications qui n'ont pas de config.toml, et
+          # exiger la seule clé laisserait passer un document qui la citerait.
+          # Le contenu, lui, est laissé libre — une liste vide est le cas le
+          # plus banal, et l'instance est exposée au même titre.
+          - '"userEnv"\s*:\s*(\[|null)'
+
+          # Le couple qui nomme le produit, exigé adjacent. dataPersistence et
+          # threadResumable sont insérés l'un derrière l'autre dans le
+          # dictionnaire du handler depuis la 1.0, sans qu'aucune version n'ait
+          # glissé de clé entre les deux — le maskUserEnv de la 2.8 se pose
+          # avant, le threadSharing de la même version après. Deux booléens
+          # camelCase de ce nom, écrits côte à côte, n'appartiennent qu'à cette
+          # réponse.
+          - '"dataPersistence"\s*:\s*(true|false)\s*,\s*"threadResumable"\s*:\s*(true|false)'
+
+          # Les profils de conversation, et c'est le vocabulaire propre à
+          # Chainlit — à ne pas confondre avec le GET /config de Gradio, qui
+          # décrit des composants et des dépendances d'événements. profiles est
+          # initialisé à « [] » et n'est jamais autre chose qu'une liste : une
+          # instance sans set_chat_profiles rend le tableau vide et reste
+          # exposée, donc rien n'est exigé de son contenu.
+          - '"chatProfiles"\s*:\s*\['
+        condition: and
+
+      # Pas de matcher de statut, et c'est délibéré. Le handler n'a pas de
+      # branche d'échec — il rend JSONResponse, donc un 200 —, et les deux
+      # refus possibles sont déjà écartés par l'ancrage : le 401 de la
+      # dépendance ouvre sur "detail", le 422 de Pydantic sur "detail" lui
+      # aussi. Exiger le 200 n'écarterait donc rien de plus, et ferait manquer
+      # l'instance dont un intermédiaire réécrit le statut — le catch-all, lui,
+      # rend son HTML en 200 et ne serait pas davantage écarté.
+
+    extractors:
+      # Le nom que l'exploitant a donné à l'application : c'est un champ
+      # obligatoire d'UISettings, donc toujours présent, et c'est ce qui
+      # rattache l'instance à un projet dans le rapport. Vaut le nom du dossier
+      # quand rien n'a été posé.
+      - type: json
+        part: body
+        name: name
+        json:
+          - '.ui.name'
+
+      # Ce qui vaut vraiment d'être remonté : les variables d'environnement que
+      # l'application réclame à l'utilisateur, c'est-à-dire les clés d'API
+      # qu'elle attend et, par leur nom, le fournisseur de modèle branché
+      # derrière. Rien n'est extrait quand la liste est vide ou nulle, et c'est
+      # le bon comportement : il n'y a alors rien à nommer.
+      - type: json
+        part: body
+        name: userenv
+        json:
+          - '.userEnv[]?'
+
+      # Les profils de conversation offerts à l'anonyme — le plus souvent les
+      # modèles que l'instance sert. S'arrêter au premier tairait les autres,
+      # et c'est justement leur ensemble qui décrit ce qu'un appelant peut
+      # faire tourner.
+      - type: json
+        part: body
+        name: profile
+        json:
+          - '.chatProfiles[].name'

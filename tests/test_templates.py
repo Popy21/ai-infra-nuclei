@@ -12553,6 +12553,391 @@ def test_tabby_extractors_report_the_build_the_gpus_and_the_account_layer():
     )
 
 
+# --------------------------------------------------------------------------
+# Chainlit est le cas où l'authentification n'existe pas tant que l'application
+# ne la déclare pas. get_current_user() ouvre sur « if not require_login():
+# return None » (backend/chainlit/auth/__init__.py), et require_login() n'est
+# vrai que sous CHAINLIT_CUSTOM_AUTH, un password_auth_callback, un
+# header_auth_callback, ou un oauth_callback pourvu d'un fournisseur configuré.
+# Le handler project_settings (backend/chainlit/server.py) porte donc
+# « current_user: UserParam » sans que cela ferme quoi que ce soit : la
+# dépendance rend None, et la configuration entière de l'application sort.
+#
+# La difficulté du template est de calendrier. Les clés que la réponse porte
+# aujourd'hui ne sont pas celles qu'elle portait hier : maskUserEnv et
+# threadSharing datent de la 2.8, starterCategories de la 2.10, starters et
+# debugUrl de la 1.1. Seules ui, features, userEnv, dataPersistence,
+# threadResumable, markdown et chatProfiles traversent toutes les versions
+# publiées, et ce sont elles qui doivent porter la reconnaissance — sans quoi le
+# template serait muet sur les instances anciennes, précisément celles qui
+# traînent exposées.
+
+CHAINLIT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "chainlit-project-settings-exposed.yaml")
+
+
+def chainlit_ui(name="Assistant Support"):
+    """UISettings.model_dump(), tronqué : name est le seul champ obligatoire."""
+    return {"name": name, "description": "", "cot": "full",
+            "default_theme": "dark", "language": None, "layout": "default",
+            "custom_css": None, "custom_js": None, "header_links": None}
+
+
+def chainlit_features():
+    """FeaturesSettings.model_dump(), tronqué de la même façon."""
+    return {"spontaneous_file_upload": None,
+            "audio": {"enabled": False, "sample_rate": 24000},
+            "mcp": {"enabled": False, "sse": {"enabled": True},
+                    "stdio": {"enabled": True}},
+            "latex": False, "unsafe_allow_html": False, "edit_message": True,
+            "allow_thread_sharing": False}
+
+
+def chainlit_profiles(*names):
+    """ChatProfile.to_dict(), config_overrides retiré par le handler lui-même."""
+    return [{"name": name, "markdown_description": "", "icon": None,
+             "display_name": None, "default": False, "starters": None}
+            for name in names]
+
+
+def chainlit_settings_body(user_env=(), chat_profiles=(),
+                           data_persistence=False, thread_resumable=False,
+                           name="Assistant Support"):
+    """
+    La charge utile depuis la 2.10, telle que JSONResponse la sérialise :
+    compacte — separators=(",", ":") — et dans l'ordre d'insertion du
+    dictionnaire que construit le handler.
+    """
+    return json.dumps({
+        "ui": chainlit_ui(name),
+        "features": chainlit_features(),
+        "userEnv": list(user_env),
+        "maskUserEnv": False,
+        "dataPersistence": data_persistence,
+        "threadResumable": thread_resumable,
+        "threadSharing": False,
+        "markdown": None,
+        "chatProfiles": chainlit_profiles(*chat_profiles),
+        "starters": [],
+        "starterCategories": [],
+        "debugUrl": None,
+    }, separators=(",", ":"))
+
+
+def chainlit_settings_body_2_6(user_env=None):
+    """
+    La charge utile de la 1.1 à la 2.7 : ni maskUserEnv, ni threadSharing, ni
+    starterCategories. userEnv y vaut null quand aucun config.toml ne pose
+    « user_env = [] », ProjectSettings le déclarant Optional[List[str]] = None.
+    """
+    return json.dumps({
+        "ui": chainlit_ui(),
+        "features": chainlit_features(),
+        "userEnv": user_env,
+        "dataPersistence": True,
+        "threadResumable": True,
+        "markdown": "# Bienvenue",
+        "chatProfiles": chainlit_profiles("GPT-4o", "Claude"),
+        "starters": [{"label": "Résumer un contrat", "message": "…",
+                      "command": None, "icon": None}],
+        "debugUrl": None,
+    }, separators=(",", ":"))
+
+
+def chainlit_settings_body_1_0():
+    """
+    La charge utile jusqu'à la 1.0 : ni starters, ni debugUrl. C'est la forme la
+    plus pauvre que la route ait jamais rendue, et elle reste exposée au même
+    titre.
+    """
+    return json.dumps({
+        "ui": chainlit_ui("Chatbot"),
+        "features": {"unsafe_allow_html": False, "latex": False},
+        "userEnv": [],
+        "dataPersistence": False,
+        "threadResumable": False,
+        "markdown": None,
+        "chatProfiles": [],
+    }, separators=(",", ":"))
+
+
+CHAINLIT_SETTINGS_BODY = chainlit_settings_body()
+
+# L'instance qui réclame ses clés à l'utilisateur : userEnv nomme alors le
+# fournisseur de modèle branché derrière, et load_user_env() refuse la connexion
+# websocket tant que les variables ne sont pas toutes fournies.
+CHAINLIT_USER_ENV_BODY = chainlit_settings_body(
+    user_env=("OPENAI_API_KEY", "TAVILY_API_KEY"),
+    chat_profiles=("GPT-4o mini", "o3"), data_persistence=True,
+    thread_resumable=True, name="Copilote juridique")
+
+# Le refus de la dépendance quand un rappel d'authentification est déclaré :
+# authenticate_user() appelle decode_jwt() sur un jeton absent, l'exception
+# remonte en HTTPException(401) et FastAPI n'écrit que le détail.
+CHAINLIT_UNAUTHENTICATED_BODY = '{"detail":"Invalid authentication token"}'
+
+# Le refus de Pydantic sur un language hors du motif : même forme, autre cause.
+CHAINLIT_UNPROCESSABLE_BODY = (
+    '{"detail":[{"type":"string_pattern_mismatch","loc":["query","language"],'
+    '"msg":"String should match pattern","input":"fr_FR"}]}'
+)
+
+# La coquille de l'interface, servie en 200 par « @router.get("/{full_path:path}") »
+# sur n'importe quel chemin — donc aussi sur /project/settings si un
+# intermédiaire réécrit la route, et sur toute instance protégée.
+CHAINLIT_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Chainlit</title>'
+    '<meta name="description" content="Chainlit/chainlit"></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# Le refus d'un proxy placé devant l'instance.
+CHAINLIT_PROXY_DENIED_BODY = (
+    '<html><head><title>401 Authorization Required</title></head>'
+    '<body><center><h1>401 Authorization Required</h1></center></body></html>'
+)
+
+# Une supervision qui agrège la charge utile entière sous une clé à elle : tout
+# y est, mais ce n'est pas l'instance qui a répondu.
+CHAINLIT_COMPOSITE_BODY = '{"chainlit":%s,"checked_at":0}' % CHAINLIT_SETTINGS_BODY
+
+# Les trois ancrages du corps, isolés un à un. Chacun retire d'un document par
+# ailleurs complet ce que le template est censé exiger — sans quoi l'expression
+# correspondante pourrait tomber du template sans que rien ne le dise.
+CHAINLIT_WITHOUT_USER_ENV_BODY = json.dumps(
+    {key: value for key, value in json.loads(CHAINLIT_SETTINGS_BODY).items()
+     if key != "userEnv"}, separators=(",", ":"))
+CHAINLIT_WITHOUT_CHAT_PROFILES_BODY = json.dumps(
+    {key: value for key, value in json.loads(CHAINLIT_SETTINGS_BODY).items()
+     if key != "chatProfiles"}, separators=(",", ":"))
+CHAINLIT_SPLIT_COUPLE_BODY = json.dumps(
+    {"ui": chainlit_ui(), "userEnv": [], "dataPersistence": False,
+     "markdown": None, "threadResumable": False, "chatProfiles": []},
+    separators=(",", ":"))
+
+
+def chainlit_settings_block():
+    doc = load(CHAINLIT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/project/settings" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /project/settings"
+    return blocks[0]
+
+
+def chainlit_fires(status=200, body=CHAINLIT_SETTINGS_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint.
+    """
+    block = chainlit_settings_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_chainlit_probe_reads_the_settings_and_never_opens_a_session():
+    doc = load(CHAINLIT_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la configuration se lit en GET : le même routeur porte POST "
+            "/project/action, POST /project/file et POST /mcp, et un template "
+            "n'a pas à écrire vers une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/socket.io", "le montage websocket est l'endroit où "
+                               "on_message fait tourner le modèle configuré — "
+                               "c'est l'abus que le constat signale, pas ce "
+                               "qui l'établit"),
+                ("/project/action", "POST /project/action appellerait un "
+                                    "rappel d'action de l'application"),
+                ("/project/file", "POST /project/file écrirait dans le "
+                                  "répertoire de session de l'instance auditée"),
+                ("/mcp", "POST /mcp ferait ouvrir à l'instance une connexion "
+                         "vers un serveur MCP choisi par l'appelant"),
+                ("/project/threads", "POST /project/threads interrogerait la "
+                                     "couche de données pour les conversations "
+                                     "conservées"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = chainlit_settings_block().get("path") or []
+    assert paths == ["{{BaseURL}}/project/settings"], (
+        "le constat tient à une seule lecture, sur le chemin nu : le routeur "
+        "est construit par « APIRouter(prefix=config.run.root_path) » et "
+        "root_path est vide tant que --root-path n'est pas posé, donc la route "
+        f"s'écrit telle qu'elle est déclarée — {paths}"
+    )
+
+
+def test_chainlit_matcher_needs_the_settings_payload_not_any_chat_config():
+    block = chainlit_settings_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : aucune des clés de la "
+        "réponse ne nomme le produit à elle seule, et c'est leur réunion dans "
+        "un même corps qui conclut"
+    )
+
+    assert chainlit_fires(), (
+        "le template ne reconnaît pas une instance dont /project/settings rend "
+        "sa configuration à l'anonyme"
+    )
+    assert chainlit_fires(body=CHAINLIT_USER_ENV_BODY), (
+        "le template exige un userEnv vide : l'instance qui réclame ses clés à "
+        "l'utilisateur est justement celle dont la liste renseigne le plus"
+    )
+    assert chainlit_fires(body=chainlit_settings_body_2_6()), (
+        "le template exige maskUserEnv, threadSharing ou starterCategories, "
+        "que la route n'a sérialisés qu'à partir de la 2.8 puis de la 2.10 — "
+        "les instances antérieures sont exactement aussi ouvertes"
+    )
+    assert chainlit_fires(body=chainlit_settings_body_2_6(user_env=[])), (
+        "le template ne reconnaît pas la même version quand un config.toml "
+        "pose « user_env = [] », ce que le fichier généré écrit par défaut"
+    )
+    assert chainlit_fires(body=chainlit_settings_body_1_0()), (
+        "le template exige starters ou debugUrl, absents jusqu'à la 1.0 — or "
+        "ce sont ces instances-là qui traînent exposées"
+    )
+    assert chainlit_fires(body=chainlit_settings_body(chat_profiles=())), (
+        "le template exige un profil de conversation : une application sans "
+        "set_chat_profiles rend « [] » et sert le même back-end de chat"
+    )
+    assert chainlit_fires(
+        body=json.dumps(json.loads(CHAINLIT_SETTINGS_BODY), indent=2)), (
+        "le template exige la sérialisation compacte de JSONResponse : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+    # Le refus, sous ses trois formes : la dépendance, le validateur de requête,
+    # et le proxy qu'on place devant.
+    assert not chainlit_fires(body=CHAINLIT_UNAUTHENTICATED_BODY), (
+        "le template conclut sur le 401 d'une instance dont un rappel "
+        "d'authentification est déclaré — c'est exactement l'instance fermée"
+    )
+    assert not chainlit_fires(body=CHAINLIT_UNPROCESSABLE_BODY), (
+        "le template conclut sur le refus de validation de Pydantic, qui "
+        "n'apprend rien de l'ouverture"
+    )
+    assert not chainlit_fires(body=CHAINLIT_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà la route à "
+        "l'anonyme"
+    )
+    assert not chainlit_fires(body=CHAINLIT_SPA_BODY), (
+        "le template déclenche sur la coquille de l'interface, que "
+        "« @router.get(\"/{full_path:path}\") » rend en 200 sur n'importe quel "
+        "chemin — donc sur toute instance Chainlit vivante, protégée comprise"
+    )
+    assert not chainlit_fires(body=CHAINLIT_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même, et non une supervision qui "
+        "agrégerait sa réponse sous une clé à elle"
+    )
+
+    # Les trois ancrages du corps, isolés un à un.
+    assert not chainlit_fires(body=CHAINLIT_WITHOUT_USER_ENV_BODY), (
+        "le template n'exige plus userEnv, la clé qui nomme les variables "
+        "d'environnement réclamées à l'utilisateur et sans laquelle la "
+        "signature se réduit à des booléens"
+    )
+    assert not chainlit_fires(body=CHAINLIT_WITHOUT_CHAT_PROFILES_BODY), (
+        "le template n'exige plus chatProfiles, le vocabulaire propre à "
+        "Chainlit dans cette réponse"
+    )
+    assert not chainlit_fires(body=CHAINLIT_SPLIT_COUPLE_BODY), (
+        "le template accepte dataPersistence et threadResumable séparés par "
+        "une autre clé : c'est leur adjacence, inchangée depuis la 1.0, qui "
+        "sépare ce document de deux booléens homonymes"
+    )
+
+    # Collisions : les autres interfaces de chat du pack, qui servent elles
+    # aussi une configuration anonyme sur une route de configuration.
+    for other_body, other_name in (
+        (GRADIO_CONFIG_BODY, "gradio"),
+        (GRADIO_OLD_CONFIG_BODY, "gradio, dans sa forme ancienne"),
+        (OPENWEBUI_CONFIG_SIGNUP_OPEN_BODY, "open-webui"),
+        (LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY, "librechat"),
+        (DIFY_SETUP_NOT_STARTED_BODY, "dify"),
+    ):
+        assert not chainlit_fires(body=other_body), (
+            f"le template déclenche sur {other_name}, qui sert lui aussi une "
+            "configuration d'interface de chat sans être Chainlit"
+        )
+
+
+def test_chainlit_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le handler n'a pas de branche d'échec — il rend JSONResponse, donc un 200 —
+    et les deux refus possibles ouvrent tous deux sur "detail", que l'ancrage
+    écarte déjà. Exiger le 200 n'écarterait donc rien de plus, et ferait manquer
+    l'instance dont un intermédiaire réécrit le statut ; le catch-all, lui, sert
+    son HTML sous un 200 et ne serait pas davantage écarté.
+    """
+    block = chainlit_settings_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend sa charge "
+        "utile que sous un 200, donc ce matcher n'écarte rien et n'ajoute "
+        "qu'un risque de silence"
+    )
+
+    assert chainlit_fires(status=503), (
+        "le template dépend du statut alors qu'aucun matcher n'est censé le "
+        "lire : la charge utile suffit, quel que soit le code qu'un "
+        "intermédiaire pose devant"
+    )
+    assert not chainlit_fires(status=200, body=CHAINLIT_UNAUTHENTICATED_BODY), (
+        "un 200 portant le refus de la dépendance fait conclure le template : "
+        "c'est le corps qui porte la preuve"
+    )
+    assert not chainlit_fires(status=200, body=CHAINLIT_SPA_BODY), (
+        "la coquille de l'interface, rendue en 200 sur tout chemin, suffit à "
+        "faire conclure le template"
+    )
+
+
+def test_chainlit_extractors_report_what_the_anonymous_caller_obtains():
+    block = chainlit_settings_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "name": [".ui.name"],
+        "userenv": [".userEnv[]?"],
+        "profile": [".chatProfiles[].name"],
+    }, (
+        "les trois renseignements du constat ne sont pas remontés tels quels — "
+        f"{found}. .ui.name est le seul champ obligatoire d'UISettings et "
+        "rattache l'instance à un projet ; .userEnv[] nomme les clés d'API que "
+        "l'application réclame à l'utilisateur, donc le fournisseur de modèle "
+        "branché derrière, et le « ? » est ce qui l'empêche de fauter quand la "
+        "clé vaut null ; .chatProfiles[].name nomme les modèles servis, et "
+        "s'arrêter au premier tairait les autres"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
