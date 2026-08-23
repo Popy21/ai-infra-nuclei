@@ -12118,6 +12118,441 @@ def test_kedro_viz_extractor_reports_the_registered_pipelines():
     )
 
 
+# --------------------------------------------------------------------------
+# Tabby est le cas où l'authentification existe, mais au-dessus du routeur qui
+# porte la route. api_router() (crates/tabby/src/serve.rs) enregistre
+# « /v1/health » deux fois — POST puis GET, sur le même Arc<HealthState> — sans
+# aucun Depends, et run_app() n'ajoute par-dessus que CorsLayer::permissive(), la
+# couche Prometheus et /metrics. Ce qui ferme, quand c'est fermé, est
+# routes::create() (ee/tabby-webserver/src/routes/mod.rs) : il enveloppe le
+# routeur d'API dans distributed_tabby_layer, dont authorize_request() rend
+# (false, None) sur tout chemin en « /v1/ » ou « /v1beta/ » présenté sans jeton
+# porteur — le dispatcheur répond alors un 401 au corps vide, ce que rend
+# l'instance de démonstration du produit.
+#
+# Cette couche n'est absente que dans trois cas : le drapeau caché
+# « --no-webserver », une construction sans la fonctionnalité « ee »
+# (« default = ["ee", …] » dans crates/tabby/Cargo.toml), et les versions
+# antérieures à la 0.11, où le serveur web se demandait au lieu de se retirer. Le
+# template n'a donc pas à établir que l'instance est ouverte : la charge utile
+# n'existe que là où elle l'est, et le corps du refus est vide. Sa difficulté est
+# ailleurs — reconnaître cet inventaire sur les trois formes que dix versions lui
+# ont données, sans le confondre avec une sonde GPU ou un point de version
+# quelconque.
+
+TABBY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "tabby-health-exposed.yaml")
+
+
+def tabby_version(describe="v0.32.0"):
+    """
+    La structure Version : build_date, build_timestamp, git_sha, git_describe,
+    dans cet ordre depuis la 0.7. git_describe vient de
+    « .git_describe(false, true, None) » dans build.rs, donc le tag.
+    """
+    return {"build_date": "2026-01-25",
+            "build_timestamp": "2026-01-25T17:02:11.000000000Z",
+            "git_sha": "3f0a1c9e0f5b4d2a8c7e6b5a4938271605f4e3d2",
+            "git_describe": describe}
+
+
+def tabby_local_model(model_id, device, cuda_devices):
+    """
+    ModelHealth::Local, dont l'enum est étiqueté par l'extérieur
+    (#[serde(rename = "local")]) et dont cuda_devices porte
+    skip_serializing_if = "Vec::is_empty".
+    """
+    local = {"model_id": model_id, "device": device}
+    if cuda_devices:
+        local["cuda_devices"] = list(cuda_devices)
+    return {"local": local}
+
+
+def tabby_health_body(device="cuda", cuda_devices=("NVIDIA GeForce RTX 4090",),
+                      webserver=False, describe="v0.32.0"):
+    """
+    La charge utile depuis la 0.32, telle que Json<HealthState> la sérialise :
+    compacte, et dans l'ordre de déclaration de la structure — model, chat_model,
+    chat_device, device, cuda_devices, models, arch, cpu_info, cpu_count,
+    version, webserver.
+    """
+    cuda = list(cuda_devices)
+    return json.dumps({
+        "model": "StarCoder-1B",
+        "chat_model": "Qwen2-1.5B-Instruct",
+        "chat_device": device,
+        "device": device,
+        "cuda_devices": cuda,
+        "models": {
+            "completion": tabby_local_model("StarCoder-1B", device, cuda),
+            "chat": tabby_local_model("Qwen2-1.5B-Instruct", device, cuda),
+            "embedding": tabby_local_model("Nomic-Embed-Text", device, cuda),
+        },
+        "arch": "x86_64",
+        "cpu_info": "AMD EPYC 7502P 32-Core Processor",
+        "cpu_count": 64,
+        "version": tabby_version(describe),
+        "webserver": webserver,
+    }, separators=(",", ":"))
+
+
+def tabby_health_body_0_23(device="cuda", cuda_devices=("Tesla T4",),
+                           webserver=False):
+    """
+    La charge utile de la 0.13 à la 0.31 : pas de sous-objet models, et
+    cuda_devices déclaré après cpu_count et non avant arch. C'est cette
+    permutation qui interdit au template de s'appuyer sur la position du champ.
+    """
+    return json.dumps({
+        "model": "TabbyML/StarCoder-1B",
+        "chat_model": "TabbyML/Mistral-7B",
+        "chat_device": device,
+        "device": device,
+        "arch": "x86_64",
+        "cpu_info": "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+        "cpu_count": 28,
+        "cuda_devices": list(cuda_devices),
+        "version": tabby_version("v0.23.0"),
+        "webserver": webserver,
+    }, separators=(",", ":"))
+
+
+def tabby_health_body_0_10():
+    """
+    La charge utile jusqu'à la 0.10 — ni chat_device, ni webserver, ni models —,
+    c'est-à-dire l'époque où « --webserver » était un opt-in caché et faux par
+    défaut : la route répondait alors à l'anonyme sur une instance par défaut.
+    """
+    return json.dumps({
+        "model": "TabbyML/StarCoder-1B",
+        "device": "cuda",
+        "arch": "x86_64",
+        "cpu_info": "AMD Ryzen 9 5950X 16-Core Processor",
+        "cpu_count": 32,
+        "cuda_devices": ["NVIDIA GeForce RTX 3090"],
+        "version": tabby_version("v0.10.0"),
+    }, separators=(",", ":"))
+
+
+TABBY_HEALTH_BODY = tabby_health_body()
+
+# Un hôte sans NVML — un Mac, un conteneur lancé sans --gpus : read_cuda_devices()
+# échoue et cuda_devices vaut « [] », que le Vec de premier niveau écrit tout de
+# même puisqu'il n'a pas de skip_serializing_if. L'instance est exposée au même
+# titre, et c'est même la plus banale.
+TABBY_CPU_ONLY_BODY = tabby_health_body(device="cpu", cuda_devices=())
+
+# Une instance sans modèle de complétion : model, chat_model, chat_device et
+# models.completion disparaissent tous, et le premier champ du document devient
+# device — le premier que HealthState déclare sans skip_serializing_if.
+# webserver y vaut null, ce qu'écrit une construction sans la fonctionnalité
+# « ee ».
+TABBY_EMBEDDING_ONLY_BODY = json.dumps({
+    "device": "cpu",
+    "cuda_devices": [],
+    "models": {"embedding": tabby_local_model("Nomic-Embed-Text", "cpu", ())},
+    "arch": "aarch64",
+    "cpu_info": "Apple M2 Pro",
+    "cpu_count": 12,
+    "version": tabby_version(),
+    "webserver": None,
+}, separators=(",", ":"))
+
+# Un modèle servi par un fournisseur distant : RemoteModelHealth rend kind,
+# model_name et api_endpoint, donc l'URL interne que l'exploitant a configurée.
+TABBY_REMOTE_MODEL_BODY = json.dumps({
+    **json.loads(TABBY_HEALTH_BODY),
+    "model": "qwen2.5-coder",
+    "models": {
+        "completion": {"remote": {"kind": "openai/completion",
+                                  "model_name": "qwen2.5-coder",
+                                  "api_endpoint": "http://vllm.internal.corp:8000/v1"}},
+        "embedding": {"remote": {"kind": "openai/embedding",
+                                 "model_name": "bge-m3",
+                                 "api_endpoint": "http://tei.internal.corp:8080"}},
+    },
+}, separators=(",", ":"))
+
+# Le refus de la couche, tel que l'instance de démonstration du produit le rend
+# (vérifié le 2026-08-23) : distributed_tabby_layer construit sa réponse avec
+# Body::empty(), donc un 401 sans un octet de corps.
+TABBY_UNAUTHORIZED_BODY = ""
+
+# Le refus d'un proxy placé devant l'instance pour fermer ce que « --no-webserver »
+# a ouvert.
+TABBY_PROXY_DENIED_BODY = (
+    '<html><head><title>401 Authorization Required</title></head>'
+    '<body><center><h1>401 Authorization Required</h1></center></body></html>'
+)
+
+# L'interface servie sur le même port : le routeur d'UI a pour repli une
+# redirection vers /swagger-ui, et un proxy peut rendre l'index en 200 sur un
+# chemin qu'il ne connaît pas.
+TABBY_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Tabby</title></head>'
+    '<body><div id="__next"></div></body></html>'
+)
+
+# Une supervision qui agrège la charge utile entière sous une clé à elle : tout y
+# est, mais ce n'est pas l'instance qui a répondu.
+TABBY_COMPOSITE_BODY = '{"tabby":%s,"checked_at":0}' % TABBY_HEALTH_BODY
+
+# Un autre service Rust qui publie le quatuor vergen sous la même clé « version » :
+# c'est la sortie canonique de EmitBuilder::all_git(), donc la partie du document
+# que Tabby partage avec n'importe qui, et elle ne nomme rien à elle seule.
+TABBY_OTHER_VERGEN_BODY = json.dumps({
+    "service": "billing-api", "status": "ok", "version": tabby_version("v1.4.2"),
+}, separators=(",", ":"))
+
+# Le pire de ce genre : la charge utile de Tabby privée d'un seul de ses trois
+# ancrages. Chacune isole l'expression qui la refuse — sans quoi l'une d'elles
+# pourrait tomber du template sans que rien ne le dise. Celle qui perd
+# l'inventaire GPU part de la forme 0.23 : depuis la 0.32, chaque
+# LocalModelHealth du sous-objet models porte à son tour un cuda_devices, et
+# retirer le seul champ de premier niveau ne retirerait pas le nom du document.
+TABBY_WITHOUT_CPU_BODY = json.dumps(
+    {key: value for key, value in json.loads(TABBY_HEALTH_BODY).items()
+     if key not in ("cpu_info", "cpu_count")}, separators=(",", ":"))
+TABBY_WITHOUT_CUDA_BODY = json.dumps(
+    {key: value for key, value in json.loads(tabby_health_body_0_23()).items()
+     if key != "cuda_devices"}, separators=(",", ":"))
+TABBY_PARTIAL_VERSION_BODY = json.dumps(
+    {**json.loads(TABBY_HEALTH_BODY),
+     "version": {"git_describe": "v0.32.0"}}, separators=(",", ":"))
+
+
+def tabby_health_block():
+    doc = load(TABBY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v1/health" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /v1/health"
+    return blocks[0]
+
+
+def tabby_fires(status=200, body=TABBY_HEALTH_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint.
+    """
+    block = tabby_health_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_tabby_probe_reads_the_inventory_and_never_asks_the_instance_to_infer():
+    doc = load(TABBY_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : la route est certes enregistrée aussi "
+            "en POST, sur le même Arc<HealthState> et avec le même handler, mais "
+            "le même routeur nu porte POST /v1/completions et POST /v1/events — "
+            "un template ne doit pas prendre l'habitude d'écrire vers une "
+            "instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/completions", "POST /v1/completions et POST "
+                                 "/v1/chat/completions feraient tourner le "
+                                 "modèle sur le GPU de l'exploitant — c'est "
+                                 "l'abus que le constat signale, pas ce qui "
+                                 "l'établit"),
+                ("/events", "POST /v1/events écrirait dans le journal "
+                            "d'événements de l'instance auditée"),
+                ("/v1beta/models", "GET /v1beta/models décrit le registre des "
+                                   "modèles téléchargeables, pas l'instance"),
+                ("/metrics", "/metrics est ajouté par run_app() en dehors des "
+                             "préfixes que authorize_request() regarde : il "
+                             "répond même quand le serveur web est actif, donc "
+                             "il ne dit rien de l'ouverture"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    paths = tabby_health_block().get("path") or []
+    assert paths == ["{{BaseURL}}/v1/health"], (
+        "le constat tient à une seule lecture, sur le chemin nu : le handler "
+        "rend Json(state.as_ref().clone()) sans lire ni paramètre ni en-tête, "
+        f"donc rien d'autre n'apprendrait quoi que ce soit — {paths}"
+    )
+
+
+def test_tabby_matcher_needs_the_host_inventory_not_any_build_info():
+    block = tabby_health_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : le quatuor de version est "
+        "celui de vergen et ne nomme personne, l'inventaire matériel ne date "
+        "rien, et aucun des deux ne conclut seul"
+    )
+
+    assert tabby_fires(), (
+        "le template ne reconnaît pas une instance dont /v1/health rend "
+        "l'inventaire de la machine d'inférence à l'anonyme"
+    )
+    assert tabby_fires(body=tabby_health_body_0_23()), (
+        "le template dépend de la place de cuda_devices, qui suivait cpu_count "
+        "jusqu'à la 0.31 et précède models depuis la 0.32 : ces instances-là "
+        "sont exactement aussi ouvertes"
+    )
+    assert tabby_fires(body=tabby_health_body_0_10()), (
+        "le template exige un champ que les versions antérieures à la 0.11 "
+        "n'écrivaient pas — chat_device, webserver ou models — alors que ce "
+        "sont celles où le serveur web était un opt-in caché, donc celles qui "
+        "répondaient à l'anonyme sans qu'on ait rien retiré"
+    )
+    assert tabby_fires(body=TABBY_CPU_ONLY_BODY), (
+        "le template exige une carte dans cuda_devices : read_cuda_devices() "
+        "rend un tableau vide dès que NVML n'est pas là — un Mac, un conteneur "
+        "sans --gpus — et l'instance est exposée au même titre"
+    )
+    assert tabby_fires(body=TABBY_EMBEDDING_ONLY_BODY), (
+        "le template s'ancre sur model : les trois premiers champs de "
+        "HealthState portent skip_serializing_if, donc une instance sans modèle "
+        "de complétion ouvre son document sur device"
+    )
+    assert tabby_fires(body=TABBY_REMOTE_MODEL_BODY), (
+        "le template suppose des modèles locaux : sur un fournisseur distant, "
+        "models porte des RemoteModelHealth — et c'est là que se lit "
+        "l'api_endpoint interne de l'exploitant"
+    )
+    assert tabby_fires(body=tabby_health_body(webserver=None)), (
+        "le template exige « webserver »: false : une construction sans la "
+        "fonctionnalité « ee » passe None, donc null, et c'est justement une "
+        "instance dont le routeur n'a aucune couche"
+    )
+    assert tabby_fires(body=json.dumps(json.loads(TABBY_HEALTH_BODY), indent=2)), (
+        "le template exige la sérialisation compacte de Json<HealthState> : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+    # Le refus, sous ses deux formes : la couche du produit et le proxy qu'on
+    # place devant elle.
+    assert not tabby_fires(body=TABBY_UNAUTHORIZED_BODY), (
+        "le template conclut sur le corps vide que distributed_tabby_layer "
+        "renvoie — Body::empty() sous un 401 — alors que c'est exactement la "
+        "réponse d'une instance dont la couche de comptes est en place"
+    )
+    assert not tabby_fires(body=TABBY_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà /v1/ à "
+        "l'anonyme"
+    )
+    assert not tabby_fires(body=TABBY_SPA_BODY), (
+        "le template déclenche sur l'interface rendue en 200 par un catch-all "
+        "sur un chemin qu'il ne connaît pas"
+    )
+    assert not tabby_fires(body=TABBY_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même, et non une supervision qui "
+        "agrégerait sa réponse sous une clé à elle"
+    )
+
+    # Les trois ancrages, isolés un à un.
+    assert not tabby_fires(body=TABBY_OTHER_VERGEN_BODY), (
+        "le template conclut sur le seul quatuor vergen — build_date, "
+        "build_timestamp, git_sha, git_describe —, que publie n'importe quel "
+        "projet Rust bâti avec EmitBuilder::all_git()"
+    )
+    assert not tabby_fires(body=TABBY_WITHOUT_CPU_BODY), (
+        "le template n'exige plus le couple cpu_info / cpu_count, que "
+        "read_cpu_info() écrit adjacent depuis la 0.7 et qui est ce qui nomme "
+        "la machine d'inférence"
+    )
+    assert not tabby_fires(body=TABBY_WITHOUT_CUDA_BODY), (
+        "le template n'exige plus cuda_devices, le champ que NVML remplit et "
+        "que HealthState écrit toujours puisque son Vec n'a pas de "
+        "skip_serializing_if"
+    )
+    assert not tabby_fires(body=TABBY_PARTIAL_VERSION_BODY), (
+        "le template se contente d'un objet version qui porte git_describe : "
+        "c'est le quatuor entier, dans son ordre, qui distingue la structure "
+        "Version d'un champ de version quelconque"
+    )
+
+    # Collisions : les produits du pack qui décrivent eux aussi un hôte GPU, et
+    # la sonde générique qui emploie le même vocabulaire sans être personne.
+    for other_body, other_name in (
+        (COMFYUI_SYSTEM_STATS_BODY, "comfyui"),
+        (OTHER_GPU_STATS_BODY, "une sonde de supervision GPU"),
+        (LLAMACPP_PROPS_BODY, "llama.cpp"),
+        (TEI_INFO_BODY, "text-embeddings-inference"),
+        (LANGFUSE_HEALTH_BODY, "langfuse"),
+    ):
+        assert not tabby_fires(body=other_body), (
+            f"le template déclenche sur {other_name}, qui décrit lui aussi un "
+            "hôte ou une version sans être Tabby"
+        )
+
+
+def test_tabby_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le handler n'a pas de branche d'échec — « Json(state.as_ref().clone()) », donc
+    un 200 —, et le refus de la couche est un 401 au corps vide que les
+    expressions écartent déjà. Exiger le 200 n'écarterait donc rien de plus, et
+    ferait manquer l'instance dont un intermédiaire réécrit le statut.
+    """
+    block = tabby_health_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend sa charge "
+        "utile que sous un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+
+    assert tabby_fires(status=503), (
+        "le template dépend du statut alors qu'aucun matcher n'est censé le "
+        "lire : la charge utile suffit, quel que soit le code qu'un "
+        "intermédiaire pose devant"
+    )
+    assert not tabby_fires(status=200, body=TABBY_UNAUTHORIZED_BODY), (
+        "un 200 au corps vide fait conclure le template : c'est le corps qui "
+        "porte la preuve, et le refus de la couche n'en a pas"
+    )
+    assert not tabby_fires(status=200, body=TABBY_PROXY_DENIED_BODY), (
+        "un proxy qui rend sa page de refus en 200 suffit à faire conclure le "
+        "template"
+    )
+
+
+def test_tabby_extractors_report_the_build_the_gpus_and_the_account_layer():
+    block = tabby_health_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "version": [".version.git_describe"],
+        "gpu": [".cuda_devices[]"],
+        "webserver": [".webserver"],
+    }, (
+        "les trois renseignements du constat ne sont pas remontés tels quels — "
+        f"{found}. git_describe date l'instance au tag, là où git_sha dirait la "
+        "même chose sans être lisible ; .cuda_devices[] nomme les cartes qu'un "
+        "appelant anonyme peut faire travailler par POST /v1/completions, et "
+        "s'arrêter à .cuda_devices[0] tairait les autres ; .webserver dit si la "
+        "couche de comptes existe, et c'est le champ qui explique pourquoi le "
+        "document a pu être servi"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

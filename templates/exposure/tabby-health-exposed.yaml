@@ -1,0 +1,216 @@
+id: tabby-health-exposed
+
+info:
+  name: Tabby - Unauthenticated Inference Host Inventory via Health Endpoint
+  author: popy21
+  severity: medium
+  description: |
+    Tabby est un assistant de code auto-hébergé qui sert lui-même ses modèles, et
+    GET /v1/health rend l'inventaire de la machine qui les fait tourner.
+    api_router() (crates/tabby/src/serve.rs) construit un routeur nu :
+    « .route("/v1/health", routing::post(routes::health).with_state(
+    health_state.clone())) » puis « .route("/v1/health", routing::get(
+    routes::health).with_state(health_state)) » — les deux verbes, le même état —,
+    à côté de POST /v1/events, GET /v1beta/models, POST /v1/completions et POST
+    /v1/chat/completions. Aucun Depends, aucune couche : le handler est
+    « pub async fn health(State(state): State<Arc<HealthState>>) -> Json<
+    HealthState> { Json(state.as_ref().clone()) } », et run_app()
+    (crates/tabby/src/routes/mod.rs) n'ajoute que CorsLayer::permissive(), la
+    couche Prometheus et /metrics.
+    L'authentification, quand elle existe, n'est pas dans ce routeur : elle est
+    posée par-dessus. Depuis la 0.11 le serveur web est actif par défaut — le
+    drapeau était « --webserver », opt-in et caché, il est devenu
+    « --no-webserver » — et Cargo.toml déclare « default = ["ee",
+    "llama-cpp-server/binary"] », donc la distribution officielle l'embarque.
+    Quand il s'attache, routes::create() (ee/tabby-webserver/src/routes/mod.rs)
+    enveloppe le routeur d'API dans « .layer(from_fn_with_state(ctx.clone(),
+    distributed_tabby_layer)) », qui appelle authorize_request()
+    (ee/tabby-webserver/src/service/mod.rs) : sur tout chemin commençant par
+    « /v1/ » ou « /v1beta/ », un appel sans jeton porteur rend (false, None) et le
+    dispatcheur répond un 401 au corps vide. C'est ce que rend l'instance de
+    démonstration du produit, vérifié le 2026-08-23 : « HTTP/2 401 »,
+    « content-length: 0 », « access-control-allow-origin: * » — le CORS permissif
+    du routeur nu par-dessous, le refus de la couche par-dessus.
+    Ce qui reste ouvert est donc exactement ce que ce template signale : une
+    instance qui n'a pas cette couche. Trois façons d'en arriver là — le drapeau
+    caché « --no-webserver », qui retire la seule authentification que Tabby monte
+    sur /v1/ ; une construction sans la fonctionnalité « ee » ; et toute version
+    antérieure à la 0.11, où le serveur web se demandait au lieu de se retirer. Le
+    défaut de liaison ne rattrape rien : ServeArgs déclare
+    « #[clap(long, default_value = "0.0.0.0")] host » et le port 8080, donc
+    l'écoute est publique sans qu'aucun geste ne soit posé.
+    Le corps le corrobore de lui-même. webserver vaut Some(!args.no_webserver) sur
+    une construction « ee » et None sinon : une instance qui répond écrit donc
+    « "webserver":false » ou « "webserver":null » — jamais true, puisque true est
+    précisément le cas où la couche aurait refusé. Le champ n'existe que depuis la
+    0.13 ; avant, il est simplement absent.
+  impact: |
+    HealthState (crates/tabby/src/services/health.rs) est l'inventaire de la
+    machine d'inférence, rendu en un appel. Le matériel d'abord : arch,
+    cpu_info — la chaîne de marque du premier cœur, lue par
+    System::new_all() — cpu_count, et cuda_devices, que read_cuda_devices()
+    remplit en interrogeant NVML nom de carte par nom de carte. L'appelant
+    anonyme lit donc le processeur, le nombre de cœurs et le modèle exact de
+    chaque GPU de l'hôte.
+    Les modèles ensuite : model, chat_model, chat_device, device, et depuis la
+    0.32 le sous-objet models, dont completion, chat et embedding portent chacun
+    un ModelHealth. Sur un modèle local, c'est model_id, device et cuda_devices ;
+    sur un modèle distant, RemoteModelHealth rend kind, model_name et surtout
+    api_endpoint — l'URL du fournisseur que l'exploitant a configuré, y compris
+    quand c'est un service interne que rien d'autre ne publie. La clé d'API, elle,
+    n'est pas dans la structure.
+    La version enfin, et elle est complète : build_date, build_timestamp, git_sha
+    et git_describe, ce dernier produit par « .git_describe(false, true, None) »
+    dans build.rs, donc le tag exact de la construction. L'instance se date au
+    commit, ce qui se compare aux avis du dépôt sans avoir à deviner.
+    Ce que cet inventaire annonce vaut plus que lui-même : l'instance qui l'a
+    rendu est celle où distributed_tabby_layer n'est pas monté, donc celle où POST
+    /v1/completions et POST /v1/chat/completions, servis par le même routeur, ne
+    demandent pas davantage. Les GPU que cuda_devices vient de nommer exécutent
+    les invites de qui les atteint, sans compte, sans quota et sans trace
+    nominative — et POST /v1/events écrit dans le journal d'événements de
+    l'exploitant. Ce qui borne le constat à medium est que ce template s'en tient
+    à la lecture : il ne fait rien exécuter, et l'inventaire n'est pas le contenu
+    du code assisté.
+  remediation: |
+    Ne pas retirer la couche : « --no-webserver » supprime la seule
+    authentification que Tabby monte sur /v1/ et /v1beta/, et le serveur web est
+    actif par défaut depuis la 0.11 précisément pour cette raison. Sur une
+    instance déjà lancée sans lui, le remède est de la relancer avec, de créer le
+    compte propriétaire, puis de distribuer des jetons par utilisateur —
+    authorize_request() accepte le JWT du navigateur comme le jeton
+    d'authentification en base, et refuse le reste.
+    Régler ensuite l'écoute, que le produit ne règle pas : --host vaut « 0.0.0.0 »
+    par défaut. Poser « --host 127.0.0.1 » quand le port est joignable, et dans un
+    conteneur publier « -p 127.0.0.1:8080:8080 » plutôt que le 8080 sur toutes les
+    interfaces.
+    Quand l'instance doit être atteinte depuis un autre hôte, placer devant elle
+    un proxy qui authentifie les préfixes /v1/ et /v1beta/ entiers, et pas les
+    seules routes d'inférence : /v1/health est du même routeur. Noter que
+    authorize_request() ne regarde que ces deux préfixes — /metrics, ajouté par
+    run_app() en dehors d'eux, reste anonyme même serveur web actif, et un proxy
+    a intérêt à le fermer aussi.
+    Après une exposition, tenir pour lus l'inventaire matériel, la liste des
+    modèles, l'api_endpoint du fournisseur configuré et la version exacte : mettre
+    à jour est ce qui retire à l'appelant le renseignement de datation. Vérifier
+    surtout la consommation d'inférence et le journal d'événements sur la période
+    où la route répondait — c'est là, et pas dans /v1/health, que se lit ce qui a
+    réellement été demandé à la machine.
+  reference:
+    - https://github.com/TabbyML/tabby/blob/main/crates/tabby/src/services/health.rs
+    - https://github.com/TabbyML/tabby/blob/main/crates/tabby/src/serve.rs
+    - https://github.com/TabbyML/tabby/blob/main/crates/tabby/src/routes/health.rs
+    - https://github.com/TabbyML/tabby/blob/main/crates/tabby/src/routes/mod.rs
+    - https://github.com/TabbyML/tabby/blob/main/crates/tabby/build.rs
+    - https://github.com/TabbyML/tabby/blob/main/crates/tabby/Cargo.toml
+    - https://github.com/TabbyML/tabby/blob/main/ee/tabby-webserver/src/routes/mod.rs
+    - https://github.com/TabbyML/tabby/blob/main/ee/tabby-webserver/src/service/mod.rs
+  metadata:
+    max-request: 1
+    vendor: tabbyml
+    product: tabby
+  tags: ai,llm,code-assistant,tabby,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et en GET. La route est enregistrée deux fois — POST puis
+  # GET, sur le même Arc<HealthState> — et les deux rendent le même document :
+  # prendre le POST n'apprendrait rien et ferait envoyer une requête d'écriture
+  # à une instance qu'on découvre.
+  #
+  # Rien d'autre n'est demandé. Le même routeur nu porte POST /v1/completions et
+  # POST /v1/chat/completions, qui feraient tourner le modèle sur le GPU de
+  # l'exploitant — c'est l'abus que le constat signale, pas ce qui l'établit —,
+  # POST /v1/events, qui écrirait dans son journal d'événements, et GET
+  # /v1beta/models, qui décrit le registre des modèles téléchargeables et non
+  # l'instance. /metrics est laissé de côté pour l'autre raison : il reste servi
+  # même quand le serveur web est actif, donc il ne dit rien de l'ouverture.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/health"
+
+    matchers-condition: and
+    matchers:
+      # Quatre expressions, et le corps entier doit les porter. Des expressions
+      # plutôt que des mots pour deux raisons : Json<HealthState> sérialise
+      # compact, mais un intermédiaire qui réindente ce qu'il relaie écrirait
+      # « "cpu_info": "…" », et ces noms doivent désigner des clés, pas
+      # apparaître en valeurs dans le catalogue d'un tiers qui documenterait
+      # l'API de Tabby.
+      - type: regex
+        part: body
+        regex:
+          # L'ancrage, et il tient à un fait de la structure : device est le
+          # premier champ non optionnel de HealthState, les trois qui le
+          # précèdent portent skip_serializing_if = "Option::is_none". La
+          # première clé du document est donc nécessairement l'une de ces
+          # quatre, quelle que soit la configuration. Cet ancrage dit que
+          # l'instance a répondu d'elle-même, et écarte la supervision qui
+          # agrégerait la charge utile sous une clé à elle.
+          - '^\s*\{\s*"(model|chat_model|chat_device|device)"\s*:'
+
+          # Le couple processeur, exigé adjacent. cpu_info et cpu_count sont
+          # déclarés l'un derrière l'autre depuis la 0.7 — le commentaire « CPU
+          # information for Tabby server » les groupe encore aujourd'hui —, et
+          # serde sérialise dans l'ordre de déclaration. L'adjacence coûte donc
+          # peu et sépare ce document de toute sonde qui nommerait un
+          # processeur ailleurs. cpu_info est ce que read_cpu_info() lit dans
+          # cpu.brand(), et il n'est jamais vide : « unknown » à défaut.
+          - '"cpu_info"\s*:\s*"[^"]*"\s*,\s*"cpu_count"\s*:\s*[0-9]+'
+
+          # L'inventaire GPU, sans contrainte sur son contenu. cuda_devices est
+          # un Vec sans skip_serializing_if : il est toujours écrit, et il vaut
+          # « [] » sur un hôte sans NVML — un Mac, un conteneur lancé sans
+          # --gpus. Exiger une carte raterait toutes les instances CPU, qui sont
+          # exposées au même titre. Sa position, elle, a bougé — après cpu_count
+          # jusqu'à la 0.23, avant models depuis la 0.32 —, donc aucune
+          # adjacence n'est demandée ici.
+          - '"cuda_devices"\s*:\s*\['
+
+          # Le quatuor de version, dans son ordre et sous sa clé. Version
+          # déclare build_date, build_timestamp, git_sha puis git_describe, et
+          # cet ordre n'a pas bougé depuis la 0.7. Les valeurs sont laissées
+          # libres : all_git() de vergen rend le condensé entier sur une
+          # construction issue d'un dépôt, mais une construction sans métadonnée
+          # git écrit un marqueur, et cette instance-là est exposée comme une
+          # autre. C'est la structure qui nomme, pas la forme des valeurs — et
+          # avec cpu_info et cuda_devices dans le même corps, aucun autre projet
+          # Rust qui publierait le même quatuor vergen ne peut être confondu.
+          - '"version"\s*:\s*\{\s*"build_date"\s*:\s*"[^"]*"\s*,\s*"build_timestamp"\s*:\s*"[^"]*"\s*,\s*"git_sha"\s*:\s*"[^"]*"\s*,\s*"git_describe"\s*:\s*"[^"]*"\s*\}'
+        condition: and
+
+      # Pas de matcher de statut, et c'est délibéré. Le handler n'a pas de
+      # branche d'échec — il rend Json(state.clone()), donc un 200 —, et le
+      # refus de distributed_tabby_layer est un 401 au corps vide, que les
+      # expressions écartent déjà par construction. Exiger le 200 n'écarterait
+      # rien de plus et ferait manquer l'instance dont un intermédiaire réécrit
+      # le statut.
+
+    extractors:
+      # Le tag de construction : c'est lui qui date l'instance au commit et se
+      # compare aux avis du dépôt. git_sha dirait la même chose sans être
+      # lisible, build_date sans être précis.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version.git_describe'
+
+      # Les cartes que NVML a nommées — donc le matériel qu'un appelant anonyme
+      # peut faire travailler par POST /v1/completions. Rien n'est extrait sur
+      # une instance CPU, où le tableau est vide, et c'est le bon comportement :
+      # il n'y a alors pas de GPU à signaler.
+      - type: json
+        part: body
+        name: gpu
+        json:
+          - '.cuda_devices[]'
+
+      # L'état de la couche de comptes, tel que l'instance le déclare
+      # elle-même : false sur une construction « ee » lancée avec
+      # --no-webserver, null sans cette fonctionnalité, absent avant la 0.13.
+      # C'est le champ qui explique pourquoi le document a pu être servi.
+      - type: json
+        part: body
+        name: webserver
+        json:
+          - '.webserver'
