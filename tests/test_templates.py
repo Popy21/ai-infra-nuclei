@@ -12938,6 +12938,193 @@ def test_chainlit_extractors_report_what_the_anonymous_caller_obtains():
     )
 
 
+# --------------------------------------------------------------------------
+# MLServer sert le même triplet name/version/extensions que Triton, sur le
+# même chemin nu /v2 : c'est le vocabulaire du protocole KServe v2, pas la
+# signature d'un produit. OTHER_KSERVE_METADATA_BODY, plus haut dans ce
+# fichier, en est déjà la preuve côté Triton — il porte "name":"mlserver" sans
+# faire déclencher le template de Triton. Celui-ci doit tenir la relation
+# inverse : ne jamais déclencher sur le /v2 réel de Triton, ni sur la forme
+# nue du protocole sans la littérale du produit.
+
+MLSERVER_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "mlserver-metadata-exposed.yaml")
+
+
+def mlserver_metadata_body(name="mlserver", version="1.7.1", extensions=()):
+    """
+    Ce que DataPlane.metadata() rend (mlserver/handlers/dataplane.py), dans la
+    sérialisation compacte d'encode_to_json_bytes — orjson, ou son repli
+    json.dumps(..., separators=(",", ":")).
+    """
+    return json.dumps({"name": name, "version": version, "extensions": list(extensions)},
+                      separators=(",", ":"))
+
+
+MLSERVER_METADATA_BODY = mlserver_metadata_body()
+
+# extensions n'est peuplé par aucun runtime connu du paquet, mais Settings ne
+# l'interdit pas : le template ne doit pas dépendre d'une liste vide.
+MLSERVER_METADATA_WITH_EXTENSIONS_BODY = mlserver_metadata_body(
+    extensions=["mlflow.mlserver.io/schema"])
+
+# Le même corps relayé par un intermédiaire qui réindente ce que MLServer sert
+# compact.
+MLSERVER_METADATA_REFORMATTED_BODY = json.dumps(
+    json.loads(MLSERVER_METADATA_BODY), indent=2)
+
+# server_name renommé via MLSERVER_SERVER_NAME : Settings ne l'interdit pas
+# non plus, mais la littérale est la limite assumée de ce template — une
+# instance renommée ne doit, à dessein, pas être reconnue.
+MLSERVER_METADATA_RENAMED_BODY = mlserver_metadata_body(name="prod-inference-01")
+
+# La charge utile entière, retrouvée au fond d'un document composite qu'une
+# supervision agrégerait sous une clé à elle : ce n'est pas l'instance qui a
+# répondu d'elle-même.
+MLSERVER_COMPOSITE_METADATA_BODY = '{"mlserver":%s,"checked_at":0}' % MLSERVER_METADATA_BODY
+
+
+def mlserver_block():
+    doc = load(MLSERVER_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/v2" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /v2"
+    return blocks[0]
+
+
+def mlserver_fires(body):
+    block = mlserver_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_mlserver_probe_reads_the_bare_route_and_never_touches_the_dataplane():
+    doc = load(MLSERVER_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "metadata() se lit en GET : tout ce qui ferait tourner un modèle "
+            "ou toucherait au dépôt est en POST sur ce même routeur nu"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/infer", "POST /v2/models/{name}/infer ferait tourner le "
+                           "modèle sur le matériel de l'exploitant"),
+                ("/generate", "POST /v2/models/{name}/generate ou "
+                              "/generate_stream ferait produire du texte aux "
+                              "frais de l'exploitant"),
+                ("/repository", "les routes de dépôt chargeraient, "
+                                "déchargeraient ou énuméreraient les modèles "
+                                "de l'exploitant — la littérale de /v2 suffit "
+                                "à établir le constat sans y toucher"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    assert mlserver_block().get("path") == ["{{BaseURL}}/v2"], (
+        "le constat tient à une seule lecture, sur le chemin nu que "
+        'APIRoute("/v2", endpoints.metadata) déclare — '
+        f"{mlserver_block().get('path')}"
+    )
+
+
+def test_mlserver_matcher_needs_the_product_literal_not_just_the_kserve_shape():
+    assert mlserver_fires(MLSERVER_METADATA_BODY), (
+        "le template ne reconnaît pas la réponse par défaut de "
+        "DataPlane.metadata() sur une instance dont l'exploitant n'a rien "
+        "changé"
+    )
+    assert mlserver_fires(MLSERVER_METADATA_WITH_EXTENSIONS_BODY), (
+        "le template exige une liste d'extensions non vide : Settings la "
+        "vaut [] par défaut, et aucun runtime connu ne la peuple"
+    )
+    assert mlserver_fires(MLSERVER_METADATA_REFORMATTED_BODY), (
+        "le template exige la sérialisation compacte de MLServer : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+    assert mlserver_fires(mlserver_metadata_body(version="0.6.0")), (
+        "le template contraint le numéro de version, qui change à chaque "
+        "publication — le constat ne doit tenir que de la littérale du nom"
+    )
+
+    # La frontière avec Triton, qui sert le même triplet sur le même chemin.
+    assert not mlserver_fires(TRITON_METADATA_BODY), (
+        "le template déclenche sur le /v2 réel de Triton : name, version et "
+        "extensions sont le vocabulaire du protocole KServe v2 que les deux "
+        "serveurs partagent, et Triton a déjà son propre template"
+    )
+    assert not mlserver_fires(OTHER_GATEWAY_QUOTING_TRITON_BODY), (
+        "le template déclenche sur un serveur KServe v2 quelconque qui n'est "
+        "ni Triton ni MLServer : la forme du protocole ne suffit pas, il "
+        'faut la littérale "mlserver"'
+    )
+
+    # Limite assumée : server_name peut être renommé, et le template ne doit
+    # alors plus reconnaître l'instance — c'est le choix que la roadmap a
+    # retenu en désignant la littérale comme signature.
+    assert not mlserver_fires(MLSERVER_METADATA_RENAMED_BODY), (
+        "le template dépend de MLSERVER_SERVER_NAME : c'est une limite "
+        "assumée du template, pas un oubli, mais elle doit rester vérifiée "
+        "pour ne pas se resserrer sans qu'on s'en aperçoive"
+    )
+
+    # La littérale doit être la valeur du champ name, pas un mot qui traîne.
+    assert not mlserver_fires(MLSERVER_COMPOSITE_METADATA_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'objet plat qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not mlserver_fires(
+        '{"service":"inventaire","note":"le produit est mlserver et sa '
+        'version 1.7.1"}'
+    ), (
+        "le template trouve la littérale n'importe où dans le corps : il "
+        "déclencherait sur un inventaire qui la cite en prose"
+    )
+
+
+def test_mlserver_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    metadata() n'a pas de branche d'échec — elle rend un objet, que FastAPI ne
+    peut sortir que sous un 200. Exiger ce 200 n'écarterait rien de plus, et
+    ferait manquer l'instance dont un intermédiaire réécrit le statut.
+    """
+    block = mlserver_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : metadata() ne rend sa charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute "
+        "qu'un risque de silence"
+    )
+
+
+def test_mlserver_extractor_reports_the_exact_package_version():
+    block = mlserver_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement qui vaille d'être remonté "
+        "au-delà de la littérale qui l'identifie — le numéro exact du paquet "
+        "installé"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") in (None, "body"), (
+        "l'extracteur n'est pas borné au corps de l'unique réponse"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne parcourt pas .version — c'est pourtant "
+        "self._settings.server_version, le seul renseignement daté que la "
+        "route livre"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

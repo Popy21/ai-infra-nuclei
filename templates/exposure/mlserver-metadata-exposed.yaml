@@ -1,0 +1,170 @@
+id: mlserver-metadata-exposed
+
+info:
+  name: MLServer (Seldon) - Unauthenticated KServe V2 Server Metadata Exposure
+  author: popy21
+  severity: high
+  description: |
+    MLServer est le serveur d'inférence de Seldon pour le protocole V2 de
+    KServe : c'est le runtime que Seldon Core V2 lance derrière chaque
+    déploiement de modèle, et celui que le paquet mlserver-mlflow met à la
+    disposition de « mlflow models serve --enable-mlserver ». Son application
+    HTTP n'a jamais eu de garde à désactiver, parce qu'elle n'en construit
+    aucune.
+    create_app() (mlserver/rest/app.py) bâtit la liste des routes à partir de
+    deux collections d'endpoints — Endpoints, pour le plan de données, et
+    ModelRepositoryEndpoints, pour le dépôt de modèles — puis instancie
+    « FastAPI(debug=settings.debug, routes=routes, ...) » sans argument
+    dependencies=. Aucun des APIRoute() de la liste ne reçoit de Depends(), et
+    les quatre intergiciels que la fonction peut ajouter ensuite sont tous
+    conditionnels et tous étrangers à l'identité de l'appelant : GZipMiddleware
+    quand settings.gzip_enabled (vrai par défaut), CORSMiddleware seulement si
+    settings.cors_settings est posé (None par défaut, donc absent d'une
+    instance qui n'a rien configuré), PrometheusMiddleware quand
+    settings.metrics_endpoint est renseigné (vrai par défaut, « /metrics »), et
+    l'instrumentation OpenTelemetry seulement si settings.tracing_server est
+    posé (None par défaut). Aucun des quatre ne filtre une requête sur son
+    origine.
+    GET /v2 porte le constat. APIRoute("/v2", endpoints.metadata) appelle
+    Endpoints.metadata() (mlserver/rest/endpoints.py), qui rend
+    self._data_plane.metadata() ; DataPlane.metadata()
+    (mlserver/handlers/dataplane.py) construit littéralement
+    « MetadataServerResponse(name=self._settings.server_name,
+    version=self._settings.server_version,
+    extensions=self._settings.extensions) » — les trois seuls champs du type
+    (mlserver/types/dataplane.py), tous requis et tous fournis par
+    construction, donc toujours présents dans la réponse, même quand
+    extensions est une liste vide. Settings (mlserver/settings.py) fixe
+    server_name à "mlserver" par défaut ; c'est cette valeur littérale,
+    jamais recalculée depuis une bannière ou un fichier tiers, qui distingue
+    cette instance du /v2 de Triton — dont le nom rendu par défaut est
+    "triton", et que son propre template couvre déjà.
+    Le défaut de liaison va dans le même sens que l'absence de garde : host
+    vaut "0.0.0.0" et http_port 8080, donc un simple « mlserver start . » ou
+    le conteneur officiel écoute sur toutes les interfaces sans qu'aucun
+    réglage n'ait été changé. La réponse elle-même est compacte —
+    Response.render() (mlserver/rest/responses.py) passe par
+    encode_to_json_bytes (mlserver/codecs/json.py), qui préfère orjson.dumps()
+    et retombe sinon sur « json.dumps(..., separators=(",", ":")) » — et
+    l'ordre des trois clés suit la déclaration du modèle : name, puis version,
+    puis extensions.
+  impact: |
+    /v2 seul date l'instance au correctif près — server_version reflète le
+    numéro exact du paquet mlserver installé — mais il énonce surtout que le
+    plan de données KServe V2 entier répond à l'anonyme, puisque c'est le même
+    routeur nu qui le sert. GET /v2/models/{name} (MetadataModelResponse) rend
+    la plateforme et les tenseurs d'entrée et de sortie avec leur forme et
+    leur datatype ; POST /v2/models/{name}/infer, /generate, /infer_stream et
+    /generate_stream (Endpoints.infer / infer_stream) font tourner le modèle
+    sur le matériel de l'exploitant pour quiconque connaît son nom, sans
+    compte à débiter. Et le dépôt de modèles est monté sur la même
+    application, sans garde de plus : POST /v2/repository/index
+    (ModelRepositoryHandlers.index, mlserver/handlers/model_repository.py)
+    énumère chaque modèle du dépôt avec son état — READY, LOADING,
+    UNAVAILABLE — donc les modèles présents mais non chargés au même titre que
+    les servis, et POST /v2/repository/models/{name}/load ainsi que /unload
+    chargent un modèle du dépôt configuré ou retirent un modèle en production
+    sur simple requête anonyme, un déni de service pour qui en dépend.
+    Le nom que /v2/repository/index vient de révéler dit en général le produit
+    ou le client pour lequel le modèle a été entraîné, et GET
+    /v2/models/{name}/docs — une page Swagger générée à la volée — le
+    documente ensuite en détail sans rien demander de plus. Parce que MLServer
+    est le runtime que mlserver-mlflow met derrière « mlflow models serve
+    --enable-mlserver » et que Seldon Core V2 lance derrière chaque Server,
+    une instance exposée de cette façon n'est pas un cas particulier du
+    produit : c'est l'absence de la couche d'authentification que la
+    plateforme qui l'entoure est censée fournir, et que ni Seldon Core V2 ni
+    mlserver-mlflow ne posent eux-mêmes.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à activer : aucun champ de
+    Settings ne porte sur l'identité de l'appelant, aucun APIRoute() ne reçoit
+    de Depends(), et FastAPI(...) est construit sans argument dependencies=.
+    La fermeture est entièrement réseau.
+    Poser MLSERVER_HOST à 127.0.0.1 (ou le champ host d'un settings.json)
+    quand l'instance n'a pas besoin d'être atteinte depuis l'extérieur du pod
+    ou de la machine — le défaut, "0.0.0.0", ne le fait pas à sa place. Quand
+    elle doit l'être, la placer derrière un proxy ou un maillage qui
+    authentifie le préfixe /v2/ entier, pas seulement /v2 : /v2/models/*
+    /infer, /v2/repository/index et /v2/repository/models/*/load|/unload
+    répondent au même routeur nu. Sous Seldon Core V2, c'est le rôle de la
+    politique d'autorisation du maillage (Istio ou équivalent) devant chaque
+    Server ; sous un déploiement mlflow models serve --enable-mlserver ou un
+    mlserver start nu, rien ne joue ce rôle par défaut, et il faut l'ajouter
+    explicitement.
+    Après une exposition, tenir /v2/repository/index pour lu — donc chaque nom
+    de modèle du dépôt, chargé ou non — et vérifier si /load ou /unload a été
+    appelé sur un modèle en production : les compteurs Prometheus
+    model_infer_request_success et model_infer_request_failure, exposés par
+    défaut sur /metrics, donnent un volume d'inférence mais jamais l'appelant
+    qui l'a généré.
+  reference:
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/rest/app.py
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/rest/endpoints.py
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/handlers/dataplane.py
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/types/dataplane.py
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/settings.py
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/handlers/model_repository.py
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/types/model_repository.py
+    - https://github.com/SeldonIO/MLServer/blob/master/mlserver/rest/responses.py
+    - https://github.com/kserve/kserve/blob/master/docs/predict-api/v2/required_api.md
+  metadata:
+    max-request: 1
+    vendor: seldon
+    product: mlserver
+  tags: ai,ml,mlserver,seldon,kserve,inference,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture. metadata() (mlserver/handlers/dataplane.py) ne consulte
+  # ni la requête ni le registre de modèles — elle recopie trois champs de
+  # Settings — donc rien d'autre ne renseignerait davantage sur l'absence de
+  # garde que ce chemin nu. /v2/repository/index dirait plus, mais son
+  # paramètre est un modèle Pydantic sans valeur par défaut dans la signature
+  # du handler : une requête sans corps y répond par un 422 plutôt que par
+  # l'index, et il ne peut donc pas fonder le constat.
+  #
+  # En lecture seule, et strictement : le même routeur nu porte POST
+  # /v2/models/{name}/infer et /generate, qui feraient tourner le modèle sur
+  # le matériel de l'exploitant, et POST /v2/repository/models/{name}/load et
+  # /unload, qui chargeraient ou retireraient un modèle en production.
+  # Signaler une exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v2"
+
+    matchers-condition: and
+    matchers:
+      # Deux expressions. La première tient l'objet exact que metadata()
+      # construit : l'adjacence des trois champs suit leur déclaration dans
+      # MetadataServerResponse (mlserver/types/dataplane.py) — name, version,
+      # extensions — et cet ordre est celui du modèle Pydantic, pas une
+      # convention de sérialisation qu'une version future changerait sans y
+      # toucher. La valeur du premier champ est tenue pour littérale :
+      # server_name vaut "mlserver" par défaut (mlserver/settings.py), et
+      # c'est justement ce qui distingue cette instance du /v2 de Triton, dont
+      # le nom par défaut est "triton" et que son propre template couvre déjà.
+      # Le numéro de version, lui, est laissé libre : il change à chaque
+      # publication. Le deux-points porte des espaces facultatives : la
+      # sérialisation de MLServer est compacte, mais un intermédiaire qui
+      # réindente ce qu'il relaie ne doit pas faire manquer l'instance.
+      #
+      # La seconde tient l'objet pour plat : MetadataServerResponse n'a que
+      # ces trois champs scalaires — une liste de chaînes n'ouvre pas
+      # d'accolade — donc aucune paire { } ne devrait apparaître à l'intérieur
+      # du corps. Cet ancrage écarte le document d'une supervision qui
+      # agrégerait la réponse sous une clé à elle, et toute page qui citerait
+      # la même littérale au milieu d'un objet plus large.
+      - type: regex
+        part: body
+        regex:
+          - '"name"\s*:\s*"mlserver"\s*,\s*"version"\s*:\s*"[^"]+"\s*,\s*"extensions"\s*:\s*\['
+          - '^\s*\{[^{}]*\}\s*$'
+        condition: and
+
+    extractors:
+      # Le numéro exact du paquet installé : c'est le seul renseignement que
+      # cette route livre au-delà de la littérale qui l'identifie.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
