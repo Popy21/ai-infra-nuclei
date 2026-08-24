@@ -1,0 +1,152 @@
+id: metaflow-metadata-service-exposed
+
+info:
+  name: Metaflow Metadata Service - Unauthenticated Flow, Run and Artifact Inventory
+  author: popy21
+  severity: high
+  description: |
+    metadata_service est le service auquel chaque exécution Metaflow parle : le
+    client écrit dedans à chaque étape d'un flow, et c'est lui qui répond quand
+    un tiers — un tableau de bord, un autre pipeline, un opérateur — demande ce
+    qu'un projet a produit. AuthApi.__init__() (services/metadata_service/api/
+    admin.py) enregistre quatre routes sur l'aiohttp.web.Application : « GET
+    /auth/token », « GET /ping », « GET /version » et « GET /healthcheck ». Aucun
+    des quatre appels à app.router.add_route() ne porte de garde, et aiohttp n'a
+    pas d'équivalent du Depends() de FastAPI à leur greffer : ce que la route
+    déclare est ce qu'elle sert. self.ping() le montre à nu — « return
+    web.Response(text="pong", headers=MultiDict({METADATA_SERVICE_HEADER:
+    METADATA_SERVICE_VERSION})) » — deux littérales tirées de services/
+    metadata_service/api/utils.py : METADATA_SERVICE_HEADER vaut la chaîne
+    "METADATA_SERVICE_VERSION", et METADATA_SERVICE_VERSION est
+    « metadata.version("metadata_service") », le numéro du paquet installé,
+    résolu une fois à l'import.
+    Ce même en-tête n'est pas propre à /ping. format_response() (le même
+    utils.py) l'ajoute à chaque réponse qu'il enveloppe — « headers=MultiDict({
+    METADATA_SERVICE_HEADER: METADATA_SERVICE_VERSION}) » — et c'est le
+    décorateur que FlowApi, RunApi, StepApi, TaskApi, MetadataApi et
+    ArtificatsApi posent sur leurs handlers ; web_response(), utilisé par
+    /healthcheck, fait de même en y ajoutant Content-Type: application/json.
+    C'est donc un en-tête que le produit pose partout, pas un accident de route :
+    le repérer sur /ping repère l'application entière, sans qu'aucun paramètre ne
+    soit nécessaire pour le faire apparaître.
+    server.app() (services/metadata_service/server.py) construit l'application
+    en instanciant chaque classe d'API avec le même objet — « FlowApi(app) »,
+    « RunApi(app) », ..., « AuthApi(app) » — et n'ajoute des middlewares que si
+    l'appelant en fournit à la fonction ; main(), le point d'entrée que le
+    Dockerfile officiel exécute, ne lui en passe aucun. L'écoute suit le même
+    principe d'absence : « host = str(os.environ.get("MF_METADATA_HOST",
+    "0.0.0.0")) » et « port = os.environ.get("MF_METADATA_PORT", 8080) ». Le
+    README du dépôt documente d'ailleurs la vérification par « curl
+    localhost:8080/ping » mot pour mot, sans mentionner de jeton à joindre nulle
+    part dans le processus de démarrage.
+  impact: |
+    /ping seul date l'instance au paquet près, mais c'est le même en-tête qui
+    signe le reste du routeur, entièrement ouvert au même titre. GET /flows
+    (FlowApi.get_all_flows, services/metadata_service/api/flow.py) énumère tous
+    les flows enregistrés ; chaque entrée sérialise flow_id, user_name, ts_epoch,
+    tags et system_tags (FlowRow.serialize(), services/data/models.py) —
+    c'est-à-dire le nom de chaque projet ML de l'exploitant et celui de la
+    personne qui l'a créé. De là, GET /flows/{flow_id}/runs, .../steps, .../
+    tasks et .../artifacts descendent jusqu'au détail : ArtifactRow porte un
+    champ location, l'URI exacte — le plus souvent un chemin S3 — où chaque
+    artefact loggé par chaque tâche de chaque run a été écrit, avec son sha et
+    son type. Un anonyme reconstruit ainsi l'inventaire complet des pipelines
+    d'entraînement de l'exploitant, leurs propriétaires et l'emplacement de leurs
+    sorties, sans qu'aucune de ces routes n'ait de garde propre à retirer — elles
+    portent le même en-tête que /ping parce qu'elles passent par le même
+    format_response().
+    La route la plus sévère reste sur ce même routeur nu. GET /auth/token
+    (AuthApi.get_authorization_token) lit MF_USER_IAM_ROLE dans l'environnement
+    du processus et appelle sts_connection.assume_role(RoleArn=role_arn,
+    RoleSessionName="acct_role") ; en cas de succès elle rend
+    aws_access_key_id, aws_secret_access_key et aws_session_token en clair, à
+    quiconque l'interroge. Sur un déploiement AWS où le conteneur porte un rôle
+    IAM — le mode de fonctionnement documenté pour isoler les accès S3/Batch par
+    utilisateur — cette route seule livre des identifiants AWS temporaires
+    valides à un appelant anonyme.
+  remediation: |
+    Il n'y a pas de réglage à activer : aucune des sept classes d'API que
+    server.app() monte ne consulte l'identité de l'appelant, et aiohttp n'offre
+    pas de mécanisme de garde par route équivalent à un Depends() qu'il
+    suffirait de déclarer. La fermeture passe entièrement par ce qui entoure le
+    processus.
+    Ne jamais publier le port 8080 (MF_METADATA_PORT) directement sur un réseau
+    non maîtrisé : MF_METADATA_HOST vaut "0.0.0.0" par défaut, donc un simple
+    déploiement du conteneur officiel netflixoss/metaflow_metadata_service
+    écoute sur toutes les interfaces sans qu'aucun réglage n'ait été changé.
+    Placer le service derrière un proxy ou un maillage qui authentifie
+    l'intégralité du préfixe — /flows, /auth/token et /healthcheck partagent le
+    même routeur que /ping — ou, mieux, le garder accessible uniquement depuis
+    le VPC privé où tournent les clients Metaflow, comme le recommande le
+    schéma d'architecture d'Outerbounds. server.app() accepte un paramètre
+    middlewares=: c'est le point d'insertion prévu pour une couche
+    d'authentification maison, que main() n'en fournit aucune par défaut.
+    Auditer en priorité MF_USER_IAM_ROLE : si le processus tourne avec un rôle
+    IAM attaché, révoquer ou resserrer ce rôle après toute exposition, et
+    considérer les identifiants qu'il a pu rendre par /auth/token comme
+    compromis. Après coup, tenir pour lus les noms de flows, leurs propriétaires
+    et les emplacements d'artefacts que /flows et ses routes descendantes
+    exposaient au même anonyme.
+  reference:
+    - https://github.com/Netflix/metaflow-service/blob/master/services/metadata_service/api/admin.py
+    - https://github.com/Netflix/metaflow-service/blob/master/services/metadata_service/api/utils.py
+    - https://github.com/Netflix/metaflow-service/blob/master/services/metadata_service/api/flow.py
+    - https://github.com/Netflix/metaflow-service/blob/master/services/metadata_service/api/artifact.py
+    - https://github.com/Netflix/metaflow-service/blob/master/services/metadata_service/server.py
+    - https://github.com/Netflix/metaflow-service/blob/master/services/data/models.py
+    - https://github.com/Netflix/metaflow-service/blob/master/README.md
+    - https://docs.outerbounds.com/engineering/service-architecture/
+  metadata:
+    max-request: 1
+    vendor: netflix
+    product: metaflow-service
+  tags: ai,ml,mlops,workflow,metaflow,netflix,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route la plus nue du routeur. ping() ne consulte
+  # ni la base ni le registre de flows — il recopie deux littérales de utils.py
+  # — donc rien de plus intrusif n'apprendrait davantage sur l'absence de garde.
+  # Le corps "pong" est un motif de health-check générique que n'importe quel
+  # service pourrait rendre ; c'est l'en-tête METADATA_SERVICE_VERSION, propre à
+  # ce produit (utils.py : METADATA_SERVICE_HEADER = "METADATA_SERVICE_VERSION"),
+  # que les deux matchers exigent ensemble — jamais le corps seul.
+  #
+  # En lecture seule, et strictement. GET /flows énumérerait déjà les projets et
+  # leurs propriétaires, et GET /auth/token ferait rendre de vraies identifiants
+  # AWS STS lorsque le processus porte un rôle IAM — l'un et l'autre servis par
+  # le même routeur sans garde, mais aucun n'est nécessaire pour signaler
+  # l'exposition : l'en-tête que /ping porte est celui que format_response() pose
+  # sur les deux.
+  - method: GET
+    path:
+      - "{{BaseURL}}/ping"
+
+    matchers-condition: and
+    matchers:
+      # L'en-tête, insensible à la casse parce qu'un client HTTP peut
+      # recanoniser le nom du champ (Metadata_service_version) sans en changer
+      # le sens. La valeur n'est pas contrainte au-delà d'un caractère non
+      # vide : c'est un numéro de paquet, il change à chaque publication.
+      - type: regex
+        part: header
+        regex:
+          - '(?i)metadata_service_version:\s*\S+'
+
+      # Le corps, ancré aux deux bouts : ping() ne rend jamais rien d'autre que
+      # les quatre caractères "pong", sans les entourer de JSON ni de saut de
+      # ligne. Ancrer écarte un document qui citerait le mot en passant.
+      - type: regex
+        part: body
+        regex:
+          - '^pong$'
+
+    extractors:
+      # Le numéro exact du paquet metadata_service installé, seul
+      # renseignement daté que cette route livre au-delà de la littérale qui
+      # l'identifie.
+      - type: regex
+        part: header
+        name: version
+        group: 1
+        regex:
+          - '(?i)metadata_service_version:\s*(\S+)'

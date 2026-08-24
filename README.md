@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-51 templates, 48 produits.
+52 templates, 49 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -64,6 +64,7 @@ amont.
 | lm-studio | [`lmstudio-server-exposed`](templates/exposure/lmstudio-server-exposed.yaml) | medium |
 | localai | [`localai-unauthenticated-api`](templates/exposure/localai-unauthenticated-api.yaml) | high |
 | marqo | [`marqo-unauthenticated`](templates/exposure/marqo-unauthenticated.yaml) | high |
+| metaflow-service | [`metaflow-metadata-service-exposed`](templates/exposure/metaflow-metadata-service-exposed.yaml) | high |
 | milvus | [`milvus-exposed`](templates/exposure/milvus-exposed.yaml) | high |
 | mlflow | [`mlflow-tracking-server-unauth`](templates/exposure/mlflow-tracking-server-unauth.yaml) | critical |
 | mlserver | [`mlserver-metadata-exposed`](templates/exposure/mlserver-metadata-exposed.yaml) | high |

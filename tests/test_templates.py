@@ -13125,6 +13125,154 @@ def test_mlserver_extractor_reports_the_exact_package_version():
     )
 
 
+METAFLOW_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "metaflow-metadata-service-exposed.yaml")
+
+
+def metaflow_ping_block():
+    doc = load(METAFLOW_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/ping" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /ping"
+    return blocks[0]
+
+
+def metaflow_fires(body="pong", headers="metadata_service_version: 2.15.0",
+                   status=200):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare (`header` ou `body`), et matchers-condition les
+    joint. `body_matcher_hits` sert les deux parts sans rien savoir du sujet
+    qu'on lui donne — nuclei présente les en-têtes de la réponse comme une
+    chaîne, au même titre que le corps.
+    """
+    block = metaflow_ping_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+
+    verdicts = []
+    for matcher in matchers:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, headers))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_metaflow_probe_reads_the_ping_route_and_never_touches_flows_or_auth():
+    doc = load(METAFLOW_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "ping() se lit en GET : c'est l'unique méthode que "
+            "AuthApi.__init__() enregistre pour cette route"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/flows", "GET /flows énumère tous les flows enregistrés "
+                           "— noms de projet et propriétaires — sur le même "
+                           "routeur nu ; la littérale de /ping suffit à "
+                           "établir le constat sans les lire"),
+                ("/auth/token", "GET /auth/token ferait rendre de vraies "
+                                "identifiants AWS STS quand le processus "
+                                "porte un rôle IAM : le template signalerait "
+                                "l'exposition en causant lui-même la fuite "
+                                "qu'il dénonce"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+    assert metaflow_ping_block().get("path") == ["{{BaseURL}}/ping"], (
+        "le constat tient à une seule lecture, sur la route la plus nue du "
+        "routeur — " + str(metaflow_ping_block().get("path"))
+    )
+
+
+def test_metaflow_matcher_needs_the_product_header_not_just_the_generic_pong_body():
+    assert metaflow_fires(), (
+        "le template ne reconnaît pas la réponse par défaut de ping() sur "
+        "une instance dont l'exploitant n'a rien changé"
+    )
+    assert metaflow_fires(headers="metadata_service_version: 1.0.0"), (
+        "le template contraint le numéro de version, qui change à chaque "
+        "publication — le constat ne doit tenir que du nom de l'en-tête"
+    )
+    assert metaflow_fires(headers="Metadata_Service_Version: 2.15.0"), (
+        "le template dépend de la casse exacte de l'en-tête : un client Go "
+        "recanonise METADATA_SERVICE_VERSION en Metadata_Service_Version "
+        "sans en changer le sens, et le matcher doit rester insensible à la "
+        "casse"
+    )
+
+    # Le corps "pong" seul est un motif de health-check générique — c'est
+    # justement ce que la roadmap interdit de tenir pour suffisant.
+    assert not metaflow_fires(headers="content-type: text/plain"), (
+        "le template déclenche sur le seul corps \"pong\" : n'importe quel "
+        "health-check générique le rend, et ce n'est pas la signature du "
+        "produit"
+    )
+    assert not metaflow_fires(headers=""), (
+        "le template déclenche sans aucun en-tête METADATA_SERVICE_VERSION "
+        "dans la réponse"
+    )
+
+    # Le corps est ancré : ni un JSON qui envelopperait le mot, ni une prose
+    # qui le citerait en passant, ne doivent faire déclencher le template.
+    assert not metaflow_fires(body='{"status":"pong"}'), (
+        "le template déclenche sur un corps JSON qui porte \"pong\" en "
+        "valeur : ping() ne rend jamais que les quatre caractères nus"
+    )
+    assert not metaflow_fires(body="ping pong service"), (
+        "le template déclenche sur une prose qui cite \"pong\" en passant : "
+        "l'ancrage doit exiger que le corps entier soit ce mot, rien de plus"
+    )
+
+
+def test_metaflow_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    ping() n'a pas de branche d'échec — elle rend web.Response(text="pong",
+    ...) sans condition, qu'aiohttp ne peut sortir que sous un 200. Exiger ce
+    200 n'écarterait rien de plus, et ferait manquer l'instance dont un
+    intermédiaire réécrit le statut.
+    """
+    block = metaflow_ping_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : ping() ne rend sa charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute "
+        "qu'un risque de silence"
+    )
+
+
+def test_metaflow_extractor_reports_the_exact_package_version():
+    block = metaflow_ping_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement qui vaille d'être remonté "
+        "au-delà de la littérale qui l'identifie — le numéro exact du "
+        "paquet metadata_service installé"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "regex", (
+        "le renseignement est porté par un en-tête, pas par un corps JSON : "
+        "un extracteur json n'a pas à s'en charger"
+    )
+    assert extractor.get("part") == "header", (
+        "l'extracteur n'est pas borné à l'en-tête de l'unique réponse — "
+        "c'est pourtant là, et non dans le corps, que METADATA_SERVICE_VERSION "
+        "est porté"
+    )
+    assert extractor.get("group") == 1, (
+        "l'extracteur doit isoler la valeur, pas le couple nom-valeur entier "
+        "de l'en-tête"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
