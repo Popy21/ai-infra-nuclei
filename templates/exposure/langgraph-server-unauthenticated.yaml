@@ -1,0 +1,184 @@
+id: langgraph-server-unauthenticated
+
+info:
+  name: LangGraph Server - Unauthenticated Assistant Registry Disclosure
+  author: popy21
+  severity: high
+  description: |
+    LangGraph Server est le processus HTTP que démarrent aussi bien `langgraph
+    dev` (backend en mémoire, pensé pour le développement local) que `langgraph
+    up` (conteneur `langgraph-api` officiel, backend Postgres/Redis) : les deux
+    commandes de langgraph-cli chargent le même paquet langgraph_api, distribué
+    sous licence Elastic License 2.0 via PyPI plutôt que dans un dépôt GitHub
+    séparé et navigable — le monorepo langchain-ai/langgraph (libs/cli,
+    libs/sdk-py, libs/langgraph) n'en contient que le client, pas le serveur.
+    get_auth_backend() (langgraph_api/auth/middleware.py) ne construit un
+    intergiciel qui vérifie réellement une identité que si LANGGRAPH_AUTH est
+    posé — la clé `auth:` de langgraph.json, qui pointe vers un module Python
+    implémentant des handlers Auth.on(...) — ou si LANGGRAPH_AUTH_TYPE vaut
+    "langsmith", le mode que LangGraph Cloud managé active par défaut. Sans
+    l'un ou l'autre, elle retombe sur NoopAuthBackend
+    (langgraph_api/auth/noop.py), dont authenticate() rend inconditionnellement
+    « AuthCredentials(), UnauthenticatedUser() » : ConditionalAuthenticationMiddleware
+    ne rejette jamais une requête sur cette base, elle la laisse simplement
+    passer sous une identité anonyme. C'est exactement ce que documente
+    docs.langchain.com/langgraph-platform/auth, section « No default
+    authentication » : « Complete flexibility to implement your security
+    model » — pour tout déploiement auto-hébergé, par opposition à LangGraph
+    Cloud managé qui exige une clé d'API LangSmith.
+    protected_routes (langgraph_api/api/__init__.py) inclut assistants_routes
+    sans condition dès qu'un langgraph.json ne pose pas explicitement
+    `http.disable_assistants` — le cas d'une configuration qui ne déclare
+    aucun bloc `http` — et la seule garde posée sur ce Mount résout vers ce
+    même NoopAuthBackend par défaut. POST /assistants/search
+    (langgraph_api/api/assistants.py) exécute alors search_assistants() : le
+    corps de la requête est validé contre le schéma AssistantSearchRequest,
+    dont aucun champ n'est requis — un corps « {} » suffit donc à obtenir la
+    page par défaut (limit=10, offset=0, aucun filtre) — puis la fonction
+    appelle Assistants.search() et rend directement son résultat, un tableau
+    JSON d'objets Assistant, sans aucune vérification d'identité entre les
+    deux.
+    Le TypedDict Assistant (langgraph_api/schema.py) déclare assistant_id,
+    graph_id, name, description, config, context, created_at, updated_at,
+    metadata et version — le même vocabulaire que documente
+    reference.langchain.com/python/langgraph-sdk/schema/AssistantBase pour le
+    SDK client. Et la réponse n'est jamais vide sur une instance qui sert à
+    quelque chose : register_graph() (appelé au démarrage pour chaque graphe
+    déclaré dans langgraph.json, dans langgraph-runtime-inmem pour le backend
+    de développement et dans son équivalent Postgres/gRPC en production)
+    enregistre systématiquement un assistant « système » par graphe —
+    assistant_id=uuid5(NAMESPACE_GRAPH, graph_id), name=graph_id,
+    metadata={"created_by": "system"} — avant même qu'un utilisateur n'en
+    crée un lui-même.
+    GET /ok (langgraph_api/api/__init__.py) confirme que ce même processus est
+    bien vivant, par un chemin de code entièrement disjoint : la route est
+    déclarée dans unshadowable_meta_routes, montée hors du Mount protégé et
+    donc jamais derrière ConditionalAuthenticationMiddleware, et son handler
+    rend littéralement « JSONResponse({"ok": True}) » sans lire query ni base.
+    Une instance qui répond aux deux — le health-check générique et le
+    vocabulaire propre à l'Assistant de LangGraph — écarte qu'un cache ou un
+    proxy statique ne rejoue qu'une seule réponse figée.
+  impact: |
+    Chaque assistant listé révèle son graph_id — le nom de l'agent tel que
+    déclaré dans langgraph.json — et son config, qui embarque le
+    configurable transmis au graphe : selon la façon dont le développeur a
+    câblé son graphe, ce champ peut porter des paramètres applicatifs
+    sensibles plutôt que des seuls réglages LangGraph. Le trio
+    assistant_id/graph_id/version distingue ce produit de toute autre
+    plateforme d'agents : aucune autre ne sert ces trois champs ensemble sur
+    ce chemin.
+    Le même Mount protégé porte, sous la même absence de garde, threads_routes
+    et runs_routes (langgraph_api/api/__init__.py, ajoutées inconditionnellement
+    au même titre qu'assistants_routes). Un tiers qui vient de lire un
+    assistant_id via /assistants/search peut donc enchaîner POST /threads
+    puis POST /threads/{thread_id}/runs (ou /runs en mode stateless) pour
+    faire exécuter ce graphe avec l'entrée de son choix — sur les modèles et
+    les outils que l'exploitant a configurés, à ses frais, sans qu'aucun
+    compte n'existe pour attribuer l'appel à qui que ce soit.
+    Le défaut de publication réseau va dans le même sens que l'absence de
+    garde applicative. Sur `langgraph up`, le compose officiel publie le
+    service langgraph-api en « ports: ["{port}:8000"] » (langgraph_cli/docker.py,
+    port par défaut 8123 — DEFAULT_PORT dans langgraph_cli/constants.py) :
+    c'est la syntaxe de publication Docker Compose par défaut, sans IP d'hôte,
+    qui lie le port sur toutes les interfaces. Sur `langgraph dev`, l'option
+    --host documente elle-même le risque dans son propre texte d'aide :
+    « Default 127.0.0.1 is recommended for security. Only use 0.0.0.0 in
+    trusted networks. »
+  remediation: |
+    Il n'y a pas de réglage isolé à activer sur cette route : aucun des
+    handlers d'assistants_routes ne consulte l'identité de l'appelant tant
+    qu'aucun module d'autorisation personnalisé n'est enregistré. La
+    fermeture passe par ce que documente docs.langchain.com/langgraph-platform/auth
+    — implémenter et déclarer un module `auth` dans langgraph.json (la clé
+    HTTP_CONFIG "auth", donc LANGGRAPH_AUTH côté serveur) qui enregistre des
+    handlers Auth.on(...) sur les ressources assistants, threads et runs, ou,
+    pour un déploiement géré, s'appuyer sur LANGGRAPH_AUTH_TYPE=langsmith.
+    Ne jamais publier le port du conteneur langgraph-api sur une interface non
+    maîtrisée : sur `langgraph up`, remplacer la publication par défaut
+    « ports: ["8123:8000"] » par une liaison explicite (« 127.0.0.1:8123:8000 »)
+    ou la retirer et router le trafic via un reverse proxy qui authentifie ;
+    sur `langgraph dev`, ne jamais passer --host 0.0.0.0 hors d'un réseau de
+    confiance, malgré la commodité que cela offre pour un test partagé.
+    Après une exposition, considérer comme lus assistant_id, graph_id, config
+    et metadata de chaque assistant retourné, et vérifier dans les journaux
+    si POST /threads ou POST /threads/{thread_id}/runs a été appelé par un
+    tiers pendant la fenêtre d'exposition — la même absence de garde les
+    couvre, et c'est là que l'exécution du graphe, pas seulement sa lecture,
+    aurait eu lieu.
+  reference:
+    - https://docs.langchain.com/langgraph-platform/auth
+    - https://reference.langchain.com/python/langgraph-sdk/schema/AssistantBase
+    - https://pypi.org/project/langgraph-api/
+    - https://pypi.org/project/langgraph-runtime-inmem/
+    - https://pypi.org/project/langgraph-cli/
+    - https://docs.langchain.com/oss/python/langgraph/local-server
+    - https://docs.langchain.com/langsmith/deploy-standalone-server
+  metadata:
+    max-request: 2
+    vendor: langchain-ai
+    product: langgraph-api
+  tags: ai,llm,agents,langgraph,langchain-ai,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /ok emprunte un chemin de code disjoint de tout le reste — il est monté
+  # hors du Mount protégé, jamais derrière ConditionalAuthenticationMiddleware —
+  # et ne rend que { "ok": true } : générique à lui seul, mais il confirme que
+  # le processus qui répond est bien vivant, par un handler qui ne partage rien
+  # avec celui d'assistants/search.
+  #
+  # POST /assistants/search, corps {}, est le constat : search_assistants()
+  # n'a aucun champ requis dans AssistantSearchRequest, et register_graph()
+  # garantit qu'au moins un assistant « système » existe par graphe déclaré —
+  # la réponse à un corps vide n'est donc jamais un tableau vide sur une
+  # instance qui sert effectivement un agent.
+  #
+  # En lecture seule, et strictement : le même Mount sans garde sert POST
+  # /threads et POST /threads/{thread_id}/runs, qui exécuteraient le graphe que
+  # cette liste vient de nommer avec l'entrée de son choix. Signaler
+  # l'exposition ne demande d'en toucher aucun.
+  - raw:
+      - |
+        GET /ok HTTP/1.1
+        Host: {{Hostname}}
+      - |
+        POST /assistants/search HTTP/1.1
+        Host: {{Hostname}}
+        Content-Type: application/json
+
+        {}
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, /ok conclurait seul — or il ne
+    # dit rien du produit, seulement que le processus répond.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le health-check générique, littéral : ok() ne rend que ces deux
+          # mots-clés (langgraph_api/api/__init__.py), sans condition ni champ
+          # de plus lorsque check_db n'est pas demandé.
+          - 'status_code_1 == 200 && trim_space(body_1) == "{\"ok\":true}"'
+
+          # Le tableau d'Assistant, ancré à l'ouverture ("[" ) pour écarter un
+          # document composite qui l'envelopperait sous une clé à lui, et exigé
+          # sur six champs du TypedDict Assistant ensemble : assistant_id,
+          # graph_id, config, metadata, created_at et version forment un
+          # vocabulaire propre à LangGraph, que ni le protocole KServe ni aucune
+          # autre plateforme d'agents du pack ne partagent.
+          - 'status_code_2 == 200 && starts_with(trim_space(body_2), "[") && contains(body_2, "\"assistant_id\"") && contains(body_2, "\"graph_id\"") && contains(body_2, "\"config\"") && contains(body_2, "\"metadata\"") && contains(body_2, "\"created_at\"") && contains(body_2, "\"version\"")'
+
+    extractors:
+      # Le nom de chaque graphe agent que l'exploitant sert : c'est le premier
+      # renseignement qu'un tiers en tire, et ce qui désigne la cible d'un
+      # POST /threads/{thread_id}/runs ultérieur. Un seul extracteur, borné à
+      # body_2 : sous req-condition le moteur émet un résultat par extracteur
+      # qui rend quelque chose, et /ok n'a de toute façon rien à en extraire.
+      - type: json
+        part: body_2
+        name: graph_id
+        json:
+          - '.[].graph_id'

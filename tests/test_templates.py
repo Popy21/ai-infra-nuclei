@@ -13495,6 +13495,278 @@ def test_ragflow_extractors_report_both_settings():
     }, reported
 
 
+# --------------------------------------------------------------------------
+# LangGraph Server sert le tableau d'Assistant sans jamais dépendre de l'ordre
+# de ses clés : le backend en mémoire (langgraph-runtime-inmem, celui de
+# `langgraph dev`) et le backend Postgres/gRPC de production ne sont pas
+# documentés comme sérialisant dans le même ordre, et le template ne doit donc
+# reposer que sur la présence des six champs qui nomment le produit.
+
+LANGGRAPH_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "langgraph-server-unauthenticated.yaml")
+
+OK_ROUTE = "/ok"
+ASSISTANTS_SEARCH_ROUTE = "/assistants/search"
+
+
+def langgraph_assistant(assistant_id="9f6a3b2e-1c4d-4e9a-8b7f-2d5e6c1a0f3b",
+                        graph_id="agent", version=1, name=None,
+                        description=None, extra=None):
+    """Un objet Assistant tel que register_graph() en enregistre un par graphe
+    déclaré dans langgraph.json, avant même qu'un utilisateur n'en crée un."""
+    values = {
+        "assistant_id": assistant_id,
+        "graph_id": graph_id,
+        "config": {},
+        "context": {},
+        "metadata": {"created_by": "system"},
+        "name": name or graph_id,
+        "created_at": "2026-08-26T12:00:00+00:00",
+        "updated_at": "2026-08-26T12:00:00+00:00",
+        "version": version,
+        "description": description,
+    }
+    if extra:
+        values.update(extra)
+    return values
+
+
+def langgraph_search_body(assistants=None):
+    assistants = assistants if assistants is not None else [langgraph_assistant()]
+    return json.dumps(assistants, separators=(",", ":"))
+
+
+OK_BODY = '{"ok":true}'
+LANGGRAPH_SEARCH_BODY = langgraph_search_body()
+
+# Le backend Postgres/gRPC déclare les mêmes champs dans un ordre différent de
+# celui du backend en mémoire (langgraph_api/schema.py ne fixe qu'un TypedDict,
+# pas un ordre de sérialisation) : le template ne doit pas y être sensible.
+LANGGRAPH_SEARCH_REORDERED_BODY = json.dumps(
+    [{
+        "version": 1, "updated_at": "2026-08-26T12:00:00+00:00",
+        "metadata": {"created_by": "system"}, "created_at": "2026-08-26T12:00:00+00:00",
+        "context": {}, "config": {"configurable": {}}, "graph_id": "agent",
+        "assistant_id": "9f6a3b2e-1c4d-4e9a-8b7f-2d5e6c1a0f3b",
+        "name": "agent", "description": None,
+    }],
+    separators=(",", ":"),
+)
+
+# Le même corps relayé par un intermédiaire qui réindente ce que orjson sert
+# compact.
+LANGGRAPH_SEARCH_REFORMATTED_BODY = json.dumps(json.loads(LANGGRAPH_SEARCH_BODY), indent=2)
+
+# Plusieurs assistants, pour vérifier que le template ne dépend pas d'un
+# tableau à un seul élément.
+LANGGRAPH_SEARCH_MULTIPLE_BODY = langgraph_search_body([
+    langgraph_assistant(graph_id="agent"),
+    langgraph_assistant(assistant_id="1f2e3d4c-5b6a-4978-8899-aabbccddeeff",
+                        graph_id="chatbot", name="chatbot"),
+])
+
+# Une instance qui n'a jamais eu de graphe enregistré : le cas n'est censé
+# jamais se produire sur un serveur réellement configuré, register_graph()
+# enregistrant un assistant système au démarrage de chaque graphe déclaré.
+LANGGRAPH_EMPTY_SEARCH_BODY = "[]"
+
+# Un 401 renvoyé par un module d'autorisation personnalisé — le cas que la
+# remédiation demande de mettre en place, précisément ce que le template ne
+# doit pas signaler comme ouvert.
+LANGGRAPH_UNAUTHORIZED_BODY = '{"detail":"Unauthorized"}'
+
+# La charge utile entière, retrouvée au fond d'un document composite qu'une
+# supervision agrégerait sous une clé à elle.
+LANGGRAPH_COMPOSITE_BODY = '{"langgraph":%s,"checked_at":0}' % LANGGRAPH_SEARCH_BODY
+
+# Le vocabulaire de KServe v2 (Triton, MLServer) et d'autres API du pack :
+# aucune ne partage le trio assistant_id/graph_id/version sur ce chemin.
+OTHER_API_BODY = '{"name":"mlserver","version":"1.7.1","extensions":[]}'
+
+
+def langgraph_block():
+    doc = load(LANGGRAPH_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(ASSISTANTS_SEARCH_ROUTE in raw for raw in (b.get("raw") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {ASSISTANTS_SEARCH_ROUTE} — c'est "
+        "pourtant lui qui porte le tableau d'Assistant"
+    )
+    return blocks[0]
+
+
+def langgraph_requests():
+    """
+    (méthode, chemin) de chaque requête brute, dans l'ordre déclaré : c'est cet
+    ordre qui donne son numéro à chaque body_N.
+
+    Le bloc emploie `raw` et non `path` parce que les méthodes diffèrent — /ok
+    ne répond qu'en GET, /assistants/search exige un corps JSON que seul POST
+    porte.
+    """
+    out = []
+    for raw in langgraph_block().get("raw") or []:
+        start_line = raw.strip().splitlines()[0].split()
+        assert len(start_line) >= 2, f"requête brute illisible : {raw!r}"
+        out.append((start_line[0], start_line[1]))
+    return out
+
+
+def langgraph_responses(scenario):
+    ordered = []
+    for _, route in langgraph_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que LangGraph Server ne sert "
+            f"pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def langgraph_fires(ok=(200, OK_BODY), search=(200, LANGGRAPH_SEARCH_BODY)):
+    scenario = {OK_ROUTE: ok, ASSISTANTS_SEARCH_ROUTE: search}
+    block = langgraph_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = langgraph_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+               if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_langgraph_probe_reads_search_with_an_empty_body_and_touches_nothing_else():
+    assert langgraph_block().get("req-condition") is True, (
+        "le template ne lie pas les deux réponses : sans req-condition, ni "
+        "body_N ni status_code_N n'existent, et /ok — générique à lui seul — "
+        "conclurait de son côté"
+    )
+
+    assert langgraph_requests() == [
+        ("GET", OK_ROUTE), ("POST", ASSISTANTS_SEARCH_ROUTE),
+    ], (
+        "les deux requêtes ne sont plus celles que le template documente — "
+        f"{langgraph_requests()}"
+    )
+
+    for raw in langgraph_block().get("raw") or []:
+        method, route = raw.strip().splitlines()[0].split()[:2]
+        if route == ASSISTANTS_SEARCH_ROUTE:
+            body = raw.strip().split("\n\n", 1)[1].strip()
+            assert body == "{}", (
+                "AssistantSearchRequest n'a aucun champ requis : envoyer plus "
+                "qu'un corps vide ne prouverait rien de plus et risquerait de "
+                "filtrer la réponse (graph_id, name, metadata...)"
+            )
+        for forbidden, why in (
+            ("/threads",
+             "POST /threads puis /threads/{thread_id}/runs exécuteraient le "
+             "graphe que la liste vient de nommer — la même absence de garde "
+             "les couvre, mais signaler l'exposition ne demande d'en toucher "
+             "aucun"),
+            ("/runs",
+             "POST /runs ferait tourner un graphe en mode stateless sur "
+             "l'instance auditée"),
+            ("/assistants/{",
+             "PATCH et DELETE sur un assistant précis modifieraient ou "
+             "effaceraient une ressource de l'exploitant"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_langgraph_matcher_needs_six_assistant_fields_not_just_an_array():
+    assert langgraph_fires(), (
+        "le template ne reconnaît pas la réponse par défaut de "
+        "search_assistants() sur une instance dont l'exploitant n'a rien "
+        "changé"
+    )
+    assert langgraph_fires(search=(200, LANGGRAPH_SEARCH_REORDERED_BODY)), (
+        "le template dépend de l'ordre des clés de l'objet Assistant : rien "
+        "ne garantit que le backend Postgres/gRPC de production sérialise "
+        "dans le même ordre que le backend en mémoire de `langgraph dev`"
+    )
+    assert langgraph_fires(search=(200, LANGGRAPH_SEARCH_REFORMATTED_BODY)), (
+        "le template exige la sérialisation compacte d'orjson : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+    assert langgraph_fires(search=(200, LANGGRAPH_SEARCH_MULTIPLE_BODY)), (
+        "le template ne reconnaît qu'un tableau à un seul assistant, alors "
+        "qu'une instance qui sert plusieurs graphes en enregistre un par "
+        "graphe"
+    )
+
+    assert not langgraph_fires(ok=(200, '{"ok":false}')), (
+        'le template déclenche sur /ok sans exiger exactement "ok":true — '
+        "un corps quelconque du même processus ne prouve rien de plus"
+    )
+    assert not langgraph_fires(search=(200, LANGGRAPH_EMPTY_SEARCH_BODY)), (
+        "le template remonte une instance dont /assistants/search rend un "
+        "tableau vide : aucun graphe n'y est enregistré, et il n'y a rien à "
+        "divulguer — un cas que register_graph() ne produit jamais sur un "
+        "serveur réellement configuré"
+    )
+    assert not langgraph_fires(search=(401, LANGGRAPH_UNAUTHORIZED_BODY)), (
+        "le template déclenche sur le refus que rendrait un module "
+        "d'autorisation personnalisé — précisément la remédiation que le "
+        "template recommande"
+    )
+    assert not langgraph_fires(search=(200, LANGGRAPH_COMPOSITE_BODY)), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du tableau qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not langgraph_fires(search=(200, OTHER_API_BODY)), (
+        "le template déclenche sur le vocabulaire de KServe v2 (name/version/"
+        "extensions) — aucun autre produit du pack ne partage le trio "
+        "assistant_id/graph_id/version sur ce chemin"
+    )
+
+
+def test_langgraph_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Ni ok() ni search_assistants() n'ont de branche d'échec sur un corps
+    valide — le premier rend {"ok": true} sans condition, le second son
+    tableau, que Starlette ne peut sortir que sous un 200. Les deux
+    expressions du matcher DSL exigent déjà `status_code_N == 200` : il n'y a
+    pas de matcher `status` séparé à écarter, mais le format même de
+    l'exigence doit rester DSL, pas un raccourci sur le seul code.
+    """
+    block = langgraph_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_langgraph_extractor_reports_the_graph_id_not_the_uuid():
+    block = langgraph_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un tableau JSON : une expression regex n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — la réponse de /ok (body_1) "
+        "n'a rien à en tirer"
+    )
+    assert extractor.get("json") == [".[].graph_id"], (
+        "l'extracteur ne parcourt pas .[].graph_id — c'est pourtant le nom "
+        "du graphe agent, le premier renseignement qu'un tiers tire de la "
+        "liste, et ce qui désignerait la cible d'un run ultérieur"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
