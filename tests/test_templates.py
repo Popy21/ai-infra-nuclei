@@ -13273,6 +13273,228 @@ def test_metaflow_extractor_reports_the_exact_package_version():
     )
 
 
+# --------------------------------------------------------------------------
+# RAGFlow sert la même route de configuration sous deux implémentations
+# distinctes du serveur — Python (api/apps/restful_apis/system_api.py) et Go
+# (internal/handler+service/system.go) — qui n'accordent ni l'ordre des
+# clés (alphabétique côté Quart, déclaratif côté encoding/json, et les deux
+# ordres sont inverses l'un de l'autre) ni le type de registerEnabled (entier
+# 0/1 en Python, booléen strict en Go). Le template doit reconnaître les deux
+# sans jamais dépendre de leur ordre ou de leur forme commune.
+
+RAGFLOW_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "ragflow-config-exposed.yaml")
+
+
+def ragflow_config_body(register_enabled=1, disable_password_login=False,
+                        order=("disablePasswordLogin", "registerEnabled"),
+                        extra=None, message="success", code=0):
+    """
+    L'enveloppe que get_json_result() (Python) et le type response
+    (internal/common/http.go, Go) construisent tous deux — code, puis data,
+    puis message — avec data sérialisé dans l'ordre demandé, pour couvrir
+    aussi bien le tri alphabétique de Quart que l'ordre de déclaration de Go.
+    """
+    values = {"disablePasswordLogin": disable_password_login,
+              "registerEnabled": register_enabled}
+    if extra:
+        values.update(extra)
+    data = {key: values[key] for key in order}
+    return json.dumps({"code": code, "data": data, "message": message},
+                      separators=(",", ":"))
+
+
+# La forme par défaut du dépôt principal (Python, tri alphabétique de Quart) :
+# deux clés seulement, disablePasswordLogin avant registerEnabled.
+RAGFLOW_CONFIG_BODY = ragflow_config_body()
+
+# La forme observée sur une instance publique (fork "-mt") : un champ inséré
+# alphabétiquement entre les deux, ce qu'un ancrage sur leur adjacence
+# manquerait.
+RAGFLOW_CONFIG_WITH_EXTRA_FIELD_BODY = ragflow_config_body(
+    order=("disablePasswordLogin", "emailVerificationEnabled", "registerEnabled"),
+    extra={"emailVerificationEnabled": True})
+
+# La forme Go : ordre de déclaration du struct ConfigResponse
+# (registerEnabled puis disablePasswordLogin — l'inverse de l'ordre
+# alphabétique Python) et un booléen strict pour registerEnabled plutôt que
+# l'entier 0/1 que lit settings.REGISTER_ENABLED côté Python.
+RAGFLOW_CONFIG_GO_SHAPE_BODY = ragflow_config_body(
+    register_enabled=True, order=("registerEnabled", "disablePasswordLogin"))
+
+# L'inscription fermée et le mot de passe désactivé au sens de l'interface :
+# registerEnabled=0, disablePasswordLogin=true.
+RAGFLOW_CONFIG_SSO_ONLY_BODY = ragflow_config_body(
+    register_enabled=0, disable_password_login=True)
+
+# Le même corps relayé par un intermédiaire qui réindente ce que Quart sert
+# compact.
+RAGFLOW_CONFIG_REFORMATTED_BODY = json.dumps(json.loads(RAGFLOW_CONFIG_BODY), indent=2)
+
+# Le 404 de RAGFlow lui-même sur un chemin que le back-end ne connaît pas —
+# /v1/system/config sans le préfixe /api, par exemple : un code non nul, une
+# data nulle, jamais les deux réglages.
+RAGFLOW_NOT_FOUND_BODY = ('{"code":404,"data":null,"error":"Not Found",'
+                          '"message":"Not Found: /api/v1/system/config"}')
+
+# GET /system/version, servi par le même fichier et tout aussi dépourvu de
+# @login_required, mais dont le corps ne porte aucun vocabulaire propre à
+# RAGFlow : un entier de code, une chaîne de version, un message.
+RAGFLOW_VERSION_BODY = '{"code":0,"data":"v0.26.4","message":"success"}'
+
+# La même enveloppe générique (code/data/message, code=0, message="success"),
+# sans le couple de réglages propre à RAGFlow : ce n'est pas un fait rare,
+# get_json_result() est le format que toutes les routes du produit partagent.
+RAGFLOW_GENERIC_WRAPPER_BODY = '{"code":0,"data":{"id":"abc123"},"message":"success"}'
+
+# Chacun des deux réglages, retiré un à un d'un corps par ailleurs complet :
+# ce sont ensemble qu'ils nomment RAGFlow, jamais l'un sans l'autre.
+RAGFLOW_WITHOUT_REGISTER_ENABLED_BODY = json.dumps(
+    {"code": 0, "data": {"disablePasswordLogin": False}, "message": "success"},
+    separators=(",", ":"))
+RAGFLOW_WITHOUT_DISABLE_PASSWORD_LOGIN_BODY = json.dumps(
+    {"code": 0, "data": {"registerEnabled": 1}, "message": "success"},
+    separators=(",", ":"))
+
+# La charge utile entière, retrouvée au fond d'un document composite qu'une
+# supervision agrégerait sous une clé à elle.
+RAGFLOW_COMPOSITE_BODY = '{"ragflow":%s,"checked_at":0}' % RAGFLOW_CONFIG_BODY
+
+
+def ragflow_config_block():
+    doc = load(RAGFLOW_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/v1/system/config" in (b.get("path") or [])]
+    assert blocks, "le template ne vise pas GET /api/v1/system/config"
+    return blocks[0]
+
+
+def ragflow_fires(body):
+    block = ragflow_config_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_ragflow_probe_reads_the_bare_config_and_never_touches_registration():
+    doc = load(RAGFLOW_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "get_config() et GetConfig() se lisent en GET : le même fichier "
+            "porte POST /api/v1/users, gouverné par la même variable "
+            "REGISTER_ENABLED, et un template n'a pas à créer de compte sur "
+            "une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "/users" not in path and "/auth/login" not in path, (
+                f"{path} : la création de compte et la connexion sont "
+                "l'abus que le constat signale, pas ce qui l'établit"
+            )
+
+    assert ragflow_config_block().get("path") == ["{{BaseURL}}/api/v1/system/config"], (
+        "le constat tient à une seule lecture, sur le chemin que "
+        '@manager.route("/system/config") monte sous le préfixe /api/v1 — '
+        f"{ragflow_config_block().get('path')}"
+    )
+
+
+def test_ragflow_matcher_needs_both_settings_not_just_the_shared_envelope():
+    block = ragflow_config_block()
+    assert block.get("matchers-condition") == "and", (
+        "aucune des expressions ne nomme RAGFlow à elle seule : "
+        "l'enveloppe code/data/message est celle de toutes les routes du "
+        "produit, et chaque réglage pris seul est un nom de champ banal"
+    )
+
+    assert ragflow_fires(RAGFLOW_CONFIG_BODY), (
+        "le template ne reconnaît pas la forme par défaut du dépôt principal"
+    )
+    assert ragflow_fires(RAGFLOW_CONFIG_WITH_EXTRA_FIELD_BODY), (
+        "le template exige l'adjacence des deux réglages : un fork qui "
+        "insère un champ entre eux (observé sur une instance publique) "
+        "resterait alors méconnu"
+    )
+    assert ragflow_fires(RAGFLOW_CONFIG_GO_SHAPE_BODY), (
+        "le template manque l'implémentation Go du serveur : son struct "
+        "ConfigResponse déclare registerEnabled avant disablePasswordLogin "
+        "(l'ordre inverse du tri alphabétique de Quart) et sérialise "
+        "registerEnabled en booléen strict plutôt qu'en entier 0/1"
+    )
+    assert ragflow_fires(RAGFLOW_CONFIG_SSO_ONLY_BODY), (
+        "le template dépend de la valeur des réglages : l'instance qui "
+        "ferme l'inscription et cache le mot de passe est exposée au même "
+        "titre que celle qui les laisse ouverts"
+    )
+    assert ragflow_fires(RAGFLOW_CONFIG_REFORMATTED_BODY), (
+        "le template exige la sérialisation compacte de Quart : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    # Le même fichier, sans le vocabulaire du produit.
+    assert not ragflow_fires(RAGFLOW_NOT_FOUND_BODY), (
+        "le template déclenche sur le 404 générique de RAGFlow — code n'y "
+        "vaut jamais 0, et data y est toujours nulle"
+    )
+    assert not ragflow_fires(RAGFLOW_VERSION_BODY), (
+        "le template déclenche sur GET /system/version, tout aussi dépourvu "
+        "de @login_required mais dont le corps ne porte ni registerEnabled "
+        "ni disablePasswordLogin"
+    )
+    assert not ragflow_fires(RAGFLOW_GENERIC_WRAPPER_BODY), (
+        "le template déclenche sur la seule enveloppe code/data/message, "
+        "que get_json_result() applique à chaque route du produit — il lui "
+        "faut le couple de réglages propre à /system/config"
+    )
+    assert not ragflow_fires(RAGFLOW_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture de l'enveloppe qui dit "
+        "que l'instance a répondu d'elle-même"
+    )
+
+    # Les deux réglages, isolés un à un.
+    assert not ragflow_fires(RAGFLOW_WITHOUT_REGISTER_ENABLED_BODY), (
+        "le template ne dépend pas de registerEnabled : disablePasswordLogin "
+        "seul n'est pas un nom de champ propre à RAGFlow"
+    )
+    assert not ragflow_fires(RAGFLOW_WITHOUT_DISABLE_PASSWORD_LOGIN_BODY), (
+        "le template ne dépend pas de disablePasswordLogin : registerEnabled "
+        "seul est un nom de champ trop banal pour nommer le produit"
+    )
+
+
+def test_ragflow_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    get_config() et GetConfig() n'ont ni l'un ni l'autre de branche d'échec
+    sur cette route — ils recopient deux réglages du process sans jamais
+    lever — donc les deux ne peuvent rendre que 200. Exiger ce statut
+    n'écarterait rien de plus et ferait manquer l'instance dont un
+    intermédiaire réécrit le code retourné.
+    """
+    kinds = {m.get("type") for m in (ragflow_config_block().get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut alors qu'aucune des deux "
+        "implémentations n'a de branche d'échec sur cette route"
+    )
+
+
+def test_ragflow_extractors_report_both_settings():
+    extractors = ragflow_config_block().get("extractors") or []
+    assert len(extractors) == 2, (
+        "les deux réglages valent d'être remontés : registerEnabled "
+        "conditionne réellement POST /api/v1/users, et disablePasswordLogin "
+        "dit l'intention d'interface à vérifier séparément"
+    )
+    reported = {(e.get("name"), tuple(e.get("json") or [])) for e in extractors}
+    assert reported == {
+        ("register_enabled", (".data.registerEnabled",)),
+        ("disable_password_login", (".data.disablePasswordLogin",)),
+    }, reported
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

@@ -1,0 +1,222 @@
+id: ragflow-config-exposed
+
+info:
+  name: RAGFlow - Unauthenticated System Registration and SSO Configuration Exposure
+  author: popy21
+  severity: medium
+  description: |
+    RAGFlow monte son système d'authentification par décorateur, jamais par
+    middleware global : chaque route qui doit le vérifier porte
+    @login_required (api/apps/__init__.py), et ce décorateur enveloppe le
+    handler pour appeler _load_user(auth_types), qui lit l'en-tête
+    Authorization et retourne None quand aucun jeton JWT ni jeton d'API ne
+    valide — le handler n'est jamais atteint sans lui, et un
+    « quart.exceptions.Unauthorized » referme la route. Une route qui ne porte
+    pas ce décorateur ne vérifie donc rien du tout : ni en-tête, ni cookie, ni
+    session, puisque c'est le décorateur lui-même qui porte la seule
+    vérification que le module connaisse.
+    get_config() (api/apps/restful_apis/system_api.py) est déclaré
+    « @manager.route("/system/config", methods=["GET"]) » sans ce décorateur,
+    contrairement à ses voisins status() et token_list() qui le portent tous
+    les deux. Le handler ne lit ni la requête ni l'identité de l'appelant : il
+    rend littéralement « get_json_result(data={"registerEnabled":
+    settings.REGISTER_ENABLED, "disablePasswordLogin":
+    settings.DISABLE_PASSWORD_LOGIN}) ». get_json_result()
+    (api/utils/api_utils.py) enveloppe cela dans
+    « {"code": code, "message": message, "data": data} » avec
+    code=RetCode.SUCCESS (0 dans common/constants.py) et message="success" par
+    défaut, puis _safe_jsonify() le passe à jsonify() de Quart — qui sérialise
+    les clés dans l'ordre alphabétique, donc code, puis data, puis message au
+    premier niveau, et disablePasswordLogin avant registerEnabled à
+    l'intérieur de data.
+    version() et ping() du même fichier partagent l'absence de décorateur —
+    « @manager.route("/system/version") » rend get_ragflow_version() sous la
+    même enveloppe, « @manager.route("/system/ping") » rend simplement
+    "pong", 200 — tout comme healthz(), qui appelle run_health_checks() sans
+    aucune garde. Les quatre routes sont donc anonymes par construction, à la
+    différence de status(), oceanbase_status(), gaussdb_status() et des trois
+    verbes de /system/tokens, qui portent tous @login_required.
+    Le couple de clés que get_config() sérialise n'est pas seulement propre à
+    RAGFlow : sa forme même trahit quelle implémentation du serveur répond.
+    Le projet porte aujourd'hui une deuxième implémentation de cette même
+    route en Go (internal/handler/system.go, internal/service/system.go) :
+    ConfigResponse y déclare « EnableRegister bool
+    `json:"registerEnabled"` » avant « DisablePasswordLogin bool
+    `json:"disablePasswordLogin"` », et encoding/json sérialise dans l'ordre
+    de déclaration — l'inverse exact de l'ordre alphabétique que Quart
+    applique côté Python. registerEnabled change même de type entre les deux :
+    un entier 0/1 en Python (« int(os.environ.get("REGISTER_ENABLED", "1")) »
+    dans common/settings.py), un booléen strict en Go. Un template qui exigerait
+    un ordre ou un type fixe manquerait la moitié des instances réellement
+    déployées ; router.go (internal/router/router.go) confirme d'ailleurs la
+    même faille sur cette implémentation : « apiNoAuth.GET("/system/config",
+    ...) » est enregistré dans le groupe apiNoAuth aux côtés de /system/ping,
+    /system/version et /system/healthz, tandis que /system/status et
+    /system/tokens vivent sous « authorized.Use(r.authHandler.AuthMiddleware()) ».
+    Le défaut de liaison ajoute sa part : docker/service_conf.yaml.template
+    pose « host: ${RAGFLOW_HOST:-0.0.0.0} » pour le service ragflow, et le
+    nginx du conteneur web (docker/nginx/ragflow.conf.python) relaie tout
+    chemin qui commence par /v1 ou /api vers ce service — « location ~
+    ^/(v1|api) { proxy_pass http://127.0.0.1:9380; } » — donc /api/v1/system/config
+    répond identiquement que l'on atteigne le port 80 (web) ou le port 9380
+    (API) exposés par le compose officiel.
+  impact: |
+    registerEnabled dit à l'anonyme, avant qu'il n'essaie quoi que ce soit, si
+    « POST /api/v1/users » — la création de compte, elle aussi dépourvue de
+    @login_required — va aboutir : user_add() (api/apps/restful_apis/user_api.py)
+    ouvre sur « if not settings.REGISTER_ENABLED: return get_json_result(...,
+    code=RetCode.OPERATING_ERROR) », donc la même valeur que /system/config
+    vient d'annoncer conditionne littéralement ce chemin. Sur une instance où
+    l'inscription est ouverte, quiconque lit ce champ sait qu'il peut se créer
+    un compte, obtenir son propre tenant et — selon la configuration des LLM
+    par défaut de l'exploitant — faire tourner des complétions à ses frais
+    sans qu'aucune barrière n'ait eu besoin d'être franchie.
+    disablePasswordLogin, lui, ne gouverne aucune route côté serveur : aucune
+    recherche dans le dépôt (Python comme Go) ne fait dépendre /auth/login
+    (ou son équivalent LoginByEmail) de ce réglage. Sa seule consommation est
+    web/src/pages/login-next/index.tsx, où le champ masque le formulaire de mot
+    de passe et l'écran d'inscription côté front — « {!disablePasswordLogin &&
+    (<Form ...>...) } ». Une instance qui déclare disablePasswordLogin=true dit
+    donc à l'anonyme qu'elle est censée fonctionner en SSO seul, sans que
+    l'authentification par mot de passe soit réellement coupée sur l'API : le
+    champ décrit une intention d'interface, pas un contrôle d'accès, et c'est
+    précisément ce que l'exploitant qui la lit doit vérifier lui-même avant de
+    s'y fier.
+    Le fait même que la route réponde à l'anonyme confirme aussi l'ouverture de
+    /system/version, /system/ping et /system/healthz — le même fichier, la même
+    absence de décorateur — et donc que la version exacte de l'instance
+    (get_ragflow_version(), le tag « v<major>.<minor>.<patch> » ou le résultat
+    de « git describe ») est disponible sans compte pour quiconque veut dater
+    l'installation et confronter cette date aux avis de sécurité du dépôt.
+  remediation: |
+    Il n'y a pas de réglage à activer sur ces quatre routes : ni get_config(),
+    ni version(), ni ping(), ni healthz() ne portent de logique
+    d'authentification à débloquer, et leur équivalent Go les enregistre
+    explicitement dans le groupe apiNoAuth du routeur — c'est un choix de
+    conception assumé par le produit, documenté nulle part comme
+    optionnel. La fermeture passe par ce qui entoure l'application.
+    Ne pas publier le port 9380 (SVR_HTTP_PORT) ni le port 80/443 du service
+    web sur une interface non maîtrisée sans un filtrage en amont : host vaut
+    « 0.0.0.0 » par défaut dans docker/service_conf.yaml.template, et le nginx
+    livré relaie tout /v1 et /api sans distinction vers le backend. Quand
+    l'instance doit rester atteignable de l'extérieur, placer un reverse proxy
+    qui authentifie a minima /api/v1/system/config, /api/v1/system/version et
+    /api/v1/users — ce dernier étant la route que registerEnabled annonce.
+    Poser REGISTER_ENABLED=0 (ou la variable d'environnement équivalente côté
+    Go) dès que l'auto-inscription n'est pas un besoin réel du déploiement :
+    c'est le seul réglage qui retire vraiment une capacité, contrairement à
+    disablePasswordLogin qui ne retire qu'un formulaire côté client. Si le
+    déploiement doit rester en SSO seul, vérifier séparément que /auth/login
+    est lui-même fermé ou redirigé côté proxy, puisque le drapeau ne le fait
+    pas à sa place.
+    Après une exposition, considérer comme lu : la politique d'inscription et
+    de connexion de l'instance, et sa version exacte via /system/version — et,
+    si registerEnabled valait vrai, vérifier les comptes créés depuis dans la
+    table utilisateur, puisqu'un compte auto-inscrit a pu être ouvert par
+    n'importe qui pendant toute la fenêtre d'exposition.
+  reference:
+    - https://github.com/infiniflow/ragflow/blob/main/api/apps/restful_apis/system_api.py
+    - https://github.com/infiniflow/ragflow/blob/main/api/apps/__init__.py
+    - https://github.com/infiniflow/ragflow/blob/main/api/apps/restful_apis/user_api.py
+    - https://github.com/infiniflow/ragflow/blob/main/common/settings.py
+    - https://github.com/infiniflow/ragflow/blob/main/common/constants.py
+    - https://github.com/infiniflow/ragflow/blob/main/internal/router/router.go
+    - https://github.com/infiniflow/ragflow/blob/main/internal/handler/system.go
+    - https://github.com/infiniflow/ragflow/blob/main/internal/service/system.go
+    - https://github.com/infiniflow/ragflow/blob/main/internal/common/http.go
+    - https://github.com/infiniflow/ragflow/blob/main/docker/nginx/ragflow.conf.python
+    - https://github.com/infiniflow/ragflow/blob/main/docker/service_conf.yaml.template
+  metadata:
+    max-request: 1
+    vendor: infiniflow
+    product: ragflow
+  tags: ai,llm,rag,ragflow,infiniflow,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture. get_config() (Python) et GetConfig() (Go) ne consultent
+  # ni la requête ni l'identité de l'appelant — ils recopient deux réglages du
+  # process — donc rien de plus intrusif n'apprendrait davantage sur l'absence
+  # de garde. GET /api/v1/system/version dirait la même chose (aucun
+  # décorateur non plus), mais son corps — un entier de code, une chaîne de
+  # version, un message — ne porte aucun vocabulaire propre à RAGFlow : il
+  # confirmerait un produit déjà signalé, il ne le signalerait pas seul.
+  #
+  # En lecture seule, et strictement. Le même fichier, sans plus de garde,
+  # porte POST /api/v1/users (création de compte, gouvernée par la même
+  # variable REGISTER_ENABLED que ce template lit) : le signaler ne demande
+  # pas de le déclencher.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/system/config"
+
+    matchers-condition: and
+    matchers:
+      # L'enveloppe que get_json_result() (Python) et le type response
+      # (internal/common/http.go, en Go) construisent tous deux : code avant
+      # data, en tête de document. C'est un fait des deux implémentations, pas
+      # une convention de sérialisation qu'un intermédiaire pourrait changer
+      # sans y toucher — Quart trie ses clés alphabétiquement (code < data <
+      # message) et Go marshale dans l'ordre de déclaration du struct
+      # (Code, Data, Message), qui est le même ordre par construction.
+      # code=0 est RetCode.SUCCESS côté Python comme CodeSuccess côté Go : la
+      # seule valeur qu'une réponse sans erreur puisse porter ici, puisque
+      # aucune des deux implémentations n'a de branche d'échec sur cette route.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"code"\s*:\s*0\s*,\s*"data"\s*:\s*\{'
+
+      # Les deux réglages eux-mêmes, chacun sur sa propre expression et sans
+      # exiger d'adjacence entre eux : l'ordre s'inverse d'une implémentation à
+      # l'autre (alphabétique en Python, déclaratif en Go), et un fork du
+      # produit peut insérer un champ entre les deux — c'est le cas observé
+      # sur une instance publique, qui insère emailVerificationEnabled entre
+      # disablePasswordLogin et registerEnabled.
+      #
+      # registerEnabled accepte quatre écritures parce que le champ change de
+      # type selon l'implémentation : un entier 0/1 en Python
+      # (settings.REGISTER_ENABLED, lu par « int(os.environ.get(...)) » dans
+      # common/settings.py) et un booléen strict en Go (ConfigResponse.EnableRegister
+      # bool, internal/service/system.go). Une expression qui n'accepterait
+      # qu'une forme manquerait la moitié des instances réellement déployées.
+      - type: regex
+        part: body
+        regex:
+          - '"registerEnabled"\s*:\s*(?:true|false|0|1)\b'
+
+      # disablePasswordLogin, lui, est déclaré bool des deux côtés
+      # (settings.DISABLE_PASSWORD_LOGIN en Python, ConfigResponse.DisablePasswordLogin
+      # en Go) : une seule forme suffit.
+      - type: regex
+        part: body
+        regex:
+          - '"disablePasswordLogin"\s*:\s*(?:true|false)\b'
+
+      # Le message littéral que get_json_result() écrit par défaut
+      # (message="success") et que SuccessWithData() écrit en dur côté Go
+      # (« common.SuccessWithData(c, config, "success") ») : les deux
+      # implémentations n'en écrivent jamais d'autre sur cette route, qui n'a
+      # pas de branche d'erreur.
+      - type: regex
+        part: body
+        regex:
+          - '"message"\s*:\s*"success"'
+
+    extractors:
+      # Le réglage qui conditionne réellement une capacité serveur : POST
+      # /api/v1/users (création de compte) s'arrête net sur
+      # « if not settings.REGISTER_ENABLED » quand il vaut faux ou 0.
+      - type: json
+        part: body
+        name: register_enabled
+        json:
+          - '.data.registerEnabled'
+
+      # Le réglage qui ne masque qu'un formulaire côté client : à confirmer
+      # séparément si l'exploitant compte réellement sur lui pour fermer
+      # l'authentification par mot de passe.
+      - type: json
+        part: body
+        name: disable_password_login
+        json:
+          - '.data.disablePasswordLogin'
