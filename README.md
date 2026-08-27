@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-55 templates, 52 produits.
+56 templates, 53 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -74,6 +74,7 @@ amont.
 | ollama | [`ollama-model-pull-abuse`](templates/exposure/ollama-model-pull-abuse.yaml) | high |
 | ollama | [`ollama-unauthenticated-api`](templates/exposure/ollama-unauthenticated-api.yaml) | high |
 | open-webui | [`open-webui-signup-enabled`](templates/exposure/open-webui-signup-enabled.yaml) | medium |
+| optuna-dashboard | [`optuna-dashboard-exposed`](templates/exposure/optuna-dashboard-exposed.yaml) | high |
 | phoenix | [`arize-phoenix-exposed`](templates/exposure/arize-phoenix-exposed.yaml) | high |
 | prefect | [`prefect-server-admin-exposed`](templates/exposure/prefect-server-admin-exposed.yaml) | high |
 | qdrant | [`qdrant-no-api-key`](templates/exposure/qdrant-no-api-key.yaml) | high |

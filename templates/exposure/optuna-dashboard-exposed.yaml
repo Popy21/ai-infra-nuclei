@@ -1,0 +1,211 @@
+id: optuna-dashboard-exposed
+
+info:
+  name: Optuna Dashboard - Unauthenticated Study Inventory and Control API
+  author: popy21
+  severity: high
+  description: |
+    Optuna Dashboard est le tableau de bord web des études d'optimisation
+    d'hyperparamètres d'Optuna : il se branche sur le storage (RDBStorage
+    PostgreSQL/MySQL/SQLite, ou JournalStorage) que les scripts d'entraînement
+    écrivent, et en rend le contenu dans une SPA. create_app()
+    (optuna_dashboard/_app.py) construit « app = Bottle() » et n'y installe
+    aucun greffon d'authentification : le seul crochet posé sur l'application
+    est « @app.hook("before_request") » / remove_trailing_slashes_hook(), qui
+    réécrit PATH_INFO pour en retirer la barre finale et ne lit ni en-tête ni
+    cookie. Aucune des routes déclarées ensuite ne porte de décorateur de
+    contrôle non plus : chacune n'empile que le verbe (@app.get, @app.post,
+    @app.put, @app.delete) et @json_api_view, et ce dernier
+    (optuna_dashboard/_bottle_util.py) se borne à poser
+    « response.content_type = "application/json" », à appeler la vue et à
+    convertir une exception en 500 — il ne consulte jamais l'identité de
+    l'appelant. Le paquet ne contient d'ailleurs aucun module
+    d'authentification, et les neuf champs de DashboardConfig
+    (optuna_dashboard/_config.py : storage, storage_class, port, host, server,
+    artifact_dir, quiet, allow_unsafe) n'en offrent aucun réglage.
+    GET /api/studies (list_studies()) appelle get_studies(storage)
+    (optuna_dashboard/_storage.py), qui rend « storage.get_all_studies() »
+    sans le moindre filtre — ni pagination, ni paramètre à deviner — puis
+    sérialise chaque entrée par serialize_frozen_study() et rend
+    « {"study_summaries": serialized} ». La clé racine est unique et propre au
+    produit : le code lui-même la juge mal nommée et se propose de la renommer
+    en « studies » dans une note de travail laissée dans le fichier.
+    serialize_frozen_study() (optuna_dashboard/_serializer.py) construit
+    exactement cinq clés, dans cet ordre : study_id (l'entier interne
+    _study_id), study_name, directions (« [d.name.lower() for d in
+    study.directions] », donc les membres de StudyDirection en minuscules —
+    minimize, maximize, not_set), user_attrs (serialize_attrs(), un tableau de
+    {"key", "value"}) et is_preferential (le drapeau système du mode
+    human-in-the-loop préférentiel).
+    Le corps n'est pas sérialisé par la vue mais par le greffon JSON que
+    Bottle installe par défaut : JSONPlugin.apply() appelle « json_dumps(rv) »
+    sur le dictionnaire rendu. Or bottle.py importe ce json_dumps de ujson
+    quand ce paquet est présent et retombe sur json.dumps sinon — la première
+    écriture est compacte, la seconde insère une espace après chaque « : » et
+    chaque « , ». Deux instances de la même version de Optuna Dashboard ne
+    rendent donc pas les mêmes octets, et aucune expression ne peut dépendre
+    de l'espacement.
+    La route et la clé racine sont stables depuis longtemps, mais la forme de
+    chaque entrée a changé une fois : is_preferential n'apparaît qu'à partir
+    de la 0.13.0, et jusqu'à la 0.12.0 serialize_study_summary() rendait à sa
+    place « system_attrs » (plus « datetime_start » lorsqu'il était
+    renseigné). study_id, study_name, directions et user_attrs, eux, sont déjà
+    ceux-là depuis la 0.9.0 — ce sont les instances anciennes qui traînent
+    exposées, et le constat doit tenir sur les deux formes.
+  impact: |
+    L'inventaire n'est pas qu'une liste de noms : study_name porte
+    généralement le nom du projet, du modèle ou du client pour lequel
+    l'optimisation tourne, directions dit ce qui est optimisé et combien
+    d'objectifs, et user_attrs rend les métadonnées arbitraires que le
+    chercheur a attachées à l'étude — commit, jeu de données, identifiant
+    d'expérience interne.
+    study_id est surtout la clé d'adressage de tout le reste de l'API, servie
+    par le même Bottle sans garde. GET /api/studies/{study_id} rend le détail
+    complet — chaque essai, ses paramètres, ses valeurs objectives, ses
+    attributs et ses notes — et GET /csv/{study_id} en exporte la même matière
+    en CSV. register_artifact_route() (optuna_dashboard/artifact/_backend.py)
+    monte par ailleurs GET /artifacts/{study_id}/{artifact_id} et
+    GET /artifacts/{study_id}/{trial_id}/{artifact_id}, qui servent les
+    fichiers d'artefacts eux-mêmes.
+    Les routes en écriture sont ouvertes au même titre, et c'est là que
+    l'exposition cesse d'être une simple divulgation. POST
+    /api/trials/{trial_id}/tell appelle « storage.set_trial_state_values(
+    trial_id, state, values) » : un tiers fixe l'état et les valeurs
+    objectives d'un essai, donc réoriente le sampler et le « meilleur » essai
+    que l'exploitant retiendra, sans que rien ne ressemble à une intrusion
+    dans les résultats. POST /api/trials/{trial_id}/user-attrs, POST
+    /api/studies/{study_id}/rename et les routes de notes altèrent le reste ;
+    DELETE /api/studies/{study_id} supprime l'étude, et emporte avec elle les
+    artefacts associés par delete_all_artifacts() lorsqu'un artifact store est
+    configuré et que le corps ne demande pas explicitement le contraire.
+    Le défaut de publication réseau va dans le même sens. La ligne de commande
+    lie 127.0.0.1 (DashboardConfig.host), mais l'image Docker officielle force
+    l'inverse dans son ENTRYPOINT : « optuna-dashboard --port 8080 --host
+    0.0.0.0 --server gunicorn » (Dockerfile, EXPOSE 8080). Une instance lancée
+    par cette image écoute donc sur toutes les interfaces sans qu'aucun
+    réglage n'ait été touché.
+  remediation: |
+    Il n'y a rien à activer côté produit : DashboardConfig n'a pas de champ
+    d'authentification, aucune route ne porte de décorateur de contrôle, et le
+    paquet ne fournit ni jeton ni compte. La fermeture ne peut venir que de ce
+    qui entoure le processus — monter l'application WSGI que rend
+    optuna_dashboard.wsgi() dans un serveur (Gunicorn, uWSGI) placé derrière
+    un reverse proxy qui exige une identité sur la totalité du site, et non
+    sur les seules routes /api/ : la SPA, les artefacts et l'export CSV sont
+    servis par le même Bottle.
+    Ne pas publier le port 8080 de l'image officielle sur un réseau non
+    maîtrisé : son ENTRYPOINT impose « --host 0.0.0.0 », donc la restriction
+    doit être posée à la publication (liaison explicite « 127.0.0.1:8080:8080 »
+    côté Docker, règle de pare-feu, ou Service Kubernetes de type ClusterIP
+    derrière un ingress qui authentifie). En ligne de commande, garder le
+    défaut host 127.0.0.1 et atteindre le tableau de bord par un tunnel SSH.
+    Après une exposition, tenir pour lus l'inventaire des études, le détail de
+    leurs essais et les artefacts qu'elles portent. Vérifier surtout dans les
+    journaux si POST /api/trials/{trial_id}/tell, POST
+    /api/studies/{study_id}/rename, DELETE /api/studies/{study_id} ou une
+    route /api/artifacts/ ont été appelés pendant la fenêtre d'exposition :
+    c'est l'intégrité des résultats de tuning, et pas seulement leur
+    confidentialité, qui est alors en cause.
+  reference:
+    - https://github.com/optuna/optuna-dashboard/blob/main/optuna_dashboard/_app.py
+    - https://github.com/optuna/optuna-dashboard/blob/main/optuna_dashboard/_serializer.py
+    - https://github.com/optuna/optuna-dashboard/blob/main/optuna_dashboard/_bottle_util.py
+    - https://github.com/optuna/optuna-dashboard/blob/main/optuna_dashboard/_storage.py
+    - https://github.com/optuna/optuna-dashboard/blob/main/optuna_dashboard/_config.py
+    - https://github.com/optuna/optuna-dashboard/blob/main/optuna_dashboard/artifact/_backend.py
+    - https://github.com/optuna/optuna-dashboard/blob/main/Dockerfile
+    - https://github.com/optuna/optuna-dashboard/blob/v0.12.0/optuna_dashboard/_serializer.py
+    - https://github.com/bottlepy/bottle/blob/master/bottle.py
+    - https://optuna-dashboard.readthedocs.io/en/latest/getting-started.html
+    - https://optuna-dashboard.readthedocs.io/en/latest/api.html
+    - https://pypi.org/project/optuna-dashboard/
+  metadata:
+    max-request: 1
+    vendor: optuna
+    product: optuna-dashboard
+  tags: ai,ml,mlops,optuna,optuna-dashboard,hyperparameter,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route qui porte le constat. list_studies() ne lit
+  # ni la requête ni l'identité de l'appelant — il recopie
+  # storage.get_all_studies() — donc rien de plus intrusif n'apprendrait
+  # davantage sur l'absence de garde. GET /api/meta, servi par le même Bottle
+  # et tout aussi ouvert, dirait seulement que quatre capacités sont activées
+  # ou non : il corroborerait un produit déjà signalé, il ne le signalerait pas
+  # seul.
+  #
+  # En lecture seule, et strictement. Le même Bottle sans garde sert POST
+  # /api/trials/{trial_id}/tell, qui fixerait l'état et les valeurs objectives
+  # d'un essai, DELETE /api/studies/{study_id}, qui supprimerait l'étude et ses
+  # artefacts, et GET /artifacts/{study_id}/{artifact_id}, qui servirait les
+  # fichiers eux-mêmes. Signaler l'exposition ne demande d'en toucher aucune.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/studies"
+
+    matchers-condition: and
+    matchers:
+      # La clé racine, ancrée à l'ouverture du document. L'ancrage dit trois
+      # choses à la fois : que l'instance a répondu d'elle-même et non au fond
+      # d'un document composite qu'une supervision agrégerait, que la clé est
+      # bien la seule que list_studies() rende, et que le tableau porte au
+      # moins une étude — un inventaire vide ne divulgue rien et n'a pas à être
+      # signalé. Les \s* sont là parce que le greffon JSON de Bottle sérialise
+      # par ujson (compact) ou par json.dumps (une espace après chaque « : » et
+      # chaque « , ») selon que ujson est installé ou non : aucune expression ne
+      # peut dépendre de l'espacement.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"study_summaries"\s*:\s*\[\s*\{'
+
+      # L'identifiant interne de l'étude, entier par construction
+      # (summary._study_id). C'est la moitié la plus utile du constat : la clé
+      # d'adressage de GET /api/studies/{study_id}, de /csv/{study_id} et des
+      # routes en écriture.
+      - type: regex
+        part: body
+        regex:
+          - '"study_id"\s*:\s*\d+'
+
+      # Les directions d'optimisation, bornées aux trois membres de
+      # StudyDirection tels que « d.name.lower() » les écrit. Les nommer plutôt
+      # que d'accepter n'importe quelle chaîne écarte un tableau de directions
+      # qui n'aurait rien à voir, sans risquer de manquer une instance :
+      # l'énumération n'en compte pas d'autre.
+      - type: regex
+        part: body
+        regex:
+          - '"directions"\s*:\s*\[\s*"(?:minimize|maximize|not_set)"'
+
+      # Le champ qui distingue la forme actuelle de celle d'avant la 0.13.0, et
+      # les deux écritures sont admises parce que ce sont deux versions du même
+      # produit : is_preferential depuis la 0.13.0, system_attrs (un tableau,
+      # rendu par serialize_attrs()) jusqu'à la 0.12.0. N'exiger que la première
+      # ferait manquer les instances anciennes, précisément celles qui traînent
+      # exposées. Sans adjacence avec ce qui précède : l'ordre des clés est
+      # celui du dictionnaire Python, mais une version future peut en insérer
+      # une entre deux.
+      - type: regex
+        part: body
+        regex:
+          - '"is_preferential"\s*:\s*(?:true|false)'
+          - '"system_attrs"\s*:\s*\['
+
+    extractors:
+      # Le nom de chaque étude servie : c'est ce que l'exposition divulgue en
+      # premier, et il porte généralement le projet, le modèle ou le client
+      # pour lequel l'optimisation tourne.
+      - type: json
+        part: body
+        name: study_name
+        json:
+          - '.study_summaries[].study_name'
+
+      # L'identifiant qui adresse tout le reste — détail des essais, export
+      # CSV, artefacts, et les routes en écriture du même Bottle sans garde.
+      - type: json
+        part: body
+        name: study_id
+        json:
+          - '.study_summaries[].study_id'

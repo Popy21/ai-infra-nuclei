@@ -14081,6 +14081,301 @@ def test_flyteadmin_extractor_reports_the_project_identifiers():
     )
 
 
+# --------------------------------------------------------------------------
+# Optuna Dashboard rend le même document sous deux écritures et sous deux
+# formes, et le template doit tenir sur les deux axes à la fois.
+#
+# L'écriture d'abord : la vue ne sérialise rien, elle rend un dictionnaire, et
+# c'est le greffon JSON que Bottle installe par défaut qui appelle
+# « json_dumps(rv) » (bottle.py, JSONPlugin.apply). Or bottle.py importe ce
+# json_dumps de ujson quand ce paquet est présent — sortie compacte — et
+# retombe sur json.dumps sinon, qui insère une espace après chaque « : » et
+# chaque « , ». Deux instances de la même version ne rendent donc pas les mêmes
+# octets.
+#
+# La forme ensuite : serialize_frozen_study() rend study_id, study_name,
+# directions, user_attrs et is_preferential, mais ce dernier champ n'existe que
+# depuis la 0.13.0. Jusqu'à la 0.12.0, serialize_study_summary() rendait à sa
+# place system_attrs, et datetime_start quand il était renseigné. Un template
+# qui n'exigerait que la forme récente manquerait précisément les instances
+# anciennes, celles qui traînent exposées.
+
+OPTUNA_DASHBOARD_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                         "optuna-dashboard-exposed.yaml")
+
+
+def optuna_study_summary(study_id=1, study_name="quadratic-simple",
+                         directions=("minimize",), user_attrs=None,
+                         is_preferential=False):
+    """
+    Une entrée telle que serialize_frozen_study() la construit depuis la
+    0.13.0 : cinq clés, dans l'ordre du dictionnaire Python.
+    """
+    return {
+        "study_id": study_id,
+        "study_name": study_name,
+        "directions": list(directions),
+        "user_attrs": list(user_attrs or []),
+        "is_preferential": is_preferential,
+    }
+
+
+def optuna_legacy_study_summary(study_id=1, study_name="quadratic-simple",
+                                directions=("minimize",)):
+    """
+    La même entrée telle que serialize_study_summary() la rendait jusqu'à la
+    0.12.0 : system_attrs à la place d'is_preferential, et datetime_start
+    lorsque le résumé le portait.
+    """
+    return {
+        "study_id": study_id,
+        "study_name": study_name,
+        "directions": list(directions),
+        "user_attrs": [],
+        "system_attrs": [],
+        "datetime_start": "2026-08-26T12:00:00",
+    }
+
+
+def optuna_studies_body(summaries=None, compact=False, indent=None):
+    """
+    `compact` est la sortie d'ujson, le défaut sans argument celle de
+    json.dumps — les deux écritures que le greffon JSON de Bottle produit selon
+    que ujson est installé ou non.
+    """
+    if summaries is None:
+        summaries = [optuna_study_summary()]
+    document = {"study_summaries": list(summaries)}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    if compact:
+        return json.dumps(document, separators=(",", ":"))
+    return json.dumps(document)
+
+
+# La réponse par défaut d'une instance qui sert une étude, sous les deux
+# écritures du greffon JSON.
+OPTUNA_STUDIES_BODY = optuna_studies_body()
+OPTUNA_STUDIES_COMPACT_BODY = optuna_studies_body(compact=True)
+
+# Le même corps relayé par un intermédiaire qui réindente ce qu'il relaie.
+OPTUNA_STUDIES_REFORMATTED_BODY = optuna_studies_body(indent=2)
+
+# get_all_studies() ne filtre ni ne pagine : une requête nue rend tout
+# l'inventaire, en multi-objectif comme en mode préférentiel, avec les
+# métadonnées que le chercheur a attachées.
+OPTUNA_STUDIES_MULTIPLE_BODY = optuna_studies_body([
+    optuna_study_summary(),
+    optuna_study_summary(2, "pricing-model-v3", ("minimize", "maximize"),
+                         [{"key": "dataset", "value": "s3://internal/train"}]),
+    optuna_study_summary(3, "human-feedback", is_preferential=True),
+])
+
+# La forme d'avant la 0.13.0, celle des instances anciennes.
+OPTUNA_LEGACY_STUDIES_BODY = optuna_studies_body([optuna_legacy_study_summary()])
+
+# Une étude enregistrée sans direction : StudyDirection.NOT_SET s'écrit
+# "not_set" sous « d.name.lower() » comme les deux autres membres.
+OPTUNA_STUDIES_NOT_SET_BODY = optuna_studies_body(
+    [optuna_study_summary(directions=("not_set",))])
+
+# Une instance sur laquelle aucune étude n'a été enregistrée : rien n'y est
+# divulgué.
+OPTUNA_EMPTY_INVENTORY_BODY = '{"study_summaries":[]}'
+
+# La charge utile entière, retrouvée au fond d'un document composite qu'une
+# supervision agrégerait sous une clé à elle.
+OPTUNA_COMPOSITE_BODY = '{"optuna":%s,"checked_at":0}' % OPTUNA_STUDIES_COMPACT_BODY
+
+# GET /api/meta, servi par le même Bottle et tout aussi dépourvu de garde, mais
+# dont le corps ne dit rien de ce qui est divulgué : quatre drapeaux de
+# capacité.
+OPTUNA_META_BODY = ('{"artifact_is_available":false,"llm_is_available":false,'
+                    '"plotlypy_is_available":true,"allow_unsafe":false}')
+
+# GET /api/studies/{study_id}, le détail d'une seule étude : il porte bien
+# directions et user_attrs, mais pas la clé racine de l'inventaire — c'est
+# l'énumération qui est le constat, pas la lecture d'une étude nommée.
+OPTUNA_STUDY_DETAIL_BODY = (
+    '{"name":"quadratic-simple","directions":["minimize"],"user_attrs":[],'
+    '"trials":[],"best_trials":[],"has_intermediate_values":false}'
+)
+
+# Une autre plateforme de suivi d'expériences servant son propre inventaire :
+# même intention, aucun des noms de champ d'Optuna.
+OTHER_EXPERIMENT_LIST_BODY = (
+    '{"experiments":[{"experiment_id":"1","name":"quadratic-simple",'
+    '"lifecycle_stage":"active"}]}'
+)
+
+
+def optuna_dashboard_block():
+    doc = load(OPTUNA_DASHBOARD_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/studies" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/studies — c'est pourtant lui qui "
+        "porte l'inventaire des études"
+    )
+    return blocks[0]
+
+
+def optuna_dashboard_fires(body):
+    block = optuna_dashboard_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_optuna_dashboard_probe_reads_the_inventory_and_never_writes():
+    doc = load(OPTUNA_DASHBOARD_TEMPLATE)
+
+    assert optuna_dashboard_block().get("path") == ["{{BaseURL}}/api/studies"], (
+        "le constat tient à une seule lecture, sur la route que "
+        '@app.get("/api/studies") monte — '
+        f"{optuna_dashboard_block().get('path')}"
+    )
+
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", (
+            f"{method} {route} : le même Bottle sans garde sert des routes en "
+            "écriture, et aucune n'est nécessaire pour signaler l'exposition"
+        )
+        for forbidden, why in (
+            ("/tell",
+             "POST /api/trials/{trial_id}/tell fixerait l'état et les valeurs "
+             "objectives d'un essai, donc fausserait l'expérience de tuning "
+             "que le template vient signaler"),
+            ("/user-attrs",
+             "POST /api/trials/{trial_id}/user-attrs écrirait dans les "
+             "métadonnées de l'exploitant"),
+            ("/rename",
+             "POST /api/studies/{study_id}/rename recrée l'étude sous un "
+             "autre nom et supprime l'originale"),
+            ("/artifacts",
+             "les routes d'artefacts servent les fichiers eux-mêmes — les "
+             "emprunter extrairait des données"),
+            ("/csv",
+             "GET /csv/{study_id} exporte tous les essais d'une étude, ce que "
+             "signaler l'exposition ne demande pas"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+    assert not any("{" in route.replace("{{BaseURL}}", "")
+                   for _, route in request_routes(doc)), (
+        "une route paramétrée désigne une étude précise de l'exploitant — "
+        "DELETE /api/studies/{study_id} la supprimerait, avec ses artefacts"
+    )
+
+
+def test_optuna_dashboard_matcher_needs_the_summary_shape_not_any_study_list():
+    block = optuna_dashboard_block()
+    assert block.get("matchers-condition") == "and", (
+        "aucune des expressions ne nomme le produit à elle seule : study_id, "
+        "directions et is_preferential sont des noms de champ qu'un autre "
+        "document pourrait porter, et c'est leur réunion sous la clé racine "
+        "study_summaries qui désigne Optuna Dashboard"
+    )
+
+    assert optuna_dashboard_fires(OPTUNA_STUDIES_BODY), (
+        "le template ne reconnaît pas la réponse par défaut de list_studies() "
+        "sur une instance qui sert une étude"
+    )
+    assert optuna_dashboard_fires(OPTUNA_STUDIES_MULTIPLE_BODY), (
+        "le template ne reconnaît qu'un inventaire mono-objectif à une seule "
+        "étude, alors que get_all_studies() ne filtre ni ne pagine — une "
+        "requête nue rend tout l'inventaire, multi-objectif et préférentiel "
+        "compris"
+    )
+    assert optuna_dashboard_fires(OPTUNA_STUDIES_NOT_SET_BODY), (
+        "le template n'admet pas la troisième valeur de StudyDirection : "
+        "« d.name.lower() » écrit not_set comme il écrit minimize et maximize"
+    )
+    assert optuna_dashboard_fires(OPTUNA_STUDIES_REFORMATTED_BODY), (
+        "le template exige la sérialisation d'origine : un intermédiaire qui "
+        "réindenterait ce qu'il relaie ferait manquer l'instance"
+    )
+
+    assert not optuna_dashboard_fires(OPTUNA_EMPTY_INVENTORY_BODY), (
+        "le template remonte une instance dont /api/studies rend un "
+        "inventaire vide : rien n'y est divulgué, et il n'y a pas de constat "
+        "à porter"
+    )
+    assert not optuna_dashboard_fires(OPTUNA_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur la clé racine qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not optuna_dashboard_fires(OPTUNA_META_BODY), (
+        "le template déclenche sur GET /api/meta, servi par le même Bottle et "
+        "tout aussi dépourvu de garde, mais dont le corps ne divulgue rien de "
+        "l'exploitant"
+    )
+    assert not optuna_dashboard_fires(OPTUNA_STUDY_DETAIL_BODY), (
+        "le template déclenche sur le détail d'une seule étude, qui porte bien "
+        "directions et user_attrs : c'est l'énumération sous study_summaries "
+        "qui est le constat, pas la lecture d'une étude déjà nommée"
+    )
+    assert not optuna_dashboard_fires(OTHER_EXPERIMENT_LIST_BODY), (
+        "le template déclenche sur l'inventaire d'une autre plateforme de "
+        "suivi d'expériences"
+    )
+
+
+def test_optuna_dashboard_matcher_holds_across_versions_and_both_json_writers():
+    """
+    Les deux axes sur lesquels deux instances rendent des octets différents :
+    le sérialiseur retenu par Bottle et la forme de l'entrée, qui a changé à la
+    0.13.0.
+    """
+    assert optuna_dashboard_fires(OPTUNA_STUDIES_COMPACT_BODY), (
+        "le template dépend de l'espacement : bottle.py importe json_dumps "
+        "d'ujson quand ce paquet est présent — sortie compacte — et retombe "
+        "sur json.dumps sinon, qui insère une espace après chaque séparateur"
+    )
+    assert optuna_dashboard_fires(OPTUNA_LEGACY_STUDIES_BODY), (
+        "le template exige is_preferential, qui n'existe que depuis la "
+        "0.13.0 : jusqu'à la 0.12.0 serialize_study_summary() rendait "
+        "system_attrs à sa place, et ce sont les instances anciennes qui "
+        "traînent exposées"
+    )
+
+
+def test_optuna_dashboard_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    list_studies() n'a pas de branche d'échec — il recopie get_all_studies() —
+    donc il ne peut rendre que 200. Exiger ce statut n'écarterait rien de plus
+    et ferait manquer l'instance dont un intermédiaire réécrit le code retourné.
+    """
+    kinds = {m.get("type") for m in (optuna_dashboard_block().get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut alors que la route n'a pas de "
+        "branche d'échec"
+    )
+
+
+def test_optuna_dashboard_extractors_report_the_studies_the_caller_enumerates():
+    extractors = optuna_dashboard_block().get("extractors") or []
+    assert len(extractors) == 2, (
+        "les deux valent d'être remontés : study_name est ce que l'exposition "
+        "divulgue en premier, et study_id est la clé qui adresse le détail des "
+        "essais, l'export CSV, les artefacts et les routes en écriture"
+    )
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la réponse est un document JSON : une expression regex n'a pas à "
+            "s'en charger"
+        )
+    reported = {(e.get("name"), tuple(e.get("json") or [])) for e in extractors}
+    assert reported == {
+        ("study_name", (".study_summaries[].study_name",)),
+        ("study_id", (".study_summaries[].study_id",)),
+    }, reported
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
