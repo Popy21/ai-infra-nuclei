@@ -1,0 +1,210 @@
+id: flyteadmin-api-exposed
+
+info:
+  name: FlyteAdmin - Unauthenticated Control Plane API and Project Inventory
+  author: popy21
+  severity: high
+  description: |
+    FlyteAdmin est le plan de contrôle de Flyte : c'est lui qui tient le registre
+    des projets, des tâches, des workflows et des exécutions, et c'est à lui que
+    parlent flytectl, la console et flytepropeller. Son API est écrite en gRPC,
+    mais newHTTPServer() (flyteadmin/pkg/server/service.go) la republie
+    intégralement en REST — « service.RegisterAdminServiceHandlerFromEndpoint(
+    ctx, gwmux, grpcAddress, grpcConnectionOpts) », puis
+    « mux.HandleFunc("/", func(w, r) { gwmux.ServeHTTP(...) }) ». Le mux du
+    grpc-gateway est donc branché sur la racine du serveur HTTP, et chaque
+    option (google.api.http) déclarée dans flyteidl/protos/flyteidl/service/
+    admin.proto devient une route atteignable au même titre.
+    Le réglage qui décide s'il faut une identité pour les emprunter est
+    ServerSecurityOptions.UseAuth, la clé « useAuth » de flyteadmin/pkg/config/
+    config.go. defaultServerConfig ne la renseigne pas — il ne pose que HTTPPort,
+    AllowCors, AllowedHeaders, AllowedOrigins, GrpcConfig et les délais — donc
+    elle vaut le zéro de son type, false, et init() finit d'ancrer ce défaut par
+    « SetConfig(&ServerConfig{}) ». C'est cette valeur que les deux constructeurs
+    du serveur consultent, et à chaque fois pour se dispenser de tout contrôle.
+    newGRPCServer() enregistre bien auth.BlanketAuthorization comme intergiciel
+    par défaut, mais ne va le chercher — « plugins.Get[grpc.UnaryServerInterceptor](
+    pluginRegistry, plugins.PluginIDUnaryServiceMiddleware) » — que dans la
+    branche « if cfg.Security.UseAuth ». La branche else journalise « Creating
+    gRPC server without authentication » et chaîne trois intercepteurs qui ne
+    regardent pas l'appelant : la reprise sur panique, Prometheus et
+    OpenTelemetry. newHTTPServer() suit le même dessin : auth.RegisterHandlers,
+    authzserver.RegisterHandlers, runtime.WithMetadata(
+    auth.GetHTTPRequestCookieToMetadataHandler(authCtx)) et
+    runtime.WithMetadata(auth.GetHTTPMetadataTaggingHandler()) sont tous les
+    quatre à l'intérieur d'un « if cfg.Security.UseAuth ». Hors de ce bloc, il ne
+    reste que les marshaleurs et le filtre d'en-têtes. Rien, sur aucun des deux
+    chemins, ne rejette une requête sans jeton — elle est simplement servie.
+    GET /api/v1/projects (rpc ListProjects, « option (google.api.http) = { get:
+    "/api/v1/projects" } ») rend le message Projects de flyteidl/protos/flyteidl/
+    admin/project.proto : « repeated Project projects = 1 » et « string token =
+    2 », où chaque Project porte id, name, un tableau de Domain (eux-mêmes id et
+    name), description, labels, state et org. Le paramètre limit est pourtant
+    annoté « +required » dans ProjectListRequest : ProjectManager.ListProjects
+    (flyteadmin/pkg/manager/impl/project_manager.go) ne le valide jamais, il le
+    recopie tel quel dans ListResourceInput, et ProjectRepo.List
+    (flyteadmin/pkg/repositories/gormimpl/project_repo.go) écrit « if input.Limit
+    != 0 { tx = tx.Limit(input.Limit) } ». Une requête nue, sans le moindre
+    paramètre, ne se heurte donc à aucune pagination : elle rend l'inventaire
+    entier des projets non archivés. Le tableau domains n'y est jamais vide non
+    plus — domainsConfig (flyteadmin/pkg/runtime/application_config_provider.go)
+    vaut par défaut development, staging et production, et FromProjectModels les
+    attache à chaque projet rendu.
+    GET /api/v1/version (rpc GetVersion, « get: "/api/v1/version" ») corrobore
+    par un chemin de code disjoint : ni base ni paramètre, seulement le message
+    GetVersionResponse de flyteidl/protos/flyteidl/admin/version.proto, dont le
+    Version imbriqué déclare ses trois champs en capitales — « string Build = 1 »,
+    « string Version = 2 », « string BuildTime = 3 ». La casse survit à la
+    sérialisation quel que soit le marshaleur retenu : protoc calcule un json_name
+    en ne capitalisant que ce qui suit un souligné, sans jamais abaisser la
+    première lettre, et le marshaleur que flyteadmin déclare pour
+    application/json recopie de toute façon le nom du .proto tel quel
+    (« UseProtoNames: true »). Trois clés JSON capitalisées côte à côte ne
+    ressemblent à rien d'autre dans le pack.
+  impact: |
+    L'inventaire des projets n'est pas seulement une liste de noms : c'est la
+    clé d'adressage de tout le reste de l'API. Les routes de lecture d'admin.proto
+    sont paramétrées par le couple (projet, domaine) que /api/v1/projects vient de
+    livrer — GET /api/v1/tasks/{id.project}/{id.domain}, GET /api/v1/workflows/
+    {id.project}/{id.domain}, GET /api/v1/executions/{id.project}/{id.domain},
+    puis GET /api/v1/data/executions/{id.project}/{id.domain}/{id.name}, qui
+    descend jusqu'aux entrées et sorties d'une exécution. Un anonyme reconstruit
+    ainsi l'arborescence complète des pipelines de l'exploitant, sans avoir eu à
+    deviner un seul identifiant.
+    Le même gwmux sans garde porte les routes en écriture. POST /api/v1/executions
+    (rpc CreateExecution) lance un workflow sur le cluster Kubernetes de
+    l'exploitant, avec ses images, ses secrets montés et ses quotas de calcul ;
+    POST /api/v1/tasks enregistre une tâche ; PUT /api/v1/projects/{id} (rpc
+    UpdateProject) peut basculer un projet à l'état ARCHIVED et le faire
+    disparaître de la console. newHTTPServer() enregistre par ailleurs
+    RegisterDataProxyServiceHandlerFromEndpoint sur ce même mux : POST
+    /api/v1/dataproxy/artifact_urn et POST /api/v1/dataproxy/artifact_link
+    (dataproxy.proto) rendent des URL signées vers le bucket de métadonnées, donc
+    un accès aux données que les exécutions ont écrites, en dehors du service qui
+    les sert.
+    L'écoute et le partage de la même origine vont dans le sens de cette absence
+    de garde. GetHostAddress() est écrit « fmt.Sprintf("0.0.0.0:%d", s.HTTPPort) »
+    — l'adresse d'écoute est en dur, aucun réglage ne permet de la restreindre
+    depuis la configuration, et HTTPPort vaut 8088 par défaut. Et
+    defaultServerConfig pose « AllowCors: true » avec « AllowedOrigins:
+    []string{"*"} » : n'importe quelle page web ouverte par n'importe quel
+    visiteur peut donc lire ces réponses depuis son navigateur, sans passer par
+    le réseau de l'attaquant.
+  remediation: |
+    Poser server.security.useAuth à true, et poser avec lui la configuration
+    d'authentification que docs/deployment/configuration/auth_setup.rst détaille
+    (bloc auth du chart Helm : « configuration.auth.enabled: true », client OIDC,
+    serveur d'autorisation interne ou externe). C'est le seul commutateur qui
+    fasse basculer les deux constructeurs : sans lui, ni les intercepteurs gRPC
+    d'authentification ni les gestionnaires de métadonnées du gateway ne sont
+    montés, et il n'existe aucun réglage par route pour compenser — les blocs
+    « if cfg.Security.UseAuth » de flyteadmin/pkg/server/service.go sont tout ou
+    rien.
+    Ne jamais publier les ports 8088 (HTTP) et 8089 (gRPC) sur un réseau non
+    maîtrisé. GetHostAddress() lie 0.0.0.0 en dur, donc la restriction ne peut
+    venir que de ce qui entoure le processus : liaison explicite côté publication
+    Docker, règle de pare-feu, ou Service Kubernetes de type ClusterIP placé
+    derrière un ingress qui authentifie l'intégralité du préfixe /api/v1.
+    Resserrer aussi server.security.allowedOrigins, que defaultServerConfig laisse
+    à ["*"] : tant que l'API est ouverte, cette valeur en fait une cible lisible
+    depuis le navigateur d'un tiers.
+    Après une exposition, tenir pour lus la liste des projets, leurs domaines,
+    leurs labels et l'arborescence des tâches, workflows et exécutions qu'ils
+    adressent. Vérifier surtout dans les journaux si POST /api/v1/executions, POST
+    /api/v1/tasks, PUT /api/v1/projects/{id} ou une route /api/v1/dataproxy/ ont
+    été appelés pendant la fenêtre d'exposition : la même absence de garde les
+    couvrait, et c'est là qu'aurait eu lieu l'exécution ou l'extraction de
+    données, pas seulement la lecture.
+  reference:
+    - https://github.com/flyteorg/flyte/blob/master/flyteadmin/pkg/config/config.go
+    - https://github.com/flyteorg/flyte/blob/master/flyteadmin/pkg/server/service.go
+    - https://github.com/flyteorg/flyte/blob/master/flyteadmin/pkg/manager/impl/project_manager.go
+    - https://github.com/flyteorg/flyte/blob/master/flyteadmin/pkg/repositories/gormimpl/project_repo.go
+    - https://github.com/flyteorg/flyte/blob/master/flyteadmin/pkg/runtime/application_config_provider.go
+    - https://github.com/flyteorg/flyte/blob/master/flyteidl/protos/flyteidl/service/admin.proto
+    - https://github.com/flyteorg/flyte/blob/master/flyteidl/protos/flyteidl/admin/project.proto
+    - https://github.com/flyteorg/flyte/blob/master/flyteidl/protos/flyteidl/admin/version.proto
+    - https://github.com/flyteorg/flyte/blob/master/flyteidl/protos/flyteidl/service/dataproxy.proto
+    - https://github.com/flyteorg/flyte/blob/v1.16.0/docs/deployment/configuration/auth_setup.rst
+    - https://github.com/flyteorg/flyte/pull/4976
+    - https://github.com/protocolbuffers/protobuf-go/blob/master/internal/encoding/json/encode.go
+  metadata:
+    max-request: 2
+    vendor: flyteorg
+    product: flyteadmin
+  tags: ai,ml,mlops,workflow,flyte,flyteorg,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /api/v1/projects est le constat lui-même : ListProjects ne valide pas le
+  # limit que ProjectListRequest annote pourtant « +required », et ProjectRepo.List
+  # n'applique de LIMIT que si la valeur est non nulle — une requête nue rend donc
+  # l'inventaire entier des projets non archivés, sans qu'aucun paramètre n'ait à
+  # être deviné.
+  #
+  # GET /api/v1/version corrobore par un chemin de code disjoint : GetVersion ne
+  # touche ni la base ni la configuration de domaines, il recopie trois chaînes
+  # figées au build. Générique à lui seul, mais ses trois clés capitalisées
+  # écartent qu'un cache ou un proxy statique ne rejoue une seule réponse figée.
+  #
+  # En lecture seule, et strictement : le même gwmux sans garde sert POST
+  # /api/v1/executions, qui lancerait un workflow sur le cluster de l'exploitant,
+  # PUT /api/v1/projects/{id}, qui pourrait archiver un projet, et les routes
+  # /api/v1/dataproxy/, qui rendraient des URL signées vers son bucket. Signaler
+  # l'exposition ne demande d'en toucher aucune.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/projects"
+      - "{{BaseURL}}/api/v1/version"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, /api/v1/version conclurait seul — or
+    # il ne dit rien de ce qui est divulgué, seulement que le gateway répond.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat. L'ancrage sur « { "projects": [ { » dit trois choses à la
+          # fois : que l'instance a répondu d'elle-même et non au fond d'un
+          # document composite qu'une supervision agrégerait, que la clé
+          # racine est bien celle du message Projects, et que le tableau porte au
+          # moins un projet — un inventaire vide ne divulgue rien et n'a pas à
+          # être signalé. Les \s* sont là parce que protojson insère, en sortie
+          # sur une seule ligne, une espace surnuméraire tirée au sort après
+          # chaque virgule (internal/encoding/json/encode.go : « if detrand.Bool()
+          # { e.out = append(e.out, ' ') } ») : aucune expression ne peut donc
+          # dépendre de ce qui suit un séparateur.
+          #
+          # « domains » est ce qui distingue cette réponse de n'importe quelle
+          # autre liste de projets : le tableau de Domain imbriqué dans chaque
+          # Project est propre au modèle de Flyte, et domainsConfig garantit qu'il
+          # n'est jamais vide sur une instance qui n'a rien changé.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"projects\"\\s*:\\s*\\[\\s*\\{", trim_space(body_1)) && contains(body_1, "\"domains\"") && contains(body_1, "\"id\"") && contains(body_1, "\"name\"")'
+
+          # La corroboration. Les deux écritures de la clé racine sont admises
+          # parce que le gateway choisit son marshaleur sur la valeur exacte de
+          # l'en-tête Accept : celui que flyteadmin déclare pour application/json
+          # (UseProtoNames: true, ajouté par le PR #4976 en février 2024) rend
+          # « control_plane_version », et celui par défaut de grpc-gateway v2,
+          # retenu pour toute autre valeur d'Accept, rend « controlPlaneVersion ».
+          #
+          # Ce sont les trois clés imbriquées qui signent le produit : Build,
+          # Version et BuildTime gardent la capitale du champ .proto sous l'un
+          # comme sous l'autre marshaleur, et une casse pareille en JSON ne se
+          # rencontre nulle part ailleurs dans le pack.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"(controlPlaneVersion|control_plane_version)\"\\s*:\\s*\\{", trim_space(body_2)) && contains(body_2, "\"Build\"") && contains(body_2, "\"Version\"") && contains(body_2, "\"BuildTime\"")'
+
+    extractors:
+      # Le nom de chaque projet servi : c'est ce que l'exposition divulgue, et la
+      # moitié du couple (projet, domaine) dont dépendent toutes les routes de
+      # tâches, de workflows et d'exécutions. Un seul extracteur, borné à body_1 :
+      # sous req-condition le moteur émet un résultat par extracteur qui rend
+      # quelque chose, et la version n'est qu'une corroboration.
+      - type: json
+        part: body_1
+        name: project
+        json:
+          - '.projects[].id'

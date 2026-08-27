@@ -13767,6 +13767,320 @@ def test_langgraph_extractor_reports_the_graph_id_not_the_uuid():
     )
 
 
+# --------------------------------------------------------------------------
+# FlyteAdmin rend le même document sous deux orthographes et sous un espacement
+# tiré au sort, et le template doit tenir sur les deux axes à la fois.
+#
+# L'orthographe d'abord : le grpc-gateway choisit son marshaleur sur la valeur
+# exacte de l'en-tête Accept. Celui que flyteadmin déclare pour application/json
+# porte « UseProtoNames: true » et rend « control_plane_version » ; celui par
+# défaut de grpc-gateway v2, retenu pour toute autre valeur, rend
+# « controlPlaneVersion ». Une sonde qui ne joint pas d'Accept tombe sur le
+# second, mais un intermédiaire qui en pose un tombe sur le premier.
+#
+# L'espacement ensuite, et c'est le piège propre à ce produit : protojson insère
+# en sortie sur une seule ligne une espace surnuméraire tirée au sort après
+# chaque virgule (protobuf-go, internal/encoding/json/encode.go : « For
+# single-line output, add a random extra space after each comma to make output
+# unstable » / « if detrand.Bool() { e.out = append(e.out, ' ') } »). Deux
+# réponses successives du même serveur ne sont donc pas octet pour octet
+# identiques, et aucune expression du template ne peut dépendre de ce qui suit un
+# séparateur.
+
+FLYTEADMIN_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "flyteadmin-api-exposed.yaml")
+
+PROJECTS_ROUTE = "/api/v1/projects"
+VERSION_ROUTE = "/api/v1/version"
+
+
+def flyteadmin_project(identifier="flytesnacks", name="flytesnacks"):
+    """
+    Un Project tel que FromProjectModels() le rend : les trois domaines que pose
+    domainsConfig par défaut (development, staging, production), et les champs
+    vides émis quand même — le marshaleur du gateway porte « EmitUnpopulated:
+    true » des deux côtés.
+    """
+    return {
+        "id": identifier,
+        "name": name,
+        "domains": [
+            {"id": "development", "name": "development"},
+            {"id": "staging", "name": "staging"},
+            {"id": "production", "name": "production"},
+        ],
+        "description": "",
+        "labels": None,
+        "state": "ACTIVE",
+        "org": "",
+    }
+
+
+def flyteadmin_projects_body(projects=None, spaced=False, indent=None):
+    """
+    `spaced` pousse le tirage de detrand.Bool() à son extrême — une espace après
+    chacune des virgules, là où le serveur n'en met qu'après certaines.
+    """
+    projects = projects if projects is not None else [flyteadmin_project()]
+    document = {"projects": projects, "token": ""}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document,
+                      separators=(", ", ":") if spaced else (",", ":"))
+
+
+def flyteadmin_version_body(key="controlPlaneVersion", spaced=False):
+    document = {key: {"Build": "a1b2c3d", "Version": "1.16.0",
+                      "BuildTime": "2026-08-26 12:00:00"}}
+    return json.dumps(document, separators=(", ", ":") if spaced else (",", ":"))
+
+
+FLYTEADMIN_PROJECTS_BODY = flyteadmin_projects_body()
+FLYTEADMIN_VERSION_BODY = flyteadmin_version_body()
+
+# La même paire, telle que le marshaleur application/json de flyteadmin la rend :
+# les noms du .proto, donc control_plane_version. Les champs de Project sont tous
+# d'un seul mot, ils ne changent pas d'orthographe d'un marshaleur à l'autre.
+FLYTEADMIN_VERSION_PROTO_NAMES_BODY = flyteadmin_version_body("control_plane_version")
+
+# Le tirage de detrand poussé au bout : une espace après chaque virgule.
+FLYTEADMIN_PROJECTS_SPACED_BODY = flyteadmin_projects_body(spaced=True)
+FLYTEADMIN_VERSION_SPACED_BODY = flyteadmin_version_body(spaced=True)
+
+# Le même corps relayé par un intermédiaire qui réindente ce que le gateway sert
+# compact.
+FLYTEADMIN_PROJECTS_REFORMATTED_BODY = flyteadmin_projects_body(indent=2)
+
+# Plusieurs projets : ListProjects ne valide pas le limit annoté « +required »,
+# et ProjectRepo.List n'applique de LIMIT que s'il est non nul, donc une requête
+# nue rend tout l'inventaire non archivé.
+FLYTEADMIN_PROJECTS_MULTIPLE_BODY = flyteadmin_projects_body([
+    flyteadmin_project(),
+    flyteadmin_project("flytesnacks-staging", "flytesnacks-staging"),
+])
+
+# Une instance dont aucun projet n'a été enregistré : rien n'y est divulgué.
+FLYTEADMIN_PROJECTS_EMPTY_BODY = '{"projects":[],"token":""}'
+
+# Le refus que rend le gateway lorsque server.security.useAuth est posé — soit
+# exactement la remédiation que le template recommande.
+FLYTEADMIN_UNAUTHENTICATED_BODY = (
+    '{"code":16,"message":"Request unauthenticated with Bearer","details":[]}'
+)
+
+# La charge utile entière, retrouvée au fond d'un document composite qu'une
+# supervision agrégerait sous une clé à elle.
+FLYTEADMIN_COMPOSITE_BODY = (
+    '{"flyte":%s,"checked_at":0}' % FLYTEADMIN_PROJECTS_BODY
+)
+
+# Une autre plateforme qui servirait une liste de projets sur le même chemin,
+# sans le tableau de Domain imbriqué qui est propre au modèle de Flyte.
+OTHER_PROJECT_LIST_BODY = (
+    '{"projects":[{"id":"p1","name":"p1","created_at":"2026-08-26T12:00:00Z"}],'
+    '"token":""}'
+)
+
+# Un endpoint de version quelconque : la casse minuscule est la règle en JSON,
+# et c'est justement ce que Build/Version/BuildTime ne suivent pas.
+OTHER_VERSION_BODY = '{"version":"1.16.0","build":"a1b2c3d","buildTime":"2026-08-26"}'
+
+
+def flyteadmin_block():
+    doc = load(FLYTEADMIN_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(PROJECTS_ROUTE) for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {PROJECTS_ROUTE} — c'est pourtant lui qui "
+        "porte l'inventaire des projets"
+    )
+    return blocks[0]
+
+
+def flyteadmin_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+
+    Le bloc emploie `path` et non `raw` parce que les deux routes répondent à la
+    même méthode et ne prennent aucun corps.
+    """
+    block = flyteadmin_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def flyteadmin_responses(scenario):
+    ordered = []
+    for _, route in flyteadmin_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que FlyteAdmin ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def flyteadmin_fires(projects=(200, FLYTEADMIN_PROJECTS_BODY),
+                     version=(200, FLYTEADMIN_VERSION_BODY)):
+    scenario = {PROJECTS_ROUTE: projects, VERSION_ROUTE: version}
+    block = flyteadmin_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = flyteadmin_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_flyteadmin_probe_reads_two_routes_and_touches_no_write_route():
+    assert flyteadmin_block().get("req-condition") is True, (
+        "le template ne lie pas les deux réponses : sans req-condition, ni "
+        "body_N ni status_code_N n'existent, et /api/v1/version — générique à "
+        "lui seul — conclurait de son côté"
+    )
+
+    assert flyteadmin_requests() == [
+        ("GET", PROJECTS_ROUTE), ("GET", VERSION_ROUTE),
+    ], (
+        "les deux requêtes ne sont plus celles que le template documente — "
+        f"{flyteadmin_requests()}"
+    )
+
+    doc = load(FLYTEADMIN_TEMPLATE)
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", (
+            f"{method} {route} : le même gwmux sans garde sert des routes en "
+            "écriture, et aucune n'est nécessaire pour signaler l'exposition"
+        )
+        for forbidden, why in (
+            ("/api/v1/executions",
+             "POST /api/v1/executions lancerait un workflow sur le cluster "
+             "Kubernetes de l'exploitant, avec ses images et ses quotas"),
+            ("/api/v1/tasks",
+             "POST /api/v1/tasks enregistrerait une tâche dans le registre de "
+             "l'exploitant"),
+            ("/api/v1/dataproxy",
+             "les routes dataproxy rendent des URL signées vers le bucket de "
+             "métadonnées — les emprunter extrairait des données"),
+            ("/api/v1/events",
+             "les routes d'événements écrivent dans l'historique d'exécution"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+    assert not any("{" in route for _, route in request_routes(doc)), (
+        "une route paramétrée désigne une ressource précise de l'exploitant — "
+        "PUT /api/v1/projects/{id} pourrait notamment l'archiver"
+    )
+
+
+def test_flyteadmin_matcher_needs_the_domains_array_not_just_a_project_list():
+    assert flyteadmin_fires(), (
+        "le template ne reconnaît pas la réponse par défaut de ListProjects sur "
+        "une instance dont l'exploitant n'a rien changé"
+    )
+    assert flyteadmin_fires(projects=(200, FLYTEADMIN_PROJECTS_MULTIPLE_BODY)), (
+        "le template ne reconnaît qu'un inventaire à un seul projet, alors "
+        "qu'une requête nue rend tout l'inventaire non archivé — ListProjects "
+        "ne valide pas le limit annoté « +required »"
+    )
+    assert flyteadmin_fires(projects=(200, FLYTEADMIN_PROJECTS_REFORMATTED_BODY)), (
+        "le template exige la sérialisation compacte du gateway : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    assert not flyteadmin_fires(projects=(200, FLYTEADMIN_PROJECTS_EMPTY_BODY)), (
+        "le template remonte une instance dont /api/v1/projects rend un "
+        "inventaire vide : rien n'y est divulgué, et il n'y a pas de constat à "
+        "porter"
+    )
+    assert not flyteadmin_fires(projects=(401, FLYTEADMIN_UNAUTHENTICATED_BODY)), (
+        "le template déclenche sur le refus que rend le gateway quand "
+        "server.security.useAuth est posé — précisément la remédiation que le "
+        "template recommande"
+    )
+    assert not flyteadmin_fires(projects=(200, FLYTEADMIN_COMPOSITE_BODY)), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur la clé racine qui dit que l'instance a "
+        "répondu d'elle-même"
+    )
+    assert not flyteadmin_fires(projects=(200, OTHER_PROJECT_LIST_BODY)), (
+        "le template déclenche sur une liste de projets quelconque — c'est le "
+        "tableau de Domain imbriqué dans chaque Project qui est propre au "
+        "modèle de Flyte"
+    )
+
+
+def test_flyteadmin_matcher_holds_under_both_marshalers_and_random_spacing():
+    """
+    Les deux axes sur lesquels la même instance rend deux octets différents :
+    l'orthographe de la clé racine, choisie par l'en-tête Accept, et l'espace
+    surnuméraire que protojson tire au sort après chaque virgule.
+    """
+    assert flyteadmin_fires(version=(200, FLYTEADMIN_VERSION_PROTO_NAMES_BODY)), (
+        "le template n'admet qu'une orthographe de la clé racine de "
+        "GetVersionResponse : le marshaleur que flyteadmin déclare pour "
+        "application/json porte « UseProtoNames: true » et rend "
+        "control_plane_version, là où le marshaleur par défaut de grpc-gateway "
+        "v2 rend controlPlaneVersion"
+    )
+    assert flyteadmin_fires(projects=(200, FLYTEADMIN_PROJECTS_SPACED_BODY),
+                            version=(200, FLYTEADMIN_VERSION_SPACED_BODY)), (
+        "le template dépend de ce qui suit une virgule : protojson insère une "
+        "espace tirée au sort après chacune d'elles en sortie sur une seule "
+        "ligne, donc deux réponses du même serveur ne sont pas octet pour "
+        "octet identiques"
+    )
+
+    assert not flyteadmin_fires(version=(200, OTHER_VERSION_BODY)), (
+        "le template déclenche sur un endpoint de version quelconque — ce sont "
+        "les capitales de Build/Version/BuildTime, héritées telles quelles des "
+        "champs du .proto, qui signent le produit"
+    )
+    assert not flyteadmin_fires(version=(404, '{"code":5,"message":"Not Found"}')), (
+        "le template conclut sans que /api/v1/version ait confirmé : la "
+        "corroboration par un chemin de code disjoint est ce qui écarte un "
+        "cache ou un proxy statique"
+    )
+
+
+def test_flyteadmin_conclusion_rests_on_the_payload_not_on_the_http_status():
+    block = flyteadmin_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_flyteadmin_extractor_reports_the_project_identifiers():
+    extractors = flyteadmin_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "émet un résultat par extracteur qui rend quelque chose, donc la même "
+        "instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — la réponse de /api/v1/version "
+        "(body_2) n'est qu'une corroboration, elle ne divulgue rien de "
+        "l'exploitant"
+    )
+    assert extractor.get("json") == [".projects[].id"], (
+        "l'extracteur ne parcourt pas .projects[].id — c'est pourtant ce que "
+        "l'exposition divulgue, et la moitié du couple (projet, domaine) dont "
+        "dépendent toutes les routes de tâches, de workflows et d'exécutions"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
