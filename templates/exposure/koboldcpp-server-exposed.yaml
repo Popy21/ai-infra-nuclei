@@ -1,0 +1,191 @@
+id: koboldcpp-server-exposed
+
+info:
+  name: KoboldCpp - Unauthenticated Inference Server
+  author: popy21
+  severity: high
+  description: |
+    KoboldCpp est le serveur d'inférence GGUF mono-binaire de LostRuins : un
+    exécutable unique qui embarque le moteur, l'interface KoboldAI Lite et
+    l'API HTTP, ce qui en fait l'un des serveurs les plus répandus en
+    auto-hébergement. Il n'impose aucune authentification par défaut — le
+    global qui la porte est déclaré « password = "" #if empty, no auth key
+    required » (koboldcpp.py), et rien ne le renseigne tant que --password (ou
+    la variable d'environnement KCPP_PASSWORD) n'est pas passé.
+    Le défaut de publication réseau va dans le même sens, et c'est ce qui le
+    distingue de llama-server ou de LM Studio : --host vaut "" par défaut,
+    documenté « If this flag is not set, all routable interfaces are
+    accepted », et RunServerMultiThreaded() appelle « ipv4_sock.bind((addr,
+    port)) » avec cette valeur — donc toutes les interfaces, sur le port 5001
+    (defaultport). Une instance lancée sans aucun réglage écoute déjà sur le
+    réseau : il n'y a pas de --host 0.0.0.0 à saisir pour se retrouver exposé.
+    GET /api/extra/version est dispatché dans do_GET() sans appel à
+    secure_endpoint() — c'est par construction la route de découverte, celle
+    que KoboldAI Lite interroge pour savoir s'il doit demander une clé, donc
+    elle répond à l'anonyme même sur une instance fermée. Elle rend
+    get_capabilities() sérialisé par json.dumps, soit « {"result":
+    "KoboldCpp", "version": ..., "protected": ..., ... } » avec une espace
+    après chaque « : » et chaque « , ».
+    get_capabilities() rend littéralement « {"result":"KoboldCpp",
+    "version":KcppVersion, "protected":has_password, ... } », où
+    « has_password = (password!="") ». Les deux moitiés du constat sont donc
+    dans la même réponse : "result":"KoboldCpp" nomme le produit,
+    "protected":false dit que le global est resté vide et que l'instance
+    accepte l'anonyme. Le statut HTTP, lui, ne dit rien — la route rend 200
+    dans les deux cas.
+    Le reste des clés ne peut pas servir de signature : "protected"
+    n'apparaît qu'à partir de la 1.61 (jusqu'à la 1.60 la route ne rendait que
+    result et version), "transcribe" à partir de la 1.67, "multiplayer" à
+    partir de la 1.80, et les versions récentes en ajoutent une dizaine
+    d'autres (llm, audio, music, savedata, admin, router, guidance, jinja,
+    mcp). Exiger le jeu complet daterait le template au lieu de désigner le
+    produit.
+    GET /api/v1/model (et son alias /api/latest/model) corrobore sur un
+    chemin de code disjoint : il rend « {"result": friendlymodelname} », et
+    friendlymodelname est construit en « "koboldcpp/" + sanitize_string(...) »
+    au chargement du modèle. Sous mot de passe il rend
+    « koboldcpp/protected-model » à la place du vrai nom — mais cette
+    instance-là a déjà été écartée par "protected":true.
+  impact: |
+    Les drapeaux de la même réponse énumèrent les moteurs joignables sur le
+    même processus et le même port : txt2img annonce le moteur Stable
+    Diffusion, transcribe le moteur Whisper, tts la synthèse vocale, vision
+    l'entrée multimodale, embeddings la vectorisation, websearch le module de
+    recherche, multiplayer l'état de récit partagé. Un tiers sait donc, en une
+    lecture, ce qu'il peut consommer avant même de l'essayer.
+    Les routes de génération sont servies par ce processus sans garde tant que
+    password est vide — /api/v1/generate, /api/extra/generate/stream,
+    /v1/chat/completions, /v1/completions, /v1/messages, /api/generate et
+    /api/chat (émulations Ollama et Anthropic comprises) : n'importe qui
+    consomme le GPU ou le CPU de l'hôte, sans limite de débit ni trace
+    d'audit.
+    Le sous-ensemble image ne se ferme jamais, et c'est le point le plus
+    souvent manqué. Le contrôle n'est appelé que « if not is_imggen and not
+    is_img_upscale and not clean_path.endswith('/tts_to_audio') and
+    api_format!=5 » : /sdapi/v1/txt2img, /sdapi/v1/img2img,
+    /images/generations, /sdapi/v1/upscale et /sdapi/v1/interrogate (la
+    description d'image par le modèle de vision) restent ouverts même après
+    --password, ce que l'aide de l'option reconnaît elle-même (« Image
+    endpoints are not secured »). Une instance qui annonce txt2img ou vision
+    expose donc une surface de génération que le mot de passe ne refermera
+    pas.
+    Enfin, "admin":1 signale --admin et --admindir posés sans
+    --adminpassword. Or le contrôle de ces routes est
+    « self.check_header_password(args.adminpassword) », qui rend True lorsque
+    le mot de passe visé est vide : POST /api/admin/reload_config permet alors
+    à un tiers de décharger le modèle ou de rebasculer l'instance sur une
+    autre configuration du répertoire d'administration.
+  remediation: |
+    Poser --host 127.0.0.1 explicitement : le défaut n'est pas la boucle
+    locale mais toutes les interfaces routables, et ne pas publier le port
+    5001 sur un réseau non maîtrisé (liaison « 127.0.0.1:5001:5001 » côté
+    Docker, règle de pare-feu). Un accès distant légitime doit passer par un
+    tunnel ou par un proxy qui exige une identité sur la totalité du site.
+    --password (ou KCPP_PASSWORD) ferme l'accès anonyme aux endpoints texte,
+    mais c'est un jeton statique partagé, porté en « Authorization: Bearer »,
+    sans notion d'utilisateur ni de révocation — et il ne couvre ni la
+    génération d'images, ni l'upscale, ni /sdapi/v1/interrogate. Il ne
+    remplace donc pas le proxy. Si --admin est utilisé, poser
+    systématiquement --adminpassword : sans lui, le contrôle des routes
+    d'administration passe pour tout le monde.
+    Après une exposition, tenir pour lus la version du serveur, les capacités
+    annoncées et le nom du modèle servi. Vérifier dans les journaux si les
+    routes de génération, et en particulier les routes image qu'aucun mot de
+    passe ne garde, ont été appelées pendant la fenêtre d'exposition.
+  reference:
+    - https://github.com/LostRuins/koboldcpp/blob/concedo/koboldcpp.py
+    - https://github.com/LostRuins/koboldcpp/blob/concedo/embd_res/kcpp_docs.embd
+    - https://github.com/LostRuins/koboldcpp/blob/v1.61/koboldcpp.py
+    - https://github.com/LostRuins/koboldcpp/blob/v1.60/koboldcpp.py
+    - https://github.com/LostRuins/koboldcpp/blob/v1.80/koboldcpp.py
+    - https://github.com/LostRuins/koboldcpp
+  metadata:
+    max-request: 2
+    vendor: lostruins
+    product: koboldcpp
+  tags: ai,llm,koboldcpp,gguf,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /api/extra/version est la route de découverte : do_GET() la dispatche
+  # sans appeler secure_endpoint(), parce que c'est celle que KoboldAI Lite
+  # interroge pour savoir s'il doit réclamer une clé. Elle répond donc à
+  # l'anonyme sur toute instance, fermée comprise, et son corps dit dans la même
+  # phrase le produit ("result":"KoboldCpp") et l'absence de garde
+  # ("protected":false, soit password resté vide).
+  #
+  # GET /api/v1/model emprunte un chemin de code disjoint — il lit
+  # friendlymodelname, que /api/extra/version n'utilise pas — et corrobore que
+  # le processus qui répond est bien un KoboldCpp qui sert un modèle, non un
+  # cache ou un proxy statique qui rejouerait la première réponse.
+  #
+  # En lecture seule, et strictement. Le même processus sans garde sert
+  # /api/v1/generate, /v1/chat/completions et /sdapi/v1/txt2img, qui
+  # consommeraient le GPU de l'exploitant, et POST /api/admin/reload_config, qui
+  # déchargerait son modèle. Signaler l'exposition ne demande d'en toucher
+  # aucune.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/extra/version"
+      - "{{BaseURL}}/api/v1/model"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, /api/v1/model conclurait seul —
+    # or il ne dit rien de l'absence d'authentification, seulement qu'un modèle
+    # est chargé.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat, et il tient en deux clés du même objet.
+          #
+          # "result":"KoboldCpp" est la signature : c'est un littéral que
+          # get_capabilities() écrit en dur, et le seul endroit du pack où la
+          # clé « result » porte un nom de produit. L'ancrage à l'ouverture du
+          # document dit qu'elle est bien la première clé rendue — l'ordre du
+          # dictionnaire Python, inchangé depuis la 1.50 — et écarte la même
+          # charge utile retrouvée au fond d'un document composite qu'une
+          # supervision agrégerait sous une clé à elle.
+          #
+          # "protected":false est la seconde moitié, et elle est indispensable :
+          # la route répond aussi bien sur une instance fermée, où elle rend
+          # "protected":true. C'est donc ce booléen, et non le statut HTTP qui
+          # vaut 200 dans les deux cas, qui prouve que password est resté vide.
+          # Rien n'est exigé des autres clés — "transcribe" n'existe qu'à partir
+          # de la 1.67, "multiplayer" de la 1.80, et les versions récentes en
+          # ajoutent une dizaine — donc l'expression ne fixe pas d'adjacence
+          # entre les deux et laisse "version" s'intercaler.
+          #
+          # Les \s* sont là parce que le corps est écrit par json.dumps, qui
+          # insère une espace après chaque « : » et chaque « , » : le littéral
+          # lu dans la source du produit est compact, l'octet servi ne l'est
+          # pas.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"result\"\\s*:\\s*\"KoboldCpp\"", trim_space(body_1)) && regex("\"protected\"\\s*:\\s*false", body_1)'
+
+          # La corroboration. Le préfixe « koboldcpp/ » n'est pas le nom que
+          # l'exploitant a donné à son modèle : il est ajouté par le serveur,
+          # « friendlymodelname = "koboldcpp/" + sanitize_string(...) », sur les
+          # deux branches qui le renseignent. L'ancrage sur la clé racine dit
+          # que la réponse est bien celle de cette route — un objet à une seule
+          # clé — et non un document plus large qui la contiendrait.
+          #
+          # Sous mot de passe cette même route rend « koboldcpp/protected-model »,
+          # qui satisferait l'expression ; l'instance a déjà été écartée par la
+          # précédente, qui aurait lu "protected":true. Une instance sans modèle
+          # chargé rend « inactive » et ne remonte pas : elle ne sert rien.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"result\"\\s*:\\s*\"koboldcpp/", trim_space(body_2))'
+
+    extractors:
+      # Le nom du modèle servi : c'est ce que l'exposition divulgue de
+      # l'exploitant, et ce qui désigne ce qu'un tiers consommerait sur
+      # /api/v1/generate. Un seul extracteur, borné à body_2 : sous
+      # req-condition le moteur émet un résultat par extracteur qui rend
+      # quelque chose, donc la même instance serait signalée deux fois.
+      - type: json
+        part: body_2
+        name: model
+        json:
+          - '.result'

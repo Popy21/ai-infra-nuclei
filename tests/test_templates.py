@@ -14376,6 +14376,336 @@ def test_optuna_dashboard_extractors_report_the_studies_the_caller_enumerates():
     }, reported
 
 
+# --------------------------------------------------------------------------
+# KoboldCpp met les deux moitiés du constat dans la même réponse, et c'est ce
+# qui rend le template particulier : "result":"KoboldCpp" nomme le produit,
+# "protected":false dit que le global « password = "" #if empty, no auth key
+# required » est resté vide. Le statut HTTP ne départage rien — la route rend
+# 200 aussi bien sur une instance fermée, où elle écrit "protected":true.
+#
+# Deux axes font varier les octets d'une instance à l'autre. L'espacement
+# d'abord : get_capabilities() rend un dictionnaire que json.dumps sérialise
+# avec une espace après chaque « : » et chaque « , », là où le littéral lu dans
+# koboldcpp.py est compact — et un intermédiaire peut réindenter ce qu'il
+# relaie. Le jeu de clés ensuite, qui n'a fait que croître : jusqu'à la 1.60 la
+# route ne rendait que result et version, la 1.61 y ajoute protected, txt2img et
+# vision, la 1.67 transcribe, la 1.80 multiplayer, et les versions récentes une
+# dizaine d'autres (llm, audio, music, savedata, admin, router, guidance, jinja,
+# mcp). Un template qui exigerait le jeu complet daterait l'instance au lieu de
+# désigner le produit.
+
+KOBOLDCPP_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "koboldcpp-server-exposed.yaml")
+
+KOBOLDCPP_VERSION_ROUTE = "/api/extra/version"
+KOBOLDCPP_MODEL_ROUTE = "/api/v1/model"
+
+# Les jeux de clés successifs de get_capabilities(), dans l'ordre où le
+# dictionnaire Python les rend — c'est cet ordre que json.dumps recopie.
+KOBOLDCPP_FLAGS_1_61 = ("txt2img", "vision")
+KOBOLDCPP_FLAGS_1_67 = KOBOLDCPP_FLAGS_1_61 + ("transcribe",)
+KOBOLDCPP_FLAGS_1_80 = KOBOLDCPP_FLAGS_1_67 + ("multiplayer",)
+KOBOLDCPP_FLAGS_CURRENT = (
+    "llm", "txt2img", "vision", "audio", "transcribe", "multiplayer",
+    "websearch", "tts", "embeddings", "music", "savedata", "router",
+    "guidance", "jinja", "mcp",
+)
+
+
+def koboldcpp_version_body(protected=False, version="1.98.1",
+                           flags=KOBOLDCPP_FLAGS_CURRENT, compact=False,
+                           indent=None):
+    """
+    Ce que rend GET /api/extra/version : get_capabilities() sérialisé par
+    json.dumps, donc une espace après chaque séparateur. `compact` écrit le
+    même document tel que le littéral apparaît dans koboldcpp.py, `indent` tel
+    qu'un intermédiaire qui réindente le relaierait.
+    """
+    document = {"result": "KoboldCpp", "version": version, "protected": protected}
+    for flag in flags:
+        document[flag] = False
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    if compact:
+        return json.dumps(document, separators=(",", ":"))
+    return json.dumps(document)
+
+
+def koboldcpp_model_body(name="koboldcpp/Mistral-7B-Instruct-v0.3-Q4_K_M"):
+    """
+    Ce que rend GET /api/v1/model : un objet à une seule clé, dont la valeur est
+    friendlymodelname — construit par le serveur en « "koboldcpp/" +
+    sanitize_string(...) », donc toujours préfixé.
+    """
+    return json.dumps({"result": name})
+
+
+KOBOLDCPP_VERSION_BODY = koboldcpp_version_body()
+KOBOLDCPP_MODEL_BODY = koboldcpp_model_body()
+
+# L'exemple de réponse que le produit documente lui-même pour cette route
+# (embd_res/kcpp_docs.embd), recopié clé pour clé.
+KOBOLDCPP_DOCUMENTED_VERSION_BODY = (
+    '{\n   "result": "KoboldCpp",\n   "version": "2025.06.03",\n'
+    '   "protected": false,\n   "txt2img": false,\n   "vision": false,\n'
+    '   "transcribe": false,\n   "multiplayer": false,\n'
+    '   "websearch": false,\n   "tts": false,\n   "embeddings": false\n}'
+)
+
+# Jusqu'à la 1.60, la route ne rendait que le produit et sa version : rien dans
+# la réponse ne dit alors si une clé est exigée.
+KOBOLDCPP_VERSION_BODY_1_60 = '{"result": "KoboldCpp", "version": "1.60"}'
+
+# La même instance, --password posé : has_password vaut True et la route répond
+# quand même, puisqu'elle n'est pas gardée.
+KOBOLDCPP_PROTECTED_VERSION_BODY = koboldcpp_version_body(protected=True)
+
+# Ce que rend alors /api/v1/model : le vrai nom est remplacé, mais le préfixe
+# reste. C'est /api/extra/version, et lui seul, qui doit écarter cette instance.
+KOBOLDCPP_PROTECTED_MODEL_BODY = koboldcpp_model_body("koboldcpp/protected-model")
+
+# Une instance sans modèle chargé : friendlymodelname vaut encore sa valeur
+# initiale. Elle ne sert rien, il n'y a pas de constat à porter.
+KOBOLDCPP_INACTIVE_MODEL_BODY = koboldcpp_model_body("inactive")
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+KOBOLDCPP_COMPOSITE_VERSION_BODY = (
+    '{"kobold": %s, "checked_at": 0}' % KOBOLDCPP_VERSION_BODY
+)
+
+# KoboldAI United sert la même route /api/v1/model, avec la même clé racine,
+# mais son nom de modèle ne porte pas le préfixe que KoboldCpp ajoute.
+KOBOLDAI_UNITED_MODEL_BODY = koboldcpp_model_body("KoboldAI/OPT-6.7B-Nerybus-Mix")
+
+# Un serveur quelconque qui répond 200 et un objet JSON à tout ce qu'on lui
+# demande.
+OTHER_RESULT_BODY = '{"result": "ok"}'
+
+
+def koboldcpp_block():
+    doc = load(KOBOLDCPP_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(KOBOLDCPP_VERSION_ROUTE)
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {KOBOLDCPP_VERSION_ROUTE} — c'est "
+        "pourtant la seule route qui dit à la fois le produit et l'absence de "
+        "mot de passe"
+    )
+    return blocks[0]
+
+
+def koboldcpp_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = koboldcpp_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def koboldcpp_fires(version=(200, KOBOLDCPP_VERSION_BODY),
+                    model=(200, KOBOLDCPP_MODEL_BODY)):
+    scenario = {KOBOLDCPP_VERSION_ROUTE: version, KOBOLDCPP_MODEL_ROUTE: model}
+    block = koboldcpp_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in koboldcpp_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que KoboldCpp ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_koboldcpp_probe_reads_two_routes_and_never_runs_a_generation():
+    assert koboldcpp_block().get("req-condition") is True, (
+        "le template ne lie pas les deux réponses : sans req-condition, ni "
+        "body_N ni status_code_N n'existent, et /api/v1/model — qui ne dit "
+        "rien de l'absence d'authentification — conclurait de son côté"
+    )
+
+    assert koboldcpp_requests() == [
+        ("GET", KOBOLDCPP_VERSION_ROUTE), ("GET", KOBOLDCPP_MODEL_ROUTE),
+    ], (
+        "les deux requêtes ne sont plus celles que le template documente — "
+        f"{koboldcpp_requests()}"
+    )
+
+    doc = load(KOBOLDCPP_TEMPLATE)
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", (
+            f"{method} {route} : le même processus sans garde sert des routes "
+            "qui consomment le GPU de l'exploitant, et aucune n'est nécessaire "
+            "pour signaler l'exposition"
+        )
+        for forbidden, why in (
+            ("generate",
+             "les routes de génération font tourner le modèle de l'exploitant "
+             "sur son matériel"),
+            ("completions",
+             "/v1/completions et /v1/chat/completions font tourner le modèle "
+             "au même titre"),
+            ("sdapi",
+             "les routes sdapi lancent le moteur Stable Diffusion, et ce sont "
+             "précisément celles qu'aucun mot de passe ne garde"),
+            ("images",
+             "/images/generations lance la génération d'image sur le matériel "
+             "de l'exploitant"),
+            ("admin",
+             "POST /api/admin/reload_config déchargerait le modèle ou "
+             "rebasculerait l'instance sur une autre configuration"),
+            ("transcribe",
+             "/api/extra/transcribe fait tourner le moteur Whisper"),
+            ("embeddings",
+             "/api/extra/embeddings fait tourner le moteur de vectorisation"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_koboldcpp_matcher_rests_on_the_capability_literal_not_on_the_status():
+    assert koboldcpp_fires(), (
+        "le template ne reconnaît pas la réponse par défaut de "
+        "get_capabilities() sur une instance dont l'exploitant n'a rien changé"
+    )
+    assert koboldcpp_fires(version=(200, KOBOLDCPP_DOCUMENTED_VERSION_BODY)), (
+        "le template ne reconnaît pas l'exemple de réponse que le produit "
+        "documente lui-même pour cette route (embd_res/kcpp_docs.embd)"
+    )
+
+    assert not koboldcpp_fires(version=(200, KOBOLDCPP_PROTECTED_VERSION_BODY),
+                               model=(200, KOBOLDCPP_PROTECTED_MODEL_BODY)), (
+        "le template remonte une instance lancée avec --password : la route de "
+        "découverte n'est pas gardée et répond de la même façon, "
+        "« protected »:true près, donc c'est ce booléen — et non le statut "
+        "HTTP, qui vaut 200 des deux côtés — qui doit trancher"
+    )
+    assert not koboldcpp_fires(version=(200, KOBOLDCPP_COMPOSITE_VERSION_BODY)), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur la clé racine qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not koboldcpp_fires(version=(401, '{"detail": {"error": '
+                                             '"Unauthorized"}}')), (
+        "le template conclut alors qu'un intermédiaire a refusé la requête"
+    )
+    assert not koboldcpp_fires(version=(200, OTHER_RESULT_BODY),
+                               model=(200, OTHER_RESULT_BODY)), (
+        "le template déclenche sur un serveur quelconque qui rend un objet "
+        "JSON à clé « result » — c'est le littéral « KoboldCpp », écrit en dur "
+        "par get_capabilities(), qui nomme le produit"
+    )
+
+    # Collisions internes au pack : les autres serveurs d'inférence locaux ne
+    # doivent pas être revendiqués par celui-ci.
+    for other_body, other_name in (
+        (LLAMACPP_PROPS_BODY, "llama.cpp"),
+        (LMSTUDIO_MODELS_BODY, "lmstudio"),
+    ):
+        assert not koboldcpp_fires(version=(200, other_body),
+                                   model=(200, other_body)), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_koboldcpp_matcher_holds_across_versions_and_spacings():
+    """
+    Le jeu de clés n'a fait que croître, et l'espacement dépend du sérialiseur
+    autant que des intermédiaires : le template ne doit dépendre ni de l'un ni
+    de l'autre.
+    """
+    for flags, release in (
+        (KOBOLDCPP_FLAGS_1_61, "1.61"),
+        (KOBOLDCPP_FLAGS_1_67, "1.67"),
+        (KOBOLDCPP_FLAGS_1_80, "1.80"),
+    ):
+        assert koboldcpp_fires(
+            version=(200, koboldcpp_version_body(flags=flags, version=release))
+        ), (
+            f"le template exige des clés que la {release} ne rend pas encore — "
+            "il raterait les instances anciennes, qui sont précisément celles "
+            "qui traînent exposées"
+        )
+
+    assert koboldcpp_fires(version=(200, koboldcpp_version_body(compact=True))), (
+        "le template dépend de l'espacement de json.dumps : le même document "
+        "écrit sans espace après les séparateurs ne doit pas lui échapper"
+    )
+    assert koboldcpp_fires(version=(200, koboldcpp_version_body(indent=2)),
+                           model=(200, json.dumps(json.loads(
+                               KOBOLDCPP_MODEL_BODY), indent=2))), (
+        "le template exige la sérialisation d'origine : un intermédiaire qui "
+        "réindenterait ce qu'il relaie ferait manquer l'instance"
+    )
+
+    assert not koboldcpp_fires(version=(200, KOBOLDCPP_VERSION_BODY_1_60)), (
+        "le template remonte une instance antérieure à la 1.61, dont la route "
+        "ne rend que result et version : rien dans cette réponse ne dit si une "
+        "clé est exigée, et le constat porte sur l'absence de garde, pas sur "
+        "la présence du produit"
+    )
+
+
+def test_koboldcpp_confirmation_needs_a_model_the_server_actually_names():
+    assert not koboldcpp_fires(model=(200, KOBOLDCPP_INACTIVE_MODEL_BODY)), (
+        "le template remonte une instance sans modèle chargé, dont "
+        "friendlymodelname vaut encore « inactive » : elle ne sert rien"
+    )
+    assert not koboldcpp_fires(model=(200, KOBOLDAI_UNITED_MODEL_BODY)), (
+        "le template déclenche sur un serveur KoboldAI qui sert la même route "
+        "avec la même clé racine — c'est le préfixe « koboldcpp/ », ajouté par "
+        "le serveur et non par l'exploitant, qui désigne ce produit-ci"
+    )
+    assert not koboldcpp_fires(model=(404, '{"detail": "Not Found"}')), (
+        "le template conclut sans que /api/v1/model ait confirmé : la "
+        "corroboration par un chemin de code disjoint est ce qui écarte un "
+        "cache ou un proxy statique qui rejouerait la première réponse"
+    )
+
+
+def test_koboldcpp_conclusion_is_carried_by_the_dsl_alone():
+    block = koboldcpp_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_koboldcpp_extractor_reports_the_model_the_instance_serves():
+    extractors = koboldcpp_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — c'est /api/v1/model qui nomme "
+        "le modèle de l'exploitant, la réponse de /api/extra/version ne porte "
+        "que la version et des booléens"
+    )
+    assert extractor.get("json") == [".result"], (
+        "l'extracteur ne lit pas .result — c'est pourtant le nom du modèle "
+        "servi, donc ce que l'exposition divulgue et ce qu'un tiers "
+        "consommerait sur /api/v1/generate"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
