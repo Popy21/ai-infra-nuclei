@@ -15117,6 +15117,157 @@ def test_invokeai_extractor_reports_the_version_the_instance_serves():
     )
 
 
+# --------------------------------------------------------------------------
+# text-generation-webui rend le constat entier dans une seule réponse : le
+# handler de GET /v1/internal/model/info tient en deux lignes (payload =
+# get_current_model_info() ; return JSONResponse(content=payload)), et ce
+# dict à trois clés — model_name, lora_names, loader — est écrit en dur dans
+# modules/api/models.py. response_model=ModelInfoResponse ne filtre pas
+# « loader » ici, parce que le handler retourne un objet Response construit à
+# la main plutôt que le dict brut : FastAPI ne revalide un retour au travers
+# de response_model que lorsque la fonction rend la donnée elle-même. Une
+# seule route suffit donc à porter le constat, sans req-condition.
+
+TEXTGEN_WEBUI_TEMPLATE = os.path.join(
+    TEMPLATES_DIR, "exposure", "text-generation-webui-internal-api-exposed.yaml"
+)
+TEXTGEN_WEBUI_MODEL_INFO_ROUTE = "/v1/internal/model/info"
+
+# Ce que rend get_current_model_info() : le trio exact, tel que Starlette le
+# sérialise (JSONResponse.render, séparateurs compacts).
+TEXTGEN_WEBUI_MODEL_INFO_BODY = (
+    '{"model_name":"Meta-Llama-3.1-8B-Instruct","lora_names":[],'
+    '"loader":"llama.cpp"}'
+)
+
+# Une instance avec un LoRA chargé : lora_names n'est pas vide.
+TEXTGEN_WEBUI_MODEL_INFO_WITH_LORA_BODY = (
+    '{"model_name":"Mistral-7B-Instruct-v0.3","lora_names":["my-finetune"],'
+    '"loader":"Transformers"}'
+)
+
+# Ce que rendrait la route si FastAPI filtrait réellement le retour au
+# travers de ModelInfoResponse, qui ne déclare que model_name et lora_names :
+# ce n'est pas ce que le produit sert, mais c'est le cas qui distinguerait un
+# matcher qui exigerait à tort le trio complet d'un qui se contenterait des
+# deux seuls champs déclarés par le modèle de réponse.
+TEXTGEN_WEBUI_MODEL_INFO_NO_LOADER_BODY = (
+    '{"model_name":"Meta-Llama-3.1-8B-Instruct","lora_names":[]}'
+)
+
+# Un endpoint « model info » quelconque, d'un produit sans rapport.
+OTHER_MODEL_INFO_BODY = '{"model_name":"whatever","loader":"custom"}'
+
+
+def textgen_webui_block():
+    doc = load(TEXTGEN_WEBUI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(TEXTGEN_WEBUI_MODEL_INFO_ROUTE)
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {TEXTGEN_WEBUI_MODEL_INFO_ROUTE} — "
+        "c'est pourtant la seule route dont le handler rend le trio "
+        "model_name/lora_names/loader sans le filtrer"
+    )
+    return blocks[0]
+
+
+def test_textgen_webui_probe_reads_one_route_and_never_touches_generation_or_admin():
+    doc = load(TEXTGEN_WEBUI_TEMPLATE)
+    routes = request_routes(doc)
+    assert routes == {("GET", TEXTGEN_WEBUI_MODEL_INFO_ROUTE)}, (
+        "le template ne se limite plus à la seule lecture qui porte le "
+        f"constat — {routes}"
+    )
+
+    for method, route in routes:
+        assert method == "GET", (
+            f"{method} {route} : verify_api_key() est un no-op tant que "
+            "--api-key n'est pas passé, donc le même processus sans garde "
+            "servirait une écriture — aucune n'est nécessaire pour signaler "
+            "l'exposition"
+        )
+        for forbidden, why in (
+            ("completions",
+             "/v1/completions et /v1/chat/completions font tourner le "
+             "modèle sur le matériel de l'exploitant"),
+            ("chat-prompt",
+             "/v1/internal/chat-prompt construit un prompt à partir d'un "
+             "historique de conversation"),
+            ("images/generations",
+             "/v1/images/generations lance la génération d'image sur le "
+             "matériel de l'exploitant"),
+            ("audio/transcriptions",
+             "/v1/audio/transcriptions fait tourner le moteur de "
+             "transcription"),
+            ("model/load",
+             "POST /v1/internal/model/load déchargerait le modèle en place "
+             "pour en charger un autre"),
+            ("model/unload",
+             "POST /v1/internal/model/unload déchargerait le modèle de "
+             "l'exploitant"),
+            ("lora/load",
+             "POST /v1/internal/lora/load changerait les LoRA appliqués"),
+            ("lora/unload",
+             "POST /v1/internal/lora/unload retirerait les LoRA appliqués"),
+            ("stop-generation",
+             "POST /v1/internal/stop-generation agit sur une génération en "
+             "cours"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_textgen_webui_matcher_requires_the_full_model_info_trio():
+    block = textgen_webui_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature "
+        "produit peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") == "word" and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+    assert all(m.get("condition") == "and" for m in body_matchers), (
+        "un matcher sur les clés du trio en condition « or » se contenterait "
+        "d'une seule d'entre elles, qu'un produit sans rapport peut porter"
+    )
+
+    assert all(word_matcher_hits(m, TEXTGEN_WEBUI_MODEL_INFO_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas la réponse par défaut de "
+        "get_current_model_info() sur une instance dont l'exploitant n'a "
+        "chargé aucun LoRA"
+    )
+    assert all(word_matcher_hits(m, TEXTGEN_WEBUI_MODEL_INFO_WITH_LORA_BODY)
+               for m in body_matchers), (
+        "le template ne reconnaît pas une instance avec un LoRA chargé"
+    )
+
+    assert not all(word_matcher_hits(m, TEXTGEN_WEBUI_MODEL_INFO_NO_LOADER_BODY)
+                  for m in body_matchers), (
+        "le template déclenche sur un corps qui ne porte que les deux "
+        "champs déclarés par ModelInfoResponse — ce n'est pas ce que le "
+        "produit sert réellement, puisque le handler rend le dict brut sans "
+        "le filtrer au travers de ce modèle"
+    )
+    assert not all(word_matcher_hits(m, OTHER_MODEL_INFO_BODY)
+                  for m in body_matchers), (
+        "le template déclenche sur un endpoint « model info » générique "
+        "d'un produit sans rapport — c'est le trio complet, propre à "
+        "get_current_model_info(), qui doit désigner text-generation-webui"
+    )
+
+
+def test_textgen_webui_extractors_report_model_name_and_loader():
+    extractors = textgen_webui_block().get("extractors") or []
+    reported = {(e.get("type"), e.get("part"), e.get("name"),
+                tuple(e.get("json") or [])) for e in extractors}
+    assert reported == {
+        ("json", "body", "model_name", (".model_name",)),
+        ("json", "body", "loader", (".loader",)),
+    }, reported
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

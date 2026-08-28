@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-58 templates, 55 produits.
+59 templates, 56 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -86,6 +86,7 @@ amont.
 | tabby | [`tabby-health-exposed`](templates/exposure/tabby-health-exposed.yaml) | medium |
 | text-embeddings-inference | [`text-embeddings-inference-exposed`](templates/exposure/text-embeddings-inference-exposed.yaml) | medium |
 | text-generation-inference | [`text-generation-inference-exposed`](templates/exposure/text-generation-inference-exposed.yaml) | high |
+| text-generation-webui | [`text-generation-webui-internal-api-exposed`](templates/exposure/text-generation-webui-internal-api-exposed.yaml) | high |
 | torchserve | [`torchserve-management-api-open`](templates/exposure/torchserve-management-api-open.yaml) | critical |
 | triton-inference-server | [`triton-inference-server-exposed`](templates/exposure/triton-inference-server-exposed.yaml) | high |
 | vllm | [`vllm-unauthenticated-api`](templates/exposure/vllm-unauthenticated-api.yaml) | high |

@@ -1,0 +1,162 @@
+id: text-generation-webui-internal-api-exposed
+
+info:
+  name: text-generation-webui - Unauthenticated Internal API Model Info
+  author: popy21
+  severity: high
+  description: |
+    text-generation-webui (oobabooga) est l'interface Gradio et le serveur
+    d'inférence auto-hébergé le plus répandu pour faire tourner des LLM
+    locaux : un seul processus charge le modèle, sert l'UI de chat et,
+    lorsque --api est passé, monte une application FastAPI séparée
+    (modules/api/script.py) qui expose une API compatible OpenAI et
+    Anthropic sur le port --api-port, 5000 par défaut.
+    L'authentification n'est pas un middleware global : elle est portée
+    route par route par la dépendance verify_api_key(), déclarée
+    « def verify_api_key(authorization: str = Header(None)) -> None: »,
+    montée en « check_key = [Depends(verify_api_key)] » puis attachée à
+    chaque route via « dependencies=check_key ». Son corps entier tient en
+    « expected_api_key = shared.args.api_key » puis
+    « if expected_api_key and (authorization is None or authorization !=
+    f"Bearer {expected_api_key}"): raise HTTPException(401) ». Le premier
+    opérande du « and » est le garde : --api-key vaut '' par défaut
+    (« group.add_argument('--api-key', type=str, default='', ...) » dans
+    shared.py), une chaîne vide est fausse en Python, donc tant que ce
+    drapeau n'est pas passé la fonction ne lève jamais rien — elle ne lit
+    même pas l'en-tête Authorization. C'est un no-op, pas une vérification
+    qui échoue ouverte : le comportement par défaut du produit est de servir
+    l'API à l'anonyme. --admin-key suit la même règle : « if not
+    shared.args.admin_key: shared.args.admin_key = shared.args.api_key »
+    au démarrage, donc quand aucun des deux n'est fourni, les routes
+    d'administration sont aussi ouvertes. verify_anthropic_key(), qui lit
+    x-api-key au lieu de Bearer, retombe sur le même shared.args.api_key et
+    le même no-op.
+    GET /v1/internal/model/info porte cette dépendance
+    (« dependencies=check_key ») et son handler tient en deux lignes :
+    « payload = OAImodels.get_current_model_info() » puis
+    « return JSONResponse(content=payload) ». get_current_model_info(),
+    dans modules/api/models.py, rend littéralement
+    « {'model_name': shared.model_name, 'lora_names': shared.lora_names,
+    'loader': shared.args.loader} » — le trio exact. La route déclare
+    response_model=ModelInfoResponse, mais ModelInfoResponse
+    (modules/api/typing.py) ne porte que model_name et lora_names, sans
+    loader ; ce filtrage ne s'applique pourtant pas ici, parce que le
+    handler retourne un objet Response (JSONResponse) construit à la main
+    plutôt que le dict brut — FastAPI ne revalide et ne sérialise un retour
+    au travers de response_model que lorsque la fonction rend la donnée
+    elle-même, pas quand elle rend déjà une Response. Le corps servi est
+    donc bien le dict à trois clés de get_current_model_info(), dans cet
+    ordre, tel que Starlette le sérialise (JSONResponse.render, séparateurs
+    compacts « , » et « : » sans espace).
+  impact: |
+    Le trio model_name / lora_names / loader nomme le modèle chargé (avec
+    son chemin ou son identifiant Hugging Face), les LoRA actifs et le
+    backend d'inférence (transformers, llama.cpp, ExLlamaV2, ExLlamaV3...) —
+    ce que sert précisément ce processus, sur ce port.
+    C'est un symptôme : le même défaut ouvre l'intégralité de l'API de
+    génération sur le même processus, sans authentification tant que
+    --api-key n'a pas été ajouté à --api. Compatibles OpenAI :
+    /v1/chat/completions, /v1/completions, /v1/embeddings,
+    /v1/images/generations, /v1/audio/transcriptions, /v1/moderations, et
+    les utilitaires internes /v1/internal/encode, /v1/internal/decode,
+    /v1/internal/token-count, /v1/internal/logits,
+    /v1/internal/chat-prompt, /v1/internal/stop-generation. Compatible
+    Anthropic : /v1/messages, gardé par verify_anthropic_key(), qui retombe
+    sur le même shared.args.api_key resté vide. N'importe qui consomme le
+    GPU ou le CPU de l'hôte pour faire tourner ses propres prompts, sans
+    limite de débit ni trace d'audit imputable.
+    Et parce que --admin-key hérite silencieusement de --api-key quand il
+    n'est pas fourni séparément, les routes d'administration restent elles
+    aussi ouvertes dans la configuration par défaut : POST
+    /v1/internal/model/load permet à un tiers de décharger le modèle en
+    place et d'en charger un autre (avec des paramètres de chargement de
+    son choix), POST /v1/internal/model/unload le décharge purement et
+    simplement, et /v1/internal/lora/load / /v1/internal/lora/unload
+    changent les LoRA appliqués — sur le processus de l'exploitant, sans
+    qu'aucune clé distincte de --api-key n'ait besoin d'être devinée.
+  remediation: |
+    Passer --api-key à un jeton fort en même temps que --api : c'est ce
+    réglage, et lui seul, qui rend verify_api_key() effectif ; sans lui la
+    fonction ne fait rien, quel que soit l'en-tête envoyé. Passer aussi
+    --admin-key à une valeur différente de --api-key pour que les routes de
+    chargement/déchargement de modèle et de LoRA ne partagent pas le même
+    secret que le reste de l'API. --api-key n'a aucun rapport avec
+    --gradio-auth, qui protège l'interface web de chat : les deux doivent
+    être posés séparément.
+    Ne pas s'appuyer sur --listen pour faire office de contrôle d'accès :
+    c'est le réglage qui rend le port joignable au-delà de 127.0.0.1, pas
+    celui qui authentifie qui l'atteint. Lier le port 5000 à l'interface
+    loopback et faire passer tout accès distant légitime par un tunnel ou
+    par un proxy qui exige une identité, y compris pour les routes de
+    lecture comme /v1/internal/model/info.
+    Après une exposition, tenir pour lus le nom du modèle, les LoRA actifs
+    et le backend d'inférence. Vérifier dans les journaux si les routes de
+    génération ont été appelées pendant la fenêtre, et si
+    /v1/internal/model/load, /v1/internal/model/unload ou une route
+    /v1/internal/lora/ ont modifié l'état du serveur.
+  reference:
+    - https://github.com/oobabooga/text-generation-webui/blob/main/modules/api/models.py
+    - https://github.com/oobabooga/text-generation-webui/blob/main/modules/api/script.py
+    - https://github.com/oobabooga/text-generation-webui/blob/main/modules/api/typing.py
+    - https://github.com/oobabooga/text-generation-webui/blob/main/modules/shared.py
+    - https://github.com/oobabooga/text-generation-webui
+  metadata:
+    max-request: 1
+    vendor: oobabooga
+    product: text-generation-webui
+  tags: ai,llm,text-generation-webui,oobabooga,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture. Le handler de /v1/internal/model/info tient en deux
+  # lignes (payload = get_current_model_info() ; return
+  # JSONResponse(content=payload)) et rend directement le dict à trois clés
+  # du produit — nul besoin d'une seconde route pour corroborer : le trio
+  # model_name/lora_names/loader, sur ce chemin précis, ne peut venir que de
+  # ce handler-là.
+  #
+  # En lecture seule, et strictement. Le même processus sans --api-key sert
+  # /v1/chat/completions, qui ferait tourner le modèle de l'exploitant, et
+  # POST /v1/internal/model/load, qui le déchargerait. Signaler l'exposition
+  # ne demande d'appeler aucune des deux.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/internal/model/info"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Les trois clés du dict que get_current_model_info() écrit en dur,
+      # dans modules/api/models.py — model_name et lora_names viennent de
+      # response_model=ModelInfoResponse, mais loader n'y figure pas : elle
+      # ne survit dans le corps servi que parce que le handler retourne un
+      # objet Response construit à la main, que FastAPI ne refiltre pas au
+      # travers du modèle. Exiger les trois écarte un endpoint générique
+      # « model info » d'un autre produit, qui ne les porterait pas toutes.
+      - type: word
+        part: body
+        words:
+          - '"model_name"'
+          - '"lora_names"'
+          - '"loader"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: json
+        part: body
+        name: model_name
+        json:
+          - '.model_name'
+
+      - type: json
+        part: body
+        name: loader
+        json:
+          - '.loader'
