@@ -1,0 +1,235 @@
+id: invokeai-runtime-config-exposed
+
+info:
+  name: InvokeAI - Unauthenticated Runtime Configuration Exposure
+  author: popy21
+  severity: high
+  description: |
+    InvokeAI est l'interface et le back-end de génération d'images
+    auto-hébergés d'Invoke, du même écosystème que ComfyUI et AUTOMATIC1111
+    déjà couverts par le pack. Son authentification n'est pas un middleware :
+    elle est portée route par route, par des dépendances FastAPI déclarées
+    dans invokeai/app/api/auth_dependencies.py — CurrentUser, AdminUser, et
+    leurs variantes CurrentUserOrDefault et AdminUserOrDefault. Ce sont ces
+    deux dernières que presque toutes les routes portent, et leur suffixe dit
+    exactement ce qu'elles font.
+    get_current_user_or_default() ouvre sur « config =
+    ApiDependencies.invoker.services.configuration » puis « if not
+    config.multiuser: return TokenData(user_id="system",
+    email="system@system.invokeai", is_admin=True) » — elle ne lit ni
+    l'en-tête Authorization ni le moindre cookie avant de rendre ce jeton.
+    require_admin_or_default(), qui dérive de la précédente, ne fait ensuite
+    que « if not current_user.is_admin: raise HTTPException(403) » : le jeton
+    synthétique porte is_admin=True, donc le contrôle passe. Hors mode
+    multi-utilisateur, un appelant anonyme est donc servi comme
+    administrateur sur toutes les routes marquées AdminUserOrDefault, sans
+    qu'aucune ligne du chemin d'authentification ne s'exécute.
+    Or le mode multi-utilisateur n'est pas le défaut :
+    invokeai/app/services/config/config_default.py déclare « multiuser: bool =
+    Field(default=False, description="Enable multiuser support. When disabled,
+    the application runs in single-user mode using a default system account
+    with administrator privileges. When enabled, requires user authentication
+    and authorization.") ». C'est le produit lui-même qui documente que son
+    réglage par défaut fait tourner l'application sous un compte système doté
+    des privilèges d'administrateur — un choix sain pour une instance de
+    poste de travail, et rien d'autre qu'un accès administrateur anonyme dès
+    que le port est joignable.
+    Le défaut de liaison est ce qui fait basculer l'un dans l'autre : « host:
+    str = Field(default="127.0.0.1", description="IP address to bind to. Use
+    `0.0.0.0` to serve to your local network.") », port 9090, et le réglage se
+    pose aussi bien par variable d'environnement — model_config =
+    SettingsConfigDict(env_prefix="INVOKEAI_"), donc INVOKEAI_HOST — que par
+    invokeai.yaml. L'image officielle publie « ${INVOKEAI_PORT:-9090} » et
+    lance « invokeai-web » : dans un conteneur, la boucle locale ne répond à
+    personne, et poser 0.0.0.0 est le geste qui rend l'instance utilisable.
+    GET /v1/app/runtime_config (invokeai/app/api/routers/app_info.py,
+    app_router = APIRouter(prefix="/v1/app"), monté par api_app.py en
+    « app.include_router(app_info.app_router, prefix="/api") ») porte
+    AdminUserOrDefault et rend response_model=InvokeAIAppConfigWithSetFields,
+    déclaré « set_fields: set[str] » puis « config: InvokeAIAppConfig ». Le
+    handler tient en une ligne : « return
+    InvokeAIAppConfigWithSetFields(set_fields=config.model_fields_set,
+    config=_redact_config_secrets(config)) ». FastAPI sérialise un modèle de
+    réponse dans l'ordre de déclaration des champs, donc set_fields d'abord,
+    puis config — et c'est ce couple, sur ce chemin, qui désigne InvokeAI et
+    lui seul.
+    set_fields est un ensemble Python : l'ordre de ses éléments n'est pas
+    reproductible d'un processus à l'autre, et il vaut « [] » sur une
+    instance qui n'a rien surchargé. Un template qui exigerait un contenu ou
+    un ordre manquerait donc l'essentiel des instances ; c'est la présence de
+    la clé, et le fait qu'elle ouvre le document, qui portent le constat.
+  impact: |
+    La réponse est la configuration du serveur en entier, telle que le
+    processus la tient : host et port de liaison, models_dir, outputs_dir,
+    db_dir, custom_nodes_dir, style_presets_dir et profiles_dir — donc
+    l'organisation du disque de l'exploitant —, precision, attention_type,
+    device_working_mem_gb, max_cache_ram_gb et max_cache_vram_gb, patchmatch,
+    log_level et log_handlers, allow_origins / allow_credentials /
+    allow_methods / allow_headers, ssl_certfile et ssl_keyfile, base_url et
+    forwarded_allow_ips, et les réglages hérités ram, vram et lazy_offload.
+    S'y ajoutent les drapeaux qui décrivent la posture de l'installation :
+    multiuser, strict_password_checking, allow_private_download_urls, et
+    unsafe_disable_picklescan — que le produit documente lui-même « UNSAFE.
+    Disable the picklescan security check during model installation. […] This
+    will allow arbitrary code execution during model installation ». Un tiers
+    apprend donc, avant d'essayer quoi que ce soit, si l'installation de
+    modèle de cette instance est scannée ou non.
+    La redaction est partielle et le produit le dit dans son propre
+    commentaire : _redact_config_secrets() masque par « ********** » les
+    champs *_api_key d'EXTERNAL_PROVIDER_CONFIG_FIELDS, les jetons de
+    remote_api_tokens et download_proxy quand il contient un « @ » — puis
+    « NOTE: coverage is by convention, not automatic. […] If you add a
+    credential to InvokeAIAppConfig under any other name, you must extend this
+    function or it will be served verbatim. » Les url_regex de
+    remote_api_tokens, eux, ne sont pas masqués : ils nomment les hôtes
+    auxquels l'instance se présente avec un jeton.
+    Surtout, la lecture n'est qu'un symptôme : la même dépendance
+    AdminUserOrDefault garde les routes qui écrivent. PATCH
+    /api/v1/app/runtime_config applique les modifications reçues puis les
+    persiste — « persisted_config.write_file(config.config_file_path) » —,
+    donc survit au redémarrage. POST /api/v2/models/install fait installer un
+    modèle depuis une URL ou un chemin choisis par l'appelant, sur une
+    instance dont unsafe_disable_picklescan vient d'annoncer si le contrôle
+    de désérialisation est actif. DELETE /api/v2/models/i/{key} supprime un
+    modèle. POST /api/v2/models/hf_login écrit un jeton Hugging Face dans le
+    trousseau de l'hôte. Le gestionnaire de modèles est donc joignable en
+    écriture par le même anonyme que celui qui lit la configuration.
+  remediation: |
+    Ne pas publier le port 9090 sur une interface non maîtrisée : le défaut
+    du produit est « 127.0.0.1 », et c'est l'opérateur qui le change en
+    0.0.0.0 (INVOKEAI_HOST ou host dans invokeai.yaml) pour rendre un
+    conteneur joignable. Côté Docker, lier « 127.0.0.1:9090:9090 » plutôt que
+    le port nu, et faire passer tout accès distant par un tunnel ou par un
+    proxy qui exige une identité sur la totalité du site — y compris
+    /api/v1/app/version, qui ne porte aucune dépendance d'authentification et
+    répond donc même en mode multi-utilisateur.
+    Poser multiuser=true (INVOKEAI_MULTIUSER) referme les routes *OrDefault :
+    c'est le seul réglage du produit qui retire réellement le compte système
+    administrateur implicite, et il n'est pas activé par défaut. Il crée en
+    revanche une surface d'authentification à administrer (comptes, mots de
+    passe, jetons) : l'activer sans placer le service derrière un filtrage
+    revient à exposer un écran de connexion, pas à fermer l'instance.
+    Après une exposition, tenir pour lue la configuration entière de
+    l'instance — chemins sur disque, politique CORS, drapeaux de sécurité, et
+    la liste des réglages surchargés par l'exploitant — ainsi que la version
+    servie par /api/v1/app/version et l'inventaire de /api/v2/models/.
+    Vérifier ensuite dans invokeai.yaml qu'aucun réglage n'a été réécrit par
+    PATCH /api/v1/app/runtime_config pendant la fenêtre, et dans les journaux
+    si /api/v2/models/install, /api/v2/models/hf_login ou une suppression de
+    modèle ont été appelés. Faire tourner les jetons qui traînaient dans la
+    configuration : remote_api_tokens et les clés de fournisseurs externes
+    sont masqués sur cette route, pas les hôtes auxquels ils s'appliquent.
+  reference:
+    - https://github.com/invoke-ai/InvokeAI/blob/main/invokeai/app/api/routers/app_info.py
+    - https://github.com/invoke-ai/InvokeAI/blob/main/invokeai/app/api/auth_dependencies.py
+    - https://github.com/invoke-ai/InvokeAI/blob/main/invokeai/app/services/config/config_default.py
+    - https://github.com/invoke-ai/InvokeAI/blob/main/invokeai/app/api/routers/model_manager.py
+    - https://github.com/invoke-ai/InvokeAI/blob/main/invokeai/app/api_app.py
+    - https://github.com/invoke-ai/InvokeAI/blob/main/docker/docker-compose.yml
+    - https://github.com/invoke-ai/InvokeAI
+  metadata:
+    max-request: 3
+    vendor: invoke-ai
+    product: invokeai
+  tags: ai,invokeai,stable-diffusion,image-generation,exposure,unauth,misconfig
+
+http:
+  # Trois lectures, et une seule porte le constat.
+  #
+  # GET /api/v1/app/runtime_config est la route marquée AdminUserOrDefault :
+  # elle ne répond à l'anonyme que parce que get_current_user_or_default()
+  # rend un jeton system is_admin=True avant même de regarder la requête, ce
+  # qui n'arrive que si multiuser vaut false. Son corps dit donc les deux
+  # moitiés du fait : le produit (le couple set_fields + config, propre à
+  # InvokeAIAppConfigWithSetFields) et l'absence de garde (la route a répondu
+  # là où elle aurait dû rendre 401 puis 403).
+  #
+  # GET /api/v1/app/version corrobore par un chemin de code disjoint —
+  # get_version() lit invokeai.version.__version__ et ne touche pas à
+  # get_config() — mais ne peut rien conclure seule : c'est la seule route du
+  # routeur qui ne porte aucune dépendance d'authentification, donc elle
+  # répond aussi en mode multi-utilisateur.
+  #
+  # GET /api/v2/models/ est servie par un autre routeur
+  # (model_manager_router, prefix="/v2/models") sous CurrentUserOrDefault :
+  # sa réponse dit que la couche utilisateur est ouverte elle aussi, et c'est
+  # ce routeur dont les verbes d'écriture — POST /install, POST /hf_login,
+  # DELETE /i/{key} — sont gardés par la même dépendance *OrDefault.
+  #
+  # En lecture seule, et strictement. PATCH sur ce même chemin
+  # /api/v1/app/runtime_config réécrit la configuration et la persiste dans
+  # invokeai.yaml ; le signaler ne demande pas de l'appeler.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/app/runtime_config"
+      - "{{BaseURL}}/api/v1/app/version"
+      - "{{BaseURL}}/api/v2/models/"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les trois réponses. Sans lui, /api/v1/app/version — anonyme par
+    # construction sur toutes les instances — conclurait de son côté.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat. « set_fields » est le nom de champ que
+          # InvokeAIAppConfigWithSetFields déclare en premier, et FastAPI
+          # sérialise un modèle de réponse dans l'ordre de déclaration : la
+          # clé ouvre donc le document, ce que l'ancrage vérifie. Cet ancrage
+          # écarte aussi la même charge utile retrouvée au fond d'un document
+          # composite qu'une supervision agrégerait sous une clé à elle.
+          #
+          # Rien n'est exigé du contenu du tableau : set_fields est un
+          # « set[str] » Python, donc l'ordre de ses éléments n'est pas
+          # reproductible d'un processus à l'autre, et il vaut « [] » sur une
+          # instance qui n'a surchargé aucun réglage.
+          #
+          # Les \s* sont là parce que le sérialiseur n'est pas garanti : la
+          # JSONResponse de FastAPI écrit compact, un intermédiaire qui
+          # réindente ce qu'il relaie ne le fait pas.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"set_fields\"\\s*:\\s*\\[", trim_space(body_1)) && regex("\"config\"\\s*:\\s*\\{", body_1)'
+
+          # La seconde moitié du même document : trois champs
+          # d'InvokeAIAppConfig, choisis parce qu'ils datent des premières
+          # versions du modèle et qu'aucun n'est près d'en sortir — models_dir
+          # et outputs_dir sont des Path, donc sérialisés en chaîne, patchmatch
+          # un booléen. Ils disent que « config » est bien la configuration du
+          # produit et non un objet quelconque portant ce nom.
+          #
+          # Aucune adjacence n'est exigée entre eux : le modèle a gagné des
+          # champs à chaque version — image_subfolder_strategy,
+          # workflow_thumbnails_dir, http_compression_level, les réglages de
+          # fournisseurs externes — et ils s'intercalent.
+          - 'regex("\"models_dir\"\\s*:\\s*\"", body_1) && regex("\"outputs_dir\"\\s*:\\s*\"", body_1) && regex("\"patchmatch\"\\s*:\\s*(?:true|false)", body_1)'
+
+          # Première corroboration. AppVersion ne déclare qu'un champ,
+          # « version: str », rempli par invokeai.version.__version__ — un
+          # numéro, donc l'ancrage sur la clé racine suivie d'un chiffre. Elle
+          # dit qu'un processus InvokeAI vivant répond, non qu'il est ouvert :
+          # get_version() est la seule route du routeur sans dépendance
+          # d'authentification.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"version\"\\s*:\\s*\"[0-9]", trim_space(body_2))'
+
+          # Seconde corroboration, sur un autre routeur. ModelsList ne déclare
+          # qu'un champ, « models: List[AnyModelConfig] », et le tableau peut
+          # être vide sur une instance neuve — c'est la clé racine qui compte,
+          # pas son contenu. Elle atteste que CurrentUserOrDefault laisse
+          # aussi passer l'anonyme, donc que le gestionnaire de modèles est
+          # joignable.
+          - 'status_code_3 == 200 && regex("^\\{\\s*\"models\"\\s*:\\s*\\[", trim_space(body_3))'
+
+    extractors:
+      # La version exacte, et elle seule : c'est ce qui permet de dater
+      # l'installation et de la confronter aux avis du dépôt. Un seul
+      # extracteur, borné à body_2 — sous req-condition le moteur émet un
+      # résultat par extracteur qui rend quelque chose, donc la même instance
+      # serait signalée plusieurs fois. La configuration de body_1 ne s'y
+      # prête pas : c'est le document entier qui est le constat, pas un de ses
+      # champs.
+      - type: json
+        part: body_2
+        name: version
+        json:
+          - '.version'

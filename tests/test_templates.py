@@ -14706,6 +14706,417 @@ def test_koboldcpp_extractor_reports_the_model_the_instance_serves():
     )
 
 
+# --------------------------------------------------------------------------
+# InvokeAI ne porte pas son authentification en middleware mais en dépendances
+# FastAPI déclarées route par route, et le suffixe « OrDefault » de celles que
+# presque toutes les routes portent dit exactement ce qu'elles font :
+# get_current_user_or_default() ouvre sur « if not config.multiuser: return
+# TokenData(user_id="system", email="system@system.invokeai", is_admin=True) »,
+# et require_admin_or_default() n'y ajoute qu'un « if not
+# current_user.is_admin ». Hors mode multi-utilisateur — qui n'est pas le
+# défaut, « multiuser: bool = Field(default=False, ...) » — un appelant anonyme
+# est donc servi comme administrateur.
+#
+# GET /api/v1/app/runtime_config est la route qui en fait la démonstration :
+# elle est marquée AdminUserOrDefault et rend
+# InvokeAIAppConfigWithSetFields, déclaré « set_fields: set[str] » puis
+# « config: InvokeAIAppConfig ». FastAPI sérialise dans l'ordre de déclaration,
+# donc set_fields ouvre le document — mais son contenu, lui, ne se prédit pas :
+# c'est un ensemble Python, son ordre n'est pas reproductible d'un processus à
+# l'autre, et il vaut « [] » sur une instance qui n'a rien surchargé.
+
+INVOKEAI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "invokeai-runtime-config-exposed.yaml")
+
+INVOKEAI_RUNTIME_CONFIG_ROUTE = "/api/v1/app/runtime_config"
+INVOKEAI_VERSION_ROUTE = "/api/v1/app/version"
+INVOKEAI_MODELS_ROUTE = "/api/v2/models"
+
+# Les champs d'InvokeAIAppConfig dans l'ordre où config_default.py les déclare
+# — c'est cet ordre que pydantic recopie, et il place models_dir, outputs_dir
+# et patchmatch loin les uns des autres. Un extrait représentatif suffit ici :
+# ce que le template doit tolérer, c'est justement qu'il en manque ou qu'il en
+# apparaisse.
+INVOKEAI_CONFIG_DEFAULTS = {
+    "schema_version": "4.0.3",
+    "legacy_models_yaml_path": None,
+    "host": "0.0.0.0",
+    "port": 9090,
+    "allow_origins": [],
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+    "ssl_certfile": None,
+    "ssl_keyfile": None,
+    "base_url": None,
+    "forwarded_allow_ips": "127.0.0.1",
+    "http_compression_level": 9,
+    "log_tokenization": False,
+    "patchmatch": True,
+    "models_dir": "models",
+    "convert_cache_dir": "models/.convert_cache",
+    "download_cache_dir": "models/.download_cache",
+    "legacy_conf_dir": "configs",
+    "db_dir": "databases",
+    "outputs_dir": "outputs",
+    "image_subfolder_strategy": "flat",
+    "custom_nodes_dir": "nodes",
+    "style_presets_dir": "style_presets",
+    "workflow_thumbnails_dir": "workflow_thumbnails",
+    "log_handlers": ["console"],
+    "log_format": "color",
+    "log_level": "info",
+    "log_sql": False,
+    "log_level_network": "warning",
+    "use_memory_db": False,
+    "profiles_dir": "profiles",
+    "max_cache_ram_gb": None,
+    "max_cache_vram_gb": None,
+    "device_working_mem_gb": 3.0,
+    "enable_partial_loading": True,
+    "keep_ram_copy_of_weights": True,
+    "ram": None,
+    "vram": None,
+    "lazy_offload": True,
+    "precision": "auto",
+    "attention_type": "auto",
+    "attention_slice_size": "auto",
+    "hashing_algorithm": "blake3_single",
+    "remote_api_tokens": None,
+    "allow_private_download_urls": False,
+    "download_proxy": None,
+    "unsafe_disable_picklescan": False,
+    "multiuser": False,
+    "strict_password_checking": False,
+    "external_openai_api_key": None,
+}
+
+
+def invokeai_runtime_config_body(set_fields=("host", "outputs_dir", "precision"),
+                                 drop=(), extra=None, indent=None):
+    """
+    Ce que rend GET /api/v1/app/runtime_config : le modèle de réponse
+    sérialisé dans l'ordre de déclaration, donc set_fields puis config.
+
+    `set_fields` est écrit tel quel — c'est un ensemble côté serveur, donc
+    l'ordre reçu n'est pas celui d'une exécution à l'autre. `drop` retire des
+    champs de config comme le ferait une version plus ancienne, `extra` en
+    ajoute comme le ferait une plus récente, `indent` réécrit le document
+    comme le ferait un intermédiaire qui réindente ce qu'il relaie.
+    """
+    config = {k: v for k, v in INVOKEAI_CONFIG_DEFAULTS.items() if k not in drop}
+    config.update(extra or {})
+    document = {"set_fields": list(set_fields), "config": config}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # La JSONResponse de FastAPI écrit compact.
+    return json.dumps(document, separators=(",", ":"))
+
+
+def invokeai_version_body(version="6.14.0-post1"):
+    """AppVersion ne déclare qu'un champ, rempli par invokeai.version.__version__."""
+    return json.dumps({"version": version}, separators=(",", ":"))
+
+
+def invokeai_models_body(names=("sd_xl_base_1.0", "flux-schnell")):
+    """ModelsList ne déclare qu'un champ, « models: List[AnyModelConfig] »."""
+    return json.dumps(
+        {"models": [{"key": "b1a2c3d4", "name": n, "base": "sdxl",
+                     "type": "main", "format": "checkpoint"} for n in names]},
+        separators=(",", ":"),
+    )
+
+
+INVOKEAI_RUNTIME_CONFIG_BODY = invokeai_runtime_config_body()
+INVOKEAI_VERSION_BODY = invokeai_version_body()
+INVOKEAI_MODELS_BODY = invokeai_models_body()
+
+# La même instance en mode multi-utilisateur : la dépendance ne synthétise plus
+# de jeton system, et FastAPI referme la route avant le handler.
+INVOKEAI_MULTIUSER_401_BODY = '{"detail":"Authentication required"}'
+
+# Un compte authentifié mais non administrateur : require_admin_or_default()
+# s'arrête sur « if not current_user.is_admin ».
+INVOKEAI_NON_ADMIN_403_BODY = '{"detail":"Admin privileges required"}'
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+INVOKEAI_COMPOSITE_BODY = (
+    '{"invokeai":%s,"checked_at":0}' % INVOKEAI_RUNTIME_CONFIG_BODY
+)
+
+# Un service quelconque qui rend un numéro de version sous la même clé racine —
+# c'est-à-dire tout ce que /api/v1/app/version prouve à lui seul.
+GENERIC_VERSION_BODY = '{"version":"1.4.2"}'
+
+
+def invokeai_block():
+    doc = load(INVOKEAI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(INVOKEAI_RUNTIME_CONFIG_ROUTE)
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {INVOKEAI_RUNTIME_CONFIG_ROUTE} — c'est "
+        "pourtant la seule route qui prouve qu'un anonyme est servi comme "
+        "administrateur, les deux autres répondant sans rien dire du mode"
+    )
+    return blocks[0]
+
+
+def invokeai_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = invokeai_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def invokeai_fires(runtime_config=(200, INVOKEAI_RUNTIME_CONFIG_BODY),
+                   version=(200, INVOKEAI_VERSION_BODY),
+                   models=(200, INVOKEAI_MODELS_BODY)):
+    scenario = {
+        INVOKEAI_RUNTIME_CONFIG_ROUTE: runtime_config,
+        INVOKEAI_VERSION_ROUTE: version,
+        INVOKEAI_MODELS_ROUTE: models,
+    }
+    block = invokeai_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in invokeai_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin qu'InvokeAI ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les trois réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_invokeai_probe_reads_three_routes_and_never_writes():
+    assert invokeai_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et /api/v1/app/version — qui ne porte "
+        "aucune dépendance d'authentification et répond donc même en mode "
+        "multi-utilisateur — conclurait de son côté"
+    )
+
+    assert invokeai_requests() == [
+        ("GET", INVOKEAI_RUNTIME_CONFIG_ROUTE),
+        ("GET", INVOKEAI_VERSION_ROUTE),
+        ("GET", INVOKEAI_MODELS_ROUTE),
+    ], (
+        "les trois requêtes ne sont plus celles que le template documente — "
+        f"{invokeai_requests()}"
+    )
+
+    doc = load(INVOKEAI_TEMPLATE)
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", (
+            f"{method} {route} : les mêmes dépendances *OrDefault gardent les "
+            "verbes d'écriture, à commencer par PATCH "
+            "/api/v1/app/runtime_config qui persiste ce qu'il change dans "
+            "invokeai.yaml — aucun n'est nécessaire pour signaler l'exposition"
+        )
+        for forbidden, why in (
+            ("/install",
+             "POST /api/v2/models/install fait installer un modèle depuis une "
+             "URL choisie par l'appelant, sur une instance dont "
+             "unsafe_disable_picklescan dit si le contrôle de désérialisation "
+             "est actif"),
+            ("hf_login",
+             "POST /api/v2/models/hf_login écrit un jeton Hugging Face dans le "
+             "trousseau de l'hôte"),
+            ("/convert",
+             "/api/v2/models/convert/{key} réécrit un modèle de l'exploitant"),
+            ("empty_model_cache",
+             "vider le cache de modèles ferait recharger depuis le disque une "
+             "instance qu'on est censé seulement observer"),
+            ("/queue",
+             "les routes de file de session font tourner le modèle sur le "
+             "matériel de l'exploitant"),
+            ("/logging",
+             "PUT /api/v1/app/logging change le niveau de journalisation de "
+             "l'instance, donc ce qu'elle enregistrera de la visite"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_invokeai_matcher_rests_on_the_set_fields_pair_not_on_the_status():
+    assert invokeai_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance dont "
+        "l'exploitant n'a changé que la liaison réseau"
+    )
+
+    assert not invokeai_fires(
+        runtime_config=(401, INVOKEAI_MULTIUSER_401_BODY),
+        models=(401, INVOKEAI_MULTIUSER_401_BODY),
+    ), (
+        "le template remonte une instance en mode multi-utilisateur, où la "
+        "dépendance ne synthétise plus de jeton system : c'est précisément "
+        "l'instance qui n'a rien à signaler"
+    )
+    assert not invokeai_fires(
+        runtime_config=(403, INVOKEAI_NON_ADMIN_403_BODY),
+    ), (
+        "le template remonte une instance où require_admin_or_default() a "
+        "refusé l'appelant : la route a répondu, mais pas la configuration"
+    )
+    assert not invokeai_fires(runtime_config=(200, INVOKEAI_COMPOSITE_BODY)), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur la clé racine qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not invokeai_fires(
+        runtime_config=(200, GENERIC_VERSION_BODY),
+        version=(200, GENERIC_VERSION_BODY),
+        models=(200, GENERIC_VERSION_BODY),
+    ), (
+        "le template conclut sur un service quelconque qui rend un numéro de "
+        "version : c'est le couple set_fields + config, propre à "
+        "InvokeAIAppConfigWithSetFields, qui nomme le produit"
+    )
+
+    # Le statut, seul, ne départage rien : les trois routes rendent 200 sur une
+    # instance ouverte comme sur n'importe quel serveur vivant.
+    assert not invokeai_fires(runtime_config=(200, '{"config":{}}')), (
+        "le template se contente de la clé config : set_fields est la moitié "
+        "qui nomme le modèle de réponse d'InvokeAI"
+    )
+
+    # Collisions internes au pack : les deux autres interfaces de génération
+    # d'images déjà couvertes ne doivent pas être revendiquées par celle-ci.
+    for other_body, other_name in (
+        (COMFYUI_SYSTEM_STATS_BODY, "ComfyUI"),
+        (AUTOMATIC1111_SD_MODELS_BODY, "AUTOMATIC1111"),
+    ):
+        assert not invokeai_fires(runtime_config=(200, other_body),
+                                  version=(200, other_body),
+                                  models=(200, other_body)), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_invokeai_matcher_holds_across_config_shapes_and_spacings():
+    """
+    Rien du contenu de set_fields ne se prédit — c'est un ensemble Python, il
+    peut être vide — et le modèle de configuration gagne des champs à chaque
+    version. Le template ne doit dépendre ni de l'un ni de l'autre.
+    """
+    assert invokeai_fires(
+        runtime_config=(200, invokeai_runtime_config_body(set_fields=()))
+    ), (
+        "le template exige un set_fields non vide : une instance qui n'a "
+        "surchargé aucun réglage rend « [] », et c'est l'instance la plus "
+        "courante — celle qu'on lance sans rien configurer"
+    )
+    assert invokeai_fires(
+        runtime_config=(200, invokeai_runtime_config_body(
+            set_fields=("precision", "host", "models_dir", "port")))
+    ), (
+        "le template dépend de l'ordre des éléments de set_fields : côté "
+        "serveur c'est un « set[str] », dont l'itération n'est pas "
+        "reproductible d'un processus à l'autre"
+    )
+
+    assert invokeai_fires(
+        runtime_config=(200, invokeai_runtime_config_body(drop=(
+            "image_subfolder_strategy", "workflow_thumbnails_dir",
+            "http_compression_level", "external_openai_api_key",
+            "strict_password_checking",
+        )))
+    ), (
+        "le template exige des champs que les versions antérieures ne rendent "
+        "pas encore — il raterait les instances anciennes, qui sont "
+        "précisément celles qui traînent exposées"
+    )
+    assert invokeai_fires(
+        runtime_config=(200, invokeai_runtime_config_body(
+            extra={"un_reglage_a_venir": "peu importe"}))
+    ), (
+        "le template exige une adjacence entre les champs sur lesquels il "
+        "s'appuie : le modèle en gagne à chaque version, et ils s'intercalent"
+    )
+
+    assert invokeai_fires(
+        runtime_config=(200, invokeai_runtime_config_body(indent=2)),
+        version=(200, json.dumps(json.loads(INVOKEAI_VERSION_BODY), indent=2)),
+        models=(200, json.dumps(json.loads(INVOKEAI_MODELS_BODY), indent=2)),
+    ), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    assert not invokeai_fires(
+        runtime_config=(200, invokeai_runtime_config_body(
+            drop=("models_dir", "outputs_dir", "patchmatch")))
+    ), (
+        "le template se contente du couple set_fields + config sans rien "
+        "exiger de la configuration elle-même : trois champs anciens du "
+        "modèle sont ce qui distingue InvokeAI d'un service quelconque qui "
+        "emploierait les deux mêmes noms"
+    )
+
+
+def test_invokeai_confirmation_needs_both_disjoint_routes():
+    assert not invokeai_fires(version=(404, '{"detail":"Not Found"}')), (
+        "le template conclut sans que /api/v1/app/version ait confirmé : la "
+        "corroboration par un chemin de code disjoint — get_version() lit "
+        "__version__ et ne touche pas à get_config() — est ce qui écarte un "
+        "cache ou un proxy statique qui rejouerait la première réponse"
+    )
+    assert not invokeai_fires(models=(401, INVOKEAI_MULTIUSER_401_BODY)), (
+        "le template conclut alors que /api/v2/models/ a refusé : c'est cette "
+        "route, gardée par CurrentUserOrDefault sur un autre routeur, qui dit "
+        "que la couche utilisateur est ouverte elle aussi"
+    )
+    assert invokeai_fires(models=(200, invokeai_models_body(names=()))), (
+        "le template exige un inventaire non vide : une instance fraîchement "
+        "installée n'a aucun modèle enregistré, et c'est sa configuration — "
+        "pas son inventaire — qui est le constat"
+    )
+
+
+def test_invokeai_conclusion_is_carried_by_the_dsl_alone():
+    block = invokeai_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les trois réponses par leur numéro"
+    )
+
+
+def test_invokeai_extractor_reports_the_version_the_instance_serves():
+    extractors = invokeai_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — c'est /api/v1/app/version qui "
+        "rend un champ unique et exploitable, là où la configuration de "
+        "body_1 est le constat dans son entier et non l'un de ses champs"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant ce qui permet de "
+        "dater l'installation et de la confronter aux avis du dépôt"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
