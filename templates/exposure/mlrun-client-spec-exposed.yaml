@@ -1,0 +1,240 @@
+id: mlrun-client-spec-exposed
+
+info:
+  name: MLRun - Unauthenticated Client Spec Exposure
+  author: popy21
+  severity: high
+  description: |
+    MLRun est la plateforme MLOps d'Iguazio : elle orchestre les entraînements,
+    construit les images de fonction et déploie des fonctions serverless via
+    Nuclio. Son API d'administration — le service « httpdb » — écoute par
+    défaut sur le port 8080 (mlrun/config.py, section httpdb : « "port": 8080 »)
+    et se monte sous /api/v1 : server/py/framework/service/__init__.py pose
+    « self.service_prefix = f"/{self.service_name}" » puis
+    « self.base_versioned_service_prefix = f"{self.service_prefix}/v1" », que
+    main.py utilise en « self.app.include_router(api_router,
+    prefix=self.base_versioned_service_prefix) ». Le client dit la même chose
+    depuis l'autre bout : mlrun/db/httpdb.py construit ses URL avec
+    « f"api/{config.api_base_version}" » et « "api_base_version": "v1" », puis
+    appelle « self.api_call("GET", "client-spec", timeout=5) » — d'où
+    /api/v1/client-spec.
+    L'authentification de MLRun n'est pas un middleware : elle est portée
+    routeur par routeur, dans server/py/services/api/api/api.py, sous la forme
+    « dependencies=[Depends(deps.authenticate_request)] ». Presque toutes les
+    lignes du fichier la portent — artifacts, runs, projects, submit, logs,
+    functions, hub, secrets. Deux ne la portent pas :
+    « api_router.include_router(healthz.router, tags=["healthz"]) » et
+    « api_router.include_router(client_spec.router, tags=["client-spec"]) ».
+    /api/v1/client-spec répond donc quel que soit le mode d'authentification,
+    et c'est ce qui en fait un point de reconnaissance fiable — mais aussi ce
+    qui interdit d'en conclure seul que l'instance est ouverte.
+    Le handler tient en une ligne : « @router.get("/client-spec",
+    response_model=mlrun.common.schemas.ClientSpec) » puis « def
+    get_client_spec(client_spec: ... = Depends(get_cached_client_spec)): return
+    client_spec ». Sa seule dépendance, get_cached_client_spec(), ne lit que
+    deux en-têtes de version client et est mémorisée par
+    « lru_cache_with_ttl(maxsize=32, ttl_seconds=60 * 5) » : aucune ligne du
+    chemin d'authentification ne s'exécute.
+    ClientSpec est un « pydantic.v1.BaseModel » dont la tête est stable depuis
+    la 1.4 — version, namespace, docker_registry, remote_host,
+    mpijob_crd_version, ui_url, artifact_path, feature_store_data_prefixes,
+    puis les images Spark et Kubeflow, api_url, nuclio_version. FastAPI
+    sérialise un response_model dans l'ordre de déclaration et n'omet pas les
+    champs nuls — le test amont test_client_spec le vérifie sans le dire, en
+    lisant « response_body["scrape_metrics"] is None » sur une clé qui doit
+    donc exister. Le document ouvre sur « version », et les cinquante et
+    quelques noms de champs du modèle y figurent tous.
+    Le trio nuclio_version + artifact_path + ui_url est ce qui désigne MLRun :
+    crud/client_spec.py les affecte à chaque appel — « version=config.version »,
+    « nuclio_version=framework.utils.runtimes.nuclio.resolve_nuclio_version() »,
+    « ui_url=config.resolve_ui_url() », « artifact_path=config.artifact_path ».
+    Leurs valeurs, en revanche, ne se prédisent pas : « "artifact_path": "" » et
+    « "url": "" » sont les défauts du fichier de configuration, et
+    resolve_nuclio_version() rend None quand aucun tableau de bord Nuclio n'est
+    joignable. C'est la présence des clés, dans un document qui s'ouvre sur
+    « version », qui porte la reconnaissance — jamais leur contenu, et jamais
+    le statut HTTP.
+    Deux champs de ce modèle ne peuvent pas servir de matcher, pour deux
+    raisons qui se cumulent. authentication_mode passe par
+    « _get_config_value_if_not_default("httpdb.authentication.mode") », qui rend
+    None dès que la valeur courante égale celle de default_config : il est donc
+    nul exactement quand le mode par défaut « none » est en vigueur — son
+    absence de valeur confirme l'exposition, elle ne peut pas l'établir. Et il
+    n'existe qu'à partir de la 1.11, comme default_runtime_image_by_kind, qui
+    passe lui par _get_config_value_diff_from_default() et rend None quand rien
+    ne diffère du défaut. Un template qui s'appuierait sur l'un ou l'autre
+    manquerait toutes les instances antérieures — celles, précisément, qui
+    traînent exposées.
+    Le mode par défaut est le sujet : mlrun/config.py déclare sous httpdb
+    « "authentication": {"mode": "none",  # one of none, basic, bearer,
+    iguazio, iguazio-v4 » et, quelques centaines de lignes plus bas,
+    « "authorization": {"mode": "none",  # one of none, opa ». En mode none,
+    AuthVerifier.authenticate_request() n'entre dans aucune de ses branches —
+    ni _basic_auth_configured(), ni _bearer_auth_configured(), ni les deux
+    variantes Iguazio — et rend un « schemas.AuthInfo() » vide sans lever quoi
+    que ce soit ; côté autorisation, « mode == "none" » instancie
+    framework.utils.auth.providers.nop.Provider, dont query_permissions() rend
+    True inconditionnellement. En configuration par défaut, l'API
+    d'administration entière répond donc sans identifiant.
+  impact: |
+    La réponse de /api/v1/client-spec est la configuration du serveur telle que
+    le processus la tient. On y lit le registre où l'instance pousse ses images
+    de fonction (docker_registry), le namespace Kubernetes, artifact_path,
+    api_url, ui_url, kfp_url et kfp_image, spark_app_image et
+    spark_history_server_path, dask_kfp_image, igz_version, les préfixes de
+    stockage du feature store et du monitoring de modèles, les sélecteurs et
+    tolérances des nœuds préemptibles, la configuration ce, logs, packagers,
+    external_platform_tracking et system_id — c'est-à-dire la topologie de la
+    plateforme avant d'avoir essayé quoi que ce soit.
+    Trois de ces champs sont des chaînes de connexion servies verbatim :
+    « redis_url=config.redis.url », « redis_type=config.redis.type » et
+    « sql_url=config.sql.url ». Aucune fonction de redaction n'intervient sur ce
+    chemin — le handler rend le modèle tel que crud/client_spec.py l'a
+    construit. Leur défaut est la chaîne vide, ce qui veut dire que le seul cas
+    où ils portent quelque chose est celui où l'exploitant y a mis une vraie
+    URL, mot de passe inclus s'il y en a un.
+    Surtout, la lecture n'est qu'un symptôme. Le mode « none » ne ferme rien
+    d'autre : le même anonyme atteint POST /api/v1/submit_job, qui fait tourner
+    une fonction sur le cluster de l'exploitant ; POST /api/v1/build/function,
+    qui déclenche une construction d'image ; GET
+    /api/v1/projects/{project}/secrets, dont le contrôle
+    query_project_resource_permissions() passe par le provider nop et rend donc
+    les secrets de projet en clair ; et DELETE /api/v1/projects/{name}, qui
+    supprime un projet et ce qu'il contient. C'est un accès administrateur
+    complet à une plateforme qui exécute du code par construction.
+  remediation: |
+    Ne pas publier le port 8080 sur une interface non maîtrisée. Le chart
+    officiel mlrun-ce est ce qui rend l'erreur facile : il déclare
+    « mlrun.api.service: {type: NodePort, nodePort: 30070} » — donc l'API sur
+    l'IP de chaque nœud — et « ingress.enabled: false », c'est-à-dire aucune
+    terminaison qui pourrait exiger une identité. Côté Docker, lier
+    « 127.0.0.1:8080:8080 » plutôt que le port nu.
+    Poser httpdb.authentication.mode à basic ou bearer
+    (MLRUN_HTTPDB__AUTHENTICATION__MODE, avec le couple
+    authentication.basic.username / password ou authentication.bearer.token —
+    _basic_auth_configured() exige que l'un des deux soit non vide, sans quoi la
+    branche n'est pas prise et le mode reste sans effet) referme les routeurs
+    qui portent authenticate_request. Cela ne referme ni /api/v1/healthz ni
+    /api/v1/client-spec, dont les routeurs sont inclus sans dépendance : la
+    configuration reste lisible par n'importe qui atteint le port, et seul un
+    filtrage réseau ou un proxy exigeant une identité sur la totalité du
+    préfixe /api y remédie.
+    Après une exposition, tenir pour lue la configuration entière de l'instance
+    — registre d'images, namespace, chemins d'artefacts, URL de la base et de
+    Redis. Faire tourner ce qui traînait dans redis_url et sql_url, ainsi que
+    les secrets de projet accessibles par
+    /api/v1/projects/{project}/secrets. Vérifier ensuite dans les journaux et
+    dans /api/v1/projects/{project}/runs si une exécution a été soumise pendant
+    la fenêtre, et dans /api/v1/build/status si une image a été construite : en
+    mode none, rien n'a empêché ni l'une ni l'autre.
+  reference:
+    - https://github.com/mlrun/mlrun/blob/development/server/py/services/api/api/endpoints/client_spec.py
+    - https://github.com/mlrun/mlrun/blob/development/server/py/services/api/api/api.py
+    - https://github.com/mlrun/mlrun/blob/development/mlrun/common/schemas/_v1/client_spec.py
+    - https://github.com/mlrun/mlrun/blob/development/server/py/services/api/crud/client_spec.py
+    - https://github.com/mlrun/mlrun/blob/development/server/py/services/api/api/endpoints/frontend_spec.py
+    - https://github.com/mlrun/mlrun/blob/development/server/py/framework/utils/auth/verifier.py
+    - https://github.com/mlrun/mlrun/blob/development/mlrun/config.py
+    - https://github.com/mlrun/ce/blob/development/charts/mlrun-ce/values.yaml
+    - https://github.com/mlrun/mlrun
+  metadata:
+    max-request: 2
+    vendor: mlrun
+    product: mlrun
+  tags: ai,ml,mlops,mlrun,nuclio,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du fait.
+  #
+  # GET /api/v1/client-spec nomme le produit. Son routeur est l'un des deux que
+  # api.py inclut sans « dependencies=[Depends(deps.authenticate_request)] »,
+  # donc il répond aussi sur une instance correctement fermée : sa réponse dit
+  # « c'est MLRun, et voici sa configuration », elle ne dit rien du mode.
+  #
+  # GET /api/v1/frontend-spec est le pendant exact. Même processus, mais son
+  # routeur est inclus avec authenticate_request : qu'il réponde 200 à un
+  # appelant sans en-tête dit que la garde a laissé passer. Et son corps le dit
+  # lui-même — _resolve_feature_flags() pose « authentication =
+  # mlrun.common.types.AuthenticationMode(mlrun.mlconf.httpdb.authentication.mode) »,
+  # que FastAPI sérialise en clair sous feature_flags.
+  #
+  # En lecture seule, et strictement. Le mode « none » n'oppose rien à POST
+  # /api/v1/submit_job ni à POST /api/v1/build/function ; le signaler ne
+  # demande de les appeler ni l'un ni l'autre.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/client-spec"
+      - "{{BaseURL}}/api/v1/frontend-spec"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses. Sans lui, /api/v1/client-spec — ouvert par
+    # construction sur toutes les instances, fermées comprises — conclurait de
+    # son côté.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le produit. « version » est le premier champ que ClientSpec
+          # déclare, et FastAPI sérialise un response_model dans l'ordre de
+          # déclaration : la clé ouvre donc le document, ce que l'ancrage
+          # vérifie. Cet ancrage écarte la même charge utile retrouvée au fond
+          # d'un document composite qu'une supervision agrégerait sous une clé
+          # à elle.
+          #
+          # Puis le trio propre à MLRun : nuclio_version — le seul produit qui
+          # rende la version de Nuclio dans sa propre configuration —,
+          # artifact_path et ui_url. Rien n'est exigé de leurs valeurs : les
+          # défauts d'artifact_path et de ui.url sont la chaîne vide, et
+          # resolve_nuclio_version() rend null quand aucun tableau de bord
+          # Nuclio n'est joignable. C'est la présence des clés qui porte le
+          # constat, parce que FastAPI n'omet pas les champs nuls d'un
+          # response_model.
+          #
+          # Les \s* sont là parce que le sérialiseur n'est pas garanti : la
+          # JSONResponse de FastAPI écrit compact, un intermédiaire qui
+          # réindente ce qu'il relaie ne le fait pas.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"version\"\\s*:", trim_space(body_1)) && regex("\"nuclio_version\"\\s*:", body_1) && regex("\"artifact_path\"\\s*:", body_1) && regex("\"ui_url\"\\s*:", body_1)'
+
+          # Trois champs de plus, choisis parce qu'ils datent de la tête du
+          # modèle — docker_registry et feature_store_data_prefixes sont
+          # déclarés dès la 1.4, spark_operator_version juste après — et
+          # qu'aucun n'est près d'en sortir. Ils disent que le document est bien
+          # un ClientSpec et non un objet quelconque portant trois noms en
+          # commun.
+          #
+          # Aucune adjacence n'est exigée entre eux : le modèle a gagné des
+          # champs à chaque version — feature_store_default_targets, kfp_image,
+          # alerts_mode, system_id, les réglages de télémétrie — et ils
+          # s'intercalent. Rien n'est exigé non plus d'authentication_mode ni de
+          # default_runtime_image_by_kind : tous deux n'existent qu'à partir de
+          # la 1.11, et tous deux valent null précisément sur l'instance laissée
+          # à ses défauts, celle que ce template cherche.
+          - 'regex("\"docker_registry\"\\s*:", body_1) && regex("\"feature_store_data_prefixes\"\\s*:", body_1) && regex("\"spark_operator_version\"\\s*:", body_1)'
+
+          # L'absence de garde, sur un routeur qui en porte une. FrontendSpec
+          # déclare « feature_flags: FeatureFlags » et « default_artifact_path:
+          # str » : le couple dit que la réponse vient bien de MLRun, par un
+          # chemin de code disjoint de celui de client-spec.
+          #
+          # « "authentication": "none" » est la transcription littérale de
+          # httpdb.authentication.mode par _resolve_feature_flags(). Contrairement
+          # à authentication_mode de ClientSpec, qui est filtré quand il vaut son
+          # défaut, celui-ci est toujours écrit : c'est donc lui qui peut porter
+          # le constat en positif, et il le porte sur la seule route des deux
+          # dont la réponse prouve que l'anonyme a été accepté.
+          - 'status_code_2 == 200 && regex("\"feature_flags\"\\s*:\\s*\\{", body_2) && regex("\"default_artifact_path\"\\s*:", body_2) && regex("\"authentication\"\\s*:\\s*\"none\"", body_2)'
+
+    extractors:
+      # La version exacte, et elle seule : c'est ce qui permet de dater
+      # l'installation et de la confronter aux avis du dépôt. Un seul
+      # extracteur, borné à body_1 — sous req-condition le moteur émet un
+      # résultat par extracteur qui rend quelque chose, donc la même instance
+      # serait signalée plusieurs fois. « version » est rempli par
+      # config.version, qui lit mlrun.utils.version.Version().get().
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.version'

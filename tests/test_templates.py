@@ -15268,6 +15268,453 @@ def test_textgen_webui_extractors_report_model_name_and_loader():
     }, reported
 
 
+# --------------------------------------------------------------------------
+# MLRun porte son authentification routeur par routeur, dans api.py, sous la
+# forme « dependencies=[Depends(deps.authenticate_request)] ». Presque toutes
+# les lignes du fichier la portent ; deux ne la portent pas, dont
+# « api_router.include_router(client_spec.router, tags=["client-spec"]) ».
+# GET /api/v1/client-spec répond donc aussi sur une instance fermée : sa
+# réponse nomme le produit et rend sa configuration, elle ne dit rien du mode.
+#
+# C'est GET /api/v1/frontend-spec qui le dit : même processus, mais son
+# routeur est inclus avec authenticate_request, et son corps transcrit
+# littéralement httpdb.authentication.mode sous feature_flags —
+# _resolve_feature_flags() pose « authentication =
+# mlrun.common.types.AuthenticationMode(mlrun.mlconf.httpdb.authentication.mode) ».
+# Le défaut du produit est « "authentication": {"mode": "none" » ; en mode
+# none, AuthVerifier.authenticate_request() n'entre dans aucune branche et
+# rend un AuthInfo() vide sans lever quoi que ce soit.
+
+MLRUN_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                              "mlrun-client-spec-exposed.yaml")
+
+MLRUN_CLIENT_SPEC_ROUTE = "/api/v1/client-spec"
+MLRUN_FRONTEND_SPEC_ROUTE = "/api/v1/frontend-spec"
+
+# Un extrait représentatif de ClientSpec, dans l'ordre où le modèle déclare ses
+# champs — c'est cet ordre que pydantic recopie et que FastAPI sérialise, et il
+# place version en tête puis ui_url, artifact_path et nuclio_version loin les
+# uns des autres. Les valeurs sont celles d'une instance qu'on n'a pas
+# configurée : artifact_path et ui_url valent la chaîne vide, et tout ce qui
+# passe par _get_config_value_if_not_default() vaut null.
+MLRUN_CLIENT_SPEC_DEFAULTS = {
+    "version": "1.12.0",
+    "namespace": "mlrun",
+    "docker_registry": "index.docker.io/mlrun",
+    "remote_host": None,
+    "mpijob_crd_version": "v1",
+    "ui_url": "",
+    "artifact_path": "",
+    "feature_store_data_prefixes": None,
+    "feature_store_default_targets": None,
+    "spark_app_image": None,
+    "spark_app_image_tag": None,
+    "spark_history_server_path": None,
+    "spark_operator_version": "spark-3",
+    "kfp_image": "mlrun/mlrun:1.12.0",
+    "kfp_url": "",
+    "dask_kfp_image": "mlrun/ml-base:1.12.0",
+    "api_url": "http://mlrun-api:8080",
+    "nuclio_version": "1.13.24",
+    "ui_projects_prefix": None,
+    "scrape_metrics": None,
+    "default_function_node_selector": None,
+    "igz_version": None,
+    "auto_mount_type": None,
+    "auto_mount_params": None,
+    "default_function_priority_class_name": None,
+    "valid_function_priority_class_names": None,
+    "default_tensorboard_logs_path": None,
+    "default_function_pod_resources": None,
+    "preemptible_nodes_node_selector": None,
+    "preemptible_nodes_tolerations": None,
+    "default_preemption_mode": None,
+    "force_run_local": None,
+    "function": None,
+    "redis_url": "",
+    "redis_type": "standalone",
+    "sql_url": "",
+    "ce": {"mode": "full", "release": "0.7.0"},
+    "calculate_artifact_hash": None,
+    "generate_artifact_target_path_from_artifact_hash": None,
+    "logs": None,
+    "packagers": None,
+    "external_platform_tracking": None,
+    "alerts_mode": None,
+    "system_id": None,
+    "model_endpoint_monitoring_store_prefixes": None,
+    # Ajoutés au modèle en 1.11 seulement, et tous deux filtrés quand la
+    # configuration vaut son défaut : authentication_mode par
+    # _get_config_value_if_not_default("httpdb.authentication.mode"),
+    # default_runtime_image_by_kind par _get_config_value_diff_from_default().
+    # Ils valent donc null précisément sur l'instance que ce template cherche.
+    "authentication_mode": None,
+    "oauth_internal_token_endpoint": None,
+    "oauth_external_token_endpoint": None,
+    "authorization_namespaces_mlrun": None,
+    "default_runtime_image_by_kind": None,
+    "telemetry_enabled": None,
+}
+
+# Ce que le modèle ne déclarait pas encore avant la 1.11 : une instance de
+# cette époque rend le même document sans ces clés-là.
+MLRUN_FIELDS_ADDED_IN_1_11 = (
+    "authentication_mode",
+    "oauth_internal_token_endpoint",
+    "oauth_external_token_endpoint",
+    "authorization_namespaces_mlrun",
+    "default_runtime_image_by_kind",
+    "telemetry_enabled",
+)
+
+
+def mlrun_client_spec_body(drop=(), extra=None, indent=None, **overrides):
+    """
+    Ce que rend GET /api/v1/client-spec : ClientSpec sérialisé dans l'ordre de
+    déclaration, champs nuls compris — FastAPI n'omet pas les champs nuls d'un
+    response_model, et le test amont test_client_spec le vérifie sans le dire en
+    lisant « response_body["scrape_metrics"] is None » sur une clé qui doit donc
+    exister.
+
+    `drop` retire des champs comme le ferait une version plus ancienne, `extra`
+    en ajoute comme le ferait une plus récente, `indent` réécrit le document
+    comme le ferait un intermédiaire qui réindente ce qu'il relaie.
+    """
+    document = {k: v for k, v in MLRUN_CLIENT_SPEC_DEFAULTS.items()
+                if k not in drop}
+    document.update(overrides)
+    document.update(extra or {})
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # La JSONResponse de FastAPI écrit compact.
+    return json.dumps(document, separators=(",", ":"))
+
+
+def mlrun_frontend_spec_body(authentication="none", drop=(), indent=None):
+    """
+    Ce que rend GET /api/v1/frontend-spec, dans l'ordre de déclaration de
+    FrontendSpec. `authentication` est la transcription littérale de
+    httpdb.authentication.mode par _resolve_feature_flags().
+    """
+    document = {
+        "jobs_dashboard_url": None,
+        "model_monitoring_dashboard_url": None,
+        "abortable_function_kinds": ["job", "spark"],
+        "feature_flags": {
+            "project_membership": "disabled",
+            "authentication": authentication,
+            "nuclio_streams": "disabled",
+            "preemption_nodes": "disabled",
+        },
+        "default_function_priority_class_name": None,
+        "valid_function_priority_class_names": [],
+        "default_function_image_by_kind": {},
+        "function_deployment_target_image_template":
+            "index.docker.io/mlrun/func-{project}-{name}:{tag}",
+        "function_deployment_target_image_name_prefix_template": "func-{project}-{name}",
+        "function_deployment_target_image_registries_to_enforce_prefix": [],
+        "function_deployment_mlrun_requirement": "mlrun[complete]==1.12.0",
+        "auto_mount_type": "none",
+        "auto_mount_params": {},
+        "default_artifact_path": "",
+        "default_function_pod_resources": {"requests": {}, "limits": {}},
+        "default_function_preemption_mode": "prevent",
+        "feature_store_data_prefixes": {"default": "v3io:///projects/{project}"},
+        "allowed_artifact_path_prefixes_list": [],
+        "ce": {"mode": "full", "release": "0.7.0"},
+        "internal_labels": [],
+        "artifact_limits": {"max_chunk_size": 10485760,
+                            "max_preview_size": 1048576,
+                            "max_download_size": 5368709120},
+    }
+    document = {k: v for k, v in document.items() if k not in drop}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+MLRUN_CLIENT_SPEC_BODY = mlrun_client_spec_body()
+MLRUN_FRONTEND_SPEC_BODY = mlrun_frontend_spec_body()
+
+# La garde a tenu : le routeur frontend-spec porte
+# authenticate_request, et _authenticate_basic() lève
+# MLRunUnauthorizedError("Missing basic auth header"), que
+# _http_status_error_handler() rend sous la clé « detail » de FastAPI.
+MLRUN_UNAUTHORIZED_BODY = (
+    '{"detail":"MLRunUnauthorizedError(\'Missing basic auth header\')"}'
+)
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+MLRUN_COMPOSITE_BODY = '{"mlrun":%s,"checked_at":0}' % MLRUN_CLIENT_SPEC_BODY
+
+
+def mlrun_block():
+    doc = load(MLRUN_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(MLRUN_CLIENT_SPEC_ROUTE)
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {MLRUN_CLIENT_SPEC_ROUTE} — c'est "
+        "pourtant la seule route qui rende ClientSpec, donc la seule qui nomme "
+        "le produit et divulgue sa configuration"
+    )
+    return blocks[0]
+
+
+def mlrun_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = mlrun_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def mlrun_fires(client_spec=(200, MLRUN_CLIENT_SPEC_BODY),
+                frontend_spec=(200, MLRUN_FRONTEND_SPEC_BODY)):
+    scenario = {
+        MLRUN_CLIENT_SPEC_ROUTE: client_spec,
+        MLRUN_FRONTEND_SPEC_ROUTE: frontend_spec,
+    }
+    block = mlrun_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in mlrun_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que MLRun ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_mlrun_probe_reads_two_routes_and_never_submits_nor_builds():
+    assert mlrun_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et /api/v1/client-spec — dont le routeur "
+        "est inclus sans authenticate_request et qui répond donc aussi sur une "
+        "instance fermée — conclurait de son côté"
+    )
+
+    assert mlrun_requests() == [
+        ("GET", MLRUN_CLIENT_SPEC_ROUTE),
+        ("GET", MLRUN_FRONTEND_SPEC_ROUTE),
+    ], (
+        "les deux requêtes ne sont plus celles que le template documente — "
+        f"{mlrun_requests()}"
+    )
+
+    doc = load(MLRUN_TEMPLATE)
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", (
+            f"{method} {route} : en mode « none » l'anonyme est accepté sur "
+            "tous les routeurs, y compris ceux qui écrivent — aucun n'est "
+            "nécessaire pour signaler l'exposition"
+        )
+        for forbidden, why in (
+            ("submit",
+             "POST /api/v1/submit_job fait tourner une fonction sur le "
+             "cluster de l'exploitant"),
+            ("build",
+             "POST /api/v1/build/function déclenche une construction d'image"),
+            ("start/function",
+             "POST /api/v1/start/function démarre une fonction"),
+            ("secrets",
+             "GET /api/v1/projects/{project}/secrets rend les secrets de "
+             "projet en clair, le contrôle passant par le provider nop"),
+            ("/projects",
+             "les routes de projet touchent aux données de l'exploitant, et "
+             "DELETE /api/v1/projects/{name} en supprime un"),
+            ("/logs",
+             "les routes de journaux rendent la sortie des exécutions"),
+            ("/operations",
+             "/api/v1/operations/migrations déclenche une migration de base"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_mlrun_matcher_rests_on_the_client_spec_shape_not_on_the_status():
+    assert mlrun_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance laissée à ses "
+        "défauts — celle, précisément, dont le mode d'authentification est "
+        "« none »"
+    )
+
+    assert not mlrun_fires(client_spec=(200, MLRUN_COMPOSITE_BODY)), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur la clé racine qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not mlrun_fires(client_spec=(200, GENERIC_VERSION_BODY)), (
+        "le template conclut sur un service quelconque qui rend un numéro de "
+        "version sous la même clé racine : c'est le trio nuclio_version + "
+        "artifact_path + ui_url, propre à ClientSpec, qui nomme le produit"
+    )
+
+    # Le statut, seul, ne départage rien : les deux routes rendent 200 sur une
+    # instance ouverte comme sur n'importe quel serveur vivant.
+    assert not mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(
+            drop=("nuclio_version", "artifact_path", "ui_url")))
+    ), (
+        "le template se contente d'un document qui s'ouvre sur « version » : "
+        "le trio est ce qui distingue MLRun de tout autre service qui "
+        "rendrait sa configuration"
+    )
+
+    # Collisions internes au pack : les deux autres plateformes MLOps déjà
+    # couvertes ne doivent pas être revendiquées par celle-ci.
+    for other_body, other_name in (
+        (MLFLOW_EXPERIMENTS_BODY, "MLflow"),
+        (KUBEFLOW_PIPELINES_BODY, "Kubeflow Pipelines"),
+    ):
+        assert not mlrun_fires(client_spec=(200, other_body),
+                               frontend_spec=(200, other_body)), (
+            f"le template déclenche sur {other_name}, déjà couvert par son "
+            "propre template"
+        )
+
+
+def test_mlrun_matcher_holds_across_versions_and_spacings():
+    """
+    Le modèle gagne des champs à chaque version, et ceux sur lesquels il serait
+    tentant de s'appuyer sont justement les plus récents et les plus souvent
+    nuls. Le template ne doit dépendre ni des uns ni des autres.
+    """
+    assert mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(drop=MLRUN_FIELDS_ADDED_IN_1_11))
+    ), (
+        "le template exige des champs que le modèle n'a gagnés qu'en 1.11 — "
+        "authentication_mode et default_runtime_image_by_kind en tête — donc "
+        "il raterait toutes les instances antérieures, qui sont précisément "
+        "celles qui traînent exposées"
+    )
+    assert mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(
+            extra={"un_reglage_a_venir": "peu importe"}))
+    ), (
+        "le template exige une adjacence entre les champs sur lesquels il "
+        "s'appuie : le modèle en gagne à chaque version, et ils s'intercalent"
+    )
+
+    assert mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(
+            nuclio_version=None, ui_url="", artifact_path=""))
+    ), (
+        "le template exige une valeur du trio : resolve_nuclio_version() rend "
+        "null quand aucun tableau de bord Nuclio n'est joignable, et les "
+        "défauts d'artifact_path et de ui.url sont la chaîne vide — c'est la "
+        "présence des clés qui porte le constat"
+    )
+
+    assert mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(indent=2)),
+        frontend_spec=(200, mlrun_frontend_spec_body(indent=2)),
+    ), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    assert not mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(drop=(
+            "docker_registry", "feature_store_data_prefixes",
+            "spark_operator_version")))
+    ), (
+        "le template se contente du trio : trois champs de plus, tous déclarés "
+        "en tête du modèle depuis la 1.4, sont ce qui dit que le document est "
+        "bien un ClientSpec et non un objet quelconque portant trois noms en "
+        "commun"
+    )
+
+
+def test_mlrun_conclusion_needs_the_route_that_carries_the_guard():
+    assert not mlrun_fires(frontend_spec=(401, MLRUN_UNAUTHORIZED_BODY)), (
+        "le template conclut alors que /api/v1/frontend-spec a refusé : c'est "
+        "la seule des deux routes dont le routeur porte "
+        "authenticate_request, donc la seule dont la réponse dise que "
+        "l'anonyme a été accepté"
+    )
+    assert not mlrun_fires(frontend_spec=(404, GENERIC_BAD_REQUEST_BODY)), (
+        "le template conclut sans corroboration par un chemin de code "
+        "disjoint : c'est elle qui écarte un cache ou un proxy statique qui "
+        "rejouerait la première réponse"
+    )
+    assert not mlrun_fires(frontend_spec=(200, GENERIC_VERSION_BODY)), (
+        "le template se contente d'un 200 sur la seconde route : un portail "
+        "captif ou un proxy peut rendre 200 sur n'importe quel chemin, et "
+        "c'est le couple feature_flags + default_artifact_path qui dit que la "
+        "réponse vient bien de FrontendSpec"
+    )
+
+    for mode in ("basic", "bearer", "iguazio", "iguazio-v4"):
+        assert not mlrun_fires(
+            frontend_spec=(200, mlrun_frontend_spec_body(authentication=mode))
+        ), (
+            f"le template remonte une instance dont feature_flags annonce le "
+            f"mode « {mode} » : _resolve_feature_flags() transcrit "
+            "httpdb.authentication.mode tel quel, et le constat porte sur le "
+            "défaut « none », pas sur la présence du produit"
+        )
+
+    assert mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(authentication_mode=None)),
+    ), (
+        "le template exige une valeur d'authentication_mode dans ClientSpec : "
+        "il passe par _get_config_value_if_not_default(), donc il est nul "
+        "exactement quand le mode « none » est en vigueur — son absence de "
+        "valeur confirme l'exposition, elle ne peut pas l'établir"
+    )
+    assert not mlrun_fires(
+        client_spec=(200, mlrun_client_spec_body(authentication_mode="bearer")),
+        frontend_spec=(200, mlrun_frontend_spec_body(authentication="bearer")),
+    ), (
+        "le template déclenche sur une instance dont l'exploitant a posé un "
+        "mode : authentication_mode n'est renseigné que lorsqu'il diffère du "
+        "défaut, donc sa présence dit l'inverse du constat"
+    )
+
+
+def test_mlrun_conclusion_is_carried_by_the_dsl_alone():
+    block = mlrun_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_mlrun_extractor_reports_the_version_the_instance_serves():
+    extractors = mlrun_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — c'est ClientSpec qui porte "
+        "« version », rempli par config.version, là où FrontendSpec ne rend "
+        "aucun numéro de version"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant ce qui permet de "
+        "dater l'installation et de la confronter aux avis du dépôt"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
