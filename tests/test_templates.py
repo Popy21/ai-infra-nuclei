@@ -15715,6 +15715,316 @@ def test_mlrun_extractor_reports_the_version_the_instance_serves():
     )
 
 
+# --------------------------------------------------------------------------
+# AutoGen Studio pose bien son authentification en middleware —
+# « app.add_middleware(AuthMiddleware, auth_manager=auth_manager) » — mais le
+# fournisseur par défaut ne garde rien : AuthConfig déclare « type:
+# Literal["none", "github", "msal", "firebase"] = "none" », init_auth_manager()
+# retombe sur « AuthConfig(type="none") » dès qu'AUTOGENSTUDIO_AUTH_CONFIG est
+# absente ou illisible, et en ce mode dispatch() laisse passer avant de chercher
+# un jeton.
+#
+# GET /api/auth/type le dit dans sa propre réponse : le handler rend « {"type":
+# auth_manager.config.type, "exclude_paths":
+# auth_manager.config.exclude_paths} ». La route figure dans exclude_paths, donc
+# elle répond aussi sur une instance configurée — c'est la valeur « none », et
+# non le fait qu'elle réponde, qui porte le constat. GET /api/version corrobore
+# par un chemin de code disjoint, et ne peut rien conclure seule pour la même
+# raison.
+
+AUTOGEN_STUDIO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                       "autogen-studio-no-auth.yaml")
+
+AUTOGEN_STUDIO_AUTH_TYPE_ROUTE = "/api/auth/type"
+AUTOGEN_STUDIO_VERSION_ROUTE = "/api/version"
+
+# La valeur par défaut d'AuthConfig.exclude_paths, dans l'ordre où le modèle la
+# déclare.
+AUTOGEN_STUDIO_EXCLUDE_PATHS = [
+    "/",
+    "/api/health",
+    "/api/version",
+    "/api/auth/login-url",
+    "/api/auth/callback-handler",
+    "/api/auth/callback",
+    "/api/auth/type",
+]
+
+
+def autogen_studio_auth_type_body(auth_type="none", exclude_paths=None,
+                                  extra_paths=(), indent=None):
+    """
+    Ce que rend GET /api/auth/type : le dictionnaire littéral d'authroutes.py,
+    « type » d'abord puis « exclude_paths », sérialisé par FastAPI dans l'ordre
+    d'insertion.
+
+    `extra_paths` allonge la liste comme le ferait un exploitant qui a écrit son
+    propre fichier de configuration, `indent` réécrit le document comme le
+    ferait un intermédiaire qui réindente ce qu'il relaie.
+    """
+    paths = list(AUTOGEN_STUDIO_EXCLUDE_PATHS if exclude_paths is None
+                 else exclude_paths)
+    paths.extend(extra_paths)
+    document = {"type": auth_type, "exclude_paths": paths}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # La JSONResponse de FastAPI écrit compact.
+    return json.dumps(document, separators=(",", ":"))
+
+
+def autogen_studio_version_body(version="0.4.3", indent=None):
+    """
+    Ce que rend GET /api/version : l'enveloppe écrite en clair dans app.py, dont
+    le libellé est une constante du source.
+    """
+    document = {
+        "status": True,
+        "message": "Version retrieved successfully",
+        "data": {"version": version},
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+AUTOGEN_STUDIO_AUTH_TYPE_BODY = autogen_studio_auth_type_body()
+AUTOGEN_STUDIO_VERSION_BODY = autogen_studio_version_body()
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+AUTOGEN_STUDIO_COMPOSITE_BODY = (
+    '{"autogen_studio":%s,"checked_at":0}' % AUTOGEN_STUDIO_AUTH_TYPE_BODY
+)
+
+# Un service quelconque qui rendrait « none » sous la même clé racine, sans rien
+# de ce qui désigne le produit.
+AUTOGEN_STUDIO_BARE_TYPE_BODY = '{"type":"none"}'
+
+
+def autogen_studio_block():
+    doc = load(AUTOGEN_STUDIO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(AUTOGEN_STUDIO_AUTH_TYPE_ROUTE)
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {AUTOGEN_STUDIO_AUTH_TYPE_ROUTE} — c'est "
+        "pourtant la seule route dont la réponse transcrive le mode "
+        "d'authentification courant, donc la seule qui puisse conclure"
+    )
+    return blocks[0]
+
+
+def autogen_studio_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = autogen_studio_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def autogen_studio_fires(auth_type=(200, AUTOGEN_STUDIO_AUTH_TYPE_BODY),
+                         version=(200, AUTOGEN_STUDIO_VERSION_BODY)):
+    scenario = {
+        AUTOGEN_STUDIO_AUTH_TYPE_ROUTE: auth_type,
+        AUTOGEN_STUDIO_VERSION_ROUTE: version,
+    }
+    block = autogen_studio_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in autogen_studio_requests():
+        assert route in scenario, (
+            "le template interroge un chemin qu'AutoGen Studio ne sert pas : "
+            f"{route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_autogen_studio_probe_reads_two_routes_and_never_runs_a_team():
+    assert autogen_studio_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et /api/version — servie par toute "
+        "instance du produit, fermées comprises — conclurait de son côté"
+    )
+
+    assert autogen_studio_requests() == [
+        ("GET", AUTOGEN_STUDIO_AUTH_TYPE_ROUTE),
+        ("GET", AUTOGEN_STUDIO_VERSION_ROUTE),
+    ], (
+        "les deux requêtes ne sont plus celles que le template documente — "
+        f"{autogen_studio_requests()}"
+    )
+
+    doc = load(AUTOGEN_STUDIO_TEMPLATE)
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", (
+            f"{method} {route} : en mode « none » l'anonyme est accepté sur "
+            "tous les routeurs, y compris ceux qui écrivent — aucun n'est "
+            "nécessaire pour signaler l'exposition"
+        )
+        for forbidden, why in (
+            ("/api/runs",
+             "POST /api/runs crée une exécution, que le WebSocket "
+             "/api/ws/runs/{run_id} fait ensuite tourner"),
+            ("/api/ws",
+             "/api/ws/runs/{run_id} exécute l'équipe : les agents appellent "
+             "leurs outils"),
+            ("/api/teams",
+             "les routes d'équipe rendent les messages système, les outils et "
+             "la configuration des clients de modèles, et DELETE "
+             "/api/teams/{team_id} en supprime une"),
+            ("/api/sessions",
+             "les routes de session rendent l'historique des exécutions, donc "
+             "ce qui a été soumis aux agents"),
+            ("/api/settings",
+             "PUT /api/settings réécrit la configuration de l'exploitant"),
+            ("/api/gallery",
+             "les routes de galerie touchent au catalogue de composants de "
+             "l'exploitant"),
+            ("/api/mcp",
+             "POST /api/mcp/ws/connect enregistre des paramètres de serveur "
+             "avant d'ouvrir une session MCP"),
+            ("/api/validate",
+             "/api/validate fait instancier des composants à partir d'une "
+             "définition fournie"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_autogen_studio_matcher_rests_on_the_declared_type_not_on_the_status():
+    assert autogen_studio_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance laissée à ses "
+        "défauts — celle, précisément, dont init_auth_manager() a reposé "
+        "« AuthConfig(type=\"none\") »"
+    )
+
+    assert not autogen_studio_fires(
+        auth_type=(200, AUTOGEN_STUDIO_COMPOSITE_BODY)
+    ), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur la clé racine qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not autogen_studio_fires(
+        auth_type=(200, AUTOGEN_STUDIO_BARE_TYPE_BODY)
+    ), (
+        "le template conclut sur un service quelconque qui rend « none » sous "
+        "la même clé racine : c'est exclude_paths, et les noms de route "
+        "qu'authroutes.py déclare, qui nomment le produit"
+    )
+    assert not autogen_studio_fires(auth_type=(200, GENERIC_VERSION_BODY)), (
+        "le template conclut sur un corps qui ne porte pas même la clé « type »"
+    )
+
+    # Le statut, seul, ne départage rien : les deux routes figurent dans
+    # exclude_paths et rendent donc 200 sur une instance fermée comme sur une
+    # instance ouverte.
+    assert not autogen_studio_fires(
+        auth_type=(200, autogen_studio_auth_type_body(
+            exclude_paths=["/", "/api/health", "/api/version"]))
+    ), (
+        "le template se contente d'un tableau exclude_paths quelconque : ce "
+        "sont /api/auth/login-url et /api/auth/callback-handler, déclarées par "
+        "authroutes.py, qui désignent AutoGen Studio"
+    )
+
+
+def test_autogen_studio_conclusion_needs_the_type_to_be_none():
+    for mode in ("github", "msal", "firebase"):
+        assert not autogen_studio_fires(
+            auth_type=(200, autogen_studio_auth_type_body(auth_type=mode))
+        ), (
+            f"le template remonte une instance qui annonce le mode « {mode} » : "
+            "le handler transcrit auth_manager.config.type tel quel, et le "
+            "constat porte sur le défaut « none », pas sur la présence du "
+            "produit"
+        )
+
+
+def test_autogen_studio_matcher_holds_across_spacings_and_extra_paths():
+    assert autogen_studio_fires(
+        auth_type=(200, autogen_studio_auth_type_body(indent=2)),
+        version=(200, autogen_studio_version_body(indent=2)),
+    ), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    assert autogen_studio_fires(
+        auth_type=(200, autogen_studio_auth_type_body(
+            extra_paths=("/api/un/chemin/a/venir",)))
+    ), (
+        "le template exige la liste exacte d'exclude_paths : c'est un champ de "
+        "configuration que l'exploitant peut allonger, et qu'une version "
+        "future peut compléter"
+    )
+
+    assert autogen_studio_fires(
+        version=(200, autogen_studio_version_body(version="0.5.0"))
+    ), (
+        "le template exige un numéro de version précis : autogenstudio/"
+        "version.py le change à chaque publication"
+    )
+
+
+def test_autogen_studio_conclusion_needs_the_route_that_names_the_product():
+    assert not autogen_studio_fires(
+        version=(404, GENERIC_BAD_REQUEST_BODY)
+    ), (
+        "le template conclut sans corroboration par un chemin de code "
+        "disjoint : c'est elle qui écarte un cache ou un proxy statique qui "
+        "rejouerait la première réponse"
+    )
+    assert not autogen_studio_fires(version=(200, GENERIC_VERSION_BODY)), (
+        "le template se contente d'un 200 sur la seconde route : un portail "
+        "captif ou un proxy peut rendre 200 sur n'importe quel chemin, et "
+        "c'est l'enveloppe écrite en clair dans app.py — « status », le "
+        "libellé « Version retrieved successfully », puis data.version — qui "
+        "dit que la réponse vient bien d'AutoGen Studio"
+    )
+
+
+def test_autogen_studio_conclusion_is_carried_by_the_dsl_alone():
+    block = autogen_studio_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_autogen_studio_extractor_reports_the_version_the_instance_serves():
+    extractors = autogen_studio_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — c'est /api/version qui porte "
+        "VERSION, /api/auth/type ne rendant aucun numéro"
+    )
+    assert extractor.get("json") == [".data.version"], (
+        "l'extracteur ne lit pas .data.version — c'est pourtant ce qui permet "
+        "de dater l'installation et de la confronter aux publications du dépôt"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

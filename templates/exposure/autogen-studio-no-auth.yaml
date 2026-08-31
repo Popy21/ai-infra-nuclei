@@ -1,0 +1,222 @@
+id: autogen-studio-no-auth
+
+info:
+  name: AutoGen Studio - Unauthenticated Instance
+  author: popy21
+  severity: high
+  description: |
+    AutoGen Studio est l'interface web du projet microsoft/autogen — paquet
+    python/packages/autogen-studio, lancée par « autogenstudio ui ». On y
+    assemble des équipes d'agents, on leur attribue modèles et outils, puis on
+    les fait tourner depuis le navigateur. Le serveur est une application
+    FastAPI : autogenstudio/web/app.py construit « api = FastAPI(root_path=
+    "/api", ...) », y monte ses routeurs — sessions, runs, teams, ws, validate,
+    settings, gallery, auth, mcp — et rattache l'ensemble par
+    « app.mount("/api", api) ».
+    L'authentification existe, et elle est posée là où il faut :
+    « app.add_middleware(AuthMiddleware, auth_manager=auth_manager) ». Ce qui
+    manque par défaut, c'est un fournisseur. web/auth/models.py déclare
+    « class AuthConfig(BaseModel) » avec « type: Literal["none", "github",
+    "msal", "firebase"] = "none" », et web/deps.py, dans init_auth_manager(),
+    ne lit un fichier de configuration que si AUTOGENSTUDIO_AUTH_CONFIG est
+    posée et pointe sur un fichier existant ; sinon — et aussi lorsque la
+    lecture de ce fichier échoue, sous un « Falling back to no
+    authentication » — il termine sur « config = AuthConfig(type="none") ».
+    Tant que l'exploitant n'a rien configuré, le type vaut donc « none ».
+    En mode « none », le middleware ne garde rien. auth/middleware.py fait
+    « if self.auth_manager.config.type == "none": request.state.user = await
+    self.auth_manager.authenticate_request(request) » puis « return await
+    call_next(request) » : la requête passe avant qu'aucun jeton ne soit
+    cherché. Le fournisseur correspondant, NoAuthProvider dans
+    auth/providers.py, rend « True » depuis validate_token() sans rien
+    regarder, et attribue l'utilisateur par défaut « guestuser@gmail.com » /
+    « Default User » — celui-là même que web/config.py déclare sous
+    « DEFAULT_USER_ID ». Les routeurs restent donc tous joignables :
+    /api/sessions, /api/runs, /api/teams, /api/gallery, /api/settings,
+    /api/mcp et /api/ws.
+    L'instance le dit elle-même, et c'est ce qui fait le constat.
+    auth/authroutes.py déclare « @router.get("/type") » puis « return {"type":
+    auth_manager.config.type, "exclude_paths":
+    auth_manager.config.exclude_paths} ». Le routeur est monté sous le préfixe
+    /auth de l'application /api, d'où GET /api/auth/type. La valeur de
+    « type » est la configuration courante transcrite telle quelle : « none »
+    signifie qu'aucune authentification n'est exigée, et pas seulement que le
+    produit est là. C'est pourquoi le constat porte sur cette valeur et jamais
+    sur le statut HTTP — la route figure dans exclude_paths, donc elle répond
+    aussi bien sur une instance correctement fermée, où elle rend simplement
+    « "type":"github" ».
+    Le second champ de la même réponse est le fingerprint. exclude_paths est
+    déclaré dans AuthConfig avec exactement cette liste par défaut : « "/",
+    "/api/health", "/api/version", "/api/auth/login-url",
+    "/api/auth/callback-handler", "/api/auth/callback", "/api/auth/type" ».
+    Les noms de route qu'elle porte — login-url, callback-handler — sont ceux
+    qu'authroutes.py déclare et n'appartiennent qu'à ce produit. C'est leur
+    présence dans le tableau, et non son ordre ni sa longueur, qui dit d'où
+    vient la réponse : l'exploitant peut allonger la liste dans son fichier de
+    configuration, et une version future peut y ajouter une entrée.
+    GET /api/version confirme le produit par un chemin de code disjoint. Son
+    handler, écrit directement dans app.py, ne touche ni au gestionnaire
+    d'authentification ni à la base, et rend littéralement « {"status": True,
+    "message": "Version retrieved successfully", "data": {"version":
+    VERSION}} ». Comme /api/auth/type, il figure dans exclude_paths et répond
+    donc sur toute instance : il nomme le produit, il ne conclut pas.
+  impact: |
+    Le mode « none » ouvre l'API entière, pas seulement la lecture. Les
+    handlers de routes/ prennent l'identité en simple paramètre de requête —
+    « async def list_teams(user_id: str, db=Depends(get_db)) » — et la valeur
+    à fournir est publique, puisque c'est la constante
+    « DEFAULT_USER_ID: str = "guestuser@gmail.com" » de web/config.py, celle
+    que NoAuthProvider attribue.
+    GET /api/teams rend donc les définitions d'équipes de l'exploitant : les
+    agents, leurs messages système, leurs outils, et la configuration des
+    clients de modèles — c'est-à-dire l'endroit où atterrissent les clés d'API
+    des fournisseurs saisies dans l'interface. GET /api/sessions,
+    GET /api/sessions/{session_id}/runs et GET /api/runs/{run_id}/messages
+    rendent l'historique complet des exécutions, donc tout ce qui a été soumis
+    aux agents et tout ce qu'ils ont répondu. GET /api/settings rend la
+    configuration de l'environnement, et /api/gallery le catalogue des
+    composants.
+    L'écriture est ouverte au même titre : POST /api/teams et
+    POST /api/sessions créent, PUT /api/settings réécrit la configuration,
+    DELETE /api/teams/{team_id} et DELETE /api/sessions/{session_id}
+    suppriment.
+    Surtout, l'instance exécute. POST /api/runs crée une exécution et le
+    WebSocket /api/ws/runs/{run_id} la fait tourner : les agents appellent
+    leurs outils, et /api/mcp — dont POST /api/mcp/ws/connect enregistre des
+    paramètres de serveur avant d'ouvrir /api/mcp/ws/{session_id} — joint les
+    serveurs MCP déclarés. Un anonyme qui atteint le port dispose du même
+    pouvoir que l'exploitant devant son navigateur : lire ce qui a été fait,
+    lancer ce qu'il veut, et le faire facturer sur les clés du propriétaire.
+  remediation: |
+    Le README du paquet le pose d'emblée : AutoGen Studio « is not meant to be
+    a production-ready app », et il revient à qui le déploie d'implémenter
+    l'authentification. Le défaut de la ligne de commande va dans ce sens —
+    « autogenstudio ui » lie 127.0.0.1:8081. C'est l'image officielle qui rend
+    l'erreur facile : le Dockerfile du paquet termine sur
+    « --bind "0.0.0.0:8081" », donc toute publication de ce port expose
+    l'instance telle quelle.
+    Ne pas publier 8081 sur une interface non maîtrisée : garder le défaut
+    --host 127.0.0.1, ou lier « 127.0.0.1:8081:8081 » côté conteneur.
+    Configurer ensuite un fournisseur : écrire un fichier d'authentification
+    avec « type: github » (ou msal, firebase) et le passer par
+    « autogenstudio ui --auth-config CHEMIN », ce que le CLI traduit en
+    AUTOGENSTUDIO_AUTH_CONFIG. Un jwt_secret est alors obligatoire — le
+    validateur validate_jwt_secret() d'AuthConfig lève quand le type n'est pas
+    « none » et que le secret manque. Vérifier la prise en compte sur
+    GET /api/auth/type, dont la réponse doit cesser de porter
+    « "type":"none" » : si le fichier est illisible, init_auth_manager()
+    retombe silencieusement sur « none » et l'instance reste ouverte.
+    Vérifier aussi qu'AUTOGENSTUDIO_AUTH_DISABLED n'est pas positionnée : elle
+    force « AuthConfig(type="none") » avant même de regarder le fichier.
+    Après une exposition, tenir pour lues les définitions d'équipes et les
+    sessions — donc faire tourner les clés de fournisseurs de modèles qui y
+    figuraient — et relire /api/sessions et /api/runs pour établir si une
+    exécution a été lancée pendant la fenêtre : en mode « none », rien ne s'y
+    opposait.
+  reference:
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/web/auth/models.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/web/auth/authroutes.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/web/auth/providers.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/web/auth/middleware.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/web/app.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/web/deps.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/web/config.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/autogenstudio/cli.py
+    - https://github.com/microsoft/autogen/blob/main/python/packages/autogen-studio/Dockerfile
+    - https://github.com/microsoft/autogen/tree/main/python/packages/autogen-studio
+  metadata:
+    max-request: 2
+    vendor: microsoft
+    product: autogen-studio
+  tags: ai,llm,agent,autogen,autogen-studio,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première porte le constat, la seconde nomme le produit
+  # par un chemin de code disjoint.
+  #
+  # GET /api/auth/type rend « {"type": auth_manager.config.type,
+  # "exclude_paths": auth_manager.config.exclude_paths} ». Cette route figure
+  # dans exclude_paths, donc elle répond quel que soit le mode : ce n'est pas
+  # qu'elle réponde qui conclut, c'est ce qu'elle dit. « "type":"none" » est la
+  # transcription littérale de la configuration courante, celle qu'AuthConfig
+  # porte par défaut et qu'init_auth_manager() repose dès que
+  # AUTOGENSTUDIO_AUTH_CONFIG est absente ou illisible. En ce mode,
+  # AuthMiddleware.dispatch() laisse passer avant de chercher un jeton et
+  # NoAuthProvider.validate_token() rend True sans regarder.
+  #
+  # GET /api/version corrobore : son handler est écrit dans app.py, ne touche
+  # ni au gestionnaire d'authentification ni à la base, et rend une enveloppe
+  # dont le libellé est fixé dans le code. Elle est excluse elle aussi, donc
+  # elle répond sur toute instance et ne peut rien conclure seule.
+  #
+  # En lecture seule, et strictement. En mode « none » rien n'oppose de
+  # résistance à POST /api/runs, qui crée une exécution, ni à POST /api/teams,
+  # ni à PUT /api/settings ; le signaler ne demande d'appeler aucun d'eux.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/auth/type"
+      - "{{BaseURL}}/api/version"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses. Sans lui, /api/version — servie par toute instance
+    # du produit, fermées comprises — conclurait de son côté.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat, et il tient dans une valeur. Le handler rend un
+          # dictionnaire littéral dont « type » est la première clé, et FastAPI
+          # sérialise un dict dans son ordre d'insertion : la clé ouvre donc le
+          # document, ce que l'ancrage vérifie. Cet ancrage écarte la même
+          # charge utile retrouvée au fond d'un document composite qu'une
+          # supervision agrégerait sous une clé à elle.
+          #
+          # « none » est l'une des quatre valeurs que le Literal d'AuthConfig
+          # admet, et la seule qui dise l'absence de garde : sur une instance
+          # configurée la même route rend « "type":"github" », « "msal" » ou
+          # « "firebase" ». Le statut, lui, vaut 200 dans les deux cas — il ne
+          # départage rien.
+          #
+          # Les \s* sont là parce que le sérialiseur n'est pas garanti : la
+          # JSONResponse de FastAPI écrit compact, un intermédiaire qui
+          # réindente ce qu'il relaie ne le fait pas.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"type\"\\s*:\\s*\"none\"", trim_space(body_1))'
+
+          # Le fingerprint, dans la même réponse. exclude_paths est la seconde
+          # clé du dictionnaire, et sa valeur par défaut énumère les routes
+          # qu'authroutes.py déclare. Deux d'entre elles suffisent à désigner ce
+          # produit — /api/auth/login-url et /api/auth/callback-handler — et la
+          # troisième est la route interrogée elle-même, que la liste porte par
+          # construction.
+          #
+          # Rien n'est exigé de l'ordre, de la longueur ni du reste du tableau :
+          # exclude_paths est un champ de configuration que l'exploitant peut
+          # allonger, et une version future peut y ajouter une entrée.
+          - 'regex("\"exclude_paths\"\\s*:\\s*\\[", body_1) && regex("\"/api/auth/login-url\"", body_1) && regex("\"/api/auth/callback-handler\"", body_1) && regex("\"/api/auth/type\"", body_1)'
+
+          # La corroboration, par un chemin de code disjoint. L'enveloppe est
+          # écrite en clair dans app.py — « {"status": True, "message":
+          # "Version retrieved successfully", "data": {"version": VERSION}} » —
+          # donc « status » ouvre le document et le libellé est une constante du
+          # source, pas une valeur d'exploitation.
+          #
+          # L'adjacence n'est exigée qu'entre « data » et « version », parce que
+          # le dictionnaire imbriqué ne porte que cette clé-là. Le numéro
+          # lui-même n'est contraint à rien : c'est autogenstudio/version.py qui
+          # le fournit, et il change à chaque publication.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"status\"\\s*:\\s*true", trim_space(body_2)) && regex("\"message\"\\s*:\\s*\"Version retrieved successfully\"", body_2) && regex("\"data\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"", body_2)'
+
+    extractors:
+      # La version exacte, et elle seule : c'est ce qui permet de dater
+      # l'installation et de la confronter aux publications du dépôt. Un seul
+      # extracteur, borné à body_2 — sous req-condition le moteur émet un
+      # résultat par extracteur qui rend quelque chose, donc la même instance
+      # serait signalée plusieurs fois — et VERSION n'est porté que par
+      # /api/version, /api/auth/type ne rendant aucun numéro.
+      - type: json
+        part: body_2
+        name: version
+        json:
+          - '.data.version'
