@@ -1,0 +1,172 @@
+id: vespa-config-server-exposed
+
+info:
+  name: Vespa - Unauthenticated Config Server Tenant API
+  author: popy21
+  severity: critical
+  description: |
+    Vespa sépare le conteneur qui sert les requêtes de recherche du conteneur
+    d'administration — le config server, celui qui reçoit, prépare et active
+    les paquets d'application sur le cluster. configdefinitions/src/vespa/
+    configserver.def pose « httpport int default=19071 », et le services.xml
+    embarqué dans le paquet configserver (configserver-app/services.xml) monte
+    ce conteneur dessus : « <server port="19071" id="configserver"> ». C'est ce
+    conteneur, et non celui des requêtes, que TenantHandler lie sans le moindre
+    filtre déclaré à côté — « <handler id='...TenantHandler'>
+    <binding>http://*/application/v2/tenant*</binding> ».
+    Le handler ne demande rien avant de répondre. getTenant() ne vérifie que
+    l'existence du tenant dans TenantRepository et rend un TenantGetResponse,
+    dont le constructeur tient en une ligne : « super("Tenant '" + tenant + "'
+    exists.") ». MessageResponse sérialise ce message sous la seule clé
+    « message », en JSON compact — GET /application/v2/tenant/default rend donc
+    littéralement « {"message":"Tenant 'default' exists."} ». Le tenant
+    « default » n'est pas un choix de l'attaquant : TenantRepository le crée
+    lui-même au démarrage et refuse ensuite de le supprimer (un commentaire du
+    dépôt le dit : « Not allowed to remove 'default' tenant »), donc il existe
+    sur toute instance qui n'a pas été explicitement reconfigurée pour s'en
+    passer. getTenants() énumère de la même façon, sans garde non plus :
+    ListTenantsResponse écrit « {"tenants":[...]} », que
+    TenantHandlerTest.testGetAndList vérifie littéralement aussi bien sur
+    GET /application/v2/tenant/ que sur GET /application/v2/tenant.
+    GET /state/v1/version confirme par un chemin de code entièrement disjoint.
+    StateHandler est le handler système que le conteneur jdisc lie sous
+    /state/v1 — la documentation de référence le dit, « every service exposes
+    the /state/v1 API » — donc aussi bien sur le config server que sur le
+    conteneur de requêtes, indépendamment de tout ce que fait TenantHandler.
+    Sa branche « case VERSION_PATH -> buildVersionOutput() » rend
+    « {"version": Vtag.currentVersion.toString()} ». La même méthode sert
+    /state/v1/health, dont buildJsonForConsumer() compose « {"time":…,
+    "status":{"code":…}, "metrics":{"snapshot":{"from":…,"to":…},
+    "values":[…]}} » — typiquement observé sur le conteneur de requêtes, dont
+    le port par défaut est 8080.
+    Le produit le dit lui-même côté sécurité : « Vespa's internal protocols are
+    not authenticated by default and are therefore not safe in the face of
+    untrusted network actors » et « By default, the container allows
+    unauthenticated writes to, and reads from, the Vespa installation » — d'où
+    l'avertissement qui suit dans le même document, que la documentation pose
+    en capitales : les hôtes Vespa ne doivent jamais être exposés directement à
+    internet ni à un réseau non maîtrisé. Rien de tout cela n'est un cas
+    particulier de configuration : c'est le comportement par défaut du produit,
+    sur son port d'administration comme sur son port de requêtes.
+  impact: |
+    Ce que /application/v2/tenant/* ouvre n'est pas de la lecture seule. Le même
+    handler porte PUT /application/v2/tenant/{tenant}, qui crée un tenant
+    (« Tenant xxx created. »), et DELETE /application/v2/tenant/{tenant}, dont
+    TenantRepository.deleteTenant() efface l'espace ZooKeeper et le système de
+    fichiers du tenant tant qu'il ne porte plus d'application active. Le même
+    conteneur 19071 monte aussi SessionCreateHandler, SessionPrepareHandler,
+    SessionActiveHandler et ApplicationApiHandler sous
+    /application/v2/tenant/{tenant}/session* et .../prepareandactivate — la
+    chaîne complète qui prépare puis active un paquet d'application sur le
+    cluster. Remplacer l'application qui sert un pipeline de recherche ou de
+    RAG en production revient à contrôler ce que le moteur retourne à ses
+    utilisateurs, ou à faire exécuter au cluster ce que l'attaquant y dépose.
+    Un anonyme qui atteint le port 19071 dispose donc du même pouvoir que
+    l'exploitant devant sa ligne de commande : lister, créer et supprimer des
+    tenants, puis préparer et activer des applications entières, sans qu'aucun
+    identifiant ne soit jamais demandé.
+  remediation: |
+    Ne jamais publier le port 19071 (ni le port 8080 du conteneur de requêtes)
+    sur une interface non maîtrisée — la documentation de sécurisation du
+    produit le pose sans nuance : les hôtes Vespa ne doivent pas être exposés
+    directement à internet ni à un réseau non maîtrisé. Restreindre l'accès
+    réseau au port d'administration aux seuls opérateurs et aux autres nœuds du
+    cluster (pare-feu, groupe de sécurité, réseau privé isolé), et poser une
+    authentification mutuelle par TLS (mTLS) entre les nœuds Vespa en suivant la
+    documentation de sécurisation de l'installation.
+    Après une exposition, tenir pour lus les identifiants de tenants et
+    d'applications que /application/v2/tenant/ énumère, et relire les journaux
+    d'activation portés par les routes de session pour vérifier qu'aucun paquet
+    d'application n'a été préparé ni activé en dehors des déploiements connus de
+    l'exploitant : en l'absence de garde, rien ne s'y opposait.
+  reference:
+    - https://docs.vespa.ai/en/reference/application-v2-tenant.html
+    - https://docs.vespa.ai/en/security/securing-your-vespa-installation.html
+    - https://docs.vespa.ai/en/reference/state-v1.html
+    - https://github.com/vespa-engine/vespa/blob/master/configserver/src/main/java/com/yahoo/vespa/config/server/http/v2/TenantHandler.java
+    - https://github.com/vespa-engine/vespa/blob/master/configserver/src/main/java/com/yahoo/vespa/config/server/http/v2/response/TenantGetResponse.java
+    - https://github.com/vespa-engine/vespa/blob/master/configserver/src/main/java/com/yahoo/vespa/config/server/http/v2/response/ListTenantsResponse.java
+    - https://github.com/vespa-engine/vespa/blob/master/configserver/src/main/resources/configserver-app/services.xml
+    - https://github.com/vespa-engine/vespa/blob/master/container-disc/src/main/java/com/yahoo/container/jdisc/state/StateHandler.java
+    - https://github.com/vespa-engine/vespa
+  metadata:
+    max-request: 2
+    vendor: vespa
+    product: vespa
+  tags: ai,ml,vectordb,rag,search,vespa,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du fait.
+  #
+  # GET /application/v2/tenant/default nomme le produit et prouve l'absence de
+  # garde dans le même souffle : son message — « Tenant 'default' exists. » —
+  # n'a de sens que rendu par ce handler précis, et le tenant « default » est
+  # celui que TenantRepository crée lui-même au démarrage et ne laisse jamais
+  # supprimer, donc il répond sur toute instance non reconfigurée.
+  #
+  # GET /state/v1/version corrobore par un chemin de code entièrement disjoint
+  # — StateHandler, le handler système que jdisc lie sous /state/v1 sur chaque
+  # conteneur Vespa, config server compris, indépendamment de TenantHandler.
+  # Seule, sa réponse ne dirait rien — {"version":"x.y.z"} est une forme que
+  # bien d'autres produits partagent — mais associée au message du tenant, elle
+  # écarte un cache ou un proxy qui rejouerait la première réponse depuis un
+  # contenu statique.
+  #
+  # En lecture seule, et strictement. Le même conteneur répond aussi bien à PUT
+  # et DELETE sur /application/v2/tenant/{tenant} qu'aux routes de session qui
+  # préparent et activent un paquet d'application — les appeler ne renseigne en
+  # rien sur l'absence de garde, que la lecture établit déjà.
+  - method: GET
+    path:
+      - "{{BaseURL}}/application/v2/tenant/default"
+      - "{{BaseURL}}/state/v1/version"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses. Sans lui, /state/v1/version — servie par tout
+    # conteneur Vespa, config server correctement fermé au réseau compris —
+    # conclurait de son côté.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat. TenantGetResponse ne sérialise qu'une clé — message —
+          # et son contenu est fixé par le code, pas par une donnée
+          # d'exploitant : « Tenant '" + tenant + "' exists. ». La requête
+          # porte elle-même le nom de tenant sur « default », donc la valeur
+          # attendue est connue à l'avance et peut être ancrée en dur plutôt que
+          # rendue générique.
+          #
+          # Les \s* sont là parce que le sérialiseur n'est pas garanti : Slime
+          # écrit compact, un intermédiaire qui réindenterait ce qu'il relaie ne
+          # le ferait pas. L'ancrage sur l'accolade ouvrante écarte la même
+          # charge utile retrouvée au fond d'un document composite qu'une
+          # supervision agrégerait sous une clé à elle.
+          #
+          # \x27 code l'apostrophe du message : le lexer DSL de nuclei accepte
+          # aussi bien les guillemets que les apostrophes comme délimiteurs de
+          # chaîne, donc une apostrophe littérale dans un motif entre guillemets
+          # tronque la chaîne au lieu de s'y insérer — l'échappement hexadécimal
+          # la garde comme un caractère du motif.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"message\"\\s*:\\s*\"Tenant \\x27default\\x27 exists\\.\"", trim_space(body_1))'
+
+          # La corroboration, par un chemin de code disjoint. buildVersionOutput()
+          # rend exactement {"version": Vtag.currentVersion.toString()} — un
+          # objet plat, sans autre clé. Le numéro lui-même n'est contraint qu'à
+          # la forme sémantique classique, sans plus : Vtag change à chaque
+          # publication du produit.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"version\"\\s*:\\s*\"[0-9]+\\.[0-9]+\\.[0-9]+", trim_space(body_2))'
+
+    extractors:
+      # La version exacte, et elle seule : c'est ce qui permet de dater
+      # l'installation et de la confronter aux avis du dépôt. Un seul
+      # extracteur, borné à body_2 — sous req-condition le moteur émet un
+      # résultat par extracteur qui rend quelque chose, donc la même instance
+      # serait signalée plusieurs fois — et /application/v2/tenant/default ne
+      # rend aucun numéro de version.
+      - type: json
+        part: body_2
+        name: version
+        json:
+          - '.version'

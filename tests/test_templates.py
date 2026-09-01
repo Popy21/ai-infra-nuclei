@@ -8,11 +8,13 @@ significatif : sans elle, un commit ne prouve rien.
 
 import ast
 import hashlib
+import http.server
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import uuid
 
 import pytest
@@ -16023,6 +16025,269 @@ def test_autogen_studio_extractor_reports_the_version_the_instance_serves():
         "l'extracteur ne lit pas .data.version — c'est pourtant ce qui permet "
         "de dater l'installation et de la confronter aux publications du dépôt"
     )
+
+
+# --------------------------------------------------------------------------
+# Vespa — GET /application/v2/tenant/default (le constat, en un seul message)
+# corroboré par GET /state/v1/version (un chemin de code disjoint, sur le même
+# port d'administration).
+
+VESPA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "vespa-config-server-exposed.yaml")
+VESPA_TENANT_ROUTE = "/application/v2/tenant/default"
+VESPA_VERSION_ROUTE = "/state/v1/version"
+
+
+def vespa_tenant_body(tenant="default", indent=None):
+    document = {"message": "Tenant '%s' exists." % tenant}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def vespa_version_body(version="8.587.16", indent=None):
+    document = {"version": version}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+VESPA_TENANT_BODY = vespa_tenant_body()
+VESPA_VERSION_BODY = vespa_version_body()
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+VESPA_COMPOSITE_BODY = '{"vespa":%s,"checked_at":0}' % VESPA_TENANT_BODY
+
+# Un service quelconque qui rendrait le même statut générique, sans rien de ce
+# qui désigne TenantGetResponse.
+VESPA_BARE_STATUS_BODY = '{"status":"ok"}'
+
+
+def vespa_block():
+    doc = load(VESPA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(VESPA_TENANT_ROUTE) for p in (b.get("path") or []))]
+    assert blocks, (
+        f"le template n'interroge pas {VESPA_TENANT_ROUTE} — c'est pourtant la "
+        "seule route dont le message transcrive, sans le moindre garde, "
+        "l'existence du tenant"
+    )
+    return blocks[0]
+
+
+def vespa_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = vespa_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def vespa_fires(tenant=(200, VESPA_TENANT_BODY), version=(200, VESPA_VERSION_BODY)):
+    scenario = {
+        VESPA_TENANT_ROUTE: tenant,
+        VESPA_VERSION_ROUTE: version,
+    }
+    block = vespa_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in vespa_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que Vespa ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_vespa_probe_reads_two_routes_and_never_writes_nor_deletes_a_tenant():
+    assert vespa_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et /state/v1/version — servie par tout "
+        "conteneur Vespa, config server correctement fermé au réseau compris "
+        "— conclurait de son côté"
+    )
+
+    assert vespa_requests() == [
+        ("GET", VESPA_TENANT_ROUTE),
+        ("GET", VESPA_VERSION_ROUTE),
+    ], (
+        "les deux requêtes ne sont plus celles que le template documente — "
+        f"{vespa_requests()}"
+    )
+
+    doc = load(VESPA_TEMPLATE)
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", (
+            f"{method} {route} : TenantHandler répond aussi bien à PUT et "
+            "DELETE sur /application/v2/tenant/{tenant} qu'aux routes de "
+            "session qui préparent et activent un paquet d'application — "
+            "aucun de ces verbes n'est nécessaire pour signaler l'exposition"
+        )
+        for forbidden, why in (
+            ("/session",
+             "SessionCreateHandler, SessionPrepareHandler et "
+             "SessionActiveHandler préparent et activent un paquet "
+             "d'application sur le cluster"),
+            ("/prepareandactivate",
+             "ApplicationApiHandler active un paquet d'application en une "
+             "seule requête"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_vespa_matcher_rests_on_the_tenant_message_not_on_the_status():
+    assert vespa_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance non "
+        "reconfigurée — celle, précisément, dont TenantGetResponse rend "
+        "littéralement \"Tenant 'default' exists.\""
+    )
+
+    assert not vespa_fires(tenant=(200, VESPA_COMPOSITE_BODY)), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'accolade ouvrante qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not vespa_fires(tenant=(200, VESPA_BARE_STATUS_BODY)), (
+        "le template conclut sur un corps qui ne porte pas même la clé "
+        "« message »"
+    )
+
+    # Le statut, seul, ne départage rien : sur une instance qui a fermé
+    # /application/v2/tenant/*, la même route rend un 401 ou un 403, jamais un
+    # corps portant ce message précis.
+    assert not vespa_fires(tenant=(401, VESPA_TENANT_BODY)), (
+        "le template ignore le statut : il conclurait même quand la route est "
+        "gardée et ne rend plus 200"
+    )
+
+
+def test_vespa_conclusion_needs_the_tenant_to_be_named_default():
+    for tenant in ("a", "foo", "acme-prod"):
+        assert not vespa_fires(tenant=(200, vespa_tenant_body(tenant=tenant))), (
+            f"le template remonte une instance dont le tenant se nomme "
+            f"« {tenant} » : la requête porte elle-même le nom sur « default », "
+            "et TenantGetResponse transcrit tel quel le nom demandé — le "
+            "constat porte sur ce tenant précis, pas sur n'importe quel tenant "
+            "existant"
+        )
+
+
+def test_vespa_matcher_holds_across_spacings_and_versions():
+    assert vespa_fires(
+        tenant=(200, vespa_tenant_body(indent=2)),
+        version=(200, vespa_version_body(indent=2)),
+    ), (
+        "le template exige la sérialisation compacte de Slime : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    assert vespa_fires(version=(200, vespa_version_body(version="7.594.36"))), (
+        "le template exige un numéro de version précis : Vtag.currentVersion "
+        "change à chaque publication du produit"
+    )
+
+
+def test_vespa_conclusion_needs_the_route_that_corroborates_by_a_disjoint_path():
+    assert not vespa_fires(version=(404, GENERIC_BAD_REQUEST_BODY)), (
+        "le template conclut sans corroboration par un chemin de code "
+        "disjoint : c'est elle qui écarte un cache ou un proxy statique qui "
+        "rejouerait la première réponse depuis un contenu figé"
+    )
+
+
+def test_vespa_conclusion_is_carried_by_the_dsl_alone():
+    block = vespa_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_vespa_extractor_reports_the_version_the_instance_serves():
+    extractors = vespa_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — c'est /state/v1/version qui "
+        "porte le numéro, /application/v2/tenant/default ne rendant que le "
+        "message"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant ce qui permet de "
+        "dater l'installation et de la confronter aux avis du dépôt"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_vespa_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL — un motif qui casse
+    le lexer (une apostrophe littérale entre guillemets, par exemple) y passe
+    sans le moindre avertissement et n'échoue qu'au premier scan réel. C'est
+    ce que `dsl_matcher_hits` ne peut pas voir non plus, puisqu'il réévalue le
+    motif en Python plutôt qu'avec le lexer de nuclei : seul un scan contre un
+    vrai serveur ferme la boucle.
+    """
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == VESPA_TENANT_ROUTE:
+                body = VESPA_TENANT_BODY.encode()
+            elif self.path == VESPA_VERSION_ROUTE:
+                body = VESPA_VERSION_BODY.encode()
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        target = "http://127.0.0.1:%d" % server.server_port
+        r = subprocess.run(
+            ["nuclei", "-t", VESPA_TEMPLATE, "-u", target,
+             "-duc", "-auth=false", "-jsonl", "-silent"],
+            capture_output=True, text=True, timeout=60,
+        )
+    finally:
+        server.shutdown()
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = [line for line in r.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1, (
+        "le scan contre un serveur qui rend les deux réponses attendues ne "
+        f"produit pas exactement un résultat : {r.stdout + r.stderr}"
+    )
+    result = json.loads(lines[0])
+    assert result.get("template-id") == "vespa-config-server-exposed"
+    assert result.get("extracted-results") == ["8.587.16"]
 
 
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
