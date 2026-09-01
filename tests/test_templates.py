@@ -16290,6 +16290,252 @@ def test_vespa_matcher_compiles_and_fires_against_a_live_server():
     assert result.get("extracted-results") == ["8.587.16"]
 
 
+# --------------------------------------------------------------------------
+# TensorBoard lie le constat à trois routes du même CorePlugin sans garde : la
+# preuve tient sur le couple loading_mechanism + remove_dom de
+# /data/plugins_listing, jamais sur le statut HTTP, et /data/environment puis
+# /data/runs corroborent par un vocabulaire disjoint.
+
+TENSORBOARD_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "tensorboard-exposed.yaml")
+
+
+def tensorboard_plugins_listing_body(plugins=None):
+    """
+    Telle que _serve_plugins_listing la construit : quatre clés fixes par
+    plugin (disable_reload, enabled, remove_dom, tab_name) puis
+    loading_mechanism, un objet typé.
+    """
+    if plugins is None:
+        plugins = {
+            "scalars": {
+                "disable_reload": False, "enabled": True, "remove_dom": False,
+                "tab_name": "scalars",
+                "loading_mechanism": {"type": "CUSTOM_ELEMENT",
+                                       "element_name": "tf-scalar-dashboard"},
+            },
+            "graphs": {
+                "disable_reload": True, "enabled": True, "remove_dom": True,
+                "tab_name": "graphs",
+                "loading_mechanism": {"type": "CUSTOM_ELEMENT",
+                                       "element_name": "tf-graph-dashboard"},
+            },
+        }
+    return json.dumps(plugins)
+
+
+TENSORBOARD_PLUGINS_LISTING_BODY = tensorboard_plugins_listing_body()
+
+# Une instance qui ne sert que des plugins Angular natifs et repliés : les
+# deux autres branches de loading_mechanism que le backend peut construire.
+TENSORBOARD_PLUGINS_LISTING_NG_AND_NONE_BODY = tensorboard_plugins_listing_body({
+    "whatif_tool": {
+        "disable_reload": False, "enabled": True, "remove_dom": False,
+        "tab_name": "whatif_tool",
+        "loading_mechanism": {"type": "NG_COMPONENT"},
+    },
+    "custom_scalars": {
+        "disable_reload": False, "enabled": False, "remove_dom": False,
+        "tab_name": "custom_scalars",
+        "loading_mechanism": {"type": "NONE"},
+    },
+})
+
+TENSORBOARD_ENVIRONMENT_BODY = json.dumps({
+    "version": "2.22.0a0",
+    "data_location": "s3://acme-ml-training/logs/run42",
+    "window_title": "", "experiment_name": "", "experiment_description": "",
+    "creation_time": 0,
+})
+
+TENSORBOARD_RUNS_BODY = json.dumps(["train", "eval", "train/2026-08-30_lr0.001"])
+
+# Un panneau quelconque qui répond 200 sur les trois chemins avec un JSON qui
+# porte des noms de clé voisins mais aucun des cinq que output_metadata pose,
+# et surtout pas de loading_mechanism typé.
+OTHER_APP_PLUGINS_LISTING_BODY = json.dumps({"plugins": ["a", "b"], "enabled": True})
+OTHER_APP_ENVIRONMENT_BODY = json.dumps({"version": "1.0", "env": "prod"})
+
+# Un inventaire qui reprend enabled et tab_name sans jamais typer sa
+# mécanique de chargement : les noms de clé isolés ne suffisent pas.
+OTHER_APP_PLUGIN_LIST_WITH_ENABLED_BODY = json.dumps({
+    "scalars": {"enabled": True, "tab_name": "scalars"},
+    "graphs": {"enabled": True, "tab_name": "graphs"},
+})
+
+
+def tensorboard_block():
+    doc = load(TENSORBOARD_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/data/plugins_listing" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /data/plugins_listing — c'est pourtant "
+        "la route qui porte le couple loading_mechanism + remove_dom"
+    )
+    return blocks[0]
+
+
+def tensorboard_fires(plugins_listing=(200, TENSORBOARD_PLUGINS_LISTING_BODY),
+                       environment=(200, TENSORBOARD_ENVIRONMENT_BODY),
+                       runs=(200, TENSORBOARD_RUNS_BODY)):
+    block = tensorboard_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in block.get("path") or []]
+    assert paths == ["/data/plugins_listing", "/data/environment", "/data/runs"], (
+        "l'ordre des chemins fixe le numéro de body_N que le DSL interroge"
+    )
+    responses = [plugins_listing, environment, runs]
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les trois réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_tensorboard_probe_is_read_only():
+    doc = load(TENSORBOARD_TEMPLATE)
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les trois routes du plugin core sont des lectures : le template "
+            "ne doit rien envoyer à une instance qu'il découvre"
+        )
+
+
+def test_tensorboard_matcher_needs_the_req_condition_to_link_the_three_routes():
+    block = tensorboard_block()
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_2 et body_3 ne seraient jamais peuplés : le "
+        "moteur n'accumule les réponses sous ces noms que si ce drapeau est "
+        "posé"
+    )
+
+
+def test_tensorboard_fires_on_a_real_plugins_listing():
+    assert tensorboard_fires(), (
+        "le template ne reconnaît pas une réponse /data/plugins_listing "
+        "authentique de TensorBoard"
+    )
+    assert tensorboard_fires(
+        plugins_listing=(200, TENSORBOARD_PLUGINS_LISTING_NG_AND_NONE_BODY)
+    ), (
+        "le template manque les instances dont les plugins actifs se "
+        "chargent en NG_COMPONENT ou en NONE plutôt qu'en CUSTOM_ELEMENT"
+    )
+
+
+def test_tensorboard_matcher_needs_the_typed_loading_mechanism_not_just_the_key_names():
+    assert not tensorboard_fires(plugins_listing=(200, OTHER_APP_PLUGINS_LISTING_BODY)), (
+        "le template déclenche sur un panneau quelconque qui porte aussi une "
+        "clé \"plugins\" et \"enabled\""
+    )
+    assert not tensorboard_fires(
+        plugins_listing=(200, OTHER_APP_PLUGIN_LIST_WITH_ENABLED_BODY)
+    ), (
+        "le template déclenche sur un inventaire qui reprend enabled et "
+        "tab_name sans jamais typer loading_mechanism — c'est pourtant cet "
+        "objet typé, pas les noms de clé isolés, qui distingue TensorBoard"
+    )
+
+
+def test_tensorboard_conclusion_needs_all_three_routes_to_corroborate():
+    assert not tensorboard_fires(environment=(200, OTHER_APP_ENVIRONMENT_BODY)), (
+        "le template conclut sans que /data/environment porte le vocabulaire "
+        "de TensorBoard (data_location, window_title, experiment_name, "
+        "experiment_description, creation_time)"
+    )
+    assert not tensorboard_fires(runs=(404, TENSORBOARD_RUNS_BODY)), (
+        "le template ignore le statut de /data/runs : il conclurait même "
+        "quand un mandataire a coupé cette route précise en laissant passer "
+        "les deux premières"
+    )
+
+
+def test_tensorboard_conclusion_is_carried_by_the_dsl_alone():
+    block = tensorboard_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les trois réponses par leur numéro"
+    )
+
+
+def test_tensorboard_extractors_report_the_storage_uri_and_the_run_names():
+    extractors = tensorboard_block().get("extractors") or []
+    assert len(extractors) == 2, (
+        "le template ne porte pas exactement deux extracteurs : data_location "
+        "et les noms de run sont les deux renseignements que l'exposition "
+        "divulgue"
+    )
+
+    by_name = {e.get("name"): e for e in extractors}
+    assert by_name.get("data_location", {}).get("part") == "body_2", (
+        "data_location n'appartient qu'à /data/environment"
+    )
+    assert by_name.get("data_location", {}).get("json") == [".data_location"]
+    assert by_name.get("runs", {}).get("part") == "body_3", (
+        "les noms de run n'appartiennent qu'à /data/runs"
+    )
+    assert by_name.get("runs", {}).get("json") == [".[]"]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_tensorboard_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et `dsl_matcher_hits`
+    réévalue le motif en Python plutôt qu'avec le lexer de nuclei : seul un
+    scan contre un vrai serveur ferme la boucle.
+    """
+    routes = {
+        "/data/plugins_listing": TENSORBOARD_PLUGINS_LISTING_BODY,
+        "/data/environment": TENSORBOARD_ENVIRONMENT_BODY,
+        "/data/runs": TENSORBOARD_RUNS_BODY,
+    }
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in routes:
+                body = routes[self.path].encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        target = "http://127.0.0.1:%d" % server.server_port
+        r = subprocess.run(
+            ["nuclei", "-t", TENSORBOARD_TEMPLATE, "-u", target,
+             "-duc", "-auth=false", "-jsonl", "-silent"],
+            capture_output=True, text=True, timeout=60,
+        )
+    finally:
+        server.shutdown()
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = [line for line in r.stdout.splitlines() if line.strip()]
+    assert len(lines) == 2, (
+        "le scan contre un serveur qui rend les trois réponses attendues ne "
+        f"produit pas exactement deux résultats — un par extracteur : "
+        f"{r.stdout + r.stderr}"
+    )
+    results = [json.loads(line) for line in lines]
+    assert {r.get("template-id") for r in results} == {"tensorboard-exposed"}
+    extracted = [value for r in results for value in (r.get("extracted-results") or [])]
+    assert sorted(extracted) == sorted([
+        "s3://acme-ml-training/logs/run42",
+        "train", "eval", "train/2026-08-30_lr0.001",
+    ])
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

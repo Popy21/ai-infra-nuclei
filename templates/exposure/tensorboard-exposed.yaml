@@ -1,0 +1,184 @@
+id: tensorboard-exposed
+
+info:
+  name: TensorBoard - Unauthenticated Training Dashboard (Plugin, Environment & Run Disclosure)
+  author: popy21
+  severity: medium
+  description: |
+    TensorBoard n'a jamais porté de couche d'authentification : il n'existe ni
+    drapeau --password ni --api-key dans son analyseur d'arguments
+    (tensorboard/plugins/core/core_plugin.py, CorePluginLoader.define_flags) —
+    --logdir, --host, --bind_all, --port, --path_prefix et une trentaine
+    d'autres réglages de rechargement, aucun qui touche à l'identité de
+    l'appelant. La seule pièce du backend qui manipule un contexte
+    d'autorisation est AuthContextMiddleware
+    (tensorboard/backend/auth_context_middleware.py), et son __call__ se lit
+    entièrement : il construit un AuthContext depuis la liste des fournisseurs
+    d'authentification, le pose dans l'environ WSGI, puis fait « return
+    self._application(environ, start_response) » — il ne compare cet objet à
+    rien et ne renvoie jamais un refus lui-même. C'est aux plugins qu'il
+    reviendrait de consulter ce contexte, et le plugin central n'en fait rien.
+    L'aide du drapeau qui publie l'instance ne prétend d'ailleurs pas le
+    contraire : « --bind_all : Serve on all public interfaces. This will
+    expose your TensorBoard instance to the network on both IPv4 and IPv6
+    (where available). Mutually exclusive with --host. » — l'exposition
+    réseau est le service rendu, pas un effet de bord.
+    GET /data/plugins_listing (DATA_PREFIX + PLUGINS_LISTING_ROUTE dans
+    tensorboard/backend/application.py, valant « /data» + «/plugins_listing »)
+    rend l'inventaire des plugins chargés. _serve_plugins_listing construit,
+    pour chacun, un dict output_metadata à exactement quatre clés fixes —
+    disable_reload, enabled, remove_dom, tab_name — puis lui ajoute
+    loading_mechanism, un objet lui-même typé selon la façon dont le plugin
+    s'intègre au frontend : {"type": "NG_COMPONENT"} pour un composant
+    Angular natif, {"type": "CUSTOM_ELEMENT", "element_name": ...} pour un
+    élément personnalisé enregistré côté client, {"type": "IFRAME",
+    "module_path": ...} pour un module chargé dans une iframe, ou {"type":
+    "NONE"} en repli. Le plugin core lui-même est explicitement filtré de
+    cette liste (« This plugin's existence is a backend implementation
+    detail »), mais tous les autres — scalars, graphs, images, histograms,
+    text, hparams, projector, profile, debugger_v2 — y figurent avec leur nom
+    de route comme clé racine.
+    tensorboard/plugins/core/core_plugin.py monte par ailleurs, sous le même
+    CorePlugin sans garde, GET /data/environment (_serve_environment, qui
+    rend version, data_location, window_title, experiment_name,
+    experiment_description et creation_time — ce dernier bloc provenant
+    littéralement de ExperimentMetadata, que le fournisseur de données par
+    défaut pour les journaux locaux construit avec
+    « data_location=self._logdir », donc le chemin ou l'URI que --logdir a
+    reçu au démarrage), GET /data/logdir, GET /data/runs (_serve_runs, un
+    tableau JSON des noms de run triés par heure de première mesure) et GET
+    /data/experiments. Chacune de ces routes ne fait qu'appeler le fournisseur
+    de données et sérialiser le résultat — aucune ne consulte l'AuthContext
+    posé plus haut dans la chaîne.
+  impact: |
+    /data/plugins_listing seul dit déjà quelles capacités de suivi
+    l'entraînement utilise — un hparams actif signale une recherche
+    d'hyperparamètres en cours, un profile ou un debugger_v2 signale une
+    instrumentation de performance ou de gradients, un projector signale des
+    embeddings appris. Chaque plugin listé sert ses propres données sous le
+    même préfixe DATA_PREFIX + PLUGIN_PREFIX + "/" + plugin_name (le chemin
+    que le module_path d'un IFRAME construit lui-même), monté par le même
+    TensorBoardWSGIApp et donc couvert par la même absence de garde : les
+    courbes de scalars, le graphe du modèle, les images d'entraînement, les
+    histogrammes de poids, les échantillons de texte ou d'audio journalisés,
+    et la grille complète d'essais d'hparams sont aussi peu protégés que
+    l'inventaire qui les annonce.
+    GET /data/environment est la pièce la plus sensible du triplet :
+    data_location expose littéralement le chemin serveur ou l'URI de dépôt
+    passé à --logdir — un chemin de système de fichiers interne, ou un
+    préfixe s3://, gs:// ou hdfs:// nommant le compartiment qui héberge les
+    journaux d'entraînement — tandis qu'experiment_name et
+    experiment_description portent souvent le nom du projet, du modèle ou du
+    client pour lequel l'entraînement tourne. GET /data/runs énumère ensuite
+    chaque identifiant de run que l'exploitant a choisi, où finissent
+    régulièrement des dates, des noms d'utilisateur, des hachages de commit
+    ou des combinaisons d'hyperparamètres utilisées comme nom de dossier.
+    Rien de tout cela n'accepte d'entrée à écrire — le plugin core ne monte
+    que des routes GET — donc le constat reste une divulgation
+    d'informations d'entraînement et d'infrastructure de stockage plutôt
+    qu'une exécution de code, ce qui borne la sévérité à medium plutôt qu'à
+    high ou critical.
+  remediation: |
+    Il n'y a pas de réglage à activer : le paquet ne définit aucun drapeau
+    d'authentification, et AuthContextMiddleware n'impose de garde nulle
+    part — il transporte un contexte que rien ne consulte. Ne pas passer
+    --bind_all sur un hôte qui n'est pas déjà derrière un périmètre de
+    confiance ; sans ce drapeau, --host par défaut reste localhost et
+    l'instance n'écoute que la boucle locale. Quand un accès distant est
+    nécessaire, le placer derrière un reverse proxy qui exige une identité
+    avant de relayer vers TensorBoard (Basic Auth, OIDC, ou un tunnel SSH
+    plutôt qu'une exposition directe du port), et couvrir la totalité du
+    site : /data/plugin/ sert autant de matière que /data/ lui-même.
+    Après une exposition, traiter comme lus data_location, les noms de run,
+    l'inventaire des plugins actifs et les données que chaque plugin sert
+    (scalars, images, hparams, profils). Si data_location pointe vers un
+    compartiment cloud, vérifier les journaux d'accès de ce compartiment sur
+    la fenêtre d'exposition et faire tourner les identifiants que l'hôte
+    TensorBoard utilisait pour l'atteindre.
+  reference:
+    - https://github.com/tensorflow/tensorboard/blob/master/tensorboard/backend/application.py
+    - https://github.com/tensorflow/tensorboard/blob/master/tensorboard/backend/auth_context_middleware.py
+    - https://github.com/tensorflow/tensorboard/blob/master/tensorboard/plugins/core/core_plugin.py
+    - https://github.com/tensorflow/tensorboard/blob/master/tensorboard/backend/event_processing/data_provider.py
+    - https://github.com/tensorflow/tensorboard/blob/master/tensorboard/data/provider.py
+    - https://www.tensorflow.org/tensorboard/get_started
+  metadata:
+    max-request: 3
+    vendor: tensorflow
+    product: tensorboard
+  tags: ai,ml,mlops,tensorboard,exposure,unauth,misconfig
+
+http:
+  # Trois lectures sur le même CorePlugin sans garde, et req-condition les lie
+  # en une seule conclusion.
+  #
+  # /data/plugins_listing porte le constat central. _serve_plugins_listing
+  # construit output_metadata avec exactement disable_reload, enabled,
+  # remove_dom et tab_name, puis lui ajoute loading_mechanism — un objet dont
+  # le "type" ne prend que quatre valeurs (NG_COMPONENT, CUSTOM_ELEMENT,
+  # IFRAME, NONE). C'est ce couple de clés qui porte la preuve, jamais le
+  # statut HTTP : un proxy qui rendrait 200 sur une page quelconque ne
+  # produirait ni ces cinq clés ni un loading_mechanism typé.
+  #
+  # /data/environment corrobore par un vocabulaire disjoint — version,
+  # data_location, window_title, experiment_name, experiment_description,
+  # creation_time — et c'est la route qui divulgue le chemin ou l'URI de
+  # stockage passé à --logdir.
+  #
+  # /data/runs ferme la preuve : un tableau JSON, vide ou non, mais un 200 sur
+  # une route qui n'a de sens que sur une instance TensorBoard.
+  #
+  # En lecture seule, et strictement : les trois routes appellent le
+  # fournisseur de données et sérialisent son résultat, aucune n'accepte
+  # d'entrée à écrire. Signaler l'exposition ne demande d'en toucher aucune.
+  - method: GET
+    path:
+      - "{{BaseURL}}/data/plugins_listing"
+      - "{{BaseURL}}/data/environment"
+      - "{{BaseURL}}/data/runs"
+
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Les quatre clés fixes de output_metadata, vérifiées sans
+          # deux-points pour rester indifférentes à l'espacement que
+          # json.dumps insère par défaut après ":" et ",".
+          - 'status_code_1 == 200 && contains(body_1, "\"disable_reload\"") && contains(body_1, "\"remove_dom\"") && contains(body_1, "\"tab_name\"") && contains(body_1, "\"loading_mechanism\"")'
+
+          # loading_mechanism est un objet typé, pas une simple clé : borner
+          # aux quatre valeurs que le backend peut poser écarte tout document
+          # qui porterait par coïncidence les mêmes noms de clé sans le même
+          # vocabulaire. Les \s* couvrent aussi bien la sortie compacte que
+          # celle, indentée, d'un intermédiaire qui reformaterait.
+          - 'regex("\"loading_mechanism\"\\s*:\\s*\\{\\s*\"type\"\\s*:\\s*\"(NG_COMPONENT|CUSTOM_ELEMENT|IFRAME|NONE)\"", body_1)'
+
+          # /data/environment, avec les six clés que _serve_environment pose
+          # toujours — y compris quand le fournisseur de données ne connaît
+          # aucune expérience nommée, auquel cas les chaînes sont vides mais
+          # les clés restent présentes.
+          - 'status_code_2 == 200 && contains(body_2, "\"data_location\"") && contains(body_2, "\"window_title\"") && contains(body_2, "\"experiment_name\"") && contains(body_2, "\"experiment_description\"") && contains(body_2, "\"creation_time\"")'
+
+          # /data/runs a répondu, sans qu'un mandataire n'ait coupé cette
+          # route précise en gardant les deux premières.
+          - "status_code_3 == 200"
+
+    extractors:
+      # Le chemin ou l'URI de dépôt passé à --logdir : la pièce la plus
+      # sensible du triplet, et celle qui situe l'infrastructure de stockage
+      # derrière l'instance.
+      - type: json
+        part: body_2
+        name: data_location
+        json:
+          - ".data_location"
+
+      # Les identifiants de run que l'exploitant a choisis — souvent des
+      # dates, des noms d'utilisateur ou des hachages de commit.
+      - type: json
+        part: body_3
+        name: runs
+        json:
+          - ".[]"
