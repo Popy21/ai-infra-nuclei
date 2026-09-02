@@ -16536,6 +16536,353 @@ def test_tensorboard_matcher_compiles_and_fires_against_a_live_server():
     ])
 
 
+# --------------------------------------------------------------------------
+# Agno AgentOS pose son authentification en dépendance de routeur —
+# « APIRouter(dependencies=[Depends(get_authentication_dependency(settings))]) »
+# — et cette dépendance ne garde rien par défaut : « if not settings or not
+# settings.os_security_key: return True », sous le commentaire « If no security
+# key is set, skip authentication entirely », là où AgnoAPISettings déclare
+# « os_security_key: Optional[str] = None » et « authorization_enabled: bool =
+# False ».
+#
+# GET /config rend alors la configuration entière du runtime. Le constat porte
+# sur ce que ce document dit — « os_id » en tête, puis l'énumération des
+# modèles, des bases, des agents et des interfaces — jamais sur le statut : la
+# route n'est pas dispensée de JWT quand l'autorisation est activée, donc une
+# instance fermée n'y rend pas la même chose.
+#
+# Deux écueils propres à ce produit, et ils commandent la forme du matcher :
+# le GET /config de Gradio, déjà couvert par le pack, occupe le même chemin
+# sans décrire un runtime d'agents ; et GET /info, sur la même instance, ouvre
+# lui aussi son document sur « os_id » sans rien énumérer.
+
+AGNO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                             "agno-agentos-config-exposed.yaml")
+
+# Les champs optionnels renseignés d'une instance réelle, entre les champs
+# obligatoires de tête et les collections de queue — c'est l'ordre de
+# déclaration de ConfigResponse, celui que pydantic sérialise.
+AGNO_OPTIONAL_BLOCKS = {
+    "chat": {"quick_prompts": {"marketing-agent": ["What can you do?"]}},
+    "session": {"dbs": [{"db_id": "db-0001",
+                         "domain_config": {"display_name": "Sessions"}}]},
+    "memory": {"dbs": [{"db_id": "db-0001",
+                        "domain_config": {"display_name": "Main app user memories"}}]},
+}
+
+
+def agno_config_body(os_id="acme-agentos", available_models=None, databases=None,
+                     agents=None, teams=(), workflows=(), interfaces=None,
+                     optional=None, drop=(), indent=None):
+    """
+    Ce que rend GET /config : ConfigResponse sérialisé par pydantic dans
+    l'ordre de déclaration de ses champs, response_model_exclude_none ayant
+    retiré ceux qui valent None.
+
+    `drop` retire une clé comme le ferait ce filtre sur un champ laissé vide,
+    `indent` réécrit le document comme le ferait un intermédiaire qui
+    réindente ce qu'il relaie.
+    """
+    if available_models is None:
+        available_models = [{"id": "gpt-4o", "provider": "OpenAI"}]
+    if databases is None:
+        databases = ["db-0001", "db-0002"]
+    if agents is None:
+        agents = [{"id": "marketing-agent", "name": "Marketing Agent",
+                   "db_id": "db-0001"}]
+    if interfaces is None:
+        interfaces = [{"type": "agui", "version": "1.0", "route": "/agui"}]
+
+    document = {
+        "os_id": os_id,
+        "description": "Your AgentOS",
+        "available_models": list(available_models),
+        "databases": list(databases),
+    }
+    document.update(AGNO_OPTIONAL_BLOCKS if optional is None else optional)
+    document["agents"] = list(agents)
+    document["teams"] = list(teams)
+    document["workflows"] = list(workflows)
+    document["interfaces"] = list(interfaces)
+    for key in drop:
+        document.pop(key, None)
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # La JSONResponse de FastAPI écrit compact.
+    return json.dumps(document, separators=(",", ":"))
+
+
+AGNO_CONFIG_BODY = agno_config_body()
+
+# La 2.x : available_models y vaut « Optional[List[str]] = None », donc des
+# chaînes « fournisseur:modèle » — la forme que l'exemple de la documentation
+# montre encore — et la clé disparaît quand rien ne la remplit.
+AGNO_CONFIG_STRING_MODELS_BODY = agno_config_body(
+    available_models=["openai:gpt-4", "anthropic:claude-3-sonnet"])
+AGNO_CONFIG_WITHOUT_MODELS_BODY = agno_config_body(drop=("available_models",))
+
+# L'instance qui n'a encore rien d'enregistré : les collections obligatoires
+# sont sérialisées vides, elles ne disparaissent pas.
+AGNO_CONFIG_EMPTY_INVENTORY_BODY = agno_config_body(
+    available_models=[], databases=[], agents=[], interfaces=[], optional={})
+
+# GET /info sur la même instance : InfoResponse déclare « os_id » en premier
+# champ lui aussi, mais n'énumère rien.
+AGNO_INFO_BODY = json.dumps({
+    "os_id": "acme-agentos", "name": "Acme AgentOS", "os_version": "1.0.0",
+    "agno_version": "3.0.5", "agent_count": 4, "team_count": 1,
+    "workflow_count": 0, "mcp": {"enabled": False, "path": None},
+    "auth_mode": "none",
+}, separators=(",", ":"))
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+AGNO_COMPOSITE_BODY = '{"agentos":%s,"checked_at":0}' % AGNO_CONFIG_BODY
+
+# Un service quelconque qui rendrait « os_id » sous la même clé racine, sans
+# rien de ce que le runtime énumère.
+AGNO_BARE_OS_ID_BODY = '{"os_id":"acme-agentos","description":"Your AgentOS"}'
+
+# Le même document, mais amputé des collections qui nomment le produit : c'est
+# ce qu'un service homonyme quelconque pourrait servir.
+AGNO_WITHOUT_INVENTORY_BODY = agno_config_body(
+    drop=("agents", "teams", "workflows", "interfaces"))
+AGNO_WITHOUT_INTERFACES_BODY = agno_config_body(drop=("interfaces",))
+
+# Les deux refus que la dépendance sait produire quand OS_SECURITY_KEY est posé.
+AGNO_MISSING_HEADER_BODY = '{"detail":"Authorization header required"}'
+AGNO_INVALID_TOKEN_BODY = '{"detail":"Invalid authentication token"}'
+
+
+def agno_block():
+    doc = load(AGNO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/config" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /config — c'est pourtant la seule route "
+        "dont la réponse porte la configuration entière du runtime"
+    )
+    return blocks[0]
+
+
+def agno_fires(body):
+    block = agno_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_agno_probe_only_reads_and_never_runs_an_agent():
+    doc = load(AGNO_TEMPLATE)
+    routes = sorted(request_routes(doc))
+    assert routes == [("GET", "/config")], (
+        "le template n'interroge plus la seule route de lecture qu'il "
+        f"documente — {routes}"
+    )
+    for _, route in routes:
+        for forbidden, why in (
+            ("/agents",
+             "POST /agents/{agent_id}/runs exécute un agent, et /config vient "
+             "précisément de livrer les agent_id à fournir"),
+            ("/teams", "les routes d'équipe font tourner une équipe"),
+            ("/workflows", "les routes de workflow en déclenchent l'exécution"),
+            ("/sessions",
+             "les routes de session rendent ce qui a été soumis aux agents"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_agno_matcher_rests_on_the_configuration_not_on_the_status():
+    assert agno_fires(AGNO_CONFIG_BODY), (
+        "le template ne reconnaît pas la réponse d'une instance laissée à ses "
+        "défauts — celle, précisément, dont get_authentication_dependency() "
+        "rend True faute d'os_security_key"
+    )
+
+    kinds = {m.get("type") for m in (agno_block().get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : /config n'est pas dispensée de "
+        "JWT quand l'autorisation est activée, donc c'est le corps — la "
+        "configuration elle-même — qui porte la preuve, jamais le code"
+    )
+
+    assert not agno_fires(AGNO_MISSING_HEADER_BODY), (
+        "le template conclut sur le refus d'une instance dont OS_SECURITY_KEY "
+        "est posé : c'est exactement l'instance fermée"
+    )
+    assert not agno_fires(AGNO_INVALID_TOKEN_BODY), (
+        "le template conclut sur le refus de jeton, qui n'apprend rien de "
+        "l'ouverture"
+    )
+    assert not agno_fires(AGNO_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+
+def test_agno_conclusion_needs_the_enumeration_not_just_the_os_id():
+    assert not agno_fires(AGNO_BARE_OS_ID_BODY), (
+        "le template conclut sur un service quelconque qui rend « os_id » "
+        "sous la même clé racine : ce sont les collections que /config "
+        "énumère qui prouvent l'accès en lecture au déploiement"
+    )
+    assert not agno_fires(AGNO_INFO_BODY), (
+        "le template déclenche sur GET /info, qui ouvre lui aussi son document "
+        "sur « os_id » — InfoResponse le déclare en premier champ — sans "
+        "énumérer ni les bases, ni les agents, ni les interfaces"
+    )
+    assert not agno_fires(AGNO_WITHOUT_INVENTORY_BODY), (
+        "le template n'exige plus les collections que ConfigResponse déclare "
+        "obligatoires : il ne reste alors que des noms de clé qu'une "
+        "configuration quelconque porterait aussi"
+    )
+    assert not agno_fires(AGNO_WITHOUT_INTERFACES_BODY), (
+        "le template se contente de « agents » : c'est la présence conjointe "
+        "d'agents et d'interfaces qui sépare ce document d'un inventaire "
+        "d'agents quelconque"
+    )
+
+    # Collision de chemin : Gradio sert lui aussi un /config anonyme, et le
+    # pack le couvre déjà. Son document décrit une interface, pas un runtime.
+    for other_body, other_name in (
+        (GRADIO_CONFIG_BODY, "gradio"),
+        (GRADIO_OLD_CONFIG_BODY, "gradio, dans sa forme ancienne"),
+    ):
+        assert not agno_fires(other_body), (
+            f"le template déclenche sur {other_name}, qui sert lui aussi une "
+            "configuration anonyme sur /config sans être un runtime d'agents"
+        )
+
+
+def test_agno_matcher_holds_across_the_two_shapes_of_available_models():
+    assert agno_fires(AGNO_CONFIG_STRING_MODELS_BODY), (
+        "le template exige les objets « {\"id\": ..., \"provider\": ...} » de "
+        "la 3.x : la 2.x déclare « available_models: Optional[List[str]] » et "
+        "y écrit des chaînes « fournisseur:modèle », la forme que l'exemple "
+        "de la documentation montre encore"
+    )
+    assert agno_fires(AGNO_CONFIG_WITHOUT_MODELS_BODY), (
+        "le template exige available_models : en 2.x le champ vaut None par "
+        "défaut et response_model_exclude_none le retire du document, alors "
+        "que « databases » y reste déclaré obligatoire"
+    )
+    assert agno_fires(agno_config_body(drop=("databases",))), (
+        "le template exige databases alors qu'available_models suffit : les "
+        "deux clés sont interchangeables pour ce constat, et une seule des "
+        "deux est garantie selon la génération"
+    )
+    assert not agno_fires(agno_config_body(
+        drop=("available_models", "databases"))), (
+        "le template conclut sans qu'aucune des deux énumérations ne soit là"
+    )
+
+
+def test_agno_matcher_holds_on_an_idle_instance_and_across_spacings():
+    assert agno_fires(AGNO_CONFIG_EMPTY_INVENTORY_BODY), (
+        "le template manque l'instance qui n'a encore rien d'enregistré : les "
+        "collections obligatoires y sont sérialisées vides, et c'est bien la "
+        "même absence de garde qui les rend lisibles"
+    )
+    assert agno_fires(agno_config_body(indent=2)), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+    assert agno_fires(agno_config_body(optional={})), (
+        "le template dépend d'un champ optionnel renseigné — chat, session, "
+        "memory et les autres valent None sur une instance qui ne les "
+        "configure pas, et exclude_none les retire alors"
+    )
+
+
+def test_agno_extractors_report_what_the_anonymous_caller_obtains():
+    block = agno_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "os_id": [".os_id"],
+        "databases": [".databases[]"],
+        "agents": [".agents[]?.id"],
+    }, (
+        "les trois renseignements du constat ne sont pas remontés tels quels — "
+        f"{found}. .os_id rattache l'instance à un déploiement identifiable, "
+        ".databases[] nomme la couche de persistance atteinte par la même "
+        "absence de garde, et .agents[]?.id livre exactement les agent_id que "
+        "POST /agents/{agent_id}/runs attend — le « ? » évitant de fauter "
+        "quand un résumé ne porte pas d'identifiant, AgentSummaryResponse.id "
+        "étant optionnel"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_agno_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni le chemin
+    des extracteurs, et `body_matcher_hits` réévalue les motifs avec le module
+    `re` de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur
+    ferme la boucle.
+    """
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/config":
+                body = AGNO_CONFIG_BODY.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        target = "http://127.0.0.1:%d" % server.server_port
+        r = subprocess.run(
+            ["nuclei", "-t", AGNO_TEMPLATE, "-u", target,
+             "-duc", "-auth=false", "-jsonl", "-silent"],
+            capture_output=True, text=True, timeout=60,
+        )
+    finally:
+        server.shutdown()
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = [line for line in r.stdout.splitlines() if line.strip()]
+    assert len(lines) == 3, (
+        "le scan contre un serveur qui rend la configuration attendue ne "
+        "produit pas exactement trois résultats — un par extracteur : "
+        f"{r.stdout + r.stderr}"
+    )
+    results = [json.loads(line) for line in lines]
+    assert {item.get("template-id") for item in results} == {
+        "agno-agentos-config-exposed"}
+    extracted = [value for item in results
+                 for value in (item.get("extracted-results") or [])]
+    assert sorted(extracted) == sorted([
+        "acme-agentos", "db-0001", "db-0002", "marketing-agent",
+    ])
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

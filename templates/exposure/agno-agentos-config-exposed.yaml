@@ -1,0 +1,246 @@
+id: agno-agentos-config-exposed
+
+info:
+  name: Agno AgentOS - Unauthenticated Runtime Configuration Exposure
+  author: popy21
+  severity: high
+  description: |
+    AgentOS est le runtime FastAPI du projet agno-agi/agno — paquet
+    libs/agno/agno/os — celui qui sert en production les agents, les équipes et
+    les workflows d'un projet Agno. L'application est construite par
+    agno/os/app.py, qui rattache ses routeurs par « _add_router() » et termine
+    à chaque branche sur « fastapi_app.include_router(router) », sans préfixe :
+    les routes de get_home_router(), get_health_router(health_endpoint=
+    "/health"), get_info_router() et get_base_router() se posent donc telles
+    quelles à la racine, d'où GET /config. Le défaut de liaison est local —
+    serve() déclare « host: str = "localhost", port: int = 7777 » — mais les
+    variables AGENT_OS_HOST et AGENT_OS_PORT, qu'il lit juste après, suffisent
+    à porter l'instance sur une interface publique.
+    L'authentification est posée en dépendance de routeur, et elle ne garde
+    rien par défaut. agno/os/router.py construit « router = APIRouter(
+    dependencies=[Depends(get_authentication_dependency(settings))], ...) »
+    puis y déclare « @router.get("/config", response_model=ConfigResponse,
+    response_model_exclude_none=True, ...) ». La dépendance elle-même
+    (agno/os/auth.py) rend True sans rien vérifier dès que rien n'a été
+    configuré : « # If no security key is set, skip authentication entirely »,
+    puis « if not settings or not settings.os_security_key: return True ». Or
+    AgnoAPISettings (agno/os/settings.py) déclare « os_security_key:
+    Optional[str] = Field(default=None) » et « authorization_enabled: bool =
+    Field(default=False) ». La documentation officielle le pose dans les mêmes
+    termes sous ses valeurs par défaut : « Authentication: authorization=False.
+    Opt in with authorization=True and JWT_VERIFICATION_KEY for production. »
+    Tant que l'exploitant n'a pas activé explicitement l'autorisation, aucune
+    vérification de jeton n'est appliquée — et la liste de routes que la même
+    page dispense de JWT (« / », /health, /info, /docs, /redoc,
+    /openapi.json, /docs/oauth2-redirect) ne vaut *que* lorsque le JWT est
+    activé ; /config n'y figure pas.
+    Ce que rend cette route est la configuration entière de l'instance.
+    ConfigResponse (agno/os/schema.py) déclare ses champs dans cet ordre —
+    os_id, name, description, available_models, os_database, databases, chat,
+    manifest, session, metrics, memory, learning, knowledge, evals, traces,
+    agents, teams, workflows, interfaces — et pydantic sérialise dans l'ordre
+    de déclaration, donc « os_id » ouvre le document. C'est aussi l'ordre de
+    l'exemple de réponse publié sur docs.agno.com/agent-os/config, dont la page
+    résume la route d'une phrase : « The /config endpoint returns your complete
+    AgentOS configuration as JSON. »
+    Le couple « os_id » + « available_models » est propre à ce produit et le
+    sépare du GET /config de Gradio, déjà couvert par le pack : celui-là décrit
+    une interface — son document ouvre sur « version » et porte dev_mode,
+    enable_queue, is_colab — quand celui-ci décrit un runtime d'agents et ne
+    porte aucune de ces clés.
+    Le constat ne peut pas reposer sur available_models seul, parce que ce champ
+    a changé deux fois. En 2.x il est déclaré « available_models:
+    Optional[List[str]] = None » — donc absent du document quand rien ne le
+    remplit, puisque response_model_exclude_none retire les champs nuls — et il
+    porte des chaînes du genre « openai:gpt-4 », la forme que l'exemple de la
+    documentation montre encore. En 3.x il vaut « available_models:
+    List[Model] = Field(default_factory=list) », donc toujours présent, et
+    chaque entrée est un objet « {"id": ..., "provider": ...} » construit par
+    _collect_unique_models(). Restent garantis dans les deux générations les
+    champs déclarés obligatoires : os_id, databases, agents, teams, workflows
+    et interfaces. C'est sur eux que porte la reconnaissance, jamais sur le
+    statut HTTP.
+  impact: |
+    La réponse énumère le déploiement : « os_id » et « description » nomment
+    l'instance, « databases » liste les identifiants de bases que ses
+    composants utilisent, « available_models » les modèles et fournisseurs
+    réellement branchés, et « agents », « teams », « workflows » rendent chacun
+    des résumés — AgentSummaryResponse porte id, name, description, db_id,
+    model et metadata — c'est-à-dire l'inventaire complet de ce que
+    l'exploitant fait tourner. « interfaces » rend en plus le type, la version
+    et la route de chaque interface montée, donc les points d'entrée
+    supplémentaires à essayer. C'est une preuve d'accès en lecture au
+    déploiement, et pas seulement le constat qu'un port répond.
+    Surtout, cette route n'est pas un cas particulier : elle est gardée par
+    exactement la même dépendance que tout le reste du runtime. Les routeurs
+    d'agents, d'équipes et de workflows sont construits sur le même
+    « dependencies=[Depends(get_authentication_dependency(settings))] », donc
+    la même absence de garde vaut pour eux. POST /agents/{agent_id}/runs
+    exécute l'agent — et /config vient précisément de livrer les agent_id à
+    fournir. L'anonyme qui atteint le port dispose donc du même pouvoir que
+    l'exploitant : lire la configuration, énumérer les composants, puis les
+    faire tourner sur les clés de fournisseurs de modèles du propriétaire.
+    Le reste de la surface suit, sessions, mémoire, connaissance et métriques
+    comprises, puisqu'aucun de ces routeurs ne pose de garde qui lui soit
+    propre.
+  remediation: |
+    Activer l'autorisation, ce que la documentation pose comme le geste de mise
+    en production : construire l'instance avec « authorization=True » et
+    fournir JWT_VERIFICATION_KEY (ou JWT_JWKS_FILE). La dépendance reconnaît
+    aussi ces variables d'environnement seules — _is_jwt_configured() les lit
+    directement — et un JWTMiddleware installé à la main est détecté de même.
+    À défaut de JWT, poser OS_SECURITY_KEY : c'est le champ os_security_key
+    d'AgnoAPISettings, et sa seule présence fait basculer la dépendance sur la
+    comparaison du jeton porteur, avec un 401 « Authorization header required »
+    quand l'en-tête manque. C'est la protection la plus faible des deux — un
+    secret partagé sans portée ni expiration — mais elle ferme la route.
+    Ne pas publier le port 7777 sur une interface non maîtrisée : le défaut de
+    serve() lie « localhost », et c'est AGENT_OS_HOST / AGENT_OS_PORT, ou une
+    publication de conteneur, qui l'ouvrent. Lier « 127.0.0.1:7777:7777 » côté
+    conteneur quand l'instance doit rester locale.
+    Vérifier la prise en compte sur GET /config lui-même, en anonyme : la
+    réponse doit cesser d'être la configuration et devenir un refus. Vérifier
+    au passage que GET /info ne déclare plus « "auth_mode":"none" » — le champ
+    transcrit le mode effectivement appliqué au plan REST, tel que
+    get_effective_auth_mode() le calcule.
+    Après une exposition, tenir pour lues la configuration entière et
+    l'énumération des composants — donc faire tourner les clés des fournisseurs
+    de modèles que les agents utilisent — et relire les sessions et les
+    exécutions pour établir si un agent, une équipe ou un workflow a été lancé
+    pendant la fenêtre : rien ne s'y opposait.
+  reference:
+    - https://docs.agno.com/agent-os/config
+    - https://docs.agno.com/features/security-and-auth
+    - https://github.com/agno-agi/agno/blob/main/libs/agno/agno/os/router.py
+    - https://github.com/agno-agi/agno/blob/main/libs/agno/agno/os/auth.py
+    - https://github.com/agno-agi/agno/blob/main/libs/agno/agno/os/schema.py
+    - https://github.com/agno-agi/agno/blob/main/libs/agno/agno/os/settings.py
+    - https://github.com/agno-agi/agno/blob/main/libs/agno/agno/os/app.py
+    - https://github.com/agno-agi/agno/blob/main/libs/agno/agno/os/routers/agents/router.py
+  metadata:
+    max-request: 1
+    vendor: agno
+    product: agentos
+  tags: ai,llm,agent,agno,agentos,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture. Le handler config() ne consulte ni la requête ni
+  # l'identité de l'appelant : il recopie l'état de l'objet AgentOS. Rien de
+  # plus intrusif n'apprendrait davantage sur l'absence de garde, puisque la
+  # dépendance qui laisse passer cette route est celle-là même qui laisse
+  # passer les autres.
+  #
+  # En lecture seule, et strictement. Le même
+  # « dependencies=[Depends(get_authentication_dependency(settings))] » garde
+  # POST /agents/{agent_id}/runs, qui exécute un agent avec les identifiants
+  # que cette réponse vient de livrer : le signaler ne demande pas de le
+  # déclencher.
+  - method: GET
+    path:
+      - "{{BaseURL}}/config"
+
+    matchers-condition: and
+    matchers:
+      # Le constat, et son ancrage. os_id est le premier champ déclaré par
+      # ConfigResponse, et pydantic sérialise dans l'ordre de déclaration :
+      # la clé ouvre donc le document, ce que l'exemple de réponse de
+      # docs.agno.com/agent-os/config montre aussi. Il est déclaré obligatoire
+      # (« os_id: str = Field(...) ») et le handler le remplit toujours —
+      # « os_id=os.id or "Unnamed OS" » — donc response_model_exclude_none ne
+      # peut pas le retirer.
+      #
+      # L'ancrage sur l'ouverture du corps écarte la même charge utile
+      # retrouvée au fond d'un document composite qu'une supervision agrégerait
+      # sous une clé à elle : c'est lui qui dit que l'instance a répondu
+      # d'elle-même. La valeur n'est contrainte à rien d'autre qu'à être une
+      # chaîne — os_id est le nom que l'exploitant donne à son OS.
+      #
+      # Rien n'est exigé du statut. La documentation ne dispense de JWT que
+      # « / », /health, /info, /docs, /redoc, /openapi.json et
+      # /docs/oauth2-redirect, et seulement lorsque le JWT est activé : sur une
+      # instance fermée cette route ne rend pas la configuration, et c'est le
+      # corps, pas le code, qui en fait foi.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"os_id"\s*:\s*"'
+
+      # L'énumération qui prouve l'accès en lecture au déploiement, et non le
+      # seul fait qu'un port réponde. Les deux formes sont acceptées
+      # indifféremment parce qu'une seule des deux clés est garantie selon la
+      # génération :
+      #
+      # - databases est déclaré obligatoire dans les deux (« databases:
+      #   List[str] = Field(...) »), donc toujours sérialisé ;
+      # - available_models ne l'est qu'à partir de la 3.x (« List[Model] =
+      #   Field(default_factory=list) »). En 2.x il vaut « Optional[List[str]]
+      #   = None » et disparaît du document quand rien ne le remplit, puisque
+      #   response_model_exclude_none retire les champs nuls.
+      #
+      # Rien n'est exigé du contenu du tableau, et pour la même raison : la
+      # 2.x y écrit des chaînes du genre « openai:gpt-4 » — la forme que
+      # l'exemple de la documentation montre encore — quand la 3.x y écrit les
+      # objets « {"id": ..., "provider": ...} » que _collect_unique_models()
+      # construit. Une expression qui exigerait l'une des deux écritures
+      # manquerait toutes les instances de l'autre génération.
+      - type: regex
+        part: body
+        regex:
+          - '"available_models"\s*:\s*\['
+          - '"databases"\s*:\s*\['
+
+      # Le fingerprint, dans la même réponse. Ces deux collections sont
+      # déclarées obligatoires par ConfigResponse dans les deux générations —
+      # « agents: List[AgentSummaryResponse] = Field(...) », « interfaces:
+      # List[InterfaceResponse] = Field(...) » — donc
+      # response_model_exclude_none ne peut pas les retirer, même vides, et
+      # l'exemple de réponse de docs.agno.com/agent-os/config les porte toutes
+      # les deux. C'est leur présence conjointe qui dit qu'un runtime d'agents
+      # décrit son inventaire, là où le GET /config de Gradio, sur le même
+      # chemin, décrit une interface et n'en porte aucune.
+      #
+      # teams et workflows sont tout aussi obligatoires côté source, mais ne
+      # sont pas exigés ici : ils n'apparaissent pas dans la réponse type que
+      # la documentation publie, et deux collections suffisent à nommer le
+      # produit.
+      #
+      # Leur ordre relatif n'est pas exigé : ce sont les derniers champs
+      # déclarés, mais tout champ optionnel renseigné — chat, manifest,
+      # session, metrics, memory, learning, knowledge, evals, traces —
+      # s'intercale devant eux et déplace ce qui les suit.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"agents"\s*:\s*\['
+          - '"interfaces"\s*:\s*\['
+
+    extractors:
+      # Le nom que l'exploitant a donné à son OS — « os.id or "Unnamed OS" » —
+      # qui rattache l'instance à un déploiement identifiable.
+      - type: json
+        part: body
+        name: os_id
+        json:
+          - '.os_id'
+
+      # Les identifiants de bases que les composants de l'OS utilisent : c'est
+      # la part de l'énumération qui décrit la couche de persistance atteinte
+      # par la même absence de garde.
+      - type: json
+        part: body
+        name: databases
+        json:
+          - '.databases[]'
+
+      # Les agents enregistrés, nommés un à un. Ce sont exactement les
+      # agent_id que POST /agents/{agent_id}/runs attend, et c'est ce qui fait
+      # la différence entre un port qui répond et un runtime dont on connaît
+      # les composants. Le « ? » évite de fauter quand un résumé ne porte pas
+      # d'identifiant : AgentSummaryResponse.id est optionnel, et
+      # response_model_exclude_none retire alors la clé.
+      - type: json
+        part: body
+        name: agents
+        json:
+          - '.agents[]?.id'
