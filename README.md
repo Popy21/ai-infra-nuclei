@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-64 templates, 61 produits.
+65 templates, 62 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -97,6 +97,7 @@ amont.
 | vllm | [`vllm-unauthenticated-api`](templates/exposure/vllm-unauthenticated-api.yaml) | high |
 | weaviate | [`weaviate-anonymous-access`](templates/exposure/weaviate-anonymous-access.yaml) | high |
 | xinference | [`xinference-exposed`](templates/exposure/xinference-exposed.yaml) | high |
+| zenml | [`zenml-server-info-exposed`](templates/exposure/zenml-server-info-exposed.yaml) | medium |
 <!-- /couverture -->
 
 Tableau écrit par `python3 scripts/coverage.py --readme` ; la suite de tests

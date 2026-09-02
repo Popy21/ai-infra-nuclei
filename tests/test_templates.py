@@ -16883,6 +16883,348 @@ def test_agno_matcher_compiles_and_fires_against_a_live_server():
     ])
 
 
+# --------------------------------------------------------------------------
+# ZenML rend GET /api/v1/info sans jeton, et c'est une propriété du code plutôt
+# qu'un réglage : dans server_endpoints.py, « def server_info() -> ServerModel:
+# return zen_store().get_store_info() » ne porte aucun « _: AuthContext =
+# Security(authorize) », là où ses quatre voisins du même fichier — sous
+# LOAD_INFO, ONBOARDING_STATE, SERVER_SETTINGS et STATISTICS — en portent un.
+#
+# Deux conséquences commandent la forme du matcher. La route répond pareil sur
+# une instance dont le reste de l'API est correctement gardé, donc le statut ne
+# dit rien du produit ni de la divulgation : c'est le ServerModel lui-même qui
+# porte le constat. Et ce modèle a grossi — la 0.40.0 ne déclarait que id,
+# version, deployment_type, database_type et secrets_store_type — donc seul ce
+# noyau peut être exigé, sous peine de manquer les instances anciennes,
+# précisément celles qui traînent exposées.
+
+ZENML_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                              "zenml-server-info-exposed.yaml")
+
+ZENML_SERVER_ID = "6f2c6b6a-6d3f-4a0f-8f2b-2f9b0d1c3e4a"
+
+
+def zenml_info_body(server_id=ZENML_SERVER_ID, version="0.84.1",
+                    deployment_type="docker", database_type="mysql",
+                    secrets_store_type="sql",
+                    auth_scheme="OAUTH2_PASSWORD_BEARER", drop=(), indent=None):
+    """
+    Ce que rend GET /api/v1/info : ServerModel sérialisé par pydantic dans
+    l'ordre de déclaration de ses champs, tel que get_store_info() le remplit —
+    BaseZenStore pose deployment_type, auth_scheme, metadata et
+    secrets_store_type, SqlZenStore pose ensuite database_type depuis le nom du
+    driver SQLAlchemy, puis id, name, active, last_user_activity et
+    analytics_enabled depuis les réglages en base.
+
+    `drop` retire une clé comme le ferait une génération qui ne la déclarait
+    pas encore, `indent` réécrit le document comme le ferait un intermédiaire
+    qui réindente ce qu'il relaie.
+    """
+    document = {
+        "id": server_id,
+        "name": "default",
+        "version": version,
+        "active": True,
+        "debug": False,
+        "deployment_type": deployment_type,
+        "database_type": database_type,
+        "secrets_store_type": secrets_store_type,
+        "auth_scheme": auth_scheme,
+        "server_url": "https://mlops.internal.acme.corp",
+        "dashboard_url": "https://mlops.internal.acme.corp",
+        "analytics_enabled": True,
+        "metadata": {"deployment": "prod"},
+        "last_user_activity": "2026-08-30T09:12:44.183000",
+        "pro_dashboard_url": None,
+        "pro_api_url": None,
+        "pro_organization_id": None,
+        "pro_organization_name": None,
+        "pro_workspace_id": None,
+        "pro_workspace_name": None,
+    }
+    for key in drop:
+        document.pop(key, None)
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # La JSONResponse de FastAPI écrit compact.
+    return json.dumps(document, separators=(",", ":"))
+
+
+ZENML_INFO_BODY = zenml_info_body()
+
+# La même réponse sur une instance lancée avec ZENML_SERVER_AUTH_SCHEME=NO_AUTH :
+# authentication_provider() rend alors no_authentication(), qui appelle
+# « authenticate_credentials(user_name_or_id=DEFAULT_USERNAME) », et toute l'API
+# résout sur l'utilisateur par défaut. C'est ce que le corps annonce.
+ZENML_NO_AUTH_BODY = zenml_info_body(auth_scheme="NO_AUTH")
+
+# La 0.40.0 : ServerModel n'y déclarait que ces cinq champs — ni name, ni
+# active, ni debug, ni auth_scheme.
+ZENML_OLD_INFO_BODY = json.dumps({
+    "id": ZENML_SERVER_ID, "version": "0.40.0", "deployment_type": "other",
+    "database_type": "sqlite", "secrets_store_type": "none",
+}, separators=(",", ":"))
+
+# Le refus que rend une route gardée, tel qu'error_detail() le formate :
+# « [class_name, str(error)] » sous la clé « detail » du modèle ErrorModel.
+ZENML_UNAUTHORIZED_BODY = ('{"detail":["CredentialsNotValid",'
+                           '"Authentication error: no credentials provided"]}')
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+ZENML_COMPOSITE_BODY = '{"zenml":%s,"checked_at":0}' % ZENML_INFO_BODY
+
+# Un service quelconque qui décrit lui aussi son déploiement — un identifiant,
+# une version, le type de déploiement, le type de base — sans être ZenML. Le
+# vocabulaire seul ne prouve donc rien : c'est le trio qui nomme le produit.
+OTHER_DEPLOYMENT_INFO_BODY = json.dumps({
+    "id": "3f1b4d20-0f4e-4a51-9a6c-8d0c2f3b7a11", "version": "2.11.0",
+    "deployment_type": "docker", "database_type": "mysql",
+    "replicas": 3, "region": "eu-west-3",
+}, separators=(",", ":"))
+
+
+def zenml_block():
+    doc = load(ZENML_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/v1/info" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/v1/info — c'est pourtant la seule "
+        "route du serveur dont le handler ne réclame pas d'AuthContext"
+    )
+    return blocks[0]
+
+
+def zenml_fires(body):
+    block = zenml_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_zenml_probe_reads_the_open_route_and_touches_nothing_guarded():
+    doc = load(ZENML_TEMPLATE)
+    routes = sorted(request_routes(doc))
+    assert routes == [("GET", "/api/v1/info")], (
+        "le template n'interroge plus la seule route de lecture qu'il "
+        f"documente — {routes}"
+    )
+    for _, route in routes:
+        for forbidden, why in (
+            ("/secrets",
+             "/api/v1/secrets rend les secrets que le dépôt conserve : sur "
+             "NO_AUTH, les lire serait exploiter le constat, pas l'établir"),
+            ("/stacks", "les stacks décrivent les infrastructures branchées"),
+            ("/components",
+             "les composants de stack portent les connexions à ces "
+             "infrastructures"),
+            ("/service_connectors",
+             "les connecteurs de service portent des identifiants de "
+             "fournisseur cloud"),
+            ("/run_templates",
+             "les templates d'exécution permettent de lancer un pipeline"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_zenml_matcher_rests_on_the_server_model_not_on_the_status():
+    block = zenml_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+    assert zenml_fires(ZENML_INFO_BODY), (
+        "le template ne reconnaît pas la réponse d'un serveur ZenML — celle, "
+        "précisément, que server_info() rend sans réclamer d'AuthContext"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : cette route rend 200 aussi bien "
+        "sur une instance dont le reste de l'API est gardé, et n'importe quel "
+        "intermédiaire servant ce chemin en rendrait un — c'est le ServerModel "
+        "qui porte le constat, jamais le code"
+    )
+
+    assert not zenml_fires(ZENML_UNAUTHORIZED_BODY), (
+        "le template conclut sur le refus d'une route gardée, qui n'est pas la "
+        "divulgation qu'il rapporte"
+    )
+    assert not zenml_fires(ZENML_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not zenml_fires(zenml_info_body(drop=("id",))), (
+        "le template conclut sur un document qui ne s'ouvre plus sur « id », "
+        "le premier champ que ServerModel déclare dans toutes les générations"
+    )
+    assert not zenml_fires(zenml_info_body(server_id="acme-mlops")), (
+        "le template accepte n'importe quelle valeur d'« id » : le champ est "
+        "typé UUID, et SqlZenStore le remplace par settings.server_id, lui "
+        "aussi un UUID"
+    )
+
+
+def test_zenml_conclusion_needs_the_trio_not_a_deployment_document():
+    for key in ("deployment_type", "database_type", "secrets_store_type"):
+        assert not zenml_fires(zenml_info_body(drop=(key,))), (
+            f"le template conclut sans « {key} » : c'est la présence conjointe "
+            "des trois clés qui nomme ZenML, aucune ne le fait seule"
+        )
+
+    assert not zenml_fires(OTHER_DEPLOYMENT_INFO_BODY), (
+        "le template déclenche sur un service quelconque qui décrit son "
+        "déploiement et sa base sans ranger de secrets : « deployment_type » "
+        "et « database_type » sont des clés banales hors du trio"
+    )
+    assert not zenml_fires(zenml_info_body(database_type="postgresql")), (
+        "le template accepte une valeur hors de ServerDatabaseType, qui tient "
+        "en sqlite, mysql et other depuis la 0.40.0"
+    )
+    assert not zenml_fires(zenml_info_body(secrets_store_type="vault")), (
+        "le template accepte une valeur hors de SecretsStoreType, qui tient en "
+        "none, sql, rest, aws, gcp, azure, hashicorp et custom"
+    )
+
+    # Collisions internes au pack et au voisinage : /info est un nom banal, et
+    # deux templates ne doivent pas revendiquer la même instance.
+    assert not zenml_fires(TGI_INFO_BODY), (
+        "le template déclenche sur le /info du routeur TGI, déjà couvert par "
+        "son propre template"
+    )
+    assert not zenml_fires(ACTUATOR_INFO_BODY), (
+        "le template déclenche sur un /info sans rapport avec le MLOps"
+    )
+
+
+def test_zenml_matcher_holds_across_versions_and_spacings():
+    assert zenml_fires(ZENML_OLD_INFO_BODY), (
+        "le template exige un champ que la 0.40.0 ne déclarait pas — name, "
+        "active, debug ou auth_scheme — il raterait les instances anciennes, "
+        "celles qui traînent exposées"
+    )
+    assert zenml_fires(ZENML_NO_AUTH_BODY), (
+        "le template manque l'instance en NO_AUTH, celle dont le corps prouve "
+        "que l'API entière est joignable sans identifiant"
+    )
+    assert zenml_fires(zenml_info_body(deployment_type="hf_spaces")), (
+        "le template énumère les membres de ServerDeploymentType : l'enum a "
+        "gagné hf_spaces, sandbox puis cloud, et le prochain serait manqué"
+    )
+    assert zenml_fires(zenml_info_body(deployment_type="kubernetes",
+                                       database_type="sqlite",
+                                       secrets_store_type="hashicorp")), (
+        "le template dépend des valeurs d'une instance particulière plutôt que "
+        "des énumérations que le produit sérialise"
+    )
+    assert zenml_fires(zenml_info_body(secrets_store_type="rest")), (
+        "le template refuse « rest », que SecretsStoreType héritait de "
+        "StoreType sur les versions anciennes"
+    )
+    assert zenml_fires(zenml_info_body(version="0.91.1.dev0")), (
+        "le template exige une version à trois nombres nus : les versions de "
+        "développement portent un suffixe"
+    )
+    assert zenml_fires(zenml_info_body(indent=2)), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+
+def test_zenml_extractors_report_what_the_anonymous_caller_obtains():
+    block = zenml_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "version": [".version"],
+        "deployment_type": [".deployment_type"],
+        "secrets_store_type": [".secrets_store_type"],
+        "auth_scheme": [".auth_scheme // empty"],
+    }, (
+        "les quatre renseignements du constat ne sont pas remontés tels "
+        f"quels — {found}. .version dit quels correctifs manquent à "
+        "l'instance, .deployment_type où elle tourne, .secrets_store_type où "
+        "sont rangés les secrets de l'organisation, et .auth_scheme sépare le "
+        "constat medium du constat high — le « // empty » évitant la ligne "
+        "vide sur les instances antérieures à l'apparition du champ"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_zenml_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni le chemin
+    des extracteurs, et `body_matcher_hits` réévalue les motifs avec le module
+    `re` de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur
+    ferme la boucle.
+    """
+    def scan(body):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/v1/info":
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", ZENML_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=60,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} == {
+            "zenml-server-info-exposed"}, r.stdout + r.stderr
+        return [value for item in results
+                for value in (item.get("extracted-results") or [])]
+
+    assert sorted(scan(ZENML_NO_AUTH_BODY)) == sorted([
+        "0.84.1", "docker", "sql", "NO_AUTH",
+    ]), "le scan ne remonte pas les quatre renseignements du constat"
+
+    assert sorted(scan(ZENML_OLD_INFO_BODY)) == sorted([
+        "0.40.0", "other", "none",
+    ]), (
+        "l'extracteur d'auth_scheme remonte une ligne vide sur une instance "
+        "antérieure à l'apparition du champ — c'est « // empty » qui l'évite, "
+        "et une ligne vide se lirait comme un renseignement"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

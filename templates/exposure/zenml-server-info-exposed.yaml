@@ -1,0 +1,232 @@
+id: zenml-server-info-exposed
+
+info:
+  name: ZenML Server - Unauthenticated Deployment Information Exposure
+  author: popy21
+  severity: medium
+  description: |
+    ZenML (zenml-io/zenml) est un serveur MLOps auto-hébergé : il centralise les
+    pipelines, les stacks et leurs composants, les artefacts, les exécutions et
+    un dépôt de secrets. Il se déploie couramment par son image officielle, et
+    la documentation le pose en une ligne — « docker run -it -d -p 8080:8080
+    --name zenml zenmldocker/zenml-server » — c'est-à-dire un port publié tel
+    quel sur l'hôte.
+    GET /api/v1/info répond sans jeton, et c'est une propriété du code, pas un
+    réglage. src/zenml/zen_server/routers/server_endpoints.py déclare
+    « router = APIRouter(prefix=API + VERSION_1, tags=["server"],
+    responses={401: error_response}) » — src/zenml/constants.py donnant
+    « API = "/api" », « VERSION_1 = "/v1" » et « INFO = "/info" », d'où le
+    chemin — puis, sous « @router.get(INFO, ...) », le handler
+    « def server_info() -> ServerModel: return zen_store().get_store_info() ».
+    Ce handler ne porte aucun paramètre « _: AuthContext = Security(authorize) »,
+    là où ses quatre voisins du même fichier en portent un : server_load_info()
+    sous LOAD_INFO, get_onboarding_state() sous ONBOARDING_STATE, get_settings()
+    sous SERVER_SETTINGS et get_server_statistics() sous STATISTICS. Le
+    « responses={401: error_response} » du routeur ne garde rien non plus : il
+    décrit une réponse possible dans le schéma OpenAPI, il n'en impose aucune.
+    Et rien ne l'authentifie en amont — add_middlewares() (zen_server/
+    middleware.py) n'installe que track_last_user_activity, infer_source_context,
+    CORSMiddleware, RequestBodyLimit, RestrictFileUploadsMiddleware,
+    set_secure_headers, log_requests, record_requests et skip_health_middleware.
+    La réponse est le ServerModel entier (src/zenml/models/v2/misc/
+    server_models.py), sérialisé par pydantic dans l'ordre de déclaration de ses
+    champs : id, name, version, active, debug, deployment_type, database_type,
+    secrets_store_type, auth_scheme, server_url, dashboard_url,
+    analytics_enabled, metadata, last_user_activity, puis les champs
+    pro_dashboard_url, pro_api_url, pro_organization_id, pro_organization_name,
+    pro_workspace_id et pro_workspace_name quand l'instance est rattachée à
+    ZenML Pro. get_store_info() le remplit en deux temps : BaseZenStore y pose
+    deployment_type, auth_scheme et metadata depuis ServerConfiguration, et
+    secrets_store_type depuis la configuration du store ; SqlZenStore le
+    complète ensuite — « model.database_type = ServerDatabaseType(
+    sql_url.drivername) », puis id, name, active, last_user_activity et
+    analytics_enabled depuis les réglages en base.
+    Le constat porte sur ce document, jamais sur le statut HTTP. Un 200 sur ce
+    chemin ne nomme pas le produit et ne prouve aucune divulgation — n'importe
+    quel intermédiaire servant /api/v1/info en rendrait un — et cette route
+    répond de la même façon sur une instance dont le reste de l'API est
+    correctement gardé : c'est bien le corps qui dit qu'un serveur ZenML se
+    décrit ici à un anonyme.
+    La signature est le trio deployment_type + database_type +
+    secrets_store_type. C'est ce qu'aucun autre produit ne sérialise ensemble,
+    et c'est aussi la part stable du modèle : dans la 0.40.0, ServerModel ne
+    déclarait que id, version, deployment_type, database_type et
+    secrets_store_type — ni name, ni active, ni debug, ni auth_scheme, apparu
+    plus tard. Exiger l'un de ces champs récents raterait précisément les
+    instances anciennes, celles qui traînent exposées.
+    Dans la même réponse, auth_scheme prend l'une des valeurs de l'énumération
+    AuthScheme de src/zenml/enums.py : NO_AUTH, HTTP_BASIC,
+    OAUTH2_PASSWORD_BEARER ou EXTERNAL. Le défaut est le troisième —
+    ServerConfiguration déclare « auth_scheme: AuthScheme =
+    AuthScheme.OAUTH2_PASSWORD_BEARER » — et la variable
+    ZENML_SERVER_AUTH_SCHEME le remplace, le préfixe d'environnement valant
+    « ZENML_SERVER_ ». La valeur NO_AUTH établit alors, dans le corps lui-même,
+    que l'instance entière est joignable sans identifiant, et le constat monte
+    en high.
+  impact: |
+    Ce que l'anonyme obtient d'abord, c'est la carte du déploiement : « version »
+    donne la version exacte du serveur, donc la liste des correctifs qui lui
+    manquent ; « deployment_type » dit où il tourne — local, docker, kubernetes,
+    aws, gcp, azure, cloud ; « database_type » dit sur quelle base — sqlite ou
+    mysql ; « secrets_store_type » dit où sont rangés les secrets de
+    l'organisation — sql, aws, gcp, azure, hashicorp, custom, ou none ;
+    « server_url » et « dashboard_url » rendent les URL que l'exploitant a
+    configurées, souvent des noms internes ; « id », « name » et « metadata »
+    rattachent l'instance à un déploiement identifiable ; « debug » dit si le
+    serveur tourne en mode debug ; « last_user_activity » dit s'il est encore
+    utilisé, donc s'il vaut la peine d'insister. Sur une instance ZenML Pro, les
+    champs pro_organization_name et pro_workspace_name nomment en plus
+    l'organisation et l'espace de travail.
+    Surtout, la même réponse indique par « auth_scheme » ce que vaut le reste de
+    la surface. Sur NO_AUTH, authentication_provider() (zen_server/auth.py) rend
+    no_authentication(), qui appelle « authenticate_credentials(user_name_or_id=
+    DEFAULT_USERNAME) » : chaque route gardée par Security(authorize) résout
+    alors sur le contexte de l'utilisateur par défaut, sans le moindre
+    identifiant. L'API entière est ouverte en lecture comme en écriture —
+    /api/v1/secrets rend les secrets que le dépôt conserve, les stacks et leurs
+    composants livrent les connexions aux infrastructures, les templates
+    d'exécution permettent de lancer des pipelines. C'est ce cas-là qui justifie
+    de remonter le constat en high, et il se lit dans le corps.
+    Sur les autres valeurs d'auth_scheme, la divulgation reste bornée à cette
+    route — mais elle reste : ni le port, ni la version, ni l'emplacement du
+    dépôt de secrets n'avaient à être publics.
+  remediation: |
+    Ne pas publier le port du serveur sur une interface non maîtrisée. La
+    commande que la documentation donne pour démarrer le conteneur publie 8080
+    sur toutes les interfaces de l'hôte ; lier « 127.0.0.1:8080:8080 » quand
+    l'instance doit rester locale, et placer devant elle un proxy inverse qui
+    authentifie lorsqu'elle doit être atteinte de l'extérieur. C'est la seule
+    remédiation qui ferme cette route : server_info() ne porte de dépendance
+    d'authentification dans aucune version publiée, donc aucun réglage du
+    serveur ne la referme.
+    Vérifier d'abord ce que la réponse dit d'elle-même : si « auth_scheme » vaut
+    « NO_AUTH », traiter l'incident comme un accès anonyme complet et non comme
+    une divulgation. Reposer ZENML_SERVER_AUTH_SCHEME sur sa valeur par défaut,
+    OAUTH2_PASSWORD_BEARER, et n'employer NO_AUTH que sur une instance de
+    développement inatteignable depuis le réseau.
+    Après une exposition avec NO_AUTH, tenir pour lus les secrets du dépôt que
+    « secrets_store_type » désigne et les identifiants portés par les
+    composants de stack, donc les faire tourner, puis relire les exécutions de
+    la fenêtre pour établir si un pipeline a été lancé : rien ne s'y opposait.
+    Sans NO_AUTH, tenir pour connues la version, la topologie et les URL
+    internes que la route rend, et appliquer les mises à jour que la version
+    divulguée rend nécessaires.
+  reference:
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/zen_server/routers/server_endpoints.py
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/models/v2/misc/server_models.py
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/constants.py
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/enums.py
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/zen_stores/base_zen_store.py
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/zen_server/auth.py
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/zen_server/middleware.py
+    - https://github.com/zenml-io/zenml/blob/main/src/zenml/config/server_config.py
+    - https://docs.zenml.io/deploying-zenml/deploying-zenml/deploy-with-docker
+    - https://docs.zenml.io/deploying-zenml/deploying-zenml/secret-management
+  metadata:
+    max-request: 1
+    vendor: zenml
+    product: zenml
+  tags: ai,ml,mlops,zenml,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et la seule route du serveur dont le handler ne réclame
+  # rien. server_info() ne consulte ni la requête ni l'identité de l'appelant :
+  # il recopie ce que zen_store().get_store_info() rend. Interroger autre chose
+  # n'apprendrait rien de plus sur l'absence de garde — /api/v1/secrets,
+  # /api/v1/stacks et les templates d'exécution sont, eux, gardés par
+  # Security(authorize), et les atteindre serait exploiter le NO_AUTH que cette
+  # réponse suffit à constater.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/info"
+
+    matchers-condition: and
+    matchers:
+      # Le document s'ouvre sur son propre identifiant. « id » est le premier
+      # champ déclaré par ServerModel dans toutes les générations — la 0.40.0
+      # comme la 0.9x — et pydantic sérialise dans l'ordre de déclaration.
+      #
+      # Sa valeur est contrainte à la forme d'un UUID parce que le champ est
+      # typé « id: UUID = Field(default_factory=uuid4) » et que SqlZenStore le
+      # remplace par « settings.server_id », lui aussi un UUID : la clé seule
+      # ne vaudrait rien, la clé plus la forme disent déjà quelque chose.
+      #
+      # L'ancrage sur l'ouverture du corps écarte la même charge utile
+      # retrouvée au fond d'un document composite qu'une supervision agrégerait
+      # sous une clé à elle : c'est lui qui dit que l'instance a répondu
+      # d'elle-même.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"id"\s*:\s*"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"'
+
+      # La signature du produit, et la seule part du modèle que toutes les
+      # versions sérialisent : la 0.40.0 ne déclarait que id, version,
+      # deployment_type, database_type et secrets_store_type. Aucun autre
+      # produit ne décrit un déploiement par ces trois clés à la fois.
+      #
+      # Deux des trois valeurs sont contraintes à leur énumération, parce
+      # qu'elles n'ont pas bougé depuis la 0.40.0 : ServerDatabaseType tient en
+      # sqlite, mysql et other, et SecretsStoreType en none, sql, aws, gcp,
+      # azure, hashicorp et custom — « rest » y figure en plus, hérité de
+      # StoreType, sur les versions anciennes.
+      #
+      # deployment_type n'est contraint qu'à porter un jeton, pas une valeur :
+      # ServerDeploymentType a gagné hf_spaces, sandbox puis cloud au fil des
+      # versions, et énumérer ses membres ferait manquer le prochain.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"deployment_type"\s*:\s*"[a-z_]+"'
+          - '"database_type"\s*:\s*"(sqlite|mysql|other)"'
+          - '"secrets_store_type"\s*:\s*"(none|sql|rest|aws|gcp|azure|hashicorp|custom)"'
+
+      # Ce que la divulgation vaut d'abord, et le champ que ServerModel déclare
+      # obligatoire sans valeur par défaut — « version: str = Field(title=...) »
+      # — donc toujours présent. Le handler le remplit avec zenml.__version__,
+      # d'où la forme pointée. Rien n'est exigé au-delà des deux premiers
+      # nombres : les versions de développement portent un suffixe.
+      - type: regex
+        part: body
+        regex:
+          - '"version"\s*:\s*"\d+\.\d+'
+
+    extractors:
+      # La version exacte du serveur, celle qui dit quels correctifs lui
+      # manquent.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
+
+      # Où l'instance tourne, tel qu'elle le déclare : local, docker,
+      # kubernetes, aws, gcp, azure, cloud.
+      - type: json
+        part: body
+        name: deployment_type
+        json:
+          - '.deployment_type'
+
+      # Où sont rangés les secrets de l'organisation. C'est le renseignement le
+      # plus lourd du document, et il se lit sans jeton.
+      - type: json
+        part: body
+        name: secrets_store_type
+        json:
+          - '.secrets_store_type'
+
+      # Ce qui sépare le constat medium du constat high, dans la même réponse :
+      # sur « NO_AUTH », authentication_provider() rend no_authentication() et
+      # toute l'API résout sur l'utilisateur par défaut.
+      #
+      # Le « // empty » couvre les instances antérieures à l'apparition du
+      # champ, où ServerModel ne le déclarait pas encore : sans lui, elles
+      # remonteraient une ligne d'extraction vide, qui se lirait comme un
+      # renseignement alors qu'elle n'en est pas un.
+      - type: json
+        part: body
+        name: auth_scheme
+        json:
+          - '.auth_scheme // empty'
