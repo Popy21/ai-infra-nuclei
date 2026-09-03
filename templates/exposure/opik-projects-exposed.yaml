@@ -1,0 +1,244 @@
+id: opik-projects-exposed
+
+info:
+  name: Opik - Unauthenticated Project Inventory Exposure
+  author: popy21
+  severity: high
+  description: |
+    Opik (comet-ml/opik) est la plateforme d'observabilité LLM de Comet : elle
+    collecte les traces des applications à modèle de langage, les fils de
+    conversation, les prompts versionnés, les jeux d'évaluation et le coût de
+    chaque appel. Elle s'auto-héberge par le docker-compose du dépôt, qui
+    publie le frontend nginx tel quel — « - "${NGINX_PORT:-5173}:
+    ${NGINX_PORT:-5173}" » — d'où le port 5173 par défaut.
+    Le chemin passe par ce frontend. nginx_default_local.conf déclare
+    « location /api/ { try_files /dev/null @api; } » et, dans « location @api »,
+    « rewrite /api/(.*) /$1 break; proxy_pass http://backend; » sur l'amont
+    « server backend:8080 ». GET /api/v1/private/projects arrive donc au
+    back-end en /v1/private/projects, que ProjectsResource sert sous
+    « @Path("/v1/private/projects") ».
+    L'absence de garde est un choix de liaison, pas un oubli de configuration.
+    AuthModule.authService() (infrastructure/auth/AuthModule.java) choisit
+    l'implémentation du service d'authentification et sort par la première
+    branche — « if (!config.isEnabled()) { ... return new AuthServiceImpl(
+    requestContext); } » — avant même de regarder l'adresse du service distant.
+    RemoteAuthService, la seule implémentation qui interroge quelque chose,
+    n'est construite que dans l'autre branche, et config.yml pose
+    « enabled: ${AUTH_ENABLED:-false} » : c'est la valeur par défaut de la
+    distribution open source en auto-hébergement.
+    AuthServiceImpl (déclarée dans le même fichier qu'AuthService) ne vérifie
+    rien. Son authenticate() lit l'en-tête d'espace de travail par
+    « WorkspaceUtils.getWorkspaceName(headers.getHeaderString(WORKSPACE_HEADER))
+    », et cet utilitaire rend DEFAULT_WORKSPACE_NAME dès que la valeur est vide
+    — « return StringUtils.isEmpty(workspaceName) ? DEFAULT_WORKSPACE_NAME :
+    workspaceName ». La requête sans en-tête, sans cookie et sans jeton tombe
+    donc sur l'espace « default », et le contexte est posé sur DEFAULT_USER,
+    c'est-à-dire « admin ». Le « @RequiredPermissions(WorkspaceUserPermission
+    .PROJECT_DATA_VIEW) » que porte la route n'y change rien : AuthFilter passe
+    bien les permissions requises dans le ContextInfoHolder qu'il construit
+    pour tout chemin « /v1/private/.* », mais l'implémentation locale ne les
+    consulte pas.
+    Ce que rend la route est une ProjectPage — page, size, total, content,
+    puis la liste des champs triables — et, pour chaque projet, la vue Public
+    du record Project : id, name, visibility, description, created_at,
+    created_by, last_updated_at, last_updated_by, last_updated_trace_at.
+    Les compteurs du produit — trace_count, thread_count,
+    total_estimated_cost, guardrails_failed_count, error_count — sont déclarés
+    sur le même record mais sous « @JsonView({Project.View.Detailed.class}) »,
+    quand find() sérialise sous « @JsonView({View.Public.class}) » : ils ne
+    figurent pas dans cette réponse. Ils se lisent sur les routes voisines,
+    POST /v1/private/projects/retrieve — la seule annotée View.Detailed — et
+    GET /v1/private/projects/stats, que la même absence de garde laisse
+    ouvertes ; c'est l'affaire d'un autre appel, pas de ce constat.
+    La signature ne tient donc pas à ces compteurs, mais au tableau des champs
+    triables que la page publie. ProjectService.find() le remplit avec
+    « sortingFactory.getSortableFields() », et SortingFactoryProjects rend
+    « asList(ID, NAME, LAST_UPDATED_AT, CREATED_AT, LAST_UPDATED_TRACE_AT) »,
+    dont SortableFields donne les valeurs : « id », « name »,
+    « last_updated_at », « created_at », « last_updated_trace_at ». Ce sont des
+    constantes de chaîne, pas des noms de propriété : aucune stratégie de
+    nommage ne les réécrit. Le point mérite d'être posé, parce que la casse de
+    l'enveloppe, elle, est incertaine — OpikApplication pose
+    « setPropertyNamingStrategy(PropertyNamingStrategies.SnakeCaseStrategy
+    .INSTANCE) » sur l'ObjectMapper, quand le schéma OpenAPI publié écrit
+    « sortableBy » parce que le record ProjectPage, à la différence de Project,
+    ne porte pas l'annotation @JsonNaming dont dépend la génération du schéma.
+    Le matcher se tient à l'écart de ce désaccord.
+    Le tableau n'est rempli que si la page ne l'est pas : ProjectService.find()
+    fait « if (projectRecordSet.content().isEmpty()) { return ProjectPage.empty
+    (page); } », et ProjectPage.empty() rend deux listes vides. Le constat
+    porte donc sur une instance qui divulgue au moins un projet — une instance
+    qui n'en a encore aucun ne remonte rien, et c'est voulu : ce qui est
+    rapporté est la divulgation, pas le port. Le constat porte sur le corps,
+    jamais sur le statut : un 200 sur ce chemin ne nomme pas le produit.
+  impact: |
+    Un appelant anonyme obtient l'inventaire des projets d'observabilité de
+    l'exploitant. « name » est le renseignement principal : les projets d'Opik
+    portent le nom de l'application, du client ou de la fonctionnalité qu'ils
+    instrumentent, et « description » les commente. « total » dit combien il y
+    en a au-delà de la première page, « created_by » et « last_updated_by »
+    nomment les comptes qui travaillent dessus, « created_at » et
+    « last_updated_at » datent le déploiement, et « last_updated_trace_at »
+    dit quand la dernière trace est arrivée, donc si l'instance est vivante et
+    mérite qu'on insiste.
+    La divulgation ne s'arrête pas à cette page, et c'est ce qui porte le
+    constat en high : AuthFilter applique le même traitement à tout le préfixe
+    « /v1/private/.* », de sorte que le contexte anonyme d'administrateur qui a
+    servi cette lecture sert aussi le reste de l'API privée. Les traces et
+    leurs spans portent les prompts, les entrées des utilisateurs, les réponses
+    du modèle et les métadonnées qui les accompagnent — c'est là que passent
+    les données personnelles et les secrets qu'une application glisse dans son
+    contexte ; les fils de conversation les recomposent ; les jeux de données
+    et les expériences portent le travail d'évaluation ; les compteurs de
+    /v1/private/projects/stats rendent le volume de traces et le coût LLM
+    cumulé, donc l'échelle de l'activité. Le nom de projet lu ici est
+    précisément le paramètre qui ouvre ces routes.
+    Le même contexte vaut en écriture. DELETE /v1/private/projects/{id} et
+    POST /v1/private/projects/delete ne sont gardés par rien d'autre que ce
+    filtre : ce qui est lisible sans compte est aussi destructible sans compte.
+    Rien de tout cela n'est journalisé sous une identité distincte, puisque
+    l'appel anonyme est résolu sur l'utilisateur « admin » de l'espace de
+    travail « default ».
+  remediation: |
+    Ne pas publier le port du frontend sur une interface non maîtrisée. Le
+    docker-compose du dépôt publie « ${NGINX_PORT:-5173} » sur toutes les
+    interfaces de l'hôte ; lier « 127.0.0.1:5173:5173 » quand l'instance doit
+    rester locale, et placer devant elle un proxy authentifiant, un VPN ou une
+    liste d'adresses autorisées lorsqu'elle doit être atteinte de l'extérieur.
+    Ne pas compter sur un réglage du produit pour refermer la route : poser
+    AUTH_ENABLED=true fait passer AuthModule dans l'autre branche, qui exige
+    « authentication.reactService.url » et refuse de démarrer sans elle — « The
+    property authentication.reactService.url is required when authentication is
+    enabled ». Ce service d'authentification n'est pas fourni par la
+    distribution open source ; sur une instance auto-hébergée, la garde se pose
+    donc devant, pas dedans.
+    Vérifier la prise en compte sur la route elle-même, depuis l'extérieur du
+    périmètre et sans identifiant : « curl -s http://<hôte>:5173/api/v1/private
+    /projects » ne doit plus rendre la page. Tant qu'il la rend, la frontière
+    n'est pas là où on la croit — et le reste du préfixe /v1/private répond
+    dans les mêmes conditions.
+    Après une exposition, ne pas s'en tenir aux noms de projets : tenir pour
+    lues les traces et les prompts que le même contexte anonyme servait, donc
+    faire tourner les secrets qui auraient pu transiter dans le contexte des
+    appels observés, et traiter les données personnelles qu'ils portent selon
+    l'obligation applicable. Relire ensuite les journaux du back-end pour
+    établir ce qui a été demandé d'autre depuis la même adresse : les requêtes
+    anonymes s'y confondent avec celles de l'exploitant, toutes étant résolues
+    sur l'utilisateur « admin » de l'espace « default ».
+  reference:
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/infrastructure/auth/AuthModule.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/infrastructure/auth/AuthService.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/infrastructure/auth/AuthFilter.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/utils/WorkspaceUtils.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/api/resources/v1/priv/ProjectsResource.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/api/Project.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/api/sorting/SortingFactoryProjects.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/api/sorting/SortableFields.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/src/main/java/com/comet/opik/domain/ProjectService.java
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-backend/config.yml
+    - https://github.com/comet-ml/opik/blob/main/deployment/docker-compose/nginx_default_local.conf
+    - https://github.com/comet-ml/opik/blob/main/deployment/docker-compose/docker-compose.yaml
+    - https://github.com/comet-ml/opik/blob/main/apps/opik-frontend/src/types/projects.ts
+  metadata:
+    max-request: 1
+    vendor: comet-ml
+    product: opik
+  tags: ai,llm,llmops,observability,opik,comet,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur l'index des projets. C'est la route la moins
+  # intrusive qui établisse le constat : find() ne consulte que la requête pour
+  # sa pagination et rend une page de dix projets au plus. Les routes qui en
+  # diraient davantage se paieraient trop cher — POST /v1/private/projects
+  # /retrieve, seule annotée View.Detailed, exige d'envoyer un corps à une
+  # instance qu'on découvre, et /v1/private/traces rendrait les prompts
+  # eux-mêmes, c'est-à-dire les données de l'exploitant. Elles répondent dans
+  # les mêmes conditions, mais les interroger serait exploiter l'absence de
+  # garde plutôt que la constater.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/private/projects"
+
+    matchers-condition: and
+    matchers:
+      # L'ouverture du document, dans l'ordre où le record ProjectPage déclare
+      # ses composants : page, size, total, puis content. Jackson sérialise les
+      # composants d'un record dans l'ordre du constructeur canonique, et ces
+      # trois-là sont des primitives — aucune inclusion NON_NULL ne les retire.
+      #
+      # L'ancrage sur l'ouverture du corps écarte la même charge utile
+      # retrouvée au fond d'un document composite qu'une supervision agrégerait
+      # sous une clé à elle : c'est lui qui dit que l'instance a répondu
+      # d'elle-même.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"page"\s*:\s*\d+\s*,\s*"size"\s*:\s*\d+\s*,\s*"total"\s*:\s*\d+'
+
+      # Le constat : au moins un projet est divulgué. Une page vide n'en est
+      # pas un — ProjectService.find() rend alors ProjectPage.empty(page), dont
+      # les deux listes sont vides — et le template doit rester muet dessus.
+      #
+      # « id » ouvre le record Project et « name » le suit ; le premier est
+      # typé UUID, donc sa forme est contrainte, le second est déclaré
+      # @NotBlank, donc toujours écrit. Rien n'est exigé au-delà : « visibility »
+      # est venu plus tard et « description » est nullable, que l'inclusion
+      # NON_NULL de l'ObjectMapper retire alors du document.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"content"\s*:\s*\[\s*\{\s*"id"\s*:\s*"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"'
+          - '"name"\s*:\s*"'
+
+      # Ce qui nomme le produit, et la raison pour laquelle il est cherché
+      # comme une valeur et non comme une clé. La page publie ses champs
+      # triables depuis SortingFactoryProjects — asList(ID, NAME,
+      # LAST_UPDATED_AT, CREATED_AT, LAST_UPDATED_TRACE_AT) — et ce sont les
+      # constantes de SortableFields qui sont écrites dans le tableau : des
+      # chaînes, qu'aucune stratégie de nommage ne réécrit. La casse de
+      # l'enveloppe, elle, est disputée — l'ObjectMapper est posé en
+      # SnakeCaseStrategy quand le schéma OpenAPI publié écrit « sortableBy »,
+      # le record ProjectPage ne portant pas l'annotation @JsonNaming — et un
+      # matcher écrit sur cette clé-là parierait sur l'issue du désaccord.
+      #
+      # « last_updated_trace_at » est le seul de ces cinq champs qui appartienne
+      # au vocabulaire du produit : une page de projets datée par sa dernière
+      # trace, c'est-à-dire par un appel de modèle observé. Le champ homonyme du
+      # projet ne suffirait pas — il est nullable, donc absent d'un projet qui
+      # n'a encore rien reçu — mais le tableau des champs triables, lui, est
+      # écrit dès que la page n'est pas vide, ce que le matcher précédent exige
+      # déjà.
+      - type: word
+        part: body
+        words:
+          - '"last_updated_trace_at"'
+
+    extractors:
+      # Ce que l'appelant anonyme lit : les projets eux-mêmes. Le nom est le
+      # renseignement — il désigne l'application, le client ou la
+      # fonctionnalité instrumentée — et c'est aussi le paramètre par lequel
+      # les traces de ce projet se demandent.
+      - type: json
+        part: body
+        name: project
+        json:
+          - '.content[].name'
+
+      # Combien il y en a au-delà de la première page, que la route borne à dix
+      # projets par défaut.
+      - type: json
+        part: body
+        name: total
+        json:
+          - '.total'
+
+      # Quand la dernière trace est arrivée, donc si l'instance est vivante.
+      # Le « // empty » écarte les projets qui n'ont encore rien reçu : le
+      # champ est nullable, et une ligne vide se lirait comme un renseignement
+      # alors qu'elle n'en est pas un.
+      - type: json
+        part: body
+        name: last_trace_at
+        json:
+          - '.content[].last_updated_trace_at // empty'

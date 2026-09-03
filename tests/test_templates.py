@@ -17652,6 +17652,446 @@ def test_determined_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Opik sert l'index de ses projets sur GET /api/v1/private/projects — le
+# préfixe « /api/ » du nginx du docker-compose, réécrit vers /v1/private
+# /projects par « rewrite /api/(.*) /$1 break » et relayé vers backend:8080 —
+# et il le sert à un anonyme parce que AuthModule.authService() sort par
+# « if (!config.isEnabled()) ... return new AuthServiceImpl(requestContext) »,
+# la configuration posant « enabled: ${AUTH_ENABLED:-false} ». Cette
+# implémentation ne vérifie rien : sans en-tête d'espace de travail,
+# WorkspaceUtils.getWorkspaceName() rend « default » et le contexte est posé
+# sur l'utilisateur « admin ».
+#
+# Trois points commandent la forme du matcher, et ce sont eux que cette
+# section amarre.
+#
+# Ce que la route rend d'abord. find() est annotée « @JsonView({View.Public
+# .class}) », or trace_count, thread_count, total_estimated_cost,
+# guardrails_failed_count et error_count sont déclarés sur le record Project
+# sous « @JsonView({Project.View.Detailed.class}) » : ils ne sont pas dans
+# cette réponse, et un matcher écrit sur eux ne déclencherait sur rien. Ils se
+# lisent sur POST /v1/private/projects/retrieve et GET /v1/private/projects
+# /stats, que la même absence de garde laisse ouvertes.
+#
+# La casse de l'enveloppe ensuite, qui est disputée. OpikApplication pose
+# « setPropertyNamingStrategy(PropertyNamingStrategies.SnakeCaseStrategy
+# .INSTANCE) » sur l'ObjectMapper, quand le schéma OpenAPI publié écrit
+# « sortableBy » — le record ProjectPage ne portant pas l'annotation
+# @JsonNaming dont la génération du schéma dépend, à la différence de Project.
+# La signature doit donc tenir aux valeurs du tableau des champs triables,
+# constantes de SortableFields qu'aucune stratégie de nommage ne réécrit, et
+# non à la clé qui le porte.
+#
+# La page vide enfin. « if (projectRecordSet.content().isEmpty()) { return
+# ProjectPage.empty(page); } » rend deux listes vides : une instance sans
+# projet ne divulgue rien, et le template doit rester muet dessus.
+
+OPIK_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                             "opik-projects-exposed.yaml")
+
+OPIK_PROJECT_ID = "0194f2a1-6c3d-7b4e-8a91-2f0c5d6e7a83"
+OPIK_OTHER_PROJECT_ID = "0195c7b3-8d1e-7a2f-9c40-6b8e1d3f2a57"
+
+# SortingFactoryProjects.getSortableFields() rend « asList(ID, NAME,
+# LAST_UPDATED_AT, CREATED_AT, LAST_UPDATED_TRACE_AT) », dont SortableFields
+# donne les valeurs.
+OPIK_SORTABLE_FIELDS = ["id", "name", "last_updated_at", "created_at",
+                        "last_updated_trace_at"]
+
+
+def opik_project(project_id=OPIK_PROJECT_ID, name="Default Project",
+                 last_trace_at="2026-08-30T09:14:22.118Z", drop=()):
+    """
+    La vue Public d'un record Project, dans l'ordre de ses composants — Jackson
+    sérialise un record dans l'ordre du constructeur canonique.
+
+    `last_trace_at=None` rend le projet qui n'a encore reçu aucune trace :
+    l'ObjectMapper est posé en « JsonInclude.Include.NON_NULL », donc le champ
+    nul n'est pas écrit du tout. `drop` retire une clé comme le ferait une
+    génération qui ne la déclarait pas encore — « visibility » est récent — ou
+    l'inclusion NON_NULL sur une description laissée vide.
+    """
+    project = {
+        "id": project_id,
+        "name": name,
+        "visibility": "private",
+        "description": "Traces de l'assistant de support",
+        "created_at": "2026-05-04T08:11:03.482Z",
+        "created_by": "admin",
+        "last_updated_at": "2026-08-30T09:14:22.118Z",
+        "last_updated_by": "admin",
+        "last_updated_trace_at": last_trace_at,
+    }
+    if last_trace_at is None:
+        project.pop("last_updated_trace_at")
+    for key in drop:
+        project.pop(key, None)
+    return project
+
+
+def opik_projects_body(projects=None, page=1, total=None, sortable_by=None,
+                       sortable_key="sortable_by", indent=None):
+    """
+    Ce que rend GET /api/v1/private/projects : la ProjectPage que
+    ProjectService.find() construit — « new ProjectPage(page, projectRecordSet
+    .content().size(), projectRecordSet.total(), projectRecordSet.content(),
+    sortingFactory.getSortableFields()) » — sérialisée dans l'ordre des
+    composants du record.
+
+    Une liste vide rend ce que ProjectPage.empty(page) rend : deux listes
+    vides. `sortable_key` réécrit la clé de l'enveloppe pour éprouver le
+    désaccord entre l'ObjectMapper du serveur et le schéma publié, et `indent`
+    réécrit le document comme le ferait un intermédiaire qui réindente ce
+    qu'il relaie.
+    """
+    content = [opik_project()] if projects is None else list(projects)
+
+    if content:
+        document = {
+            "page": page,
+            "size": len(content),
+            "total": len(content) if total is None else total,
+            "content": content,
+            sortable_key: list(OPIK_SORTABLE_FIELDS if sortable_by is None
+                               else sortable_by),
+        }
+    else:
+        document = {"page": page, "size": 0, "total": 0, "content": [],
+                    sortable_key: []}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+OPIK_PROJECTS_BODY = opik_projects_body()
+
+# Une instance qui travaille : plusieurs projets, dont le total dépasse la page
+# de dix que la route rend par défaut.
+OPIK_MULTI_PROJECT_BODY = opik_projects_body(
+    projects=[opik_project(),
+              opik_project(project_id=OPIK_OTHER_PROJECT_ID,
+                           name="checkout-agent-prod",
+                           last_trace_at="2026-09-01T17:02:44.006Z")],
+    total=7,
+)
+
+# Un projet fraîchement créé sur une génération antérieure : aucune trace reçue
+# — « last_updated_trace_at » nul, donc retiré par l'inclusion NON_NULL — ni
+# « visibility », venu plus tard, ni description. Le template doit toujours le
+# reconnaître : c'est le tableau des champs triables qui porte la signature.
+OPIK_FRESH_PROJECT_BODY = opik_projects_body(
+    projects=[opik_project(last_trace_at=None,
+                           drop=("visibility", "description"))],
+)
+
+# L'instance qui n'a encore aucun projet : ProjectPage.empty(page).
+OPIK_EMPTY_BODY = opik_projects_body(projects=[])
+
+# La même page, avec la clé d'enveloppe que le schéma OpenAPI publié annonce.
+OPIK_SPEC_CASING_BODY = opik_projects_body(sortable_key="sortableBy")
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+OPIK_COMPOSITE_BODY = '{"opik":%s,"checked_at":0}' % OPIK_PROJECTS_BODY
+
+# Le refus que rend AuthServiceImpl quand l'en-tête d'espace de travail nomme
+# autre chose que « default » : « throw new ClientErrorException("Workspace not
+# found", Response.Status.NOT_FOUND) ».
+OPIK_WORKSPACE_NOT_FOUND_BODY = ('{"code":404,"message":"Workspace not found"}')
+
+# Un index paginé quelconque : la même enveloppe, des objets portant un
+# identifiant et un nom, et jusqu'à un tableau de champs triables. Ce
+# vocabulaire n'appartient à personne — c'est celui de n'importe quelle liste
+# REST — et il ne dit rien d'une plateforme d'observabilité LLM.
+OTHER_PAGINATED_INDEX_BODY = json.dumps({
+    "page": 1,
+    "size": 2,
+    "total": 2,
+    "content": [
+        {"id": "3f9a1c22-4e5b-4a90-b1d6-9c2e8f0a5d34", "name": "facturation",
+         "created_at": "2026-02-11T10:00:00Z", "created_by": "admin",
+         "last_updated_at": "2026-07-19T12:30:00Z"},
+        {"id": "8c2d4e61-7a3b-4f18-9e05-1d7c6b0a2f93", "name": "rh",
+         "created_at": "2026-03-02T09:15:00Z", "created_by": "admin",
+         "last_updated_at": "2026-07-20T08:45:00Z"},
+    ],
+    "sortable_by": ["id", "name", "created_at", "last_updated_at"],
+}, separators=(",", ":"))
+
+
+def opik_block():
+    doc = load(OPIK_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/v1/private/projects" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/v1/private/projects — c'est pourtant "
+        "l'index que le filtre d'authentification laisse lire en anonyme"
+    )
+    return blocks[0]
+
+
+def opik_fires(body):
+    block = opik_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_opik_probe_reads_the_project_index_and_touches_nothing_else():
+    doc = load(OPIK_TEMPLATE)
+    routes = sorted(request_routes(doc))
+    assert routes == [("GET", "/api/v1/private/projects")], (
+        "le template n'interroge plus le seul index qui établisse le constat "
+        f"sans toucher aux données de l'exploitant — {routes}"
+    )
+    for _, route in routes:
+        for forbidden, why in (
+            ("/traces",
+             "les traces portent les prompts, les entrées des utilisateurs et "
+             "les réponses du modèle : les lire serait exploiter l'absence de "
+             "garde, pas la constater"),
+            ("/retrieve",
+             "POST /v1/private/projects/retrieve est la seule route annotée "
+             "View.Detailed, mais l'appeler serait envoyer un corps à une "
+             "instance qu'on découvre"),
+            ("/delete",
+             "le même contexte anonyme vaut en écriture — c'est précisément ce "
+             "qu'un scan ne doit jamais éprouver"),
+            ("/datasets",
+             "les jeux d'évaluation portent le travail de l'exploitant"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+    assert opik_block().get("method") == "GET", (
+        "l'index des projets se lit en GET : le template ne doit rien envoyer "
+        "à une instance qu'il découvre"
+    )
+
+
+def test_opik_matcher_rests_on_the_page_not_on_the_status():
+    block = opik_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+    assert opik_fires(OPIK_PROJECTS_BODY), (
+        "le template ne reconnaît pas la page que find() rend à un appelant "
+        "anonyme — celle, précisément, que le constat rapporte"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : ce chemin rend 200 sur toute "
+        "instance vivante, et n'importe quel intermédiaire servant /api/ en "
+        "rendrait un — c'est la page qui porte le constat, jamais le code"
+    )
+
+    assert not opik_fires(OPIK_WORKSPACE_NOT_FOUND_BODY), (
+        "le template conclut sur le refus que rend AuthServiceImpl pour un "
+        "espace de travail inconnu, qui n'est pas la divulgation qu'il "
+        "rapporte"
+    )
+    assert not opik_fires(OPIK_COMPOSITE_BODY), (
+        "le template retrouve la page entière au fond d'un document composite : "
+        "c'est l'ancrage sur l'ouverture du corps qui dit que l'instance a "
+        "répondu d'elle-même"
+    )
+
+
+def test_opik_conclusion_needs_a_disclosed_project_and_the_trace_vocabulary():
+    assert not opik_fires(OPIK_EMPTY_BODY), (
+        "le template conclut sur une instance qui ne divulgue aucun projet — "
+        "ProjectPage.empty(page) rend deux listes vides, et ce qui est "
+        "rapporté est la divulgation, pas le port"
+    )
+    assert not opik_fires(opik_projects_body(
+        projects=[opik_project(last_trace_at=None)],
+        sortable_by=["id", "name", "last_updated_at", "created_at"])), (
+        "le template conclut sur une page où « last_updated_trace_at » ne "
+        "figure nulle part — ni parmi les champs triables, ni sur le projet : "
+        "c'est le seul terme du document qui appartienne au vocabulaire du "
+        "produit, une page de projets datée par la dernière trace observée"
+    )
+    assert not opik_fires(OTHER_PAGINATED_INDEX_BODY), (
+        "le template déclenche sur un index paginé quelconque : une enveloppe "
+        "page/size/total et des objets à identifiant et nom sont le lot commun "
+        "de n'importe quelle liste REST"
+    )
+    assert not opik_fires(opik_projects_body(
+        projects=[opik_project(project_id="default-project")])), (
+        "le template accepte n'importe quelle valeur d'identifiant : le "
+        "composant est typé UUID, et c'est cette forme qui sépare la page "
+        "d'un index bricolé qui reprendrait les mêmes clés"
+    )
+
+    # Le constat ne doit pas non plus revendiquer une instance qu'un autre
+    # template du pack rapporte déjà.
+    for other_body, what in (
+        (ZENML_INFO_BODY, "le /api/v1/info de ZenML"),
+        (DETERMINED_MASTER_BODY, "le /api/v1/master de Determined"),
+        (FLOWISE_CHATFLOWS_BODY, "l'index des chatflows de Flowise"),
+        (LANGFLOW_WHOAMI_BODY, "le /api/v1/users/whoami de Langflow"),
+    ):
+        assert not opik_fires(other_body), (
+            f"le template déclenche sur {what}, déjà couvert par ailleurs"
+        )
+
+
+def test_opik_signature_does_not_bet_on_the_envelope_casing():
+    """
+    Le point que le désaccord entre le serveur et son schéma rendait incertain,
+    et qui se contourne plutôt qu'il ne se devine : l'ObjectMapper est posé en
+    SnakeCaseStrategy, mais le schéma OpenAPI publié — donc le SDK qu'il
+    engendre — écrit « sortableBy », le record ProjectPage ne portant pas
+    l'annotation @JsonNaming. La signature tient aux valeurs du tableau, qui
+    sont des constantes de SortableFields, et non à la clé qui le porte.
+    """
+    assert opik_fires(OPIK_SPEC_CASING_BODY), (
+        "le template exige la clé d'enveloppe en snake_case : il manquerait "
+        "l'instance si le serveur émettait la forme que son propre schéma "
+        "annonce, et le constat parierait alors sur l'issue d'un désaccord"
+    )
+
+    for matcher in (opik_block().get("matchers") or []):
+        for needle in (matcher.get("regex") or []) + (matcher.get("words") or []):
+            for envelope_key in ("sortable_by", "sortableBy"):
+                assert envelope_key not in needle, (
+                    f"le matcher porte « {envelope_key} », la clé disputée : "
+                    "ce sont les valeurs du tableau qui nomment le produit, et "
+                    "elles ne dépendent d'aucune stratégie de nommage"
+                )
+            for detailed_field in ("trace_count", "thread_count",
+                                   "total_estimated_cost",
+                                   "guardrails_failed_count", "error_count"):
+                assert detailed_field not in needle, (
+                    f"le matcher porte « {detailed_field} », déclaré sous "
+                    "« @JsonView({Project.View.Detailed.class}) » quand find() "
+                    "sérialise sous View.Public : ce champ n'est pas dans "
+                    "cette réponse et le template ne déclencherait sur rien"
+                )
+
+
+def test_opik_matcher_holds_across_versions_and_spacings():
+    assert opik_fires(OPIK_FRESH_PROJECT_BODY), (
+        "le template exige du projet lui-même un « last_updated_trace_at » que "
+        "l'inclusion NON_NULL retire tant qu'aucune trace n'est arrivée, ou "
+        "une « visibility » que les générations anciennes ne déclaraient pas — "
+        "il raterait précisément les instances laissées de côté"
+    )
+    assert opik_fires(OPIK_MULTI_PROJECT_BODY), (
+        "le template manque l'instance qui travaille, celle dont le total "
+        "dépasse la page que la route rend par défaut"
+    )
+    assert opik_fires(opik_projects_body(indent=4)), (
+        "le template exige la sérialisation compacte du serveur : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+    assert opik_fires(opik_projects_body(
+        projects=[opik_project(project_id=OPIK_PROJECT_ID.upper())])), (
+        "le template exige un UUID en minuscules : rien n'oblige un "
+        "intermédiaire à conserver la casse d'un identifiant qu'il relaie"
+    )
+    assert opik_fires(opik_projects_body(
+        projects=[opik_project(name="Default Project")], page=3, total=27)), (
+        "le template dépend de la première page : la route est paginée et "
+        "rien n'oblige un scan à tomber sur la page 1"
+    )
+
+
+def test_opik_extractors_report_what_the_anonymous_caller_obtains():
+    block = opik_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "project": ['.content[].name'],
+        "total": ['.total'],
+        "last_trace_at": ['.content[].last_updated_trace_at // empty'],
+    }, (
+        "les trois renseignements du constat ne sont pas remontés tels "
+        f"quels — {found}. .content[].name nomme ce que l'exploitant "
+        "instrumente et sert de paramètre aux routes de traces, .total dit "
+        "combien de projets existent au-delà de la page rendue, et "
+        ".content[].last_updated_trace_at dit si l'instance est vivante — le "
+        "« // empty » évitant la ligne vide sur un projet qui n'a encore rien "
+        "reçu, qui se lirait comme un renseignement"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_opik_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni le chemin
+    des extracteurs, et `body_matcher_hits` réévalue les motifs avec le module
+    `re` de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur
+    ferme la boucle.
+    """
+    def scan(body):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/v1/private/projects":
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", OPIK_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=60,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} == {
+            "opik-projects-exposed"}, r.stdout + r.stderr
+        return [value for item in results
+                for value in (item.get("extracted-results") or [])]
+
+    assert sorted(scan(OPIK_MULTI_PROJECT_BODY)) == sorted([
+        "Default Project", "checkout-agent-prod", "7",
+        "2026-08-30T09:14:22.118Z", "2026-09-01T17:02:44.006Z",
+    ]), "le scan ne remonte pas les projets divulgués par la page"
+
+    assert sorted(scan(OPIK_FRESH_PROJECT_BODY)) == sorted([
+        "Default Project", "1",
+    ]), (
+        "le projet qui n'a encore reçu aucune trace remonte une ligne vide — "
+        "c'est le « // empty » qui l'évite — ou fait échouer l'extraction"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
