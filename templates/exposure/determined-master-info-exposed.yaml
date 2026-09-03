@@ -1,0 +1,247 @@
+id: determined-master-info-exposed
+
+info:
+  name: Determined - Unauthenticated Master Information Exposure
+  author: popy21
+  severity: medium
+  description: |
+    Determined (determined-ai/determined) est une plateforme d'entraînement
+    distribué, de tuning d'hyperparamètres et de gestion de ressources GPU. Son
+    composant « master » sert la WebUI et une API REST, celle-ci étant un
+    gRPC-gateway monté dans le serveur echo : RegisterHTTPProxy()
+    (master/internal/grpcutil/api.go) construit le groupe « apiV1 :=
+    e.Group("/api/v1") » puis « apiV1.Any("/*", handler,
+    middleware.RemoveTrailingSlash()) », qui relaie tout le préfixe vers le mux
+    de la passerelle. Le port est celui du master — 8080 sans TLS, 8443 avec,
+    tels que master/internal/config/config.go les remplit quand la
+    configuration laisse le champ vide.
+    GET /api/v1/master est déclaré par le contrat lui-même :
+    proto/src/determined/api/v1/api.proto porte « rpc GetMaster(
+    GetMasterRequest) returns (GetMasterResponse) » sous « option
+    (google.api.http) = { get: "/api/v1/master" } », et la même méthode y
+    déclare « option (grpc.gateway.protoc_gen_swagger.options
+    .openapiv2_operation) = { tags: "Cluster" security: {} } » — le « security:
+    {} » vide dit au swagger généré que la route ne réclame aucun schéma
+    d'authentification.
+    L'exemption est explicite côté serveur, et elle n'est pas un réglage.
+    master/internal/grpcutil/auth.go déclare « var unauthenticatedMethods =
+    map[string]bool{ "/determined.api.v1.Determined/Login": true,
+    "/determined.api.v1.Determined/GetMaster": true,
+    "/determined.api.v1.Determined/GetTelemetry": true } », que les
+    intercepteurs unaryAuthInterceptor et streamAuthInterceptor consultent
+    avant de réclamer un jeton. GetMaster y figure aux côtés de Login : la
+    route répond donc en anonyme sur un cluster qui exige par ailleurs un
+    compte, et aucune option de configuration ne la referme.
+    Ce que rend la route est le message GetMasterResponse
+    (proto/src/determined/api/v1/master.proto), que le handler d'api_master.go
+    remplit entièrement : version (master/version), master_id — « MasterID:
+    uuid.New().String() » dans core.go, régénéré à chaque démarrage —,
+    cluster_id (GetOrCreateClusterID, persistant), cluster_name,
+    telemetry_enabled, sso_providers, external_login_uri, external_logout_uri,
+    branding (« determined », ou « hpe » quand license.IsEE()), rbac_enabled,
+    product, feature_switches, user_management_enabled,
+    strict_job_queue_control, cluster_message et has_custom_logo.
+    La casse des clés est celle que la passerelle sérialise, pas celle du
+    .proto. newGRPCGatewayMux() (grpcutil/api.go) enregistre « runtime
+    .WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{EmitDefaults:
+    true}) », et le runtime.JSONPb de grpc-gateway v1 — celui qu'importe le
+    fichier, « github.com/grpc-ecosystem/grpc-gateway/runtime » — est le
+    jsonpb.Marshaler de github.com/golang/protobuf : son champ OrigName reste à
+    sa valeur nulle, donc le marshaler écrit le json_name du descripteur, la
+    forme lowerCamelCase, et non le nom déclaré. Le client que le produit
+    publie lit exactement ces clés-là : v1GetMasterResponse.from_json(), dans
+    le fichier généré harness/determined/common/api/bindings.py, se construit
+    sur obj["masterId"], obj["clusterId"], obj["clusterName"], obj["version"],
+    obj["strictJobQueueControl"] et obj["hasCustomLogo"]. C'est le client qui
+    parle au serveur réel — la casse n'est donc pas déduite du seul marshaler.
+    Deux propriétés de ce marshaler commandent la forme du matcher.
+    « EmitDefaults: true » sérialise chaque champ même à sa valeur nulle, donc
+    le document est complet quelle que soit la configuration du déploiement —
+    « clusterName »: "" sur le défaut de config.go, « ssoProviders »: [] sans
+    SSO. Et jsonpb écrit les champs dans l'ordre de déclaration, donc
+    « version », champ 1, ouvre le document.
+    Le message, lui, a grossi : les champs 1 à 4 sont les plus anciens quand
+    rbac_enabled est le 10, user_management_enabled le 13,
+    strict_job_queue_control le 14, cluster_message le 15 et has_custom_logo le
+    16. Seul le noyau peut donc être exigé, sous peine de manquer les instances
+    anciennes — précisément celles qui traînent exposées.
+    Le constat porte sur l'API, non sur la page : la WebUI de Determined est
+    déjà reconnue en amont par son titre servi à la racine, ce qui dit qu'un
+    port répond ; ici c'est la réponse anonyme de la route qui fait foi.
+  impact: |
+    Un appelant anonyme obtient l'identité et le niveau de durcissement du
+    cluster en une seule lecture, sans compte et sans laisser de session.
+    « masterId » et « clusterId » nomment l'instance : le premier change à
+    chaque redémarrage du master — c'est un uuid.New() —, le second persiste,
+    de sorte que le couple sépare deux clusters, rattache plusieurs adresses à
+    un même déploiement et date les redémarrages observés. « clusterName » est
+    le nom que l'exploitant a donné à son cluster, et « version » dit
+    exactement quels correctifs manquent au master.
+    La même réponse annonce ce qui garde le reste de l'API. « rbacEnabled »
+    dit si le contrôle d'accès par rôles est actif, « userManagementEnabled »
+    si les comptes sont gérés localement, « ssoProviders » énumère les
+    fournisseurs SSO configurés avec leur nom, leur type et leur sso_url, et
+    « externalLoginUri » / « externalLogoutUri » livrent les redirections de
+    sessions externes. « branding » sépare l'édition entreprise (« hpe ») de
+    l'open source, « featureSwitches » liste les fonctionnalités activées et
+    « clusterMessage » rend l'avis que l'administrateur diffuse au cluster,
+    avec son contenu et ses dates. C'est le renseignement qui précède une
+    tentative, pas une donnée d'entraînement : il dit à un attaquant si le
+    cluster vaut l'effort et par quelle porte l'aborder.
+    La sévérité s'arrête là, et c'est pourquoi elle est medium : la route ne
+    rend ni identifiant, ni expérience, ni jeu de données, et le reste de l'API
+    — /api/v1/master/config compris, dont le handler réclame un utilisateur
+    puis CanGetMasterConfig — demeure gardé par les mêmes intercepteurs. Le
+    constat est que ce port est joignable depuis là où le scan a été lancé, et
+    qu'il décrit son cluster à qui le demande.
+  remediation: |
+    Cette route ne se referme pas par configuration : elle est inscrite dans
+    unauthenticatedMethods au même titre que Login, parce que la WebUI la lit
+    avant toute connexion pour connaître le branding, l'URI de login externe et
+    les fournisseurs SSO à afficher. La mitigation est donc celle du périmètre,
+    pas celle du produit.
+    Ne pas publier le port du master sur une interface non maîtrisée : lier
+    « 127.0.0.1:8080:8080 » côté conteneur quand l'accès doit rester local, et
+    placer l'accès distant derrière un VPN, un proxy authentifiant ou une liste
+    d'adresses autorisées. C'est la même frontière qui protège le reste de
+    l'API, dont l'authentification n'est pas une isolation réseau.
+    Durcir ce que la réponse annonce, puisqu'elle l'annonce à tout le monde :
+    activer le RBAC — « rbacEnabled » passe alors à true —, tenir le master à
+    jour puisque « version » est publié à quiconque atteint le port, et
+    n'écrire dans « cluster_name » ni dans le message de cluster rien qui
+    renseigne au-delà du nécessaire.
+    Vérifier la prise en compte sur la route elle-même, depuis l'extérieur du
+    périmètre et sans identifiant : « curl -s https://<master>/api/v1/master »
+    ne doit plus rendre le document. Tant qu'il le rend, la frontière n'est pas
+    là où on la croit.
+    Après une exposition, tenir pour lus la version, le nom du cluster, les
+    identifiants master et cluster, la configuration SSO et les drapeaux de
+    durcissement, et relire les journaux du master pour établir ce qui a été
+    tenté d'autre depuis la même adresse : la route qui a répondu ne journalise
+    aucune identité, puisqu'elle n'en demande aucune.
+  reference:
+    - https://github.com/determined-ai/determined/blob/main/proto/src/determined/api/v1/api.proto
+    - https://github.com/determined-ai/determined/blob/main/proto/src/determined/api/v1/master.proto
+    - https://github.com/determined-ai/determined/blob/main/master/internal/grpcutil/auth.go
+    - https://github.com/determined-ai/determined/blob/main/master/internal/grpcutil/api.go
+    - https://github.com/determined-ai/determined/blob/main/master/internal/api_master.go
+    - https://github.com/determined-ai/determined/blob/main/master/internal/config/config.go
+    - https://github.com/determined-ai/determined/blob/main/harness/determined/common/api/bindings.py
+  metadata:
+    max-request: 1
+    vendor: determined-ai
+    product: determined
+  tags: ai,ml,mlops,gpu,determined,determined-ai,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la seule route de description que les intercepteurs
+  # laissent passer en anonyme. GetMaster ne consulte pas la requête et ne
+  # touche à rien : le handler recopie la configuration du master et va
+  # chercher l'avis de cluster actif. Rien de plus intrusif n'apprendrait
+  # davantage sur l'absence de garde, puisque c'est le contrat lui-même qui
+  # exempte cette méthode — et que les autres, /api/v1/master/config comprise,
+  # réclament un utilisateur.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/master"
+
+    matchers-condition: and
+    matchers:
+      # L'ancrage. jsonpb sérialise dans l'ordre de déclaration du descripteur
+      # et « string version = 1 » ouvre GetMasterResponse : la clé ouvre donc
+      # le document. « EmitDefaults: true » garantit qu'elle y est même sur un
+      # master qui ne renseignerait rien d'autre.
+      #
+      # L'ancrage sur l'ouverture du corps écarte la même charge utile
+      # retrouvée au fond d'un document composite qu'une supervision
+      # agrégerait sous une clé à elle : c'est lui qui dit que l'instance a
+      # répondu d'elle-même. La valeur n'est contrainte à rien — les versions
+      # du master vont de « 0.19.9 » à des chaînes de développement suffixées.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"version"\s*:\s*"'
+
+      # Le constat, et ce qui nomme le produit. Les trois clés sont déclarées
+      # obligatoires par le json_schema du message — required: [version,
+      # master_id, cluster_id, cluster_name, strict_job_queue_control,
+      # has_custom_logo] — elles portent les numéros de champ 2, 3 et 4, donc
+      # les plus anciens, et « EmitDefaults: true » les écrit même vides :
+      # « clusterName »: "" est ce que rend le défaut de config.go.
+      #
+      # La casse est celle que la passerelle émet, jamais celle du .proto :
+      # runtime.JSONPb laisse OrigName à faux, donc masterId et non master_id.
+      # Le client généré du produit lit ces mêmes clés.
+      #
+      # masterId est contraint à la forme d'un UUID parce que le master n'en
+      # écrit pas d'autre — « MasterID: uuid.New().String() » —, et c'est ce
+      # qui sépare cette réponse de n'importe quel document qui décrirait un
+      # cluster avec une version et un nom. clusterId, lui, n'est contraint à
+      # rien : GetOrCreateClusterID() accepte la valeur que la configuration de
+      # télémétrie lui impose.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"masterId"\s*:\s*"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"'
+          - '"clusterId"\s*:\s*"'
+          - '"clusterName"\s*:\s*"'
+
+      # Ce que la réponse annonce du durcissement, et qui achève de la
+      # rattacher à ce produit : des drapeaux booléens qu'« EmitDefaults »
+      # écrit toujours en clair. La condition reste « or » parce que ces trois
+      # champs ne sont pas de la même génération — telemetry_enabled est le
+      # champ 5, rbac_enabled le 10, user_management_enabled le 13 — et
+      # qu'exiger les trois manquerait les instances anciennes.
+      - type: regex
+        part: body
+        regex:
+          - '"telemetryEnabled"\s*:\s*(true|false)'
+          - '"rbacEnabled"\s*:\s*(true|false)'
+          - '"userManagementEnabled"\s*:\s*(true|false)'
+
+    extractors:
+      # Quels correctifs manquent au master, puisque la route les publie.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
+
+      # Le nom que l'exploitant a donné à son cluster. Le « select » évite la
+      # ligne vide sur le défaut de config.go — « ClusterName: "" » — qui se
+      # lirait comme un renseignement.
+      - type: json
+        part: body
+        name: cluster_name
+        json:
+          - '.clusterName | select(. != "")'
+
+      # L'identifiant persistant du cluster : c'est lui, et non masterId qui
+      # change à chaque démarrage, qui rattache plusieurs adresses à un même
+      # déploiement.
+      - type: json
+        part: body
+        name: cluster_id
+        json:
+          - '.clusterId'
+
+      # Le drapeau qui dit ce qui garde le reste de l'API. « select(. != null) »
+      # plutôt qu'une valeur par défaut : le champ est absent des générations
+      # antérieures au numéro 10, et « false » est précisément le cas
+      # intéressant — une alternative jq l'écarterait, false étant faux.
+      - type: json
+        part: body
+        name: rbac_enabled
+        json:
+          - '.rbacEnabled | select(. != null)'
+
+      # Les fournisseurs SSO déclarés, par leur type (SAML, OIDC). Le « ? »
+      # évite de fauter quand la clé est absente ou nulle, ce qu'elle est sur
+      # les instances sans SSO comme sur celles qui ne déclaraient pas encore
+      # le champ.
+      - type: json
+        part: body
+        name: sso_providers
+        json:
+          - '.ssoProviders[]?.type'

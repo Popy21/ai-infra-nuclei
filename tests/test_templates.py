@@ -17225,6 +17225,433 @@ def test_zenml_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Determined : GET /api/v1/master est exempté d'authentification par le serveur
+# lui-même. master/internal/grpcutil/auth.go déclare « unauthenticatedMethods »
+# et y inscrit « /determined.api.v1.Determined/GetMaster » aux côtés de Login
+# et GetTelemetry ; les intercepteurs consultent cette carte avant de réclamer
+# un jeton. La route répond donc en anonyme sur un cluster qui exige par
+# ailleurs un compte, et aucun réglage ne la referme.
+#
+# Deux points commandent la forme du matcher, et ce sont eux que cette section
+# amarre.
+#
+# La casse d'abord. La réponse est sérialisée par un gRPC-gateway, et
+# newGRPCGatewayMux() enregistre « &runtime.JSONPb{EmitDefaults: true} » : le
+# runtime.JSONPb de grpc-gateway v1 est le jsonpb.Marshaler de
+# github.com/golang/protobuf, dont OrigName reste faux — les clés émises sont
+# donc les json_name du descripteur, en lowerCamelCase, et non les noms
+# déclarés dans le .proto. Le client généré du produit lit exactement
+# celles-là : v1GetMasterResponse.from_json() se construit sur obj["masterId"]
+# et obj["clusterId"]. Un template écrit sur « master_id » ne déclencherait sur
+# rien.
+#
+# Les générations ensuite. GetMasterResponse a grossi champ par champ —
+# rbac_enabled est le 10, user_management_enabled le 13, has_custom_logo le 16 —
+# donc seul le noyau des champs 1 à 5 peut être exigé, sous peine de manquer
+# les instances anciennes, celles qui traînent exposées.
+
+DETERMINED_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "determined-master-info-exposed.yaml")
+
+DETERMINED_MASTER_ID = "5c1f7f8e-3c1a-4f6d-9b2e-71f0a4c8d3b5"
+DETERMINED_CLUSTER_ID = "0a9e6b41-2d7c-4c88-8f31-6b0d5a2e94c7"
+
+
+def determined_master_body(version="0.38.0", master_id=DETERMINED_MASTER_ID,
+                           cluster_id=DETERMINED_CLUSTER_ID, cluster_name="",
+                           branding="determined", rbac_enabled=False,
+                           sso_providers=(), drop=(), indent=None,
+                           snake_case=False):
+    """
+    Ce que rend GET /api/v1/master : GetMasterResponse sérialisé par jsonpb
+    dans l'ordre de déclaration du descripteur, tel que le handler GetMaster()
+    d'api_master.go le remplit — version depuis master/version, masterId depuis
+    « uuid.New().String() », clusterId depuis GetOrCreateClusterID(), branding
+    valant « determined » ou « hpe » selon license.IsEE(), puis les drapeaux de
+    durcissement que config.GetAuthZConfig() rend.
+
+    « EmitDefaults: true » écrit chaque champ même à sa valeur nulle : d'où
+    « clusterName »: "" sur le défaut de config.go, « ssoProviders »: [] sans
+    SSO et « clusterMessage »: null sans avis actif.
+
+    `drop` retire une clé comme le ferait une génération qui ne déclarait pas
+    encore le champ, `indent` réécrit le document comme le ferait un
+    intermédiaire qui réindente ce qu'il relaie, et `snake_case` rend les noms
+    déclarés dans le .proto — la forme qu'un marshaler « OrigName: true »
+    émettrait, et que celui du produit n'émet pas.
+    """
+    document = {
+        "version": version,
+        "masterId": master_id,
+        "clusterId": cluster_id,
+        "clusterName": cluster_name,
+        "telemetryEnabled": False,
+        "ssoProviders": [dict(p) for p in sso_providers],
+        "externalLoginUri": "",
+        "externalLogoutUri": "",
+        "branding": branding,
+        "rbacEnabled": rbac_enabled,
+        "product": "PRODUCT_UNSPECIFIED",
+        "featureSwitches": [],
+        "userManagementEnabled": True,
+        "strictJobQueueControl": False,
+        "clusterMessage": None,
+        "hasCustomLogo": False,
+    }
+    for key in drop:
+        document.pop(key, None)
+
+    if snake_case:
+        renamed = {
+            "masterId": "master_id", "clusterId": "cluster_id",
+            "clusterName": "cluster_name", "telemetryEnabled": "telemetry_enabled",
+            "ssoProviders": "sso_providers", "externalLoginUri": "external_login_uri",
+            "externalLogoutUri": "external_logout_uri", "rbacEnabled": "rbac_enabled",
+            "featureSwitches": "feature_switches",
+            "userManagementEnabled": "user_management_enabled",
+            "strictJobQueueControl": "strict_job_queue_control",
+            "clusterMessage": "cluster_message", "hasCustomLogo": "has_custom_logo",
+        }
+        document = {renamed.get(k, k): v for k, v in document.items()}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # Le marshaler de la passerelle écrit compact : Indent n'est posé que sur le
+    # marshaler « application/json+pretty », que seul le paramètre ?pretty
+    # sélectionne.
+    return json.dumps(document, separators=(",", ":"))
+
+
+DETERMINED_MASTER_BODY = determined_master_body()
+
+# Une instance durcie : RBAC actif, SSO déclaré, cluster nommé. Le template doit
+# la reconnaître aussi — le constat est l'accès anonyme à la description, pas
+# l'absence de durcissement qu'elle peut annoncer.
+DETERMINED_HARDENED_BODY = determined_master_body(
+    cluster_name="research-eu-west", rbac_enabled=True, branding="hpe",
+    sso_providers=[{"name": "okta", "ssoUrl": "https://sso.internal/saml",
+                    "type": "SAML", "alwaysRedirect": False}],
+)
+
+# Une génération antérieure : ni rbac_enabled (champ 10), ni product (11), ni
+# feature_switches (12), ni user_management_enabled (13), ni
+# strict_job_queue_control (14), ni cluster_message (15), ni has_custom_logo
+# (16). Le template doit toujours la reconnaître.
+DETERMINED_OLD_MASTER_BODY = determined_master_body(
+    version="0.19.9",
+    drop=("rbacEnabled", "product", "featureSwitches", "userManagementEnabled",
+          "strictJobQueueControl", "clusterMessage", "hasCustomLogo"),
+)
+
+# Le refus que rend une route gardée, tel que l'errorHandler de
+# grpcutil/errors.go le formate : errorBody{Error: errorMessage{Code, Reason,
+# Message}}, dont les balises json sont « error », « code », « reason » et —
+# pour le message — « error » de nouveau. Code 16 est codes.Unauthenticated.
+DETERMINED_UNAUTHENTICATED_BODY = ('{"error":{"code":16,'
+                                   '"reason":"Unauthenticated",'
+                                   '"error":"token missing"}}')
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+DETERMINED_COMPOSITE_BODY = ('{"determined":%s,"checked_at":0}'
+                             % DETERMINED_MASTER_BODY)
+
+# Un service quelconque qui décrit lui aussi un cluster — une version, un
+# identifiant, un nom — sans être le master de Determined. Ce vocabulaire
+# n'appartient à personne.
+OTHER_CLUSTER_INFO_BODY = json.dumps({
+    "version": "1.29.4",
+    "clusterId": "7f3a1c22-4e5b-4a90-b1d6-9c2e8f0a5d34",
+    "clusterName": "prod-gpu",
+    "telemetryEnabled": True,
+    "nodes": 12,
+}, separators=(",", ":"))
+
+
+def determined_block():
+    doc = load(DETERMINED_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/v1/master" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/v1/master — c'est pourtant la seule "
+        "route de description que unauthenticatedMethods laisse passer"
+    )
+    return blocks[0]
+
+
+def determined_fires(body):
+    block = determined_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_determined_probe_reads_the_open_route_and_touches_nothing_guarded():
+    doc = load(DETERMINED_TEMPLATE)
+    routes = sorted(request_routes(doc))
+    assert routes == [("GET", "/api/v1/master")], (
+        "le template n'interroge plus la seule route que le serveur exempte "
+        f"d'authentification — {routes}"
+    )
+    for _, route in routes:
+        for forbidden, why in (
+            ("/master/config",
+             "GET /api/v1/master/config réclame un utilisateur puis "
+             "CanGetMasterConfig : l'appeler ne dirait rien du constat et "
+             "sortirait de la route exemptée"),
+            ("/auth/login",
+             "Login est exempté au même titre, mais le poster serait tenter "
+             "une authentification, pas constater une divulgation"),
+            ("/experiments", "les expériences portent le travail de l'exploitant"),
+            ("/users", "l'énumération des comptes est une autre affaire que celle-ci"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+    assert determined_block().get("method") == "GET", (
+        "la description du master se lit en GET : le template ne doit rien "
+        "envoyer à une instance qu'il découvre"
+    )
+
+
+def test_determined_matcher_rests_on_the_master_response_not_on_the_status():
+    block = determined_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+    assert determined_fires(DETERMINED_MASTER_BODY), (
+        "le template ne reconnaît pas la réponse d'un master Determined — "
+        "celle, précisément, que GetMaster rend sans réclamer de jeton"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : cette route rend 200 sur toute "
+        "instance vivante, gardée ou non, et n'importe quel intermédiaire "
+        "servant ce chemin en rendrait un — c'est GetMasterResponse qui porte "
+        "le constat, jamais le code"
+    )
+
+    assert not determined_fires(DETERMINED_UNAUTHENTICATED_BODY), (
+        "le template conclut sur le refus que l'errorHandler de la passerelle "
+        "rend pour une route gardée, qui n'est pas la divulgation qu'il "
+        "rapporte"
+    )
+    assert not determined_fires(DETERMINED_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not determined_fires(determined_master_body(drop=("version",))), (
+        "le template conclut sur un document qui ne s'ouvre plus sur "
+        "« version », le champ 1 du message — jsonpb sérialise dans l'ordre de "
+        "déclaration du descripteur"
+    )
+
+
+def test_determined_matcher_reads_the_casing_the_gateway_emits():
+    """
+    Le point que la passerelle rendait incertain, et qui se vérifie plutôt
+    qu'il ne se devine : « &runtime.JSONPb{EmitDefaults: true} » laisse
+    OrigName à faux, donc les clés émises sont les json_name du descripteur.
+    """
+    assert determined_fires(DETERMINED_MASTER_BODY), (
+        "le template ne reconnaît pas la casse lowerCamelCase que le "
+        "marshaler de la passerelle émet"
+    )
+    assert not determined_fires(determined_master_body(snake_case=True)), (
+        "le template accepte les noms déclarés dans le .proto — master_id, "
+        "cluster_id — qu'aucun marshaler de ce déploiement n'émet : la casse "
+        "n'est plus tenue à ce que la source dit, et le prochain qui la "
+        "retournerait ne serait plus arrêté"
+    )
+
+    for matcher in (determined_block().get("matchers") or []):
+        for needle in (matcher.get("regex") or []) + (matcher.get("words") or []):
+            for proto_name in ("master_id", "cluster_id", "cluster_name",
+                               "rbac_enabled", "telemetry_enabled"):
+                assert proto_name not in needle, (
+                    f"le matcher porte « {proto_name} », le nom déclaré dans "
+                    "le .proto : le gateway émet le json_name, et le client "
+                    "généré du produit lit obj[\"masterId\"]"
+                )
+
+
+def test_determined_conclusion_needs_the_master_identity_not_a_cluster_document():
+    assert not determined_fires(determined_master_body(drop=("masterId",))), (
+        "le template conclut sans « masterId » : c'est lui qui sépare la "
+        "réponse du master de n'importe quel document décrivant un cluster"
+    )
+    assert not determined_fires(determined_master_body(drop=("clusterId",))), (
+        "le template conclut sans « clusterId », que le json_schema du message "
+        "déclare pourtant obligatoire"
+    )
+    assert not determined_fires(determined_master_body(drop=("clusterName",))), (
+        "le template conclut sans « clusterName », que « EmitDefaults: true » "
+        "écrit même vide"
+    )
+    assert not determined_fires(determined_master_body(master_id="master-01")), (
+        "le template accepte n'importe quelle valeur de « masterId » : core.go "
+        "n'en écrit qu'une, « uuid.New().String() », et c'est cette forme qui "
+        "distingue la réponse d'un document de supervision quelconque"
+    )
+    assert not determined_fires(OTHER_CLUSTER_INFO_BODY), (
+        "le template déclenche sur un service quelconque qui décrit son "
+        "cluster : « version », « clusterId » et « clusterName » sont des clés "
+        "banales sans l'identifiant du master"
+    )
+    assert not determined_fires(determined_master_body(
+        drop=("telemetryEnabled", "rbacEnabled", "userManagementEnabled"))), (
+        "le template conclut sans aucun des drapeaux que la réponse publie : "
+        "ce sont eux qui disent que le document décrit le durcissement d'un "
+        "cluster, et non seulement son identité"
+    )
+
+    # Collisions internes au pack et au voisinage : ces corps décrivent eux
+    # aussi une pile de calcul, et deux templates ne doivent pas revendiquer la
+    # même instance.
+    for other_body, what in (
+        (TGI_INFO_BODY, "le /info du routeur TGI"),
+        (ACTUATOR_INFO_BODY, "un /info sans rapport avec le calcul distribué"),
+        (COMFYUI_SYSTEM_STATS_BODY, "le /system_stats de ComfyUI"),
+        (ZENML_INFO_BODY, "le /api/v1/info de ZenML"),
+    ):
+        assert not determined_fires(other_body), (
+            f"le template déclenche sur {what}, déjà couvert par ailleurs"
+        )
+
+
+def test_determined_matcher_holds_across_versions_and_spacings():
+    assert determined_fires(DETERMINED_OLD_MASTER_BODY), (
+        "le template exige un champ que les générations anciennes ne "
+        "déclaraient pas — rbac_enabled, user_management_enabled, "
+        "has_custom_logo — il raterait les instances anciennes, celles qui "
+        "traînent exposées"
+    )
+    assert determined_fires(DETERMINED_HARDENED_BODY), (
+        "le template manque l'instance durcie : le constat est l'accès anonyme "
+        "à la description, pas l'absence de RBAC qu'elle peut annoncer"
+    )
+    assert determined_fires(determined_master_body(branding="hpe")), (
+        "le template dépend du branding open source : license.IsEE() fait "
+        "écrire « hpe » sur l'édition entreprise"
+    )
+    assert determined_fires(determined_master_body(cluster_name="research-eu-west")), (
+        "le template dépend du nom de cluster d'une instance particulière"
+    )
+    assert determined_fires(determined_master_body(version="0.42.0.dev0")), (
+        "le template exige une version à trois nombres nus : les versions de "
+        "développement portent un suffixe"
+    )
+    assert determined_fires(determined_master_body(
+        master_id=DETERMINED_MASTER_ID.upper())), (
+        "le template exige un UUID en minuscules : rien n'oblige un "
+        "intermédiaire à conserver la casse d'un identifiant qu'il relaie"
+    )
+    assert determined_fires(determined_master_body(indent=4)), (
+        "le template exige la sérialisation compacte de la passerelle : le "
+        "marshaler « application/json+pretty » écrit « Indent: \"    \" », et "
+        "un intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+
+def test_determined_extractors_report_what_the_anonymous_caller_obtains():
+    block = determined_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "version": ['.version'],
+        "cluster_name": ['.clusterName | select(. != "")'],
+        "cluster_id": ['.clusterId'],
+        "rbac_enabled": ['.rbacEnabled | select(. != null)'],
+        "sso_providers": ['.ssoProviders[]?.type'],
+    }, (
+        "les cinq renseignements du constat ne sont pas remontés tels "
+        f"quels — {found}. .version dit quels correctifs manquent au master, "
+        ".clusterName nomme le déploiement — le « select » évitant la ligne "
+        "vide sur le défaut « ClusterName: \"\" » de config.go —, .clusterId "
+        "le rattache par-delà les redémarrages puisque masterId, lui, est "
+        "régénéré à chaque fois, .rbacEnabled dit ce qui garde le reste de "
+        "l'API — « select(. != null) » plutôt qu'une alternative jq, qui "
+        "écarterait false, précisément le cas intéressant — et .ssoProviders "
+        "énumère les fournisseurs déclarés"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_determined_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni le chemin
+    des extracteurs, et `body_matcher_hits` réévalue les motifs avec le module
+    `re` de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur
+    ferme la boucle.
+    """
+    def scan(body):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/v1/master":
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", DETERMINED_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=60,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} == {
+            "determined-master-info-exposed"}, r.stdout + r.stderr
+        return [value for item in results
+                for value in (item.get("extracted-results") or [])]
+
+    assert sorted(scan(DETERMINED_HARDENED_BODY)) == sorted([
+        "0.38.0", "research-eu-west", DETERMINED_CLUSTER_ID, "true", "SAML",
+    ]), "le scan ne remonte pas les cinq renseignements du constat"
+
+    assert sorted(scan(DETERMINED_MASTER_BODY)) == sorted([
+        "0.38.0", DETERMINED_CLUSTER_ID, "false",
+    ]), (
+        "l'instance par défaut remonte une ligne vide pour le nom de cluster — "
+        "c'est le « select » qui l'évite — ou perd « rbacEnabled: false », que "
+        "l'alternative jq écarterait alors qu'il est le cas intéressant"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
