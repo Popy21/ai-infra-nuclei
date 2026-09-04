@@ -18586,6 +18586,419 @@ def test_h2o_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# SkyPilot sert GET /api/health sans identifiant parce qu'aucun middleware
+# d'authentification n'est monté par défaut : OAuth2ProxyMiddleware sort par
+# « if not self.enabled: return await call_next(request) », son drapeau venant
+# d'« os.getenv(server_constants.OAUTH2_PROXY_ENABLED_ENV_VAR, 'false') » ;
+# BasicAuthMiddleware n'est même pas ajouté à la pile, « app.add_middleware(
+# BasicAuthMiddleware) » étant sous « if (str(enable_basic_auth).lower() ==
+# 'true' ...) » avec « enable_basic_auth = os.environ.get(constants
+# .ENV_VAR_ENABLE_BASIC_AUTH, 'false') » ; et BearerTokenMiddleware laisse
+# passer toute requête sans jeton. C'est donc l'API entière qui répond en
+# anonyme — /users, /status, /launch comprises — et cette route est simplement
+# la moins intrusive qui l'établisse.
+#
+# Trois points commandent la forme du matcher, et ce sont eux que cette section
+# amarre.
+#
+# La signature d'abord, qui n'est pas choisie mais reprise du client du produit.
+# get_api_server_status() (sky/server/common.py) conclut « if api_version is
+# None or version is None or commit is None: ... 'may not be running SkyPilot
+# API server.' » : c'est ce trio, et lui seul, qui nomme le produit.
+#
+# La forme de deux de ces trois clés ensuite. Le handler pose « api_version=str(
+# server_constants.API_VERSION) », donc un entier écrit en chaîne — ce qu'un
+# document de santé quelconque n'écrit pas ainsi —, et « commit=sky.__commit__ »
+# est un SHA git complet, éventuellement suffixé « -dirty ».
+#
+# Ce que le matcher n'a pas le droit d'exiger enfin. Une instance 0.13.0 rend
+# bien version_on_disk, basic_auth_enabled, user et latest_version — le corps
+# de SKYPILOT_HEALTH_BODY est celui qu'elle a servi — mais l'exemple que publie
+# la documentation officielle n'en porte aucun. Les exiger manquerait les
+# instances anciennes, précisément celles qui traînent exposées.
+
+SKYPILOT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "skypilot-api-server-exposed.yaml")
+
+# Le SHA que rend une roue publiée : sky/__init__.py le fige au build, et le
+# workflow nightly y écrit celui du commit.
+SKYPILOT_COMMIT = "b1431e52d97c22e9bb8fa8b67f162543754ddaf5"
+
+
+def skypilot_health_body(status="healthy", api_version="56", version="0.13.0",
+                         commit=SKYPILOT_COMMIT, basic_auth_enabled=False,
+                         latest_version=None, drop=(), indent=None):
+    """
+    Ce que rend GET /api/health : APIHealthResponse sérialisée par pydantic dans
+    l'ordre de déclaration de ses champs — status, api_version, version,
+    version_on_disk, commit, puis les drapeaux.
+
+    Les valeurs par défaut sont celles qu'une instance 0.13.0 lancée sans
+    réglage a effectivement servies, « external_proxy_auth_enabled »: true
+    compris — load_external_proxy_config() part de « enabled = None » puis pose
+    « enabled = True » tant qu'aucun des deux schémas intégrés n'est armé, donc
+    ce drapeau dit que le serveur suppose une garde en amont, pas qu'il en a
+    une.
+
+    `drop` retire une clé comme le ferait une génération qui ne la déclarait pas
+    encore, `indent` réécrit le document comme le ferait un intermédiaire qui
+    réindente ce qu'il relaie.
+    """
+    document = {
+        "status": status,
+        "api_version": api_version,
+        "version": version,
+        "version_on_disk": version,
+        "commit": commit,
+        "basic_auth_enabled": basic_auth_enabled,
+        "user": None,
+        "service_account_token_enabled": False,
+        "ingress_basic_auth_enabled": False,
+        "latest_version": latest_version,
+        "external_proxy_auth_enabled": True,
+        "telemetry_enabled": True,
+        "restrict_config_to_admins": False,
+    }
+    for key in drop:
+        document.pop(key, None)
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # La JSONResponse de FastAPI écrit compact.
+    return json.dumps(document, separators=(",", ":"))
+
+
+# Relevé sur une instance skypilot 0.13.0 lancée par « sky api start », sans
+# aucun réglage d'authentification.
+SKYPILOT_HEALTH_BODY = skypilot_health_body()
+
+# L'exemple littéral que publie la documentation officielle, à la casse et à
+# l'ordre près : ni version_on_disk, ni basic_auth_enabled, ni user, ni
+# latest_version, et les quatre clés dans l'ordre d'une génération antérieure.
+# C'est la preuve qu'aucune de ces quatre-là ne peut entrer dans le matcher.
+SKYPILOT_DOC_EXAMPLE_BODY = (
+    '{"status":"healthy","api_version":"1","commit":"ba7542c6dcd08484d83145d3'
+    'e63ec9966d5909f3-dirty","version":"1.0.0-dev0"}')
+
+# Ce que rend une instance derrière oauth2-proxy à un appelant qui n'annonce
+# pas sa version d'API — ce que nuclei ne fait pas : le handler sort alors par
+# « return responses.APIHealthResponse(status=common.ApiServerStatus.HEALTHY,)
+# » et « response_model_exclude_unset=True » retire tout le reste. Le trio
+# manque donc précisément quand une authentification est armée.
+SKYPILOT_OAUTH_GATED_BODY = '{"status":"healthy"}'
+
+# La même instance répondant à un client récent : le document est complet, mais
+# le statut dit NEEDS_AUTH.
+SKYPILOT_NEEDS_AUTH_BODY = skypilot_health_body(status="needs_auth")
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+SKYPILOT_COMPOSITE_BODY = '{"skypilot":%s,"checked_at":0}' % SKYPILOT_HEALTH_BODY
+
+# Une sonde de santé quelconque qui publie elle aussi sa version et son commit.
+# Ce vocabulaire n'appartient à personne : c'est la forme des valeurs qui
+# sépare les deux.
+OTHER_HEALTH_BODY = json.dumps({
+    "status": "healthy", "version": "2.41.0", "commit": "9f1c0a7",
+    "uptime_seconds": 8134,
+}, separators=(",", ":"))
+
+# Le même document avec un SHA complet et une version d'API — mais écrite en
+# nombre, comme l'écrit à peu près tout le monde sauf ce handler.
+OTHER_VERSIONED_HEALTH_BODY = json.dumps({
+    "status": "healthy", "api_version": 1, "version": "2.41.0",
+    "commit": SKYPILOT_COMMIT,
+}, separators=(",", ":"))
+
+
+def skypilot_block():
+    doc = load(SKYPILOT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/api/health" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/health — c'est pourtant la route de "
+        "description du serveur, et la moins intrusive qui établisse le constat"
+    )
+    return blocks[0]
+
+
+def skypilot_fires(body):
+    block = skypilot_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_skypilot_probe_reads_the_health_route_and_touches_nothing_else():
+    doc = load(SKYPILOT_TEMPLATE)
+    routes = sorted(request_routes(doc))
+    assert routes == [("GET", "/api/health")], (
+        "le template n'interroge plus la seule route de description qu'il "
+        f"documente — {routes}"
+    )
+    for method, route in routes:
+        for forbidden, why in (
+            ("/launch",
+             "POST /launch provisionne un cluster sur les comptes cloud de "
+             "l'exploitant : c'est exploiter l'absence de garde, pas la "
+             "constater"),
+            ("/exec", "POST /exec exécute une tâche sur un cluster existant"),
+            ("/down", "POST /down détruit un cluster"),
+            ("/stop", "POST /stop arrête un cluster"),
+            ("/users",
+             "GET /users rend l'annuaire des comptes, avec leurs rôles"),
+            ("/logs",
+             "les journaux d'exécution portent la sortie des entraînements"),
+            ("/storage", "GET /storage/ls rend les stockages déclarés"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+    assert method == "GET", (
+        "l'état du serveur se lit en GET : le template ne doit rien envoyer à "
+        "une instance qu'il découvre"
+    )
+
+
+def test_skypilot_matcher_rests_on_the_health_document_not_on_the_status():
+    block = skypilot_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+    assert skypilot_fires(SKYPILOT_HEALTH_BODY), (
+        "le template ne reconnaît pas la réponse d'un API server SkyPilot — "
+        "celle, précisément, que le handler rend sans qu'aucun middleware "
+        "d'authentification n'ait été monté"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : ce chemin rend 200 sur toute "
+        "instance vivante, gardée ou non — une instance derrière oauth2-proxy "
+        "en rend un aussi, avec un corps vide de tout renseignement — c'est le "
+        "document de santé qui porte le constat, jamais le code"
+    )
+
+    assert not skypilot_fires(SKYPILOT_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not skypilot_fires(skypilot_health_body(drop=("status",))), (
+        "le template conclut sur un document qui ne s'ouvre plus sur "
+        "« status » : c'est le premier champ qu'APIHealthResponse déclare, et "
+        "le seul sans valeur par défaut, donc le premier sérialisé dans toutes "
+        "les générations"
+    )
+
+
+def test_skypilot_conclusion_needs_the_trio_the_client_itself_requires():
+    for key in ("api_version", "version", "commit"):
+        assert not skypilot_fires(skypilot_health_body(drop=(key,))), (
+            f"le template conclut sans « {key} » : c'est le trio entier que "
+            "get_api_server_status() exige avant de reconnaître un API server "
+            "SkyPilot, et sans lui le client lui-même avertit que l'hôte "
+            "« may not be running SkyPilot API server »"
+        )
+
+    assert not skypilot_fires(OTHER_HEALTH_BODY), (
+        "le template déclenche sur une sonde de santé quelconque qui publie sa "
+        "version et un commit court : « status », « version » et « commit » "
+        "sont des clés banales hors du trio"
+    )
+
+    # Collisions internes au pack et au voisinage : ces corps décrivent eux
+    # aussi un plan de contrôle versionné, et deux templates ne doivent pas
+    # revendiquer la même instance.
+    for other_body, what in (
+        (TGI_INFO_BODY, "le /info du routeur TGI"),
+        (ACTUATOR_INFO_BODY, "un /info sans rapport avec le calcul distribué"),
+        (ZENML_INFO_BODY, "le /api/v1/info de ZenML"),
+        (DETERMINED_MASTER_BODY, "le /api/v1/master de Determined"),
+        (H2O_CLOUD_BODY, "le /3/Cloud d'un cluster H2O-3"),
+    ):
+        assert not skypilot_fires(other_body), (
+            f"le template déclenche sur {what}, déjà couvert par ailleurs"
+        )
+
+
+def test_skypilot_matcher_reads_the_shapes_the_handler_emits():
+    """
+    Deux des trois clés portent une forme, et c'est elle qui sépare ce document
+    d'une sonde de santé quelconque. Le point se vérifie plutôt qu'il ne se
+    devine : le corps de référence est celui qu'une instance a servi.
+    """
+    assert not skypilot_fires(OTHER_VERSIONED_HEALTH_BODY), (
+        "le template accepte « api_version » écrit en nombre : le handler pose "
+        "« api_version=str(server_constants.API_VERSION) », donc un entier "
+        "écrit en chaîne, et c'est cette forme-là qui distingue le document"
+    )
+    assert not skypilot_fires(skypilot_health_body(api_version="v1")), (
+        "le template accepte une version d'API non numérique : API_VERSION est "
+        "un entier, et str() n'en fait rien d'autre qu'une suite de chiffres"
+    )
+    assert not skypilot_fires(skypilot_health_body(commit="9f1c0a7")), (
+        "le template accepte un commit abrégé : sky/__init__.py rend "
+        "« git rev-parse HEAD » entier, et le workflow nightly y écrit le SHA "
+        "complet du commit"
+    )
+    assert not skypilot_fires(
+        skypilot_health_body(commit="{{SKYPILOT_COMMIT_SHA}}")), (
+        "le template accepte le gabarit non substitué de sky/__init__.py, qui "
+        "ne dit rien du build"
+    )
+
+
+def test_skypilot_refuses_what_an_authenticated_deployment_returns():
+    """
+    Le corps sépare l'instance ouverte de l'instance gardée, et c'est ce qui
+    rend ce constat rapportable : les deux répondent 200 sur ce chemin.
+    """
+    assert not skypilot_fires(SKYPILOT_OAUTH_GATED_BODY), (
+        "le template déclenche sur la réponse d'une instance derrière "
+        "oauth2-proxy : le handler sort alors par « APIHealthResponse("
+        "status=HEALTHY,) » et « response_model_exclude_unset=True » retire "
+        "tout le reste — le trio manque précisément quand la garde existe"
+    )
+    assert not skypilot_fires(SKYPILOT_NEEDS_AUTH_BODY), (
+        "le template déclenche sur un document dont le statut est "
+        "« needs_auth », que le handler pose quand la requête n'est pas "
+        "authentifiée sur une instance qui l'exige"
+    )
+
+
+def test_skypilot_matcher_holds_across_versions_and_spacings():
+    assert skypilot_fires(SKYPILOT_DOC_EXAMPLE_BODY), (
+        "le template exige une clé absente de l'exemple que publie la "
+        "documentation officielle — version_on_disk, basic_auth_enabled, user "
+        "ou latest_version — il raterait les instances anciennes, celles qui "
+        "traînent exposées ; l'exemple porte aussi les quatre clés dans un "
+        "autre ordre, dont le matcher n'a donc rien à exiger"
+    )
+    assert skypilot_fires(skypilot_health_body(
+        version="1.0.0.dev20260901", api_version="57")), (
+        "le template dépend d'une version de release : les images nightly, "
+        "celles que le YAML de déploiement sur VM utilise, portent toutes une "
+        "version de la forme 1.0.0.devAAAAMMJJ"
+    )
+    assert skypilot_fires(skypilot_health_body(
+        commit="ba7542c6dcd08484d83145d3e63ec9966d5909f3-dirty")), (
+        "le template refuse le suffixe « -dirty » que sky/__init__.py ajoute "
+        "quand l'arbre porte des modifications non commitées — c'est ce que "
+        "montre l'exemple de la documentation"
+    )
+    assert skypilot_fires(skypilot_health_body(basic_auth_enabled=True)), (
+        "le template manque l'instance dont l'authentification basique est "
+        "armée : /api/health lui est explicitement exempté, le drapeau n'est "
+        "pas rendu par toutes les générations, et c'est le rôle de "
+        "l'extracteur — pas du matcher — de le rapporter au triage"
+    )
+    assert skypilot_fires(skypilot_health_body(latest_version="0.14.0")), (
+        "le template dépend de l'état de la vérification de mise à jour, que "
+        "get_latest_version_for_current() laisse à null hors ligne"
+    )
+    assert skypilot_fires(skypilot_health_body(indent=2)), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+
+def test_skypilot_extractors_report_what_the_anonymous_caller_obtains():
+    block = skypilot_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "version": [".version"],
+        "api_version": [".api_version"],
+        "commit": [".commit"],
+        "basic_auth_enabled": [".basic_auth_enabled | select(. != null)"],
+    }, (
+        "les quatre renseignements du constat ne sont pas remontés tels "
+        f"quels — {found}. .version dit quels correctifs manquent au serveur, "
+        ".api_version quelle génération d'API il sert, .commit pinne le build "
+        "là où la version ne le fait pas — les nightly portent toutes "
+        "1.0.0.devAAAAMMJJ — et .basic_auth_enabled dit ce que le corps sait "
+        "de sa propre garde ; « select(. != null) » plutôt qu'une alternative "
+        "jq, qui écarterait false, précisément le cas intéressant"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_skypilot_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni le chemin des
+    extracteurs, et `body_matcher_hits` réévalue les motifs avec le module `re`
+    de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur ferme la
+    boucle.
+    """
+    def scan(body):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/health":
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", SKYPILOT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=60,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} == {
+            "skypilot-api-server-exposed"}, r.stdout + r.stderr
+        return [value for item in results
+                for value in (item.get("extracted-results") or [])]
+
+    assert sorted(scan(SKYPILOT_HEALTH_BODY)) == sorted([
+        "0.13.0", "56", SKYPILOT_COMMIT, "false",
+    ]), "le scan ne remonte pas les quatre renseignements du constat"
+
+    assert sorted(scan(SKYPILOT_DOC_EXAMPLE_BODY)) == sorted([
+        "1.0.0-dev0", "1",
+        "ba7542c6dcd08484d83145d3e63ec9966d5909f3-dirty",
+    ]), (
+        "l'extracteur d'authentification basique remonte une ligne vide sur "
+        "une instance antérieure à l'apparition du champ — c'est « select(. != "
+        "null) » qui l'évite, et une ligne vide se lirait comme un "
+        "renseignement"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

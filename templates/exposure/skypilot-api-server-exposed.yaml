@@ -1,0 +1,250 @@
+id: skypilot-api-server-exposed
+
+info:
+  name: SkyPilot - Unauthenticated API Server Exposure
+  author: popy21
+  severity: high
+  description: |
+    SkyPilot (skypilot-org/skypilot) provisionne et pilote des clusters et des
+    jobs GPU sur un parc multi-cloud. Depuis le passage à l'architecture
+    client/serveur, ce n'est plus le poste de l'utilisateur qui tient l'état
+    des déploiements mais l'API server : c'est lui qui détient les identifiants
+    cloud, la liste des clusters, la file des requêtes et le plan de contrôle
+    par lequel une machine se lance ou s'éteint. Le port par défaut est celui
+    que sky/server/common.py déclare — « DEFAULT_SERVER_PORT = 46580 » — et
+    c'est aussi celui que le déploiement sur VM publie, la documentation posant
+    « ports: 46580 » dans le YAML de lancement.
+    GET /api/health est la route de description, déclarée dans
+    sky/server/server.py par « @app.get('/api/health',
+    response_model_exclude_unset=True) ». Le handler ne consulte pas la requête
+    et remplit une responses.APIHealthResponse dont
+    sky/schemas/api/responses.py donne l'ordre des champs : status, api_version,
+    version, version_on_disk, commit, puis les drapeaux. La documentation
+    officielle en publie l'exemple littéral — « curl ${ENDPOINT}/api/health »
+    rendant « {"status":"healthy","api_version":"1","commit":"ba7542c6dcd08484
+    d83145d3e63ec9966d5909f3-dirty","version":"1.0.0-dev0"} » — et cette même
+    page dit du déploiement sur VM : « API server deployment using the above
+    YAML does not have any authentication by default. We recommend adding a
+    authentication layer (e.g., nginx reverse proxy) or using the SkyPilot helm
+    chart on a Kubernetes cluster for a more secure deployment. »
+    L'absence de garde n'est pas un oubli de configuration mais l'état par
+    défaut du montage. Les trois middlewares d'authentification que
+    sky/server/server.py enregistre sont conditionnés à un réglage explicite :
+    OAuth2ProxyMiddleware pose « self.enabled = (os.getenv(server_constants
+    .OAUTH2_PROXY_ENABLED_ENV_VAR, 'false') == 'true') » puis « if not
+    self.enabled: return await call_next(request) » ; BasicAuthMiddleware n'est
+    même pas ajouté à la pile — « enable_basic_auth = os.environ.get(constants
+    .ENV_VAR_ENABLE_BASIC_AUTH, 'false') ... if (str(enable_basic_auth).lower()
+    == 'true' ...): app.add_middleware(BasicAuthMiddleware) » ; et
+    BearerTokenMiddleware laisse passer toute requête qui ne porte ni jeton de
+    compte de service ni en-tête X-Skypilot-Auth-Mode — « if (not
+    has_skypilot_auth_header and not has_bearer_token_starting_with_sky):
+    return await call_next(request) ». Seul le déploiement Helm arme
+    l'authentification, par le « --set ingress.authCredentials=$AUTH_STRING »
+    de l'ingress nginx, qui refuse alors la requête avant qu'elle n'atteigne
+    l'application : ce déploiement-là ne rend pas ce corps.
+    La signature est le trio api_version + commit + version, et c'est le client
+    du produit lui-même qui la retient : get_api_server_status()
+    (sky/server/common.py) lit la réponse puis conclut « if api_version is None
+    or version is None or commit is None: ... logger.warning(f'API server
+    response missing version info. {server_url} may not be running SkyPilot API
+    server.') ». Deux propriétés de ce trio le rendent reconnaissable.
+    api_version est écrit en chaîne et non en nombre — le handler pose
+    « api_version=str(server_constants.API_VERSION) », API_VERSION étant un
+    entier — et commit est un SHA git de quarante caractères, que
+    sky/__init__.py obtient par « git rev-parse HEAD » sur une installation de
+    développement, en y ajoutant « -dirty » s'il y a des modifications non
+    commitées, et que le workflow de build remplace par le SHA du commit sur
+    les roues publiées.
+    Le reste du document ne peut pas porter le matcher, et le point a été
+    vérifié plutôt que déduit. La même dataclasse ApiServerInfo lit aussi
+    version_on_disk, user, basic_auth_enabled et latest_version, qu'une
+    instance 0.13.0 rend effectivement — le corps observé est
+    « {"status":"healthy","api_version":"56","version":"0.13.0",
+    "version_on_disk":"0.13.0","commit":"b1431e52d97c22e9bb8fa8b67f162543754
+    ddaf5","basic_auth_enabled":false,"user":null, ... } » — mais l'exemple que
+    publie la documentation ne porte aucune de ces quatre clés. Elles sont donc
+    remontées par les extracteurs, où leur absence ne coûte rien, jamais
+    exigées par le matcher, où elle ferait manquer les instances anciennes,
+    précisément celles qui traînent exposées.
+    Une clé demande d'être lue à l'envers de ce que son nom suggère :
+    « external_proxy_auth_enabled »: true est ce que rend une instance qui n'a
+    rien configuré. load_external_proxy_config() (sky/server/config.py) part de
+    « enabled = None » et, dans ce cas, pose « enabled = True » sauf si l'un
+    des deux schémas intégrés est armé — « if (os.getenv(constants
+    .ENV_VAR_ENABLE_BASIC_AUTH, 'false') == 'true' or (os.getenv(
+    server_constants.OAUTH2_PROXY_ENABLED_ENV_VAR, 'false') == 'true')):
+    enabled = False ». Le drapeau dit que le serveur suppose une garde en
+    amont, pas qu'il en a une.
+    Le constat porte sur le corps, jamais sur le statut : ce chemin rend 200
+    sur toute instance vivante, gardée ou non, et n'importe quel intermédiaire
+    qui le servirait en rendrait un. La route /health, que la section VM de la
+    documentation propose encore, n'existe pas dans le serveur — une instance
+    0.13.0 y répond « {"detail":"Not Found"} » en 404.
+  impact: |
+    Ce qui répond n'est pas un tableau de bord mais un plan de contrôle. La
+    réponse anonyme le date exactement : « version » et « commit » disent quels
+    correctifs manquent au serveur — le SHA le pinne au commit près, ce que la
+    version ne fait pas sur les images nightly, dont le workflow de build fixe
+    « __version__ = '1.0.0.dev${RELEASE_VERSION}' » — et « api_version » donne
+    la génération de l'API, donc les routes qui existent.
+    La divulgation ne s'arrête pas là, et c'est ce qui porte le constat en
+    high : quand /api/health répond ce document, aucun middleware
+    d'authentification n'est monté, donc le reste de l'API répond dans les
+    mêmes conditions. Vérifié sur une instance 0.13.0 lancée par défaut,
+    « GET /users » rend l'annuaire complet — identifiants, noms de comptes et
+    rôles, « role »: "admin" compris — et « GET /api/status » rend la file des
+    requêtes avec le corps de chacune, variables d'environnement incluses.
+    « POST /status » énumère les clusters et leurs handles, « /endpoints »
+    leurs services exposés, « /jobs/queue » les jobs gérés, « /storage/ls » les
+    stockages déclarés, « /download_logs » et « /logs » les journaux
+    d'exécution, c'est-à-dire la sortie des entraînements.
+    Le même contexte vaut en écriture, et c'est là que le coût devient
+    matériel. « POST /launch » provisionne un cluster, « /exec » exécute une
+    tâche sur un cluster existant, « /down » et « /stop » les détruisent ou les
+    arrêtent — tout cela sur les comptes cloud dont le serveur porte les
+    identifiants. Un appelant anonyme peut donc faire tourner du calcul GPU aux
+    frais de l'exploitant, atteindre le code exécuté sur ces machines, et
+    supprimer un entraînement en cours. Rien de tout cela n'est rattachable à
+    une identité : les requêtes non authentifiées se confondent avec celles de
+    l'exploitant, puisque request.state.auth_user reste à None.
+  remediation: |
+    Ne pas publier le port de l'API server sur une interface non maîtrisée. Le
+    YAML de déploiement sur VM que documente le produit ouvre « ports: 46580 »
+    sur l'internet ; lier le port en local et placer devant lui un VPN, une
+    liste d'adresses autorisées ou le proxy authentifiant que la documentation
+    recommande elle-même — « adding a authentication layer (e.g., nginx reverse
+    proxy) ».
+    Armer une authentification dans le produit plutôt que de compter sur
+    l'obscurité du port. Le déploiement Helm pose l'authentification basique
+    sur l'ingress par « --set ingress.authCredentials=$AUTH_STRING », ce qui
+    refuse la requête avant l'application ; sur un déploiement direct,
+    ENABLE_BASIC_AUTH=true ajoute BasicAuthMiddleware à la pile, et
+    SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED=true délègue à oauth2-proxy, seul chemin
+    qui active aussi le RBAC du produit.
+    Savoir ce que cela ne referme pas : /api/health reste servi en anonyme dans
+    les deux cas, BasicAuthMiddleware l'exemptant explicitement — « if
+    request.url.path.startswith('/api/health'): await
+    _try_set_basic_auth_user(request); return await call_next(request) ». Ce
+    n'est pas un défaut, la route sert de sonde d'orchestration ; c'est
+    seulement la raison pour laquelle une instance qui répond ce document n'est
+    pas nécessairement ouverte, et pour laquelle « basic_auth_enabled » est
+    remonté par ce template — false y dit que rien n'a été armé côté serveur.
+    Vérifier la prise en compte sur une route de données, depuis l'extérieur du
+    périmètre et sans identifiant : « curl -s http://<hôte>:46580/users » ne
+    doit plus rendre l'annuaire. Tant qu'il le rend, la frontière n'est pas là
+    où on la croit.
+    Après une exposition, ne pas s'en tenir à l'inventaire : tenir pour lus les
+    journaux d'exécution et les corps de requêtes que /api/status conservait,
+    faire tourner les identifiants cloud que le serveur détient, et relire la
+    file des requêtes pour établir ce qui a été lancé depuis la même adresse —
+    un cluster provisionné par un tiers y figure comme les autres, puisque
+    aucune identité n'était réclamée pour l'y mettre.
+  reference:
+    - https://docs.skypilot.ai/en/latest/reference/api-server/api-server-admin-deploy.html
+    - https://github.com/skypilot-org/skypilot/blob/master/sky/server/server.py
+    - https://github.com/skypilot-org/skypilot/blob/master/sky/server/common.py
+    - https://github.com/skypilot-org/skypilot/blob/master/sky/schemas/api/responses.py
+    - https://github.com/skypilot-org/skypilot/blob/master/sky/server/auth/oauth2_proxy.py
+    - https://github.com/skypilot-org/skypilot/blob/master/sky/server/config.py
+    - https://github.com/skypilot-org/skypilot/blob/master/sky/server/constants.py
+    - https://github.com/skypilot-org/skypilot/blob/master/sky/__init__.py
+    - https://github.com/skypilot-org/skypilot/blob/master/docs/source/reference/api-server/api-server-admin-deploy.rst
+  metadata:
+    max-request: 1
+    vendor: skypilot-org
+    product: skypilot
+    shodan-query: port:46580
+  tags: ai,ml,mlops,gpu,skypilot,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route de description. C'est la moins intrusive
+  # qui établisse le constat : le handler ne consulte pas la requête et ne
+  # touche à rien. Les routes qui en diraient davantage se paieraient trop
+  # cher — GET /users rendrait l'annuaire des comptes de l'exploitant, POST
+  # /status ses clusters, et POST /launch provisionnerait une machine sur ses
+  # comptes cloud. Elles répondent dans les mêmes conditions, mais les
+  # interroger serait exploiter l'absence de garde plutôt que la constater.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/health"
+
+    matchers-condition: and
+    matchers:
+      # L'ouverture du document. « status » est le premier champ que
+      # APIHealthResponse déclare et le seul sans valeur par défaut, donc le
+      # premier que pydantic sérialise, dans toutes les générations — l'exemple
+      # de la documentation l'ouvre déjà ainsi. « healthy » est la valeur que
+      # rend common.ApiServerStatus.HEALTHY ; l'autre issue du handler,
+      # NEEDS_AUTH, dit précisément qu'une authentification est armée.
+      #
+      # L'ancrage sur l'ouverture du corps écarte la même charge utile
+      # retrouvée au fond d'un document composite qu'une supervision
+      # agrégerait sous une clé à elle : c'est lui qui dit que l'instance a
+      # répondu d'elle-même.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"status"\s*:\s*"healthy"'
+
+      # Le trio, et rien d'autre. C'est la signature que le client du produit
+      # retient lui-même — get_api_server_status() dégrade en UNHEALTHY dès que
+      # l'une des trois clés manque, en avertissant que l'hôte « may not be
+      # running SkyPilot API server ».
+      #
+      # Deux d'entre elles portent une forme, et c'est ce qui sépare ce
+      # document d'une sonde de santé quelconque. api_version est écrit en
+      # chaîne alors que c'est un entier — « api_version=str(server_constants
+      # .API_VERSION) » —, et commit est un SHA git complet, éventuellement
+      # suffixé « -dirty » sur une installation de développement, ce que
+      # l'exemple de la documentation montre. La valeur de version n'est
+      # contrainte à rien : une release rend « 0.13.0 », une nightly
+      # « 1.0.0.dev20260901 », un arbre de développement « 1.0.0-dev0 ».
+      #
+      # Rien n'est exigé au-delà. version_on_disk, basic_auth_enabled, user et
+      # latest_version sont bien rendus par une instance 0.13.0, mais absents
+      # de l'exemple que publie la documentation : les exiger manquerait les
+      # instances anciennes.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"api_version"\s*:\s*"[0-9]+"'
+          - '"commit"\s*:\s*"[0-9a-fA-F]{40}'
+          - '"version"\s*:\s*"[^"]'
+
+    extractors:
+      # Quels correctifs manquent au serveur, et de quelle génération d'API il
+      # relève. La version seule ne suffit pas à le dater : les images nightly,
+      # celles que le YAML de déploiement sur VM utilise, portent toutes une
+      # version de la forme 1.0.0.devAAAAMMJJ.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
+
+      - type: json
+        part: body
+        name: api_version
+        json:
+          - '.api_version'
+
+      # Le commit exact du serveur, qui pinne le build là où la version ne le
+      # fait pas.
+      - type: json
+        part: body
+        name: commit
+        json:
+          - '.commit'
+
+      # Ce que le corps dit de sa propre garde. « select(. != null) » plutôt
+      # qu'une alternative jq : false est précisément le cas intéressant — rien
+      # n'a été armé côté serveur — et une alternative l'écarterait, false
+      # étant faux. Le champ est absent des générations qui ne le déclaraient
+      # pas encore, et le select évite alors la ligne vide.
+      - type: json
+        part: body
+        name: basic_auth_enabled
+        json:
+          - '.basic_auth_enabled | select(. != null)'
