@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-67 templates, 64 produits.
+68 templates, 65 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -50,6 +50,7 @@ amont.
 | flowise | [`flowise-unauthenticated-api`](templates/exposure/flowise-unauthenticated-api.yaml) | critical |
 | flyteadmin | [`flyteadmin-api-exposed`](templates/exposure/flyteadmin-api-exposed.yaml) | high |
 | gradio | [`gradio-app-exposed`](templates/exposure/gradio-app-exposed.yaml) | medium |
+| h2o-3 | [`h2o-cluster-status-exposed`](templates/exposure/h2o-cluster-status-exposed.yaml) | high |
 | hayhooks | [`hayhooks-status-exposed`](templates/exposure/hayhooks-status-exposed.yaml) | high |
 | infinity | [`infinity-embedding-server-exposed`](templates/exposure/infinity-embedding-server-exposed.yaml) | medium |
 | invokeai | [`invokeai-runtime-config-exposed`](templates/exposure/invokeai-runtime-config-exposed.yaml) | high |

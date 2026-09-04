@@ -18092,6 +18092,500 @@ def test_opik_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# H2O-3 sert GET /3/Cloud sans identifiant parce que le serveur web n'a monté
+# aucune contrainte : water/init/NetworkInit.java pose « config.loginType =
+# parseLoginType(args) », et parseLoginType sort par « else { return LoginType
+# .NONE; } » dès qu'aucun des cinq drapeaux -hash_login / -ldap_login /
+# -kerberos_login / -spnego_login / -pam_login n'est passé — aucun n'a de valeur
+# par défaut. Jetty9Helper.authWrapper() commence alors par « if (config
+# .loginType == LoginType.NONE) { return jettyServer; } » et rend le serveur
+# avant de construire le « ConstraintSecurityHandler » et de poser « mapping
+# .setPathSpec("/*") ». C'est donc l'API entière qui répond en anonyme, pas
+# seulement cette route ; celle-ci est simplement la moins intrusive qui
+# l'établisse.
+#
+# Trois points commandent la forme du matcher, et ce sont eux que cette section
+# amarre.
+#
+# L'enveloppe d'abord. La sérialisation part de la classe la plus basse :
+# SchemaV3 déclare « public Meta __meta » avant les champs de RequestSchemaV3
+# puis de CloudV3, donc __meta ouvre le document et sa classe Meta y écrit
+# schema_version, schema_name puis schema_type. « schema_name »: "CloudV3" est
+# le couple le plus court qui nomme à la fois le produit et l'endpoint — la
+# route voisine GET /3/About, déclarée dans le même RegisterV3Api, rend la même
+# enveloppe sous un autre nom de schéma.
+#
+# La casse ensuite. H2O n'applique aucune stratégie de renommage : les clés
+# sérialisées sont les noms des champs Java, donc cloud_name et non cloudName.
+# Un matcher écrit en lowerCamelCase ne déclencherait sur rien.
+#
+# Les valeurs exceptionnelles enfin. water/AutoBuffer.java écrit
+# « Double.isNaN(d) ? putJSONStr(JSON_NAN) : putJStr(Double.toString(d)) » avec
+# « JSON_NAN = "NaN" » : gflops et mem_bw peuvent être des chaînes. Le document
+# reste du JSON valide — c'est ce qui autorise des extracteurs json — mais le
+# matcher n'a rien à exiger de leur forme.
+
+H2O_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "h2o-cluster-status-exposed.yaml")
+
+
+def h2o_node(ip_port="10.42.0.11:54321", num_keys=0, gflops=18.42,
+             mem_bw=9700000000.0):
+    """
+    Un élément du tableau `nodes` : le sous-schéma NodeV3, dans l'ordre où
+    CloudV3.NodeV3 déclare ses champs @API, précédé de sa propre enveloppe
+    puisqu'il étend lui aussi SchemaV3.
+    """
+    return {
+        "__meta": {"schema_version": 3, "schema_name": "NodeV3",
+                   "schema_type": "Iced"},
+        "h2o": "/" + ip_port,
+        "ip_port": ip_port,
+        "healthy": True,
+        "last_ping": 1788091200000,
+        "pid": 17,
+        "num_cpus": 32,
+        "cpus_allowed": 32,
+        "nthreads": 32,
+        "sys_load": 0.42,
+        "my_cpu_pct": 3,
+        "sys_cpu_pct": 11,
+        "mem_value_size": 0,
+        "pojo_mem": 123456789,
+        "free_mem": 25769803776,
+        "max_mem": 27487790694,
+        "swap_mem": 0,
+        "num_keys": num_keys,
+        "free_disk": 912680550400,
+        "max_disk": 1000204886016,
+        "rpcs_active": 0,
+        "fjthrds": [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+        "fjqueue": [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+        "tcps_active": 0,
+        "open_fds": 231,
+        "gflops": gflops,
+        "mem_bw": mem_bw,
+    }
+
+
+def h2o_cloud_body(cloud_name="h2o_prod_eu", version="3.46.0.7",
+                   uptime_millis=827431, nodes=None, cloud_size=None,
+                   internal_security_enabled=False, schema_name="CloudV3",
+                   drop=(), indent=None, camel_case=False):
+    """
+    Ce que rend GET /3/Cloud : la CloudV3 sérialisée en partant de la classe la
+    plus basse — l'enveloppe __meta de SchemaV3, puis le _exclude_fields de
+    RequestSchemaV3, puis les champs de CloudV3 dans leur ordre de déclaration.
+
+    `drop` retire une clé comme le ferait une génération qui ne la déclarait pas
+    encore, `indent` réécrit le document comme le ferait un intermédiaire qui
+    réindente ce qu'il relaie, `camel_case` rend les noms en lowerCamelCase —
+    la forme qu'un sérialiseur à stratégie de renommage émettrait, et que celui
+    d'H2O n'émet pas.
+    """
+    if nodes is None:
+        nodes = [h2o_node(), h2o_node(ip_port="10.42.0.12:54321", num_keys=118,
+                                      gflops=17.93)]
+    document = {
+        "__meta": {"schema_version": 3, "schema_name": schema_name,
+                   "schema_type": "Iced"},
+        "_exclude_fields": "",
+        "skip_ticks": False,
+        "version": version,
+        "branch_name": "rel-3.46.0",
+        "last_commit_hash": "1c8b5c4d0a2e7f3b9d61a0c5e8f47b2d3a9c0e11",
+        "describe": "rel-3.46.0/7",
+        "compiled_by": "jenkins",
+        "compiled_on": "2026-05-14 10:31:22",
+        "build_number": "7",
+        "build_age": "3 months",
+        "build_too_old": False,
+        "node_idx": 0,
+        "cloud_name": cloud_name,
+        "cloud_size": len(nodes) if cloud_size is None else cloud_size,
+        "cloud_uptime_millis": uptime_millis,
+        "cloud_internal_timezone": "Etc/UTC",
+        "datafile_parser_timezone": "Etc/UTC",
+        "cloud_healthy": True,
+        "bad_nodes": 0,
+        "consensus": True,
+        "locked": False,
+        "is_client": False,
+        "hadoop_version": None,
+        "telemetry_enabled": False,
+        "nodes": nodes,
+        "internal_security_enabled": internal_security_enabled,
+        "leader_idx": 0,
+        "web_ip": "10.42.0.11",
+    }
+    for key in drop:
+        document.pop(key, None)
+
+    if camel_case:
+        def camel(name):
+            head, *rest = name.split("_")
+            return head + "".join(part.title() for part in rest)
+        document = {key if key.startswith("_") else camel(key): value
+                    for key, value in document.items()}
+        document["nodes"] = [
+            {key if key.startswith("_") else camel(key): value
+             for key, value in node.items()}
+            for node in nodes
+        ]
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    # AutoBuffer écrit compact : il n'y a pas de marshaler « pretty » sur cette
+    # route.
+    return json.dumps(document, separators=(",", ":"))
+
+
+H2O_CLOUD_BODY = h2o_cloud_body()
+
+# Un cluster d'un seul nœud, ce que rend l'instance lancée à la main — le cas le
+# plus courant de celles qui traînent exposées.
+H2O_SINGLE_NODE_BODY = h2o_cloud_body(cloud_size=1, nodes=[h2o_node()])
+
+# Le nœud n'a pas encore passé le benchmark Linpack : putJSON8d écrit alors la
+# chaîne "NaN" plutôt qu'un nombre. Le document reste du JSON valide, et le
+# template doit toujours reconnaître l'instance.
+H2O_NAN_BENCHMARK_BODY = h2o_cloud_body(
+    nodes=[h2o_node(gflops="NaN", mem_bw="NaN")])
+
+# Une instance durcie sur le réseau interne : le constat est l'accès anonyme à
+# la description, pas l'absence de chiffrement qu'elle peut annoncer.
+H2O_INTERNAL_SECURITY_BODY = h2o_cloud_body(internal_security_enabled=True)
+
+# Une génération antérieure : ni build_age, ni build_too_old, ni node_idx, ni
+# les deux fuseaux, ni is_client, ni hadoop_version, ni telemetry_enabled, ni
+# internal_security_enabled. Le template doit toujours la reconnaître.
+H2O_OLD_CLOUD_BODY = h2o_cloud_body(
+    version="3.10.0.6", cloud_name="h2o_legacy", cloud_size=1,
+    nodes=[h2o_node()],
+    drop=("build_age", "build_too_old", "node_idx", "cloud_internal_timezone",
+          "datafile_parser_timezone", "is_client", "hadoop_version",
+          "telemetry_enabled", "internal_security_enabled"),
+)
+
+# La même enveloppe sous l'autre schéma que RegisterV3Api déclare : GET /3/About
+# rend une AboutV3, pas une CloudV3. Le nom du schéma est ce qui sépare les deux.
+H2O_ABOUT_BODY = json.dumps({
+    "__meta": {"schema_version": 3, "schema_name": "AboutV3",
+               "schema_type": "Iced"},
+    "_exclude_fields": "",
+    "entries": [
+        {"__meta": {"schema_version": 3, "schema_name": "AboutEntryV3",
+                    "schema_type": "Iced"},
+         "name": "Build git branch", "value": "rel-3.46.0"},
+        {"__meta": {"schema_version": 3, "schema_name": "AboutEntryV3",
+                    "schema_type": "Iced"},
+         "name": "H2O cluster version", "value": "3.46.0.7"},
+    ],
+}, separators=(",", ":"))
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+H2O_COMPOSITE_BODY = '{"h2o":%s,"checked_at":0}' % H2O_CLOUD_BODY
+
+# Un cluster de calcul quelconque qui décrit lui aussi ses nœuds — une version,
+# une taille, un temps de fonctionnement, des adresses avec leur port. Ce
+# vocabulaire n'appartient à personne.
+OTHER_COMPUTE_CLUSTER_BODY = json.dumps({
+    "version": "2.41.0",
+    "cluster_name": "gpu-prod",
+    "uptime_millis": 827431,
+    "healthy": True,
+    "nodes": [{"ip_port": "10.42.0.11:8265", "num_cpus": 32,
+               "free_mem": 25769803776}],
+}, separators=(",", ":"))
+
+
+def h2o_block():
+    doc = load(H2O_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/3/Cloud" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /3/Cloud — c'est pourtant la route que "
+        "RegisterV3Api déclare sous « cloudStatus », et la moins intrusive qui "
+        "établisse le constat"
+    )
+    return blocks[0]
+
+
+def h2o_fires(body):
+    block = h2o_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_h2o_probe_reads_the_status_route_and_touches_nothing_else():
+    doc = load(H2O_TEMPLATE)
+    routes = sorted(request_routes(doc))
+    assert routes == [("GET", "/3/Cloud")], (
+        "le template n'interroge plus la seule route de description qu'il "
+        f"documente — {routes}"
+    )
+    for _, route in routes:
+        for forbidden, why in (
+            ("/Frames",
+             "GET /3/Frames rendrait les jeux de données chargés en mémoire : "
+             "les lire serait exploiter l'absence de garde, pas la constater"),
+            ("/ImportFiles",
+             "POST /3/ImportFiles ferait lire un chemin du système de fichiers "
+             "au cluster"),
+            ("/Parse", "POST /3/Parse ferait exécuter du travail au cluster"),
+            ("/Rapids",
+             "POST /99/Rapids évalue une expression sur les données de "
+             "l'exploitant"),
+            ("/Models", "les modèles portent le travail de l'exploitant"),
+            ("/CloudLock",
+             "POST /3/CloudLock verrouille le cluster : c'est une écriture sur "
+             "une instance qu'on découvre"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+    assert h2o_block().get("method") == "GET", (
+        "l'état du cluster se lit en GET : le template ne doit rien envoyer à "
+        "une instance qu'il découvre"
+    )
+
+
+def test_h2o_matcher_rests_on_the_cloud_schema_not_on_the_status():
+    block = h2o_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+    assert h2o_fires(H2O_CLOUD_BODY), (
+        "le template ne reconnaît pas la réponse d'un cluster H2O-3 — celle, "
+        "précisément, que CloudHandler.status() rend sans qu'aucune contrainte "
+        "n'ait été montée"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : ce chemin rend 200 sur toute "
+        "instance vivante, gardée ou non, et n'importe quel intermédiaire qui "
+        "le servirait en rendrait un — c'est la CloudV3 qui porte le constat, "
+        "jamais le code"
+    )
+
+    assert not h2o_fires(H2O_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not h2o_fires(h2o_cloud_body(drop=("__meta",))), (
+        "le template conclut sur un document qui ne s'ouvre plus sur "
+        "« __meta » : c'est le champ que SchemaV3 déclare, donc le premier "
+        "sérialisé, avant ceux de RequestSchemaV3 et de CloudV3"
+    )
+    assert not h2o_fires(H2O_ABOUT_BODY), (
+        "le template déclenche sur la réponse de GET /3/About, l'autre route "
+        "de description que RegisterV3Api déclare : le matcher ne nomme plus "
+        "l'endpoint, seulement le produit"
+    )
+    assert not h2o_fires(h2o_cloud_body(schema_name="AboutV3")), (
+        "le template accepte n'importe quel nom de schéma dans l'enveloppe : "
+        "c'est « CloudV3 » qui dit de quelle route vient le document"
+    )
+
+
+def test_h2o_matcher_reads_the_field_names_the_serialiser_emits():
+    """
+    H2O n'applique aucune stratégie de renommage : les clés sont les noms des
+    champs @API déclarés dans CloudV3.java et son sous-schéma NodeV3. Le point
+    se vérifie plutôt qu'il ne se devine.
+    """
+    assert h2o_fires(H2O_CLOUD_BODY), (
+        "le template ne reconnaît pas les noms que CloudV3 déclare"
+    )
+    assert not h2o_fires(h2o_cloud_body(camel_case=True)), (
+        "le template accepte la forme lowerCamelCase — cloudName, ipPort — "
+        "qu'aucun sérialiseur de ce produit n'émet : la casse n'est plus tenue "
+        "à ce que la source dit, et le prochain qui la retournerait ne serait "
+        "plus arrêté"
+    )
+
+    for matcher in (h2o_block().get("matchers") or []):
+        for needle in (matcher.get("regex") or []) + (matcher.get("words") or []):
+            for camel_name in ("cloudName", "cloudUptimeMillis", "ipPort",
+                               "cloudSize", "internalSecurityEnabled"):
+                assert camel_name not in needle, (
+                    f"le matcher porte « {camel_name} » : H2O sérialise les "
+                    "noms des champs Java tels quels, donc cloud_name"
+                )
+
+
+def test_h2o_conclusion_needs_the_cluster_and_its_nodes():
+    assert not h2o_fires(h2o_cloud_body(drop=("cloud_name",))), (
+        "le template conclut sans « cloud_name » : c'est le nom que le cluster "
+        "se donne, et la valeur qu'un nœud doit connaître pour le rejoindre"
+    )
+    assert not h2o_fires(h2o_cloud_body(drop=("cloud_uptime_millis",))), (
+        "le template conclut sans « cloud_uptime_millis » : c'est avec "
+        "cloud_name le couple qui appartient à H2O"
+    )
+    assert not h2o_fires(h2o_cloud_body(nodes=[])), (
+        "le template conclut sur un document sans aucun nœud : c'est "
+        "l'inventaire des adresses qui fait la divulgation, et CloudHandler "
+        "remplit toujours ce tableau, ne serait-ce que du nœud qui répond"
+    )
+    assert not h2o_fires(OTHER_COMPUTE_CLUSTER_BODY), (
+        "le template déclenche sur un cluster de calcul quelconque qui décrit "
+        "ses nœuds : « nodes », « ip_port », « num_cpus » et une durée de "
+        "fonctionnement sont des clés banales hors de l'enveloppe CloudV3"
+    )
+
+    # Collisions internes au pack et au voisinage : ces corps décrivent eux aussi
+    # une pile de calcul, et deux templates ne doivent pas revendiquer la même
+    # instance.
+    for other_body, what in (
+        (TGI_INFO_BODY, "le /info du routeur TGI"),
+        (ACTUATOR_INFO_BODY, "un /info sans rapport avec le calcul distribué"),
+        (COMFYUI_SYSTEM_STATS_BODY, "le /system_stats de ComfyUI"),
+        (ZENML_INFO_BODY, "le /api/v1/info de ZenML"),
+        (DETERMINED_MASTER_BODY, "le /api/v1/master de Determined"),
+    ):
+        assert not h2o_fires(other_body), (
+            f"le template déclenche sur {what}, déjà couvert par ailleurs"
+        )
+
+
+def test_h2o_matcher_holds_across_versions_and_shapes():
+    assert h2o_fires(H2O_OLD_CLOUD_BODY), (
+        "le template exige un champ que les générations anciennes ne "
+        "déclaraient pas — build_age, node_idx, telemetry_enabled, "
+        "internal_security_enabled — il raterait les instances anciennes, "
+        "celles qui traînent exposées"
+    )
+    assert h2o_fires(H2O_SINGLE_NODE_BODY), (
+        "le template exige plusieurs nœuds : l'instance lancée à la main n'en "
+        "a qu'un, et c'est le cas le plus courant"
+    )
+    assert h2o_fires(H2O_NAN_BENCHMARK_BODY), (
+        "le template contraint la valeur de « gflops » : putJSON8d écrit la "
+        "chaîne \"NaN\" tant que le benchmark Linpack n'a pas tourné, et "
+        "l'instance serait manquée"
+    )
+    assert h2o_fires(H2O_INTERNAL_SECURITY_BODY), (
+        "le template manque l'instance dont le réseau interne est chiffré : le "
+        "constat est l'accès anonyme à la description, pas l'absence de "
+        "chiffrement qu'elle peut annoncer"
+    )
+    assert h2o_fires(h2o_cloud_body(version="3.47.0.99999")), (
+        "le template dépend de la version d'une instance particulière"
+    )
+    assert h2o_fires(h2o_cloud_body(nodes=[h2o_node(ip_port="127.0.0.1:54323")])), (
+        "le template dépend de l'adresse ou du port d'un déploiement "
+        "particulier : -port et -baseport déplacent le second"
+    )
+    assert h2o_fires(h2o_cloud_body(indent=4)), (
+        "le template exige la sérialisation compacte d'AutoBuffer : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+
+def test_h2o_extractors_report_what_the_anonymous_caller_obtains():
+    block = h2o_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON — AutoBuffer écrit même NaN en "
+            "chaîne, donc le document reste analysable — et un extracteur "
+            f"regex n'a pas à s'en charger : {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "version": ['.version'],
+        "cloud_name": ['.cloud_name'],
+        "cloud_size": ['.cloud_size'],
+        "node": ['.nodes[].ip_port'],
+        "internal_security_enabled": ['.internal_security_enabled | select(. != null)'],
+    }, (
+        "les cinq renseignements du constat ne sont pas remontés tels "
+        f"quels — {found}. .version dit quels correctifs manquent au cluster, "
+        ".cloud_name le nomme — c'est aussi la valeur qu'un nœud doit "
+        "connaître pour le rejoindre —, .cloud_size dit combien de machines le "
+        "composent, .nodes[].ip_port livre leurs adresses internes une par "
+        "une, et .internal_security_enabled dit si elles se parlent en clair — "
+        "« select(. != null) » plutôt qu'une alternative jq, qui écarterait "
+        "false, précisément le cas intéressant"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_h2o_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni le chemin des
+    extracteurs, et `body_matcher_hits` réévalue les motifs avec le module `re`
+    de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur ferme la
+    boucle.
+    """
+    def scan(body):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/3/Cloud":
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", H2O_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=60,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} == {
+            "h2o-cluster-status-exposed"}, r.stdout + r.stderr
+        return [value for item in results
+                for value in (item.get("extracted-results") or [])]
+
+    assert sorted(scan(H2O_CLOUD_BODY)) == sorted([
+        "3.46.0.7", "h2o_prod_eu", "2", "10.42.0.11:54321", "10.42.0.12:54321",
+        "false",
+    ]), "le scan ne remonte pas les renseignements du constat, nœud par nœud"
+
+    assert sorted(scan(H2O_OLD_CLOUD_BODY)) == sorted([
+        "3.10.0.6", "h2o_legacy", "1", "10.42.0.11:54321",
+    ]), (
+        "l'extracteur de chiffrement interne remonte une ligne vide sur une "
+        "instance antérieure à l'apparition du champ — c'est « select(. != "
+        "null) » qui l'évite, et une ligne vide se lirait comme un "
+        "renseignement"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

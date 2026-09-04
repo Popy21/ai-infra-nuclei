@@ -1,0 +1,253 @@
+id: h2o-cluster-status-exposed
+
+info:
+  name: H2O-3 - Unauthenticated Cluster Status Exposure
+  author: popy21
+  severity: high
+  description: |
+    H2O-3 (h2oai/h2o-3) est la plateforme d'AutoML et d'entraînement distribué
+    de H2O.ai : un cluster de JVM qui se découvrent entre elles, partagent un
+    espace de clés distribué et entraînent des modèles sur des jeux de données
+    chargés en mémoire. Chaque nœud embarque un serveur web qui sert l'interface
+    Flow et l'API REST, sur le port que water/H2O.java nomme
+    « public static final int H2O_DEFAULT_PORT = 54321 » et que OptArgs reprend
+    en « public int baseport = H2O_DEFAULT_PORT » quand -port n'est pas passé.
+    GET /3/Cloud est déclarée par le registre des routes lui-même :
+    h2o-core/src/main/java/water/api/RegisterV3Api.java porte « context
+    .registerEndpoint("cloudStatus", "GET /3/Cloud", CloudHandler.class,
+    "status", "Determine the status of the nodes in the H2O cloud."); », aux
+    côtés de « GET /3/About » que sert AboutHandler.
+    L'absence d'authentification est le défaut de la distribution, et elle se
+    lit en deux endroits. water/init/NetworkInit.java construit la
+    configuration du serveur web — « final H2OHttpConfig config = new
+    H2OHttpConfig(); ... config.loginType = parseLoginType(args); » — et
+    parseLoginType n'a de branche que pour les drapeaux explicites :
+    « if (args.hash_login) ... else if (args.ldap_login) ... else if
+    (args.kerberos_login) ... else if (args.spnego_login) ... else if
+    (args.pam_login) ... else { return LoginType.NONE; } ». Aucun de ces cinq
+    drapeaux n'a de valeur par défaut : une instance lancée sans eux vaut
+    LoginType.NONE.
+    Côté serveur, h2o-jetty-9/src/main/java/water/webserver/jetty9
+    /Jetty9Helper.java commence son authWrapper() par « if (config.loginType ==
+    LoginType.NONE) { return jettyServer; } » et rend le serveur tel quel. Ce
+    n'est qu'après cette sortie que le fichier construit « final
+    ConstraintSecurityHandler security = new ConstraintSecurityHandler(); » et
+    pose « mapping.setPathSpec("/*"); // Lock down all API calls ». La
+    conséquence dépasse cette route : sans drapeau de connexion, aucune
+    contrainte n'est montée, donc c'est l'API REST entière — et l'interface
+    Flow avec elle — qui répond sans identifiant, pas seulement /3/Cloud.
+    Le produit assume ce modèle de menace. h2o-docs/src/product/security.rst
+    pose que « H2O lives in a secure data center » et que « You trust the person
+    that starts H2O to start it correctly. Enabling H2O security requires
+    specifying the correct security options. » La garde est donc laissée à
+    l'exploitant, et le constat porte sur les instances où elle n'a pas été
+    posée.
+    Ce que rend la route est la CloudV3 de h2o-core/src/main/java/water/api
+    /schemas3/CloudV3.java, sérialisée dans l'ordre de déclaration en partant de
+    la classe la plus basse : SchemaV3 déclare « public Meta __meta », dont la
+    classe Meta porte schema_version, schema_name et schema_type, puis
+    RequestSchemaV3 déclare _exclude_fields, puis CloudV3 ses propres champs —
+    version, branch_name, last_commit_hash, describe, compiled_by, compiled_on,
+    build_number, build_age, build_too_old, node_idx, cloud_name, cloud_size,
+    cloud_uptime_millis, cloud_internal_timezone, datafile_parser_timezone,
+    cloud_healthy, bad_nodes, consensus, locked, is_client, hadoop_version,
+    telemetry_enabled, nodes, internal_security_enabled, leader_idx et web_ip.
+    Le sous-schéma NodeV3 décrit chaque nœud : h2o, ip_port, healthy, last_ping,
+    pid, num_cpus, cpus_allowed, nthreads, sys_load, my_cpu_pct, sys_cpu_pct,
+    mem_value_size, pojo_mem, free_mem, max_mem, swap_mem, num_keys, free_disk,
+    max_disk, rpcs_active, fjthrds, fjqueue, tcps_active, open_fds, gflops et
+    mem_bw. Les noms sérialisés sont ceux déclarés dans le Java : H2O n'applique
+    aucune stratégie de renommage, et water/AutoBuffer.java écrit les clés
+    telles quelles.
+    Deux propriétés de ce sérialiseur commandent la forme du matcher.
+    L'enveloppe __meta ouvre le document et se nomme : schema_name vaut
+    « CloudV3 » pour cette route, et c'est le couple le plus court qui dise à la
+    fois le produit et l'endpoint. Et le document reste du JSON valide quelle
+    que soit la machine : putJSON8d et putJSON4f écrivent les valeurs
+    exceptionnelles en chaînes — « Double.isNaN(d) ? putJSONStr(JSON_NAN) : ...
+    » avec « static final String JSON_NAN = "NaN" » — donc gflops et mem_bw
+    peuvent valoir "NaN" sans casser la lecture, et le matcher n'a rien à
+    exiger de leur valeur.
+    Le constat porte sur le corps, jamais sur le statut : ce chemin rend 200 sur
+    toute instance vivante, gardée ou non, et n'importe quel intermédiaire qui
+    le servirait en rendrait un.
+  impact: |
+    Un appelant anonyme obtient la carte complète du cluster de calcul en une
+    seule lecture. « cloud_name » est le nom que l'exploitant a donné à son
+    cluster — c'est aussi la valeur qu'un nœud doit connaître pour rejoindre le
+    groupe — « cloud_size » dit combien de machines le composent, et le tableau
+    « nodes » les énumère une par une : « ip_port » livre l'adresse et le port
+    de chacune, donc des cibles internes que rien d'autre n'aurait nommées, et
+    « h2o » la même adresse telle que la JVM la voit.
+    Le même document dimensionne le matériel et l'activité. « num_cpus »,
+    « cpus_allowed », « nthreads », « gflops » et « mem_bw » décrivent la
+    puissance de chaque nœud, « max_mem » et « free_mem » la mémoire disponible,
+    « free_disk » et « max_disk » le stockage, « num_keys » le nombre de clés
+    distribuées détenues localement — donc si des données sont chargées — et
+    « cloud_uptime_millis » depuis combien de temps le cluster tourne, ce qui
+    dit s'il s'agit d'un service permanent ou d'une session oubliée.
+    « version », « branch_name », « build_number » et « build_age » disent
+    exactement quels correctifs manquent, et « internal_security_enabled » si
+    les communications entre nœuds sont chiffrées.
+    La sévérité ne tient pourtant pas à ce renseignement seul, mais à ce que sa
+    lecture anonyme démontre. Jetty9Helper sort d'authWrapper() avant de monter
+    la moindre contrainte quand loginType vaut NONE : la réponse de cette route
+    établit donc que l'API entière est joignable dans les mêmes conditions —
+    POST /3/ImportFiles pour faire lire un chemin du système de fichiers au
+    cluster, POST /3/Parse et les routes de modélisation pour y exécuter du
+    travail, GET /3/Frames pour lire les jeux de données chargés en mémoire,
+    et le POST /99/Rapids qui évalue des expressions sur ces données. « locked »
+    dit par ailleurs si le cluster accepte encore de nouveaux membres, c'est-à-
+    dire s'il est encore possible de le rejoindre.
+    Rien de tout cela n'est attribué : la requête ne porte aucune identité,
+    puisque le serveur n'en réclame aucune.
+  remediation: |
+    Poser une authentification au démarrage, ce qui est le seul moyen de faire
+    monter la contrainte : passer l'un des drapeaux que parseLoginType
+    reconnaît — -hash_login, -ldap_login, -kerberos_login, -spnego_login ou
+    -pam_login — avec le fichier -login_conf correspondant. Tant qu'aucun n'est
+    passé, loginType vaut LoginType.NONE et authWrapper() rend le serveur sans
+    ConstraintSecurityHandler : il n'existe pas de réglage qui referme la seule
+    route /3/Cloud.
+    Ne pas publier le port du cluster sur une interface non maîtrisée. Lier
+    l'instance à une adresse interne — l'option -ip, ou « 127.0.0.1:54321:54321 »
+    côté conteneur quand elle doit rester locale — et placer l'accès distant
+    derrière un VPN, un proxy authentifiant ou une liste d'adresses autorisées.
+    C'est ce que le modèle de menace du produit suppose déjà : security.rst
+    écrit que « H2O lives in a secure data center ».
+    Activer le chiffrement interne quand les nœuds communiquent hors d'un
+    réseau de confiance — « internal_security_enabled » dit précisément à
+    l'appelant anonyme si c'est le cas — et tenir la version à jour, puisque
+    « version » et « build_age » sont publiés à quiconque atteint le port.
+    Vérifier la prise en compte sur la route elle-même, depuis l'extérieur du
+    périmètre et sans identifiant : « curl -s http://<hote>:54321/3/Cloud » ne
+    doit plus rendre le document. Tant qu'il le rend, la frontière n'est pas là
+    où on la croit — et le reste de l'API répond dans les mêmes conditions.
+    Après une exposition, tenir pour lues l'adresse de chaque nœud, la taille du
+    cluster et sa version, mais ne pas s'arrêter là : puisque l'API entière
+    était ouverte, relire les journaux du cluster pour établir quels jeux de
+    données ont été listés, quels fichiers ont été importés et quelles
+    expressions ont été évaluées depuis la même adresse. Un cluster dont la
+    garde manquait doit être redémarré avec une authentification avant de
+    recharger la moindre donnée.
+  reference:
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-core/src/main/java/water/api/RegisterV3Api.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-core/src/main/java/water/api/schemas3/CloudV3.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-core/src/main/java/water/api/schemas3/SchemaV3.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-core/src/main/java/water/api/schemas3/RequestSchemaV3.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-core/src/main/java/water/init/NetworkInit.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-jetty-9/src/main/java/water/webserver/jetty9/Jetty9Helper.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-core/src/main/java/water/H2O.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-core/src/main/java/water/AutoBuffer.java
+    - https://github.com/h2oai/h2o-3/blob/master/h2o-docs/src/product/security.rst
+  metadata:
+    max-request: 1
+    vendor: h2oai
+    product: h2o-3
+    shodan-query: http.title:"H2O Flow"
+  tags: ai,ml,mlops,automl,h2o,h2o-3,h2oai,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route de description que le registre déclare.
+  # CloudHandler.status() recopie l'état que les nœuds s'échangent déjà par
+  # battements de cœur : il ne touche ni aux clés distribuées, ni aux frames, ni
+  # aux modèles. Les routes qui en diraient davantage se paieraient trop cher —
+  # GET /3/Frames rendrait les jeux de données de l'exploitant, POST
+  # /3/ImportFiles ferait lire un chemin au cluster, POST /99/Rapids y
+  # exécuterait une expression. Elles répondent dans les mêmes conditions,
+  # puisque authWrapper() n'a monté aucune contrainte, mais les interroger
+  # serait exploiter l'absence de garde plutôt que la constater.
+  - method: GET
+    path:
+      - "{{BaseURL}}/3/Cloud"
+
+    matchers-condition: and
+    matchers:
+      # L'ancrage, et ce qui nomme d'un coup le produit et l'endpoint. La
+      # sérialisation part de la classe la plus basse : SchemaV3 déclare
+      # « public Meta __meta » avant tout ce que RequestSchemaV3 et CloudV3
+      # ajoutent, donc l'enveloppe ouvre le document, et la classe Meta y écrit
+      # schema_version, schema_name puis schema_type dans cet ordre.
+      #
+      # L'ancrage sur l'ouverture du corps écarte la même charge utile
+      # retrouvée au fond d'un document composite qu'une supervision agrégerait
+      # sous une clé à elle : c'est lui qui dit que l'instance a répondu
+      # d'elle-même. Le « [^}]* » traverse ce qui précède schema_name sans
+      # sortir de l'objet Meta, qui est plat.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"__meta"\s*:\s*\{[^}]*"schema_name"\s*:\s*"CloudV3"'
+
+      # Le couple qui appartient à H2O, et rien qu'à lui : le nom que le cluster
+      # se donne — celui-là même qu'un nœud doit connaître pour le rejoindre —
+      # et son temps de fonctionnement en millisecondes. « cloud_uptime_millis »
+      # est un long, donc putJSON8 l'écrit en entier nu ; sa valeur n'est
+      # contrainte à rien d'autre.
+      #
+      # Les noms sont ceux déclarés dans le Java : H2O n'applique aucune
+      # stratégie de renommage, et un matcher écrit en lowerCamelCase ne
+      # déclencherait sur rien.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"cloud_name"\s*:\s*"'
+          - '"cloud_uptime_millis"\s*:\s*[0-9]+'
+
+      # L'inventaire des nœuds, c'est-à-dire ce que la divulgation a de plus
+      # concret. Le tableau n'est jamais vide : CloudHandler le remplit depuis
+      # les membres du cloud, dont celui qui répond. « ip_port » est documenté
+      # « IP address and port in the form a.b.c.d:e », d'où la forme exigée.
+      #
+      # « gflops » n'est cherché que comme clé. C'est un double, et putJSON8d
+      # écrit « Double.isNaN(d) ? putJSONStr(JSON_NAN) : ... » — donc la valeur
+      # peut être le nombre du benchmark Linpack comme la chaîne "NaN" sur un
+      # nœud qui ne l'a pas encore mesuré. Contraindre sa forme ferait manquer
+      # l'un des deux cas.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"ip_port"\s*:\s*"[^"]+:[0-9]{1,5}"'
+          - '"gflops"\s*:'
+
+    extractors:
+      # Quels correctifs manquent au cluster, puisque la route les publie.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
+
+      # Le nom que l'exploitant a donné à son cluster — et la valeur qu'un nœud
+      # doit connaître pour le rejoindre.
+      - type: json
+        part: body
+        name: cloud_name
+        json:
+          - '.cloud_name'
+
+      # Combien de machines le composent.
+      - type: json
+        part: body
+        name: cloud_size
+        json:
+          - '.cloud_size'
+
+      # Les nœuds eux-mêmes, par leur adresse et leur port : ce sont des cibles
+      # internes que rien d'autre n'aurait nommées.
+      - type: json
+        part: body
+        name: node
+        json:
+          - '.nodes[].ip_port'
+
+      # Si les communications entre nœuds sont chiffrées. « select(. != null) »
+      # plutôt qu'une alternative jq : « false » est précisément le cas
+      # intéressant, et une alternative l'écarterait puisqu'il est faux.
+      - type: json
+        part: body
+        name: internal_security_enabled
+        json:
+          - '.internal_security_enabled | select(. != null)'
