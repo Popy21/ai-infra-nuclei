@@ -1,0 +1,255 @@
+id: openvino-model-server-exposed
+
+info:
+  name: OpenVINO Model Server - Unauthenticated KServe V2 Server Metadata Exposure
+  author: popy21
+  severity: high
+  description: |
+    OpenVINO Model Server (openvinotoolkit/model_server) est le serveur
+    d'inférence d'Intel, distribué par l'image openvino/model_server et déployé
+    aussi bien en périphérie qu'en centre de données. Il sert le protocole V2 de
+    KServe sur son port REST, et l'absence d'authentification n'y est pas un
+    réglage oublié : c'est le modèle du produit, écrit dans sa propre
+    documentation. docs/security_considerations.md pose que « OpenVINO Model
+    Server currently does not provide access restrictions and traffic encryption
+    on gRPC and REST API endpoints », d'où la recommandation qui suit — « The
+    recommended configuration is to place OpenVINO Model Server behind any
+    reverse proxy component or load balancer, which provides traffic encryption
+    and user authorization ».
+    La seule vérification de clé que porte le code ne change rien à ce constat,
+    et pour deux raisons cumulées. Sa portée d'abord : isAuthorized()
+    (src/http_rest_api_handler.cpp) n'est appelée que depuis processV3(), sous
+    « if (!this->apiKey.empty()) », donc elle ne couvre que les endpoints
+    génératifs /v3 — aucune route /v2 ni /v1 ne la traverse. Son défaut ensuite :
+    src/cli_parser.cpp déclare « api_key_file » avec
+    default_value("") et la décrit comme « path to the text file containing API
+    key for authentication for generative endpoints. If not set, authentication
+    is disabled. », ce que la documentation reprend — « If parameter api_key_file
+    and variable API_KEY are not set, the server will not require any
+    authorization ». Une instance qui n'a rien configuré laisse donc apiKey vide,
+    et la branche entière est inerte.
+    GET /v2 est la route de métadonnées serveur du protocole, documentée dans
+    docs/model_server_rest_api_kfs.md sous « Server Metadata API » :
+    « GET http://${REST_URL}:${REST_PORT}/v2 ». Le routeur la reconnaît par
+    « kfs_servermetadataRegexExp = R"(/v2)" » et la dispatche vers
+    processServerMetadataKFSRequest, qui appelle
+    « kfsGrpcImpl.ServerMetadataImpl(nullptr, &grpc_request, &grpc_response) »
+    puis sérialise le message avec
+    « MessageToJsonString(grpc_response, &output, opts) ». Le handler lui-même
+    (src/kfs_frontend/kfs_grpc_inference_service.cpp) tient en deux affectations
+    inconditionnelles — « response->set_name(PROJECT_NAME);
+    response->set_version(PROJECT_VERSION); » — et src/version.hpp porte
+    « #define PROJECT_NAME "OpenVINO Model Server" ». La littérale n'est donc
+    jamais recalculée depuis une bannière, un drapeau ou un fichier de
+    configuration : c'est une constante de compilation, et c'est elle qui
+    identifie le produit.
+    Deux propriétés de ce sérialiseur commandent la forme du matcher.
+    L'ordre d'abord : la sérialisation JSON de protobuf suit les numéros de
+    champ, et src/kfserving_api/grpc_predict_v2.proto déclare
+    ServerMetadataResponse avec « string name = 1; string version = 2; repeated
+    string extensions = 3; » — « name » ouvre donc le document et « version » le
+    suit immédiatement. L'omission ensuite : opts est un JsonPrintOptions
+    construit par défaut, et ServerMetadataImpl ne touche jamais extensions ;
+    une liste répétée vide n'est pas écrite sous ces options. L'exemple de la
+    documentation, daté de 2022, montre encore « "extensions": [] », mais un
+    binaire courant rend « {"name":"OpenVINO Model Server","version":"..."} » et
+    rien d'autre. Le matcher n'exige donc ni la présence de la clé ni son
+    absence.
+    Cette littérale est aussi ce qui sépare l'instance des deux autres serveurs
+    KServe V2 déjà couverts par le pack, qui répondent sur exactement la même
+    route : le /v2 de MLServer rend « "name":"mlserver" », celui de Triton
+    « "name":"triton" » par défaut. « name », « version » et « extensions » sont
+    le vocabulaire du protocole, pas la signature d'un produit — seule la valeur
+    l'est.
+    Le défaut de liaison va dans le même sens que l'absence de garde :
+    src/cli_parser.cpp donne à « rest_bind_address » le default_value("0.0.0.0").
+    Le port REST, lui, n'est pas ouvert tant qu'il n'est pas demandé — rest_port
+    vaut 0 par défaut — mais chaque exemple de docs/starting_server.md le
+    demande, et publie le conteneur avec : « -p 9000:9000 -p 8000:8000 » puis
+    « --port 9000 --rest_port 8000 » pour les modèles classiques, les deux
+    numéros échangés pour les exemples génératifs. Enfin, rien dans les en-têtes
+    ne nommera le produit : src/drogon_http_server.cpp appelle explicitement
+    « .enableServerHeader(false) », donc l'identification ne peut venir que du
+    corps.
+  impact: |
+    La réponse date l'instance au correctif près — PROJECT_VERSION est le numéro
+    de publication exact du binaire, du type « 2022.2.0.fd742507 », donc quels
+    correctifs manquent — mais son vrai apport est ailleurs : c'est le même
+    routeur nu qui sert tout le reste, et une réponse anonyme sur /v2 établit
+    qu'aucun proxy n'authentifie le préfixe.
+    Le plan de données KServe répond dans les mêmes conditions. GET
+    /v2/models/${MODEL_NAME} rend les métadonnées du modèle — ses tenseurs
+    d'entrée et de sortie, leur forme et leur datatype — GET
+    /v2/models/${MODEL_NAME}/ready son état, et POST
+    /v2/models/${MODEL_NAME}/infer fait tourner le modèle sur le matériel de
+    l'exploitant, CPU, GPU ou NPU, pour quiconque en connaît le nom et sans
+    compte à débiter.
+    L'API de gestion, elle, ne demande même pas de connaître ce nom. GET
+    /v1/config est dispatchée vers processConfigStatusRequest, qui appelle
+    « GetModelStatusImpl::getAllModelsStatuses » : elle énumère tous les modèles
+    servis avec leurs versions et leur état. Le nom d'un modèle dit en général le
+    produit ou le client pour lequel il a été entraîné, et il désigne du même
+    coup une route /infer appelable. Pire, POST /v1/config/reload est routée vers
+    processConfigReloadRequest, qui appelle « manager.loadConfig() » : une requête
+    anonyme fait relire au serveur son fichier de configuration et recharger ses
+    modèles, ce qui est un déni de service pour qui en dépend. Aucune de ces deux
+    routes ne passe par isAuthorized(), qui n'est appelée que dans processV3().
+    Les endpoints génératifs /v3 — la partie du serveur qui héberge les grands
+    modèles de langage — sont les seuls que la clé d'API puisse fermer, et ils
+    restent ouverts tant qu'api_key_file et API_KEY ne sont pas posés, ce qui est
+    le défaut. Rien de tout cela n'est attribué : la requête ne porte aucune
+    identité, puisque le serveur n'en réclame aucune, et le serveur ne se nomme
+    pas non plus dans ses en-têtes.
+  remediation: |
+    Il n'existe pas de réglage qui ferme /v2. La clé d'API — api_key_file ou la
+    variable API_KEY — ne couvre que les endpoints génératifs /v3, parce que
+    isAuthorized() n'est appelée que depuis processV3() ; l'activer laisse le
+    plan de données KServe et l'API de gestion /v1 ouverts. La fermeture est
+    entièrement réseau, et c'est ce que le produit demande lui-même :
+    docs/security_considerations.md recommande de placer le serveur « behind any
+    reverse proxy component or load balancer, which provides traffic encryption
+    and user authorization ».
+    Quand l'instance n'a pas besoin d'être atteinte depuis l'extérieur de la
+    machine ou du pod, la lier explicitement : « --rest_bind_address
+    127.0.0.1,::1 --grpc_bind_address 127.0.0.1,::1 », ce que la documentation
+    donne comme configuration de développement. Le défaut, "0.0.0.0", ne le fait
+    pas à sa place, et « -p 8000:8000 » côté conteneur publie le port sur toutes
+    les interfaces de l'hôte — « -p 127.0.0.1:8000:8000 » quand il doit rester
+    local.
+    Quand elle doit être atteinte, authentifier le préfixe entier au niveau du
+    proxy, pas seulement /v2 : /v2/models/*/infer, /v1/config et surtout POST
+    /v1/config/reload répondent au même routeur nu. Ne pas démarrer le serveur
+    REST du tout — rest_port vaut 0 par défaut — quand seul le gRPC est utilisé.
+    Vérifier la prise en compte sur la route elle-même, depuis l'extérieur du
+    périmètre et sans identifiant : « curl -s http://<hote>:8000/v2 » ne doit
+    plus rendre le document.
+    Après une exposition, tenir la version du serveur pour lue et l'inventaire
+    de /v1/config pour connu — donc chaque nom de modèle servi — puis vérifier
+    dans les journaux du serveur si /v1/config/reload a été appelée et si des
+    requêtes d'inférence sont parties d'une adresse inattendue. Aucune trace ne
+    portera d'identité d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/docs/model_server_rest_api_kfs.md
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/docs/security_considerations.md
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/docs/starting_server.md
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/src/http_rest_api_handler.cpp
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/src/kfs_frontend/kfs_grpc_inference_service.cpp
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/src/version.hpp
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/src/cli_parser.cpp
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/src/http_server.cpp
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/src/drogon_http_server.cpp
+    - https://github.com/openvinotoolkit/model_server/blob/releases/2025/4/src/kfserving_api/grpc_predict_v2.proto
+  metadata:
+    max-request: 2
+    vendor: openvinotoolkit
+    product: openvino-model-server
+  tags: ai,ml,openvino,model-server,intel,kserve,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit et porte le constat, la seconde
+  # dit que le service est réellement en état de servir.
+  #
+  # GET /v2 est la route de métadonnées serveur du protocole. Son handler ne
+  # consulte ni la requête, ni le registre de modèles, ni le système de
+  # fichiers : ServerMetadataImpl recopie deux constantes de compilation et
+  # rend. C'est la lecture la moins chère qui identifie l'instance.
+  #
+  # GET /v2/health/ready est la sonde de disponibilité, documentée au même
+  # endroit. processServerReadyKFSRequest n'écrit rien dans la réponse et rend
+  # OK ou MODEL_NOT_LOADED ; src/http_server.cpp ne fabrique un objet d'erreur
+  # que sous « if (!status.ok() && output.empty()) », donc une instance prête
+  # répond 200 avec un corps vide. Son 200 sépare le serveur qui sert de celui
+  # qui démarre ou dont aucun modèle n'a chargé, et son corps vide écarte le
+  # portail captif qui répond 200 et sa page à tout ce qu'on lui demande.
+  #
+  # GET, et rien d'autre : parseRequestComponents rend REST_UNSUPPORTED_METHOD
+  # sur POST /v2 comme sur POST /v2/health/ready.
+  #
+  # En lecture seule, et strictement : le même routeur nu sert POST
+  # /v2/models/{nom}/infer, qui ferait tourner le modèle sur le matériel de
+  # l'exploitant, GET /v1/config, qui énumérerait ses modèles, et surtout POST
+  # /v1/config/reload, qui lui ferait relire sa configuration et recharger ses
+  # modèles. Signaler une exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v2"
+      - "{{BaseURL}}/v2/health/ready"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, chacune conclurait de son côté
+    # — or la sonde ne rend qu'un corps vide, qui n'appartient à personne.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'identification, et elle tient dans une valeur littérale.
+          # PROJECT_NAME est un #define de src/version.hpp, posé sans condition
+          # par ServerMetadataImpl : ni un drapeau de ligne de commande ni un
+          # fichier de configuration ne le change, contrairement au nom que
+          # Triton rend sur la même route et que --id remplace.
+          #
+          # L'adjacence des deux champs suit les numéros du proto — name = 1,
+          # version = 2 — et la sérialisation JSON de protobuf écrit dans cet
+          # ordre. L'ancrage sur l'ouverture du corps écarte la même charge
+          # utile retrouvée au fond d'un document composite qu'une supervision
+          # agrégerait sous une clé à elle : c'est lui qui dit que l'instance a
+          # répondu d'elle-même.
+          #
+          # Le numéro de version est laissé libre : il change à chaque
+          # publication. Les \s* sont là parce que MessageToJsonString écrit
+          # compact sous des JsonPrintOptions par défaut, mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          #
+          # Rien n'est exigé d'« extensions » : ServerMetadataImpl ne pose
+          # jamais ce champ, et une liste répétée vide n'est pas écrite sous les
+          # options par défaut. L'exemple de la documentation, daté de 2022, la
+          # montre encore ; un binaire courant ne la rend pas. Exiger l'un ou
+          # l'autre ferait manquer une moitié du parc.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"name\"\\s*:\\s*\"OpenVINO Model Server\"\\s*,\\s*\"version\"\\s*:\\s*\"[^\"]+\"", trim_space(body_1))'
+
+          # Le document est tenu pour plat, et il l'est par construction :
+          # ServerMetadataResponse n'a que deux chaînes et une liste de chaînes,
+          # dont aucune n'ouvre d'accolade. Aucune paire { } ne doit donc
+          # apparaître à l'intérieur du corps.
+          #
+          # C'est ce qui sépare la réponse du serveur du document d'une
+          # passerelle qui citerait la même littérale en la logeant à côté d'un
+          # objet à elle — l'ancrage de la première expression ne le ferait pas,
+          # puisqu'un tel document peut très bien commencer par les deux mêmes
+          # clés.
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_1))'
+
+          # La sonde a répondu, et elle a répondu comme le produit la sert :
+          # rien. Le contrôle porte sur le vide plutôt que sur une chaîne,
+          # puisqu'il n'y en a aucune à attendre — processServerReadyKFSRequest
+          # ne touche pas à `response`, et le corps n'est rempli d'un objet
+          # d'erreur que lorsque le statut n'est pas OK.
+          #
+          # « {} » est admis à côté du corps vide parce que l'exemple de
+          # docs/model_server_rest_api_kfs.md annonce « Content-Length: 2 » sur
+          # cette route : le serveur HTTP a changé depuis, mais un binaire
+          # ancien — et ce sont ceux-là qu'on trouve oubliés sur un port ouvert
+          # — peut encore rendre ces deux octets. Les deux formes disent la même
+          # chose, et ni l'une ni l'autre n'est une page.
+          #
+          # Le statut est l'autre moitié : la route rend 4xx tant que le serveur
+          # n'est pas prêt. L'exiger sépare « un binaire OVMS est joignable » de
+          # « l'inférence est servie à qui la demande ».
+          - 'status_code_2 == 200 && (trim_space(body_2) == "" || trim_space(body_2) == "{}")'
+
+    extractors:
+      # Le numéro de publication exact du binaire, donc quels correctifs lui
+      # manquent : c'est le seul renseignement que cette route livre au-delà de
+      # la littérale qui l'identifie.
+      #
+      # Un seul extracteur, et borné à body_1 — sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, et la sonde n'a de toute façon rien à
+      # en extraire.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.version'

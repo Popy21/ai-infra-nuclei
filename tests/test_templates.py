@@ -19450,6 +19450,435 @@ def test_swarmui_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# OpenVINO Model Server est le troisième serveur KServe V2 du pack, et les trois
+# répondent sur exactement le même chemin : GET /v2. Le protocole ne distingue
+# donc rien — « name », « version » et « extensions » sont son vocabulaire, pas
+# la signature d'un produit. Seule la valeur du premier champ sépare les trois,
+# et chez OVMS c'est une constante de compilation : src/version.hpp porte
+# « #define PROJECT_NAME "OpenVINO Model Server" », et ServerMetadataImpl
+# l'affecte sans condition — « response->set_name(PROJECT_NAME);
+# response->set_version(PROJECT_VERSION); » — là où le nom de Triton, lui, se
+# change par --id.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette section
+# amarre.
+#
+# La sérialisation d'abord. Le corps n'est pas écrit à la main : le handler REST
+# recopie la réponse gRPC et la passe à « MessageToJsonString(grpc_response,
+# &output, opts) » avec un JsonPrintOptions construit par défaut. L'ordre des
+# clés suit donc les numéros du proto — name = 1, version = 2, extensions = 3 —
+# et « extensions », que ServerMetadataImpl ne pose jamais, n'est pas écrit :
+# une liste répétée vide est omise sous ces options. L'exemple de
+# docs/model_server_rest_api_kfs.md, daté de 2022, la montre pourtant encore. Le
+# template doit reconnaître les deux formes, et n'en exiger aucune.
+#
+# La sonde ensuite. processServerReadyKFSRequest ne touche pas à la réponse, et
+# src/http_server.cpp ne fabrique un objet d'erreur que sous « if (!status.ok()
+# && output.empty()) » : une instance prête rend 200 et un corps vide. Le même
+# document annonce « Content-Length: 2 » sur cette route, d'un serveur HTTP
+# antérieur — les deux octets d'un « {} » — donc les deux formes doivent passer,
+# et rien d'autre : c'est ce contrôle qui écarte le portail captif.
+#
+# L'absence de garde enfin, qui n'a pas à être devinée. isAuthorized()
+# (src/http_rest_api_handler.cpp) n'est appelée que depuis processV3(), et
+# seulement « if (!this->apiKey.empty()) » ; api_key_file vaut "" par défaut.
+# Aucune route /v2 ne la traverse, quelle que soit la configuration.
+
+OPENVINO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "openvino-model-server-exposed.yaml")
+
+OPENVINO_METADATA_ROUTE = "/v2"
+OPENVINO_READY_ROUTE = "/v2/health/ready"
+
+# La littérale de src/version.hpp, et rien d'autre : c'est elle qui identifie le
+# produit, puisque le protocole ne le fait pas.
+OPENVINO_PROJECT_NAME = "OpenVINO Model Server"
+
+# Le numéro que porte l'exemple de la documentation — publication, puis hash du
+# commit de compilation.
+OPENVINO_VERSION = "2022.2.0.fd742507"
+
+
+def openvino_metadata_body(name=OPENVINO_PROJECT_NAME, version=OPENVINO_VERSION,
+                           extensions=None, drop=(), first=None, indent=None):
+    """
+    Ce que rend GET /v2 : le KFSServerMetadataResponse que ServerMetadataImpl
+    remplit, sérialisé par MessageToJsonString sous des JsonPrintOptions par
+    défaut — donc compact, et dans l'ordre des numéros de champ du proto.
+
+    `extensions=None` est le cas courant : le champ n'est jamais posé, et une
+    liste répétée vide n'est pas écrite sous ces options. Lui passer une liste
+    reproduit la forme que montre encore la documentation de 2022.
+
+    `drop` retire une clé, `first` en remonte une autre en tête pour défaire
+    l'ancrage, `indent` réécrit le document comme le ferait un intermédiaire qui
+    réindente ce qu'il relaie.
+    """
+    document = {"name": name, "version": version}
+    if extensions is not None:
+        document["extensions"] = list(extensions)
+    for key in drop:
+        document.pop(key, None)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+OPENVINO_METADATA_BODY = openvino_metadata_body()
+
+# La forme que montre docs/model_server_rest_api_kfs.md : le champ y est écrit,
+# vide. Le template ne doit pas s'appuyer sur son absence.
+OPENVINO_METADATA_WITH_EXTENSIONS_BODY = openvino_metadata_body(extensions=[])
+
+# Le même corps relayé par un intermédiaire qui réindente ce qu'il transporte.
+OPENVINO_METADATA_REFORMATTED_BODY = openvino_metadata_body(indent=2)
+
+# Ce que la sonde rend sur une instance prête : rien. Le second corps est celui
+# qu'annonce le « Content-Length: 2 » de la documentation, servi par un serveur
+# HTTP antérieur.
+OPENVINO_READY_EMPTY_BODY = ""
+OPENVINO_READY_BRACES_BODY = "{}"
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+OPENVINO_COMPOSITE_BODY = '{"ovms":%s,"checked_at":0}' % OPENVINO_METADATA_BODY
+
+# Une passerelle qui republie les métadonnées du serveur qu'elle proxifie : la
+# littérale y figure mot pour mot, en tête, mais logée à côté d'un objet à elle.
+# C'est ce corps qui rend nécessaire de tenir le document pour plat.
+OPENVINO_GATEWAY_QUOTING_BODY = json.dumps(
+    {"name": OPENVINO_PROJECT_NAME, "version": OPENVINO_VERSION,
+     "upstream": {"host": "ovms-0.internal", "port": 8000}},
+    separators=(",", ":"))
+
+# Une page qui cite le produit sans être lui — inventaire, tableau de bord,
+# documentation republiée.
+OPENVINO_INVENTORY_BODY = json.dumps(
+    {"service": "inference", "note": "le produit est OpenVINO Model Server et "
+     "sa version est 2025.4", "name": "inventaire"},
+    separators=(",", ":"))
+
+
+def openvino_block():
+    doc = load(OPENVINO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % OPENVINO_METADATA_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /v2 — c'est pourtant la seule route "
+        "dont la réponse porte PROJECT_NAME, donc la seule qui puisse "
+        "identifier le produit"
+    )
+    return blocks[0]
+
+
+def openvino_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = openvino_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def openvino_fires(metadata=(200, OPENVINO_METADATA_BODY),
+                   ready=(200, OPENVINO_READY_EMPTY_BODY)):
+    scenario = {
+        OPENVINO_METADATA_ROUTE: metadata,
+        OPENVINO_READY_ROUTE: ready,
+    }
+    block = openvino_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in openvino_requests():
+        assert route in scenario, (
+            "le template interroge un chemin qu'OpenVINO Model Server ne sert "
+            f"pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_openvino_probe_reads_the_two_documented_routes_and_touches_nothing_else():
+    """
+    Les deux routes que docs/model_server_rest_api_kfs.md documente en lecture
+    pure, dans l'ordre, et rien de plus. Le même routeur nu sert POST
+    /v2/models/{nom}/infer, GET /v1/config et POST /v1/config/reload — la
+    dernière rappelant « manager.loadConfig() » sur simple requête anonyme.
+    Constater une exposition ne demande d'en toucher aucune.
+    """
+    doc = load(OPENVINO_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", OPENVINO_METADATA_ROUTE),
+        ("GET", OPENVINO_READY_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture "
+        f"documentées — {sorted(request_routes(doc))}"
+    )
+
+    assert openvino_requests() == [
+        ("GET", OPENVINO_METADATA_ROUTE),
+        ("GET", OPENVINO_READY_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {openvino_requests()}"
+    )
+
+    assert openvino_block().get("method") == "GET", (
+        "parseRequestComponents rend REST_UNSUPPORTED_METHOD sur POST /v2 "
+        "comme sur POST /v2/health/ready : toute autre méthode ne mesurerait "
+        "que le refus du routeur"
+    )
+
+    assert openvino_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et la sonde — dont le corps est vide — "
+        "conclurait de son côté"
+    )
+
+
+def test_openvino_matcher_needs_the_product_literal_not_the_kserve_shape():
+    assert openvino_fires(), (
+        "le template ne reconnaît pas la réponse que ServerMetadataImpl "
+        "construit sur une instance ouverte"
+    )
+
+    assert not openvino_fires(metadata=(200, MLSERVER_METADATA_BODY)), (
+        "le template déclenche sur le /v2 de MLServer, qui répond sur la même "
+        "route avec les mêmes clés : le pack le couvre déjà, et deux lignes "
+        "pour une seule instance n'en disent pas plus qu'une"
+    )
+
+    assert not openvino_fires(metadata=(200, TRITON_METADATA_BODY)), (
+        "le template déclenche sur le /v2 de Triton, qui répond sur la même "
+        "route avec les mêmes clés : il a son propre template"
+    )
+
+    assert not openvino_fires(
+        metadata=(200, openvino_metadata_body(name="ovms-prod-01"))), (
+        "le template déclenche sur un serveur KServe quelconque : « name » et "
+        "« version » sont le vocabulaire du protocole, seule la littérale de "
+        "src/version.hpp désigne le produit"
+    )
+
+    assert not openvino_fires(metadata=(200, OPENVINO_COMPOSITE_BODY)), (
+        "le template déclenche sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage sur l'ouverture du corps est "
+        "ce qui dit que l'instance a répondu d'elle-même"
+    )
+
+    assert not openvino_fires(metadata=(200, OPENVINO_GATEWAY_QUOTING_BODY)), (
+        "le template déclenche sur une passerelle qui republie les "
+        "métadonnées du serveur qu'elle proxifie : la littérale y est en tête, "
+        "mais ServerMetadataResponse n'a que deux chaînes et une liste de "
+        "chaînes — aucune paire { } ne peut apparaître à l'intérieur du corps"
+    )
+
+    assert not openvino_fires(metadata=(200, OPENVINO_INVENTORY_BODY)), (
+        "le template déclenche sur une page qui cite le produit sans être lui"
+    )
+
+    assert not openvino_fires(
+        metadata=(200, openvino_metadata_body(drop=("version",)))), (
+        "le template conclut sans le numéro de publication : set_version() est "
+        "posé sans condition à côté de set_name(), et c'est leur adjacence qui "
+        "dit que la réponse est bien celle du handler"
+    )
+
+    assert not openvino_fires(
+        metadata=(200, openvino_metadata_body(first="version"))), (
+        "le template admet un ordre de clés que protobuf n'émet pas : la "
+        "sérialisation JSON suit les numéros de champ, et le proto déclare "
+        "« string name = 1; string version = 2; »"
+    )
+
+
+def test_openvino_matcher_admits_both_serialisations_of_the_metadata():
+    """
+    ServerMetadataImpl ne pose jamais extensions, et MessageToJsonString omet
+    une liste répétée vide sous des options par défaut ; la documentation de
+    2022 montre pourtant encore « "extensions": [] ». Exiger l'une ou l'autre
+    forme ferait manquer une moitié du parc.
+    """
+    assert openvino_fires(metadata=(200, OPENVINO_METADATA_WITH_EXTENSIONS_BODY)), (
+        "le template exige l'absence d'« extensions » : c'est la forme que "
+        "montre docs/model_server_rest_api_kfs.md"
+    )
+
+    assert openvino_fires(
+        metadata=(200, openvino_metadata_body(extensions=["binary_tensor_data"]))), (
+        "le template exige une liste d'extensions vide : rien n'interdit à une "
+        "version future d'en déclarer une"
+    )
+
+    assert openvino_fires(metadata=(200, OPENVINO_METADATA_REFORMATTED_BODY)), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : MessageToJsonString écrit compact, un proxy ne s'y tient pas"
+    )
+
+    assert openvino_fires(
+        metadata=(200, openvino_metadata_body(version="2025.4.0.abcdef01"))), (
+        "le template contraint le numéro de publication : PROJECT_VERSION est "
+        "substitué à la compilation et change à chaque publication"
+    )
+
+    assert not openvino_fires(metadata=(401, OPENVINO_METADATA_BODY)), (
+        "le template conclut sur un corps servi sous un statut de refus — un "
+        "cache peut relayer l'ancienne réponse sous le statut du proxy qui la "
+        "garde désormais"
+    )
+
+
+def test_openvino_readiness_arm_separates_a_live_server_from_a_captive_portal():
+    assert openvino_fires(ready=(200, OPENVINO_READY_BRACES_BODY)), (
+        "le template exige un corps strictement vide sur la sonde : "
+        "docs/model_server_rest_api_kfs.md annonce « Content-Length: 2 » sur "
+        "cette route, et les instances anciennes sont précisément celles qu'on "
+        "trouve oubliées sur un port ouvert"
+    )
+
+    assert not openvino_fires(
+        ready=(200, "<html><body>Connexion requise</body></html>")), (
+        "le template conclut sur un portail captif qui répond 200 et sa page à "
+        "tout ce qu'on lui demande : le corps vide de la sonde est justement "
+        "ce qui l'écarte"
+    )
+
+    assert not openvino_fires(ready=(503, OPENVINO_READY_EMPTY_BODY)), (
+        "le template conclut sur une instance qui n'est pas prête : la sonde "
+        "rend 4xx tant que le serveur ne sert pas, et c'est ce qui sépare « un "
+        "binaire OVMS est joignable » de « l'inférence est servie à qui la "
+        "demande »"
+    )
+
+    assert not openvino_fires(ready=(200, '{"status":"ok"}')), (
+        "le template admet n'importe quel document sur la sonde, alors que "
+        "processServerReadyKFSRequest ne touche pas à la réponse"
+    )
+
+
+def test_openvino_conclusion_is_carried_by_the_dsl_alone():
+    block = openvino_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_openvino_extractor_reports_the_exact_build_version():
+    extractors = openvino_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — la sonde rend un corps vide, "
+        "et seul /v2 porte PROJECT_VERSION"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant le seul "
+        "renseignement que la route livre au-delà de la littérale qui "
+        "l'identifie, et ce qui dit quels correctifs manquent au binaire"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_openvino_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et `dsl_matcher_hits`
+    réévalue le motif en Python plutôt qu'avec le lexer de nuclei : seul un scan
+    contre un vrai serveur ferme la boucle. Le corps vide de la sonde en est
+    l'enjeu propre — c'est le cas qu'une réécriture en Python ne sait pas
+    reproduire fidèlement.
+    """
+    def scan(metadata_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == OPENVINO_METADATA_ROUTE:
+                    payload = metadata_body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                elif self.path == OPENVINO_READY_ROUTE:
+                    # processServerReadyKFSRequest ne touche pas à `response`,
+                    # et src/http_server.cpp ne fabrique un objet d'erreur que
+                    # lorsque le statut n'est pas OK : le corps est vide.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", OPENVINO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "openvino-model-server-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(OPENVINO_METADATA_BODY)
+    assert sorted(set(seen)) == [OPENVINO_METADATA_ROUTE, OPENVINO_READY_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == [OPENVINO_VERSION], (
+        "le scan ne remonte pas le numéro de publication du binaire — "
+        f"{extracted}"
+    )
+
+    _, other = scan(MLSERVER_METADATA_BODY)
+    assert other == [], (
+        "le scan conclut sur le /v2 de MLServer, qui répond sur la même route "
+        "avec les mêmes clés et que le pack couvre déjà"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
