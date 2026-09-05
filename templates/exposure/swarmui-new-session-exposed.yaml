@@ -1,0 +1,252 @@
+id: swarmui-new-session-exposed
+
+info:
+  name: SwarmUI - Unauthenticated Session Issuance (Anonymous Owner Session)
+  author: popy21
+  severity: high
+  description: |
+    SwarmUI est l'interface auto-hébergée d'Alex « mcmonkey » Goodwin qui pilote
+    des back-ends de génération d'images — ComfyUI en premier lieu, donc la même
+    famille que ComfyUI, AUTOMATIC1111 et InvokeAI déjà couverts par le pack.
+    Toute son API tient dans une forme unique, que sa documentation énonce :
+    « The majority of Swarm's API takes the form of POST requests sent to (your
+    server)/API/(route) », et « All API routes, with the exception of
+    GetNewSession, require a session_id input in the JSON ». L'exception nomme
+    la porte : /API/GetNewSession est la route d'entrée, celle qui délivre le
+    jeton que toutes les autres réclament.
+    Elle ne porte aucun contrôle, et c'est écrit noir sur blanc.
+    docs/APIRoutes/BasicAPIFeatures.md documente chaque route par un bloc
+    « Permission Flag » — manage_presets, edit_user_settings,
+    fundamental_generate_tab_access, read_user_settings — et celui de
+    GetNewSession est le seul à porter « (MISSING) ». Sa description dit
+    pourquoi : « Special route to create a new session ID. Must be called before
+    any other API route. Also returns other fundamental user and server data.
+    Intentionally no permission flag required, as permissions are not defined
+    until you create a session. » Le code le confirme dans les deux sens :
+    API.SessionlessRoutes contient « getnewsession », et l'enregistrement se
+    fait par « API.RegisterAPICall(GetNewSession) », sans le troisième argument
+    de permission que portent toutes les autres lignes du même bloc.
+    Ce qui devrait fermer la porte est le système de comptes, et il est opt-in.
+    La documentation le pose en condition : « If the Swarm instance is
+    configured to require accounts, you must feed a cookie named swarm_token
+    with the value of a token associated with a valid SwarmUI account » — donc
+    rien tant qu'elle ne l'est pas. Settings.cs le règle par défaut :
+    « AuthorizationRequired = false », commenté « If false, the UI will be open
+    to anyone who can connect to it ». Le handler s'ouvre alors sur
+    « User user = WebServer.GetUserFor(context) », et GetUserFor, hors mode
+    autorisé, ne lit ni en-tête ni cookie : il rend l'utilisateur local, dont
+    SessionHandler.LocalUserID vaut « local ». Ce compte accountless porte le
+    rôle « owner » — « public List<string> Roles = ["owner"] », commenté
+    « Defaults to owner (for local/accountless usage) » — auquel
+    ApplyDefaultPermissions() verse jusqu'aux permissions marquées
+    PermissionDefault.NOBODY.
+    Reste la liaison réseau, qui fait basculer l'un dans l'autre.
+    « Host = "localhost" », « Port = 7801 » : l'instance de poste de travail ne
+    répond à personne. Le README donne pourtant le geste inverse pour une
+    installation sans écran — « or if running on a headless server,
+    ./launch-linux.sh --launch_mode none --host 0.0.0.0 » — et le drapeau est
+    documenté comme surcharge du réglage : « --host | localhost | Can be used to
+    override the 'Network.Host' server setting ». À partir de là, la porte
+    d'entrée de l'API répond à qui atteint le port.
+  impact: |
+    Le constat n'est pas qu'une route bavarde : c'est qu'un tiers anonyme
+    repart avec le jeton d'accès du produit. GetNewSession rend
+    « session_id = session.ID », soit Utilities.SecureRandomHex(40) — et c'est
+    exactement la valeur que le répartiteur d'API exige de toutes les autres
+    routes avant de les servir. La réponse est donc auto-prouvante : ce qu'elle
+    délivre est la condition d'entrée de tout le reste.
+    Le même corps énumère ce que « tout le reste » recouvre, sans qu'on ait à le
+    deviner : « permissions = JArray.FromObject(session.User.GetPermissions()) »
+    rend les drapeaux du rôle accordé à l'appelant, donc, sur une instance sans
+    comptes, ceux de « owner » — la totalité. Ce que ces drapeaux ouvrent est le
+    parc : basic_image_generation pour POST /API/GenerateText2Image, qui fait
+    tourner le GPU de l'exploitant sur le prompt d'un tiers ;
+    view_image_history et view_logs pour /API/ListImages et
+    /API/ListRecentLogMessages, qui rendent les productions passées et la sortie
+    console ; edit_server_settings pour /API/ChangeServerSettings, qui réécrit
+    la configuration du serveur, chemins de modèles compris ; manage_extensions
+    et restart pour /API/InstallExtension puis /API/UpdateAndRestart, qui
+    installent du code depuis un dépôt et relancent le processus ; manage_users
+    pour /API/AdminAddUser et /API/AdminSetUserPassword, qui inscrivent un
+    compte survivant à la fermeture du port. La documentation du projet
+    l'admet elle-même : « You should not host publicly without an
+    authentication layer in front. Some Swarm API routes can be used
+    maliciously, such as the routes that forward raw ComfyUI access » — le
+    chemin /ComfyBackendDirect, dont le handler part du même GetUserFor.
+    Les trois autres champs situent la cible pour la suite. user_id vaut
+    « local » sur l'instance sans comptes, et le dit donc du même coup ;
+    output_append_user reflète Paths.AppendUserNameToOutputPath, donc la forme
+    du chemin de sortie sur le disque de l'hôte ; version rend Utilities.VaryID,
+    c'est-à-dire la version d'assemblage, suffixée du commit git quand l'arbre
+    en porte un.
+  remediation: |
+    Poser « AuthorizationRequired: true » dans Data/Settings.fds, ou par l'onglet
+    Server Configuration, et créer le compte administrateur avant de redémarrer —
+    c'est ce réglage, et lui seul, qui fait passer GetUserFor par
+    WebUtil.GetValidLogin() et rend « Invalid or unauthorized. » à l'appelant
+    sans cookie swarm_token. Le contrôle se fait de l'extérieur, sur cette même
+    route : tant qu'elle rend un session_id à une requête nue, la garde n'existe
+    pas.
+    Ne pas s'en remettre au seul multi-utilisateur, que la documentation
+    qualifie d'« initial experimental form » : remettre Network.Host à
+    « localhost », ne pas passer --host 0.0.0.0 ni publier le port 7801 d'un
+    conteneur sur un réseau non maîtrisé, et exposer le service derrière un
+    mandataire qui authentifie — « Apache2/Nginx reverse-proxy setups can be
+    built with an authentication layer », ce que le projet recommande lui-même
+    avant tout hébergement public. Le filtrage doit couvrir /ComfyBackendDirect
+    comme /API : les deux passent par GetUserFor.
+    Après une exposition, considérer comme lus l'historique d'images, les
+    journaux et les réglages du serveur, et vérifier ce qui a été écrit :
+    comptes créés par AdminAddUser, extensions installées, chemins de modèles ou
+    de sortie modifiés, back-ends ajoutés. Les sessions délivrées survivent
+    jusqu'à MaxSessionAge, trente-et-un jours ; un redémarrage du serveur est ce
+    qui les invalide.
+  reference:
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/API.md
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/APIRoutes/BasicAPIFeatures.md
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/Advanced%20Usage.md
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/Command%20Line%20Arguments.md
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/src/WebAPI/API.cs
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/src/WebAPI/BasicAPIFeatures.cs
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/src/Core/WebServer.cs
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/src/Core/Settings.cs
+    - https://github.com/mcmonkeyprojects/SwarmUI/blob/master/src/Accounts/SessionHandler.cs
+  metadata:
+    max-request: 1
+    vendor: mcmonkeyprojects
+    product: swarmui
+    shodan-query: title:"SwarmUI"
+  tags: ai,swarmui,stable-diffusion,comfyui,exposure,unauth,misconfig
+
+http:
+  # Une seule requête, sur la porte d'entrée elle-même. Ce n'est pas un choix
+  # de commodité : toutes les autres routes exigent le session_id que celle-ci
+  # délivre, donc aucune ne peut établir le constat sans l'avoir appelée
+  # d'abord. C'est aussi la seule que la documentation dispense de
+  # « Permission Flag », et elle le dit — « Intentionally no permission flag
+  # required, as permissions are not defined until you create a session ».
+  #
+  # Ce que la requête laisse derrière elle, dit franchement : une session, et
+  # rien d'autre. CreateSession l'inscrit en mémoire et dans LiteDB, où
+  # CleanOldSessions la supprime passé MaxSessionAge — trente-et-un jours — et
+  # où un redémarrage l'invalide. Aucun travail n'est mis en file, aucun GPU
+  # n'est sollicité, aucun réglage n'est touché. Les routes qui en diraient
+  # davantage se paieraient trop cher : GenerateText2Image ferait tourner le
+  # matériel de l'exploitant, ListImages et ListRecentLogMessages
+  # exfiltreraient ses productions et sa sortie console, ChangeServerSettings
+  # et InstallExtension réécriraient sa configuration et installeraient du
+  # code, AdminAddUser inscrirait un compte survivant à la fermeture du port.
+  # Elles répondent toutes au jeton que celle-ci rend ; les appeler serait
+  # exploiter l'absence de garde plutôt que la constater.
+  #
+  # POST, et pas autre chose : le répartiteur redirige toute autre méthode vers
+  # /Error/NoGetAPI sans regarder la route. Le type de contenu et le corps ne
+  # sont pas décoratifs non plus — HandleAsyncRequest refuse d'abord sur
+  # « !context.Request.HasJsonContentType() », puis sur
+  # « ContentLength <= 0 ». Un corps vide serait donc rejeté avant d'atteindre
+  # le handler ; « {} » est le plus petit qui passe, et la section
+  # « Parameters » de la route est vide — **None.** —, donc il n'y a rien
+  # d'autre à envoyer. Le seul paramètre que le handler accepte,
+  # impersonateUser, exige manage_users et sert à se faire passer pour un
+  # autre compte : il n'a pas à figurer ici.
+  - method: POST
+    path:
+      - "{{BaseURL}}/API/GetNewSession"
+
+    headers:
+      Content-Type: application/json
+
+    body: "{}"
+
+    matchers-condition: and
+    matchers:
+      # L'enveloppe que YieldJsonOutput pose sur toute réponse d'API, en même
+      # temps que le corps examiné plus bas — les deux ne peuvent pas diverger,
+      # puisque la même fonction les écrit.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Aucun matcher de statut, et c'est délibéré : ce chemin rend 200 des deux
+      # côtés de la frontière. Le refus d'une instance qui exige des comptes
+      # passe par « return new JObject() { ["error"] = "Invalid or
+      # unauthorized." } », que le répartiteur journalise puis sert par
+      # « YieldJsonOutput(socket, 200, output) » — le code de statut ne sépare
+      # donc rien du tout. C'est le corps, et lui seul, qui porte le constat.
+      #
+      # Le jeton, à l'ouverture du document. GetNewSession construit son JObject
+      # en posant session_id en premier, et ToStringFast sérialise dans l'ordre
+      # d'insertion : la clé ouvre le corps sur toutes les générations, comme le
+      # « Return Format » de la documentation la montre en tête. L'ancrage
+      # écarte au passage la même charge utile retrouvée au fond d'un document
+      # composite qu'une supervision agrégerait sous une clé à elle — c'est lui
+      # qui dit que l'instance a répondu d'elle-même.
+      #
+      # La forme est la preuve : session.ID vient de SecureRandomHex(40), dont
+      # BytesToHex rend des chiffres hexadécimaux minuscules. Le plancher est
+      # posé à 32 plutôt qu'à 40 parce que SessionIDLength est annoté comme
+      # restant à rendre configurable — la longueur peut donc bouger, la nature
+      # du jeton non. Un corps qui rendrait ici autre chose qu'une longue suite
+      # aléatoire ne serait pas une session délivrée.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"session_id"\s*:\s*"[0-9a-f]{32,}"'
+
+      # Le reste du quatuor, exigé ensemble. Chacune de ces trois clés est
+      # rendue inconditionnellement par le handler, donc aucune ne manque à une
+      # instance ancienne, et le « Return Format » de la documentation les porte
+      # toutes les trois.
+      #
+      # output_append_user est le swarmisme du lot : il recopie
+      # Paths.AppendUserNameToOutputPath, un réglage de chemin de sortie que
+      # personne d'autre n'a de raison de sérialiser dans une réponse de
+      # session. La valeur n'est pas contrainte — les deux états sont également
+      # intéressants —, seule sa nature booléenne l'est.
+      #
+      # server_id est « Utilities.LoopPreventionID.ToString() », un Guid rendu
+      # au format « D » : cinq groupes hexadécimaux minuscules séparés de
+      # tirets. Cette forme-là est ce qui sépare le champ d'un identifiant de
+      # serveur quelconque, qui serait un nom d'hôte ou un entier.
+      #
+      # permissions ouvre sur un tableau, et c'est le champ qui donne au constat
+      # sa portée : il énumère, dans le même corps, les droits accordés sans
+      # compte. Rien n'est exigé de son contenu — le rôle et sa liste dépendent
+      # de la configuration, et un tableau vide resterait un tableau rendu à un
+      # anonyme.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"output_append_user"\s*:\s*(?:true|false)'
+          - '"server_id"\s*:\s*"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"'
+          - '"permissions"\s*:\s*\['
+
+    extractors:
+      # La version d'assemblage, que Utilities.VaryID rend suffixée du commit
+      # git — « .GIT-xxxxxxxx » — quand l'arbre en porte un : de quels
+      # correctifs le serveur est en retard, et de quel build il s'agit.
+      - type: json
+        part: body
+        name: version
+        json:
+          - ".version"
+
+      # Sous quel compte l'appelant anonyme a été servi. « local » est la valeur
+      # que pose SessionHandler.LocalUserID hors mode autorisé, et c'est donc
+      # elle qui dit, au triage, que l'instance n'a pas de comptes du tout.
+      - type: json
+        part: body
+        name: user_id
+        json:
+          - ".user_id"
+
+      # Combien de droits la session a reçus. Le nombre plutôt que la liste :
+      # le rôle owner en porte des dizaines, et ce qui se lit d'un coup d'œil
+      # est l'ordre de grandeur de ce qui a été accordé sans identifiants.
+      - type: json
+        part: body
+        name: granted_permissions
+        json:
+          - ".permissions | length"

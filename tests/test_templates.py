@@ -18999,6 +18999,457 @@ def test_skypilot_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# SwarmUI n'a pas de route de description à interroger : son API n'a qu'une
+# porte, et c'est elle le constat. « All API routes, with the exception of
+# GetNewSession, require a session_id input in the JSON » — donc rien ne peut
+# être établi sans avoir d'abord appelé la seule route que la documentation
+# dispense de « Permission Flag », en le disant : « Intentionally no permission
+# flag required, as permissions are not defined until you create a session ».
+#
+# Quatre points commandent la forme du template, et ce sont eux que cette
+# section amarre.
+#
+# La requête d'abord, qui est la partie intrusive. Elle crée une session, et
+# c'est irréductible ; elle n'a en revanche aucune raison de faire autre chose,
+# ni d'appeler une seconde route — celles qui suivent la porte génèrent,
+# exfiltrent, reconfigurent ou inscrivent des comptes. Sa forme est contrainte
+# par le répartiteur : POST, un type de contenu JSON, et un corps non vide,
+# HandleAsyncRequest refusant sur « !HasJsonContentType() » puis sur
+# « ContentLength <= 0 ».
+#
+# Le statut ensuite, qui ne dit rien. L'instance qui exige des comptes rend
+# « Invalid or unauthorized. » — et le répartiteur sert cette erreur par
+# « YieldJsonOutput(socket, 200, output) », donc sous le même code que le
+# succès. C'est le corps, et lui seul, qui sépare les deux.
+#
+# Le quatuor enfin, et la forme de ses valeurs. session_id est
+# SecureRandomHex(40), donc de l'hexadécimal minuscule que BytesToHex écrit ;
+# server_id est « LoopPreventionID.ToString() », donc un Guid au format « D ».
+# Le « Return Format » de la documentation, lui, montre « "session_id":
+# "session_id" » et « "server_id": "abc123" » : ce sont des valeurs
+# d'illustration, pas ce qu'un serveur émet, et c'est le handler qui fait foi.
+
+SWARMUI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "swarmui-new-session-exposed.yaml")
+
+SWARMUI_ROUTE = "/API/GetNewSession"
+
+# 40 chiffres hexadécimaux minuscules : ce que rend SecureRandomHex(40), la
+# longueur que SessionHandler.SessionIDLength fixe.
+SWARMUI_SESSION_ID = "3f2a9c1e7b45d0a86f31c2e5b90d47a1c6083be2"
+
+# Un Guid au format « D » — cinq groupes minuscules —, comme
+# Utilities.LoopPreventionID.ToString().
+SWARMUI_SERVER_ID = "6d2f0a1b-9c34-4e57-8a10-b3f5c7d92e48"
+
+# Quelques drapeaux du rôle owner, tel qu'ApplyDefaultPermissions() le remplit.
+SWARMUI_OWNER_PERMISSIONS = [
+    "fundamental", "fundamental_generate_tab_access", "basic_image_generation",
+    "view_image_history", "view_logs", "read_server_settings",
+    "edit_server_settings", "manage_extensions", "restart", "manage_users",
+]
+
+
+def swarmui_session_body(session_id=SWARMUI_SESSION_ID, user_id="local",
+                         output_append_user=True, version="0.9.7.0",
+                         server_id=SWARMUI_SERVER_ID,
+                         permissions=None, drop=(), first=None, indent=None):
+    """
+    Ce que rend POST /API/GetNewSession : le JObject que le handler construit,
+    dans son ordre d'insertion — session_id, user_id, output_append_user,
+    version, server_id, permissions —, sérialisé par Utilities.ToStringFast,
+    dont le commentaire dit la forme : « Dense, spaceless, unformatted ».
+
+    `drop` retire une clé, `first` en remonte une autre en tête pour défaire
+    l'ancrage, `indent` réécrit le document comme le ferait un intermédiaire qui
+    réindente ce qu'il relaie.
+    """
+    document = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "output_append_user": output_append_user,
+        "version": version,
+        "server_id": server_id,
+        "permissions": (list(SWARMUI_OWNER_PERMISSIONS) if permissions is None
+                        else permissions),
+    }
+    for key in drop:
+        document.pop(key, None)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+# Ce qu'une instance lancée par « ./launch-linux.sh --host 0.0.0.0 », sans
+# comptes, rend à une requête nue.
+SWARMUI_SESSION_BODY = swarmui_session_body()
+
+# Ce que rend la même route quand AuthorizationRequired est posé et que
+# l'appelant n'a pas de cookie swarm_token : GetUserFor passe alors par
+# WebUtil.GetValidLogin(), qui rend null, et le handler sort sur cette ligne.
+# Servie sous 200, comme le succès.
+SWARMUI_UNAUTHORIZED_BODY = '{"error":"Invalid or unauthorized."}'
+
+# L'autre refus du répartiteur, celui qu'il oppose à un session_id inconnu sur
+# toutes les autres routes. Il nomme le produit sans rien prouver de la garde.
+SWARMUI_INVALID_SESSION_BODY = (
+    '{"error":"Invalid session ID. You may need to refresh the page.",'
+    '"error_id":"invalid_session_id"}'
+)
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+SWARMUI_COMPOSITE_BODY = '{"swarm":%s,"checked_at":0}' % SWARMUI_SESSION_BODY
+
+# Une application quelconque délivre elle aussi une session à qui la demande, et
+# la nomme session_id. La clé seule ne désigne donc aucun produit.
+OTHER_SESSION_BODY = json.dumps({
+    "session_id": SWARMUI_SESSION_ID, "user": "anonymous", "expires_in": 3600,
+    "server": "edge-04", "roles": ["reader"],
+}, separators=(",", ":"))
+
+
+def swarmui_block():
+    doc = load(SWARMUI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % SWARMUI_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas POST /API/GetNewSession — c'est pourtant la "
+        "seule route que le produit sert sans session_id, donc la seule qui "
+        "puisse établir le constat"
+    )
+    return blocks[0]
+
+
+def swarmui_fires(body):
+    block = swarmui_block()
+    matchers = [m for m in (block.get("matchers") or [])
+                if m.get("part") != "header"]
+    assert matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_swarmui_probe_opens_one_session_and_touches_nothing_else():
+    doc = load(SWARMUI_TEMPLATE)
+    routes = sorted(request_routes(doc))
+    assert routes == [("POST", SWARMUI_ROUTE)], (
+        "le template n'appelle plus la seule route qu'il documente — "
+        f"{routes}. Toutes les autres exigent le session_id que celle-ci rend, "
+        "et les appeler serait exploiter l'absence de garde plutôt que la "
+        "constater"
+    )
+    for _, route in routes:
+        for forbidden, why in (
+            ("GenerateText2Image",
+             "POST /API/GenerateText2Image fait tourner le GPU de "
+             "l'exploitant sur le prompt du scanner"),
+            ("ListImages",
+             "GET /API/ListImages rend les productions passées"),
+            ("ListRecentLogMessages",
+             "/API/ListRecentLogMessages rend la sortie console du serveur"),
+            ("ChangeServerSettings",
+             "/API/ChangeServerSettings réécrit la configuration du serveur"),
+            ("InstallExtension",
+             "/API/InstallExtension installe du code depuis un dépôt"),
+            ("UpdateAndRestart", "/API/UpdateAndRestart relance le processus"),
+            ("ShutdownServer", "/API/ShutdownServer éteint l'instance"),
+            ("AdminAddUser",
+             "/API/AdminAddUser inscrit un compte qui survit à la fermeture "
+             "du port"),
+            ("ComfyBackendDirect",
+             "/ComfyBackendDirect relaie l'API brute du back-end ComfyUI, ce "
+             "que la documentation du projet nomme elle-même comme la surface "
+             "utilisable « maliciously »"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_swarmui_request_is_the_smallest_the_dispatcher_accepts():
+    """
+    Le corps et le type de contenu ne sont pas décoratifs : le répartiteur
+    refuse avant d'atteindre le handler, d'abord sur
+    « !context.Request.HasJsonContentType() », puis sur
+    « ContentLength <= 0 ». Et il n'y a rien de plus à envoyer — la section
+    « Parameters » de la route est vide, **None.**
+    """
+    block = swarmui_block()
+
+    assert block.get("method") == "POST", (
+        "le répartiteur redirige toute autre méthode vers /Error/NoGetAPI sans "
+        "regarder la route : un GET ne prouverait rien"
+    )
+
+    headers = {k.lower(): v for k, v in (block.get("headers") or {}).items()}
+    assert "application/json" in str(headers.get("content-type", "")), (
+        "sans type de contenu JSON, HandleAsyncRequest refuse la requête sur "
+        "« Wrong content type » et le handler n'est jamais atteint"
+    )
+
+    raw_body = block.get("body")
+    assert raw_body, (
+        "un corps vide donne ContentLength 0, que le répartiteur refuse sur "
+        "« bad content length » avant toute lecture de la route"
+    )
+    sent = json.loads(raw_body)
+    assert sent == {}, (
+        f"le corps envoie autre chose que l'objet vide — {sent!r}. La route ne "
+        "déclare aucun paramètre, et le seul que le handler accepte, "
+        "impersonateUser, exige manage_users et sert à se faire passer pour un "
+        "autre compte"
+    )
+
+
+def test_swarmui_matcher_rests_on_the_issued_session_not_on_the_status():
+    block = swarmui_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+    assert swarmui_fires(SWARMUI_SESSION_BODY), (
+        "le template ne reconnaît pas la session qu'une instance sans comptes "
+        "délivre à une requête nue — c'est pourtant tout le constat"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le refus d'une instance qui "
+        "exige des comptes est servi par « YieldJsonOutput(socket, 200, "
+        "output) », donc sous le même 200 que le succès — le code ne sépare "
+        "rien, c'est le corps qui porte le constat"
+    )
+
+    assert not swarmui_fires(SWARMUI_COMPOSITE_BODY), (
+        "le template retrouve la charge utile entière au fond d'un document "
+        "composite : c'est l'ancrage sur l'ouverture du corps qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not swarmui_fires(swarmui_session_body(first="user_id")), (
+        "le template conclut sur un document qui ne s'ouvre plus sur "
+        "session_id : le handler pose cette clé en premier dans son JObject et "
+        "ToStringFast sérialise dans l'ordre d'insertion, donc elle ouvre le "
+        "corps sur toutes les générations"
+    )
+
+
+def test_swarmui_conclusion_needs_the_whole_quartet():
+    for key in ("session_id", "output_append_user", "server_id", "permissions"):
+        assert not swarmui_fires(swarmui_session_body(drop=(key,))), (
+            f"le template conclut sans « {key} » : le quatuor entier est ce "
+            "qui distingue cette réponse — session_id est le jeton que toutes "
+            "les autres routes exigent, output_append_user recopie un réglage "
+            "de chemin de sortie que le produit seul sérialise ici, server_id "
+            "porte le Guid du processus et permissions énumère les droits "
+            "accordés sans compte"
+        )
+
+    assert not swarmui_fires(OTHER_SESSION_BODY), (
+        "le template déclenche sur une application quelconque qui délivre une "
+        "session et la nomme session_id : cette clé seule ne désigne aucun "
+        "produit"
+    )
+
+    # Collisions internes au pack : ces trois produits sont de la même famille,
+    # et deux templates ne doivent pas revendiquer la même instance.
+    for other_body, what in (
+        (COMFYUI_SYSTEM_STATS_BODY, "le /system_stats de ComfyUI"),
+        (INVOKEAI_RUNTIME_CONFIG_BODY, "le runtime_config d'InvokeAI"),
+        (AUTOMATIC1111_SD_MODELS_BODY, "le /sdapi/v1/sd-models d'AUTOMATIC1111"),
+    ):
+        assert not swarmui_fires(other_body), (
+            f"le template déclenche sur {what}, déjà couvert par son propre "
+            "template"
+        )
+
+
+def test_swarmui_matcher_reads_the_shapes_the_handler_emits():
+    """
+    Deux des quatre clés portent une forme, et c'est le code qui la fixe — le
+    « Return Format » de la documentation montre « "session_id": "session_id" »
+    et « "server_id": "abc123" », qui sont des valeurs d'illustration.
+    """
+    assert not swarmui_fires(swarmui_session_body(session_id="session_id")), (
+        "le template accepte le placeholder de la documentation comme jeton : "
+        "session.ID vient de SecureRandomHex(40), donc d'une suite "
+        "hexadécimale, et c'est elle qui prouve qu'une session a été délivrée"
+    )
+    assert not swarmui_fires(swarmui_session_body(session_id="3f2a9c1e")), (
+        "le template accepte un jeton court : ce ne serait plus la sortie d'un "
+        "générateur aléatoire, et n'ouvrirait aucune des autres routes"
+    )
+    assert not swarmui_fires(swarmui_session_body(session_id="")), (
+        "le template accepte un session_id vide, qui n'est pas une session"
+    )
+    assert not swarmui_fires(swarmui_session_body(server_id="abc123")), (
+        "le template accepte le placeholder de la documentation comme "
+        "server_id : le handler pose « LoopPreventionID.ToString() », donc un "
+        "Guid au format « D »"
+    )
+    assert not swarmui_fires(swarmui_session_body(server_id="gpu-node-04")), (
+        "le template accepte un nom d'hôte en guise d'identifiant de serveur — "
+        "c'est ce qu'écrirait à peu près n'importe quel service"
+    )
+    assert not swarmui_fires(swarmui_session_body(output_append_user="true")), (
+        "le template accepte output_append_user écrit en chaîne : le handler y "
+        "verse Paths.AppendUserNameToOutputPath, un booléen"
+    )
+
+
+def test_swarmui_refuses_what_an_instance_that_requires_accounts_returns():
+    """
+    Le corps sépare l'instance ouverte de l'instance gardée, et c'est ce qui
+    rend ce constat rapportable : les deux répondent 200 sur ce chemin.
+    """
+    assert not swarmui_fires(SWARMUI_UNAUTHORIZED_BODY), (
+        "le template déclenche sur le refus d'une instance dont "
+        "AuthorizationRequired est posé : GetUserFor passe alors par "
+        "WebUtil.GetValidLogin(), rend null, et le handler sort sur "
+        "« Invalid or unauthorized. » — aucune session n'est créée"
+    )
+    assert not swarmui_fires(SWARMUI_INVALID_SESSION_BODY), (
+        "le template déclenche sur le refus de session inconnu du "
+        "répartiteur : il nomme le produit sans rien dire de sa garde"
+    )
+
+
+def test_swarmui_matcher_holds_across_versions_and_spacings():
+    assert swarmui_fires(swarmui_session_body(version="0.9.6.2.GIT-4a1c8f3b")), (
+        "le template dépend de la forme de la version : Utilities.VaryID "
+        "suffixe « .GIT-xxxxxxxx » dès que l'arbre porte un commit lisible"
+    )
+    assert swarmui_fires(swarmui_session_body(output_append_user=False)), (
+        "le template n'accepte qu'un seul état d'output_append_user : les deux "
+        "sont également le fait d'une session délivrée à un anonyme"
+    )
+    assert swarmui_fires(swarmui_session_body(permissions=[])), (
+        "le template exige un contenu du tableau de permissions : un rôle "
+        "restreint peut n'en porter aucune, et un tableau vide rendu à un "
+        "anonyme reste une session délivrée"
+    )
+    assert swarmui_fires(swarmui_session_body(user_id="alice")), (
+        "le template exige l'utilisateur local : une instance qui a des "
+        "comptes mais laisse la porte ouverte reste le constat"
+    )
+    assert swarmui_fires(swarmui_session_body(session_id="a" * 32)), (
+        "le template fige la longueur du jeton, que SessionHandler annote "
+        "comme restant à rendre configurable — c'est la nature de la valeur "
+        "qui prouve, pas sa taille exacte"
+    )
+    assert swarmui_fires(swarmui_session_body(indent=4)), (
+        "le template exige la sérialisation compacte de ToStringFast : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+
+def test_swarmui_extractors_report_what_the_anonymous_caller_obtains():
+    block = swarmui_block()
+    extractors = block.get("extractors") or []
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+            f"charger — {extractor.get('name')!r}"
+        )
+        assert extractor.get("part") in (None, "body"), (
+            "le bloc n'a qu'une requête et un seul corps à lire — "
+            f"part={extractor.get('part')!r}"
+        )
+
+    found = {e.get("name"): e.get("json") for e in extractors}
+    assert found == {
+        "version": [".version"],
+        "user_id": [".user_id"],
+        "granted_permissions": [".permissions | length"],
+    }, (
+        "les trois renseignements du constat ne sont pas remontés tels "
+        f"quels — {found}. .version rend Utilities.VaryID, donc de quels "
+        "correctifs le serveur est en retard, .user_id dit sous quel compte "
+        "l'anonyme a été servi — « local » nomme l'instance sans comptes — et "
+        "« .permissions | length » donne l'ordre de grandeur des droits "
+        "accordés sans identifiants, là où la liste entière du rôle owner "
+        "noierait le triage"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_swarmui_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les motifs du matcher ni le chemin des
+    extracteurs, et `body_matcher_hits` réévalue les motifs avec le module `re`
+    de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur ferme la
+    boucle. Il vérifie du même coup ce que le répartiteur de SwarmUI exige de la
+    requête — méthode, type de contenu et corps non vide.
+    """
+    def scan(body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                seen.append((self.path, self.headers.get("Content-Type"),
+                             self.rfile.read(length).decode()))
+                payload = body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", SWARMUI_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        ids = {item.get("template-id") for item in results}
+        assert ids <= {"swarmui-new-session-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(SWARMUI_SESSION_BODY)
+    assert seen == [(SWARMUI_ROUTE, "application/json", "{}")], (
+        "la requête émise n'est pas celle que le répartiteur de SwarmUI "
+        f"accepte — {seen}"
+    )
+    assert sorted(extracted) == sorted(
+        ["0.9.7.0", "local", str(len(SWARMUI_OWNER_PERMISSIONS))]
+    ), "le scan ne remonte pas les trois renseignements du constat"
+
+    _, refused = scan(SWARMUI_UNAUTHORIZED_BODY)
+    assert refused == [], (
+        "le scan conclut sur le refus d'une instance qui exige des comptes, "
+        "servi sous le même 200 que le succès"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

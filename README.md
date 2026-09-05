@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-69 templates, 66 produits.
+70 templates, 67 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -90,6 +90,7 @@ amont.
 | ray | [`ray-dashboard-job-submission`](templates/exposure/ray-dashboard-job-submission.yaml) | critical |
 | sglang | [`sglang-server-exposed`](templates/exposure/sglang-server-exposed.yaml) | high |
 | skypilot | [`skypilot-api-server-exposed`](templates/exposure/skypilot-api-server-exposed.yaml) | high |
+| swarmui | [`swarmui-new-session-exposed`](templates/exposure/swarmui-new-session-exposed.yaml) | high |
 | tabby | [`tabby-health-exposed`](templates/exposure/tabby-health-exposed.yaml) | medium |
 | tensorboard | [`tensorboard-exposed`](templates/exposure/tensorboard-exposed.yaml) | medium |
 | text-embeddings-inference | [`text-embeddings-inference-exposed`](templates/exposure/text-embeddings-inference-exposed.yaml) | medium |
