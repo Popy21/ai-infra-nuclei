@@ -20340,6 +20340,439 @@ def test_roboflow_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Docling Serve : deux réglages, deux lectures, et c'est ce couplage que cette
+# section amarre.
+#
+# La coquille d'abord. helper_functions.py écrit « plaform » — platform amputé
+# de son second « t » — dans le littéral de DOCLING_VERSIONS, et c'est la seule
+# chose de cette réponse qu'aucun autre produit ne peut avoir par hasard :
+# « version », « python » et une liste de paquets sont le vocabulaire de tous
+# les endpoints de diagnostic du monde. Le template repose donc sur elle, et un
+# amont qui la corrigerait le ferait taire — c'est un choix, pas un oubli, et
+# les cas ci-dessous le disent explicitement.
+#
+# La forme du document ensuite. version_info() est annotée « -> dict » et rend
+# DOCLING_VERSIONS tel quel : jsonable_encoder préserve l'ordre d'insertion,
+# donc « docling-serve » ouvre le corps, et toutes les valeurs sont des chaînes,
+# donc aucune accolade n'apparaît à l'intérieur. Mais le milieu du dictionnaire
+# a déjà bougé — « docling-jobkit » n'y est que depuis l'extraction du paquet —
+# et rien ne dit qu'il ne bougera plus : c'est pourquoi la coquille n'est pas
+# ancrée en fin de document alors qu'elle y est écrite en dernier.
+#
+# La seconde lecture enfin, qui est tout l'enjeu. GET /v1/status/poll/{task_id}
+# porte la même « Depends(require_auth) » que POST /v1/convert/source, et
+# __call__() lève son 401 sous « if self.api_key and not result.valid » — donc
+# avant le handler dès qu'une clé existe. Voir le 404 de TaskNotFoundError,
+# c'est avoir traversé la dépendance sans en-tête. C'est ce refus-là que la
+# quatrième expression doit exiger, et c'est lui qui sépare « un Docling Serve
+# publie ses versions » de « son API de conversion répond au premier venu ».
+
+DOCLING_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "docling-serve-version-exposed.yaml")
+
+DOCLING_VERSION_ROUTE = "/version"
+
+# str(uuid.uuid4()) n'écrit jamais cette forme — uuid4() pose le chiffre de
+# version et les bits de variante — donc get_raw_task() ne peut que lever
+# TaskNotFoundError, et la lecture ne crée rien.
+DOCLING_NIL_TASK_ID = "00000000-0000-0000-0000-000000000000"
+DOCLING_POLL_ROUTE = "/v1/status/poll/" + DOCLING_NIL_TASK_ID
+
+DOCLING_SERVE_VERSION = "1.6.0"
+
+
+def docling_versions_body(serve=DOCLING_SERVE_VERSION, platform_key="plaform",
+                          jobkit=True, drop=(), first=None, extra=None,
+                          indent=None):
+    """
+    Ce que rend GET /version : le dictionnaire DOCLING_VERSIONS rendu tel quel,
+    dans l'ordre du littéral de helper_functions.py et sérialisé compact par la
+    JSONResponse de FastAPI.
+
+    `jobkit` retire « docling-jobkit », que les publications antérieures à
+    l'extraction du paquet ne portaient pas. `platform_key` réécrit la coquille,
+    `drop` retire une clé, `first` en remonte une autre en tête pour défaire
+    l'ancrage, `extra` ajoute ce qu'une passerelle logerait à côté, `indent`
+    réécrit le document comme le ferait un proxy qui réindente ce qu'il relaie.
+    """
+    document = {"docling-serve": serve}
+    if jobkit:
+        document["docling-jobkit"] = "1.5.0"
+    document["docling"] = "2.55.1"
+    document["docling-core"] = "2.48.4"
+    document["docling-ibm-models"] = "3.10.2"
+    document["docling-parse"] = "4.6.0"
+    # sys.implementation.cache_tag, puis platform.python_version() entre
+    # parenthèses : c'est le f-string du littéral, pas un numéro nu.
+    document["python"] = "cpython-312 (3.12.11)"
+    # platform.platform() : système, version du noyau, architecture, glibc.
+    document[platform_key] = "Linux-6.10.14-linuxkit-x86_64-with-glibc2.36"
+
+    for key in drop:
+        document.pop(key, None)
+    if extra is not None:
+        document.update(extra)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+DOCLING_VERSIONS_BODY = docling_versions_body()
+
+# Le 403 de version_info() quand DOCLING_SERVE_SHOW_VERSION_INFO est posé à
+# false : le drapeau est le seul contrôle de la route.
+DOCLING_VERSION_FORBIDDEN_BODY = json.dumps(
+    {"detail": "Forbidden. The server is configured for not showing version "
+               "details."}, separators=(",", ":"))
+
+# Ce que rend task_status_poll() quand la dépendance a été traversée : la
+# littérale du handler, point final compris.
+DOCLING_POLL_MISSING_BODY = json.dumps({"detail": "Task not found."},
+                                       separators=(",", ":"))
+
+# Ce que rend __call__() quand une clé d'API est posée : HTTPException(401,
+# detail=None), et Starlette remplace None par la phrase du statut.
+DOCLING_POLL_DENIED_BODY = json.dumps({"detail": "Unauthorized"},
+                                      separators=(",", ":"))
+
+# Le 404 de FastAPI quand la route n'est pas montée — une publication antérieure
+# au préfixe /v1, où la même famille de routes vivait ailleurs.
+DOCLING_POLL_ABSENT_BODY = json.dumps({"detail": "Not Found"},
+                                      separators=(",", ":"))
+
+# La charge utile entière au fond du document d'une supervision qui l'agrégerait
+# sous une clé à elle.
+DOCLING_COMPOSITE_BODY = '{"docling":%s,"scraped_at":0}' % DOCLING_VERSIONS_BODY
+
+# Une passerelle qui republie les versions du serveur qu'elle proxifie : les
+# clés y sont en tête, coquille comprise, mais logées à côté d'un objet à elle.
+DOCLING_GATEWAY_QUOTING_BODY = docling_versions_body(
+    extra={"upstream": {"host": "docling-0.internal", "port": 5001}})
+
+# Une page qui cite le produit sans être lui.
+DOCLING_MENTION_BODY = json.dumps(
+    {"service": "rag-ingest", "note": "docling-serve 1.6.0 behind the queue",
+     "plaform": "documented typo"}, separators=(",", ":"))
+
+
+def docling_block():
+    doc = load(DOCLING_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % DOCLING_VERSION_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /version — c'est pourtant la seule "
+        "route qui porte la coquille, donc la seule qui identifie le produit"
+    )
+    return blocks[0]
+
+
+def docling_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = docling_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def docling_fires(version=(200, DOCLING_VERSIONS_BODY),
+                  poll=(404, DOCLING_POLL_MISSING_BODY)):
+    scenario = {
+        DOCLING_VERSION_ROUTE: version,
+        DOCLING_POLL_ROUTE: poll,
+    }
+    block = docling_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in docling_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que Docling Serve ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_docling_probe_reads_two_routes_and_touches_no_conversion():
+    """
+    Deux lectures, dans l'ordre, et rien de plus. Le même routeur nu sert POST
+    /v1/convert/source — qui ferait aller chercher au serveur une URL arbitraire
+    et rendrait ce qu'il en a lu — et les deux GET de purge,
+    /v1/clear/converters et /v1/clear/results, qui déchargeraient les
+    convertisseurs et effaceraient les résultats stockés. Constater l'exposition
+    ne demande d'en toucher aucun.
+    """
+    doc = load(DOCLING_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", DOCLING_VERSION_ROUTE),
+        ("GET", DOCLING_POLL_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert docling_requests() == [
+        ("GET", DOCLING_VERSION_ROUTE),
+        ("GET", DOCLING_POLL_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {docling_requests()}"
+    )
+
+    assert docling_block().get("method") == "GET", (
+        "les deux routes sont déclarées en @app.get : toute autre méthode ne "
+        "mesurerait que le 405 de FastAPI"
+    )
+
+    assert docling_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N ni "
+        "status_code_N n'existent, et « un Docling Serve publie ses versions » "
+        "conclurait sans « sa clé d'API n'est pas posée »"
+    )
+
+    assert DOCLING_NIL_TASK_ID in DOCLING_POLL_ROUTE, (
+        "l'identifiant interrogé n'est pas l'UUID nul : tout autre pourrait "
+        "désigner une tâche réelle, et la lecture cesserait d'être neutre"
+    )
+
+
+def test_docling_matcher_rests_on_the_typo_not_on_a_banal_version_route():
+    assert docling_fires(), (
+        "le template ne reconnaît pas la réponse que version_info() rend sur "
+        "une instance ouverte"
+    )
+
+    assert not docling_fires(
+        version=(200, docling_versions_body(platform_key="platform"))), (
+        "le template déclenche sans la coquille. « plaform » est ce sur quoi il "
+        "repose entièrement : un amont qui corrigerait l'orthographe devrait "
+        "faire rouvrir ce template, pas le laisser conclure sur des clés que "
+        "n'importe quel endpoint de diagnostic porte"
+    )
+
+    assert not docling_fires(
+        version=(200, docling_versions_body(drop=("plaform",)))), (
+        "le template conclut sans la clé qui identifie le produit"
+    )
+
+    assert not docling_fires(version=(200, label_studio_version_body())), (
+        "le template déclenche sur le /version d'un autre produit du pack, qui "
+        "répond sur la même route : « /version » est un nom banal, et deux "
+        "lignes pour une seule instance n'en disent pas plus qu'une"
+    )
+
+    assert not docling_fires(version=(200, DOCLING_COMPOSITE_BODY)), (
+        "le template déclenche sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage sur l'ouverture du corps est ce "
+        "qui dit que l'instance a répondu d'elle-même"
+    )
+
+    assert not docling_fires(version=(200, DOCLING_GATEWAY_QUOTING_BODY)), (
+        "le template déclenche sur une passerelle qui republie les versions du "
+        "serveur qu'elle proxifie : la coquille y est, mais DOCLING_VERSIONS "
+        "n'associe que des chaînes — aucune paire { } ne peut apparaître à "
+        "l'intérieur du corps"
+    )
+
+    assert not docling_fires(version=(200, DOCLING_MENTION_BODY)), (
+        "le template déclenche sur une page qui cite le produit sans être lui"
+    )
+
+    assert not docling_fires(
+        version=(200, docling_versions_body(first="python"))), (
+        "le template admet un ordre de clés que FastAPI n'émet pas : "
+        "jsonable_encoder préserve l'ordre d'insertion du littéral, et "
+        "« docling-serve » y est écrit en premier"
+    )
+
+    assert not docling_fires(version=(403, DOCLING_VERSION_FORBIDDEN_BODY)), (
+        "le template conclut sur une instance dont show_version_info est posé à "
+        "false : elle ne publie plus rien, et son 403 n'est pas un constat"
+    )
+
+
+def test_docling_matcher_survives_the_shapes_the_dict_has_really_taken():
+    assert docling_fires(version=(200, docling_versions_body(jobkit=False))), (
+        "le template exige « docling-jobkit », que les publications antérieures "
+        "à l'extraction du paquet ne portaient pas : le milieu du dictionnaire "
+        "a déjà bougé, la coquille non"
+    )
+
+    assert docling_fires(
+        version=(200, docling_versions_body(extra={"docling-ocr": "1.0.0"}))), (
+        "le template ancre la coquille en fin de document : elle y est écrite "
+        "en dernier aujourd'hui, mais une clé ajoutée après elle ne ferait pas "
+        "cesser l'instance d'être un Docling Serve — la platitude suffit à "
+        "écarter les documents composites"
+    )
+
+    assert docling_fires(version=(200, docling_versions_body(serve="0.16.1"))), (
+        "le template contraint le numéro de publication, qui change à chaque "
+        "sortie"
+    )
+
+    assert docling_fires(version=(200, docling_versions_body(indent=2))), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : la JSONResponse de FastAPI écrit compact, un proxy ne s'y "
+        "tient pas"
+    )
+
+    assert not docling_fires(version=(401, DOCLING_VERSIONS_BODY)), (
+        "le template conclut sur un corps servi sous un statut de refus — un "
+        "cache peut relayer l'ancienne réponse sous le statut du proxy qui la "
+        "garde désormais"
+    )
+
+
+def test_docling_poll_arm_proves_the_api_key_is_unset():
+    assert not docling_fires(poll=(401, DOCLING_POLL_DENIED_BODY)), (
+        "le template conclut sur une instance dont la clé d'API est posée : "
+        "__call__() lève alors son 401 avant le handler, et l'API de conversion "
+        "— même dépendance, mot pour mot — est fermée"
+    )
+
+    assert not docling_fires(poll=(404, DOCLING_POLL_ABSENT_BODY)), (
+        "le template confond le 404 de FastAPI sur une route non montée avec "
+        "celui que task_status_poll() lève après avoir traversé require_auth : "
+        "seule la littérale du handler dit que la dépendance a été franchie"
+    )
+
+    assert not docling_fires(
+        poll=(404, "<html><body><h1>404 Not Found</h1></body></html>")), (
+        "le template conclut sur la page d'un proxy qui ne connaît pas le "
+        "chemin"
+    )
+
+    assert not docling_fires(poll=(200, DOCLING_POLL_MISSING_BODY)), (
+        "le template conclut sur un portail captif qui répond 200 et le même "
+        "corps à tout ce qu'on lui demande : le 404 est la moitié du fait"
+    )
+
+    assert not docling_fires(poll=(404, DOCLING_VERSIONS_BODY)), (
+        "le template conclut sur un serveur qui rend le même document sur "
+        "toutes ses routes : la seconde réponse doit être celle du handler de "
+        "tâches, pas l'écho de la première"
+    )
+
+
+def test_docling_conclusion_is_carried_by_the_dsl_alone():
+    block = docling_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_docling_extractor_reports_the_serve_release():
+    extractors = docling_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "les évalue contre chaque réponse, et la même instance serait signalée "
+        "plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — la clé n'existe pas dans le "
+        "404 que rend le handler de tâches"
+    )
+    assert extractor.get("json") == ['."docling-serve"'], (
+        "l'extracteur ne lit pas la version de docling-serve — c'est pourtant "
+        "ce qui dit quels correctifs manquent à l'instance. La clé porte un "
+        "tiret, d'où les guillemets dans l'expression gojq"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_docling_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs en Python plutôt
+    qu'avec le lexer de nuclei : seul un scan contre un vrai serveur ferme la
+    boucle. Le refus de l'instance à clé en est l'enjeu propre — c'est lui qui
+    sépare le constat de « un Docling Serve publie ses versions quelque part
+    derrière une authentification ».
+    """
+    def scan(poll_status, poll_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == DOCLING_VERSION_ROUTE:
+                    self.reply(200, DOCLING_VERSIONS_BODY)
+                elif self.path == DOCLING_POLL_ROUTE:
+                    self.reply(poll_status, poll_body)
+                else:
+                    self.reply(404, DOCLING_POLL_ABSENT_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", DOCLING_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "docling-serve-version-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(404, DOCLING_POLL_MISSING_BODY)
+    assert sorted(set(seen)) == sorted([DOCLING_VERSION_ROUTE,
+                                        DOCLING_POLL_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == [DOCLING_SERVE_VERSION], (
+        f"le scan ne remonte pas la version de docling-serve — {extracted}"
+    )
+
+    _, refused = scan(401, DOCLING_POLL_DENIED_BODY)
+    assert refused == [], (
+        "le scan conclut sur une instance dont la clé d'API est posée, qui "
+        "publie toujours ses versions mais dont l'API de conversion est fermée"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

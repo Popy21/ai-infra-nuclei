@@ -1,0 +1,236 @@
+id: docling-serve-version-exposed
+
+info:
+  name: Docling Serve - Unauthenticated Version Disclosure and Open Conversion API
+  author: popy21
+  severity: medium
+  description: |
+    Docling Serve (docling-project/docling-serve) est l'API HTTP officielle de
+    Docling, le pipeline de conversion de documents dont on nourrit les bases
+    vectorielles. Deux réglages y commandent l'exposition, et aucun des deux
+    n'est posé au départ.
+    Le premier ne concerne que la route qui nomme le produit. GET /version est
+    déclarée « @app.get("/version", tags=["health"]) » dans docling_serve/app.py,
+    et sa signature ne porte aucune dépendance : là où chaque route de conversion
+    déclare « auth: Annotated[AuthenticationResult, Depends(require_auth)] »,
+    version_info() n'en déclare pas. Son seul garde-fou est un drapeau —
+    « if not docling_serve_settings.show_version_info: raise HTTPException(403) »
+    — et docling_serve/settings.py lui donne « show_version_info: bool = True ».
+    Le corps est le dictionnaire DOCLING_VERSIONS rendu tel quel, sans filtre ni
+    recomposition.
+    Ce dictionnaire est construit à l'import dans docling_serve/helper_functions.py
+    et ses clés sont écrites une à une : « docling-serve », « docling-jobkit »,
+    « docling », « docling-core », « docling-ibm-models », « docling-parse »,
+    « python » et « plaform ». La dernière est une coquille — platform amputé de
+    son second « t » — et elle est restée dans le code source. C'est elle la
+    signature : aucun autre produit ne publie une clé mal orthographiée de cette
+    façon, là où « version », « python » ou une liste de paquets sont le
+    vocabulaire de n'importe quel endpoint de diagnostic. Sa valeur est
+    « platform.platform() », c'est-à-dire le système, la version du noyau,
+    l'architecture et la bibliothèque C de la machine ; celle de « python » est
+    « f"{sys.implementation.cache_tag} ({platform.python_version()})" ».
+    Le second réglage est celui qui compte, et la route de version ne dit rien de
+    lui — d'où la seconde lecture. docling_serve/auth.py construit
+    « require_auth = APIKeyAuth(docling_serve_settings.api_key) », et
+    settings.py pose « api_key: str = "" ». Dans cet état, la classe est inerte
+    deux fois : _validate_api_key() rend un résultat valide dès que
+    « header_api_key == self.api_key or self.api_key == "" », et __call__() ne
+    lève son 401 que sous « if self.api_key and not result.valid » — donc jamais
+    quand la clé est vide, pas même pour une requête sans en-tête X-Api-Key du
+    tout.
+    GET /v1/status/poll/{task_id} porte exactement la même dépendance que POST
+    /v1/convert/source. L'interroger sur un identifiant qui ne peut pas exister
+    sépare les deux états sans rien déclencher : une instance qui a une clé
+    refuse avant d'entrer dans le handler, une instance qui n'en a pas y entre,
+    et le handler rend « raise HTTPException(status_code=404, detail="Task not
+    found.") ». Les identifiants de tâche sont des « str(uuid.uuid4()) »
+    (docling_jobkit/orchestrators/local/orchestrator.py) et get_raw_task() lève
+    TaskNotFoundError sur tout ce qu'il ne connaît pas ; l'UUID nul, dont uuid4()
+    n'écrit jamais la forme, n'en est donc aucun.
+    La liaison par défaut va dans le même sens : docling_serve/settings.py donne
+    à UvicornSettings « host: str = "0.0.0.0" » et « port: int = 5001 ».
+  impact: |
+    Le renseignement d'abord, et il est large pour une seule lecture : six
+    numéros de publication d'un coup — docling-serve, docling-jobkit, docling,
+    docling-core, docling-ibm-models, docling-parse — c'est-à-dire l'inventaire
+    de dépendances de l'instance, donc quels avis de sécurité la visent et
+    lesquels ont déjà été appliqués. « plaform » y ajoute ce qu'une application
+    n'a aucune raison de publier : la chaîne de platform.platform(), qui donne le
+    système, la version exacte du noyau, l'architecture du processeur et la
+    version de la glibc — l'empreinte de l'hôte ou du conteneur, et par elle les
+    vulnérabilités locales qui restent ouvertes. « python » complète avec
+    l'implémentation et la version de l'interpréteur.
+    Le risque, lui, est sur les routes que la seconde lecture établit comme
+    ouvertes. POST /v1/convert/source reçoit un ConvertSourcesRequestModel : une
+    liste de sources dont chacune peut être une URL que le serveur va chercher
+    lui-même. C'est une falsification de requête côté serveur depuis la position
+    réseau du conteneur — service de métadonnées d'instance de l'hébergeur,
+    services internes qui ne sont joignables que de l'intérieur, cartographie du
+    réseau par les codes d'erreur — et elle n'est pas aveugle : la route rend un
+    ConvertDocumentResponse, donc le document converti revient dans la réponse.
+    Ce que le serveur a lu, l'appelant anonyme le lit.
+    La conversion elle-même est le second coût. Chaque appel fait tourner le
+    pipeline Docling — analyse de mise en page, reconnaissance de caractères,
+    reconstruction des tableaux — sur le matériel de l'exploitant, pour qui a
+    trouvé le port et sans compte à débiter. POST /v1/convert/source/batch et les
+    variantes /async font la même chose en file.
+    Deux routes de purge ferment la liste, et ce sont des GET :
+    « @app.get("/v1/clear/converters") » et « @app.get("/v1/clear/results") »,
+    gardées par la même clé inerte. La première décharge les convertisseurs
+    chargés, la seconde efface les résultats stockés — un déni de service et une
+    perte de données atteignables par une requête sans corps.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera. Et l'intergiciel d'origine croisée ne
+    rattrapera rien — settings.py pose cors_origins, cors_methods et cors_headers
+    à ["*"], montés avec allow_credentials=True, si bien qu'une page ouverte par
+    un poste du réseau interne peut piloter l'instance depuis le navigateur.
+  remediation: |
+    Deux réglages distincts, et ils ne ferment pas la même chose — poser l'un
+    sans l'autre laisse la moitié du constat debout.
+    DOCLING_SERVE_API_KEY est celui qui compte. C'est lui qui fait passer
+    APIKeyAuth d'inerte à contraignante, puisque __call__() ne lève son 401 que
+    sous « if self.api_key and not result.valid » : une fois posé, /v1/convert/*,
+    /v1/status/poll/*, /v1/result/* et /v1/clear/* exigent l'en-tête X-Api-Key.
+    Il ne ferme pas /version, dont la signature ne porte aucune dépendance
+    d'authentification. Noter au passage que /v1/status/ws/{task_id} prend la clé
+    en paramètre de requête — « api_key: Annotated[str, Query()] = "" » — donc
+    dans les journaux de tout intermédiaire qui relaie la connexion.
+    DOCLING_SERVE_SHOW_VERSION_INFO=false est le seul qui ferme /version : le
+    drapeau est le seul contrôle de la route, et elle rend alors 403.
+    La liaison ensuite, parce que le défaut ne la fait pas : UVICORN_HOST=127.0.0.1
+    quand l'instance n'a pas à être atteinte depuis l'extérieur de la machine, et
+    « -p 127.0.0.1:5001:5001 » côté conteneur — « -p 5001:5001 » publie le port
+    sur toutes les interfaces de l'hôte, et le défaut du réglage est "0.0.0.0".
+    Resserrer enfin DOCLING_SERVE_CORS_ORIGINS, qui vaut ["*"] et est monté avec
+    allow_credentials=True.
+    Vérifier la prise en compte sur les routes elles-mêmes, depuis l'extérieur du
+    périmètre et sans en-tête : « curl -s http://<hote>:5001/version » ne doit
+    plus rendre le dictionnaire, et « curl -s -o /dev/null -w '%{http_code}'
+    http://<hote>:5001/v1/status/poll/00000000-0000-0000-0000-000000000000 » doit
+    rendre 401 et non 404.
+    Après une exposition, tenir l'inventaire de versions et la chaîne d'hôte pour
+    lus. Chercher ensuite dans les journaux les appels à POST /v1/convert/source
+    dont les sources pointent vers une adresse interne — 169.254.169.254, une
+    adresse de bouclage, un préfixe RFC 1918 : c'est la falsification de requête
+    en cours d'usage, et le document rendu est parti avec. Vérifier enfin si
+    /v1/clear/converters ou /v1/clear/results ont été appelées. Aucune de ces
+    lignes ne portera d'identité d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/docling-project/docling-serve/blob/main/docling_serve/app.py
+    - https://github.com/docling-project/docling-serve/blob/main/docling_serve/helper_functions.py
+    - https://github.com/docling-project/docling-serve/blob/main/docling_serve/auth.py
+    - https://github.com/docling-project/docling-serve/blob/main/docling_serve/settings.py
+    - https://github.com/docling-project/docling-jobkit/blob/main/docling_jobkit/orchestrators/base_orchestrator.py
+    - https://github.com/docling-project/docling-jobkit/blob/main/docling_jobkit/orchestrators/local/orchestrator.py
+    - https://github.com/docling-project/docling-serve
+  metadata:
+    max-request: 2
+    vendor: docling-project
+    product: docling-serve
+  tags: ai,llm,rag,docling,docling-serve,ibm,document-conversion,ssrf,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit, la seconde dit que la clé d'API
+  # n'a pas été posée — donc que l'API de conversion répond au même anonyme.
+  #
+  # GET /version est la lecture la moins chère qui identifie l'instance :
+  # version_info() ne fait que rendre DOCLING_VERSIONS, un dictionnaire construit
+  # une fois à l'import du module, sans toucher au disque ni au registre de
+  # tâches.
+  #
+  # GET /v1/status/poll/{task_id} porte la même « Depends(require_auth) » que
+  # POST /v1/convert/source, et c'est tout l'intérêt : ce que sa réponse établit
+  # vaut pour la route de conversion, sans qu'il faille l'appeler. L'identifiant
+  # est l'UUID nul, que str(uuid.uuid4()) ne produit jamais — uuid4() écrit
+  # toujours le chiffre de version et les bits de variante — donc get_raw_task()
+  # ne peut que lever TaskNotFoundError, et la lecture reste une lecture : rien
+  # n'est créé, rien n'est mis en file, rien n'est purgé.
+  #
+  # GET, et rien d'autre. Le même routeur nu sert POST /v1/convert/source, qui
+  # ferait aller chercher au serveur une URL arbitraire et rendrait ce qu'il en a
+  # lu, et les deux GET de purge — /v1/clear/converters et /v1/clear/results —
+  # qui déchargeraient les convertisseurs et effaceraient les résultats stockés.
+  # Signaler l'exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/version"
+      - "{{BaseURL}}/v1/status/poll/00000000-0000-0000-0000-000000000000"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # « un Docling Serve se nomme » et « sa clé d'API n'est pas posée » sont deux
+    # faits distincts, et c'est leur conjonction qui fait le constat.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture du document, et « docling-serve » y est une clé, pas une
+          # valeur. L'ordre est celui du littéral de helper_functions.py, et
+          # FastAPI rend un dict annoté « -> dict » tel quel : jsonable_encoder
+          # préserve l'ordre d'insertion, donc cette clé ouvre le corps.
+          #
+          # L'ancrage sur l'ouverture écarte la même charge utile retrouvée au
+          # fond d'un document composite qu'une supervision agrégerait sous une
+          # clé à elle : c'est lui qui dit que l'instance a répondu d'elle-même.
+          #
+          # Le numéro de publication est laissé libre — il change à chaque
+          # publication — et les \s* sont là parce que FastAPI sérialise compact
+          # mais qu'un intermédiaire qui réindente ce qu'il relaie ne s'y tient
+          # pas.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"docling-serve\"\\s*:\\s*\"[^\"]+\"", trim_space(body_1))'
+
+          # La coquille, et c'est elle la signature. « platform » amputé de son
+          # second « t » est écrit tel quel dans le dictionnaire source ; aucun
+          # endpoint de diagnostic d'un autre produit ne publie cette clé, là où
+          # « version », « python » ou une liste de paquets sont le vocabulaire
+          # commun de tous.
+          #
+          # Elle n'est pas ancrée en fin de document alors qu'elle y est écrite
+          # en dernier : la platitude est déjà exigée par l'expression suivante,
+          # et une publication qui ajouterait une clé après elle ne cesserait pas
+          # pour autant d'être un Docling Serve.
+          - 'regex("\"plaform\"\\s*:\\s*\"[^\"]+\"", trim_space(body_1))'
+
+          # Le document est tenu pour plat, et il l'est par construction :
+          # DOCLING_VERSIONS n'associe que des chaînes — six numéros de version,
+          # la chaîne de l'interpréteur, celle de platform.platform() — dont
+          # aucune n'ouvre d'accolade. Aucune paire { } ne doit donc apparaître à
+          # l'intérieur du corps.
+          #
+          # C'est ce qui sépare la réponse du serveur du document d'une
+          # passerelle qui citerait les mêmes clés en les logeant à côté d'un
+          # objet à elle — l'ancrage de la première expression ne le ferait pas,
+          # puisqu'un tel document peut très bien commencer par « docling-serve ».
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_1))'
+
+          # La clé d'API n'est pas posée, et c'est ce 404 qui le dit. Il n'est
+          # atteignable qu'après la dépendance : __call__() lève son 401 sous
+          # « if self.api_key and not result.valid », donc avant d'entrer dans le
+          # handler dès qu'une clé existe. Le voir, c'est avoir traversé
+          # require_auth sans en-tête — la même dépendance, mot pour mot, que
+          # celle de POST /v1/convert/source.
+          #
+          # La littérale du detail est celle du handler, point final compris, et
+          # elle sépare ce 404-là des deux autres qu'on peut recevoir sur cette
+          # route : celui de FastAPI quand elle n'est pas montée
+          # ({"detail":"Not Found"}) et la page d'un proxy qui ne connaît pas le
+          # chemin. La platitude ferme le reste — la réponse d'une HTTPException
+          # n'a qu'une chaîne.
+          - 'status_code_2 == 404 && regex("^\\{\\s*\"detail\"\\s*:\\s*\"Task not found\\.\"\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # Le numéro de publication de docling-serve lui-même, donc quels correctifs
+      # manquent à l'instance. La clé porte un tiret, d'où les guillemets dans
+      # l'expression gojq.
+      #
+      # Un seul extracteur, et borné à body_1 — sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, et le 404 de la seconde lecture n'a de
+      # toute façon rien à en extraire.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '."docling-serve"'
