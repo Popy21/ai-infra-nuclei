@@ -19879,6 +19879,467 @@ def test_openvino_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Roboflow Inference sert GET /info, et le pack couvre déjà un autre produit qui
+# sert exactement la même route : le routeur TGI. Le nom de l'endpoint ne
+# distingue donc rien, et « name », « version », « uuid » sont des clés banales.
+# Ce qui désigne le produit est une chaîne écrite dans le corps du handler —
+# « return ServerVersionInfo(name="Roboflow Inference Server",
+# version=__version__, uuid=GLOBAL_INFERENCE_SERVER_ID) » — et rien d'autre.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette section
+# amarre.
+#
+# La forme du document d'abord. inference/core/entities/responses/server_state.py
+# déclare ServerVersionInfo avec trois champs requis, dans l'ordre name /
+# version / uuid, et FastAPI sérialise un response_model dans l'ordre de
+# déclaration, compact et sans clé imbriquée. Le corps est donc plat : trois
+# chaînes, aucune accolade à l'intérieur.
+#
+# L'identifiant ensuite, qu'il ne faut surtout pas contraindre. Le champ
+# s'appelle « uuid » et le modèle en donne un pour exemple, mais
+# get_inference_server_id() (inference/core/devices/utils.py) n'appelle jamais
+# uuid.uuid4() : il rend INFERENCE_SERVER_ID quand l'exploitant l'a fixé, sinon
+# « random_string(6) », suffixé « -GPU-0 » ou « -JETSON-<numéro de série> »
+# selon le matériel, et « UNKNOWN » si la détection échoue. Un template qui
+# exigerait la forme d'un UUID ne déclencherait sur aucune instance réelle.
+#
+# La seconde route enfin. « /info » figure dans la liste skip_check des deux
+# middlewares de contrôle, donc un déploiement dédié le sert lui aussi sans
+# identifiants ; « /model/registry » n'est que dans celle du mode serverless.
+# Sur un dédié, la route rend le 401 de _unauthorized_response — c'est cette
+# réponse que la seconde expression doit refuser, et c'est ce refus qui fait la
+# différence entre « un serveur se nomme » et « le déploiement se lit ».
+
+ROBOFLOW_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "roboflow-inference-server-exposed.yaml")
+
+ROBOFLOW_INFO_ROUTE = "/info"
+ROBOFLOW_REGISTRY_ROUTE = "/model/registry"
+
+# La littérale du handler, et rien d'autre : c'est elle qui identifie le
+# produit, puisque ni la route ni les clés ne le font.
+ROBOFLOW_SERVER_NAME = "Roboflow Inference Server"
+
+ROBOFLOW_VERSION = "1.5.2"
+
+# Ce que rend random_string(6) sur une machine sans carte graphique ni Jetson :
+# six caractères alphanumériques, et pas l'ombre d'un UUID.
+ROBOFLOW_SERVER_ID = "aB3xY9"
+
+
+def roboflow_info_body(name=ROBOFLOW_SERVER_NAME, version=ROBOFLOW_VERSION,
+                       uuid=ROBOFLOW_SERVER_ID, drop=(), first=None, extra=None,
+                       indent=None):
+    """
+    Ce que rend GET /info : le ServerVersionInfo que le handler construit,
+    sérialisé par la JSONResponse de FastAPI — donc compact, et dans l'ordre de
+    déclaration des champs du modèle.
+
+    `drop` retire une clé, `first` en remonte une autre en tête pour défaire
+    l'ancrage, `extra` ajoute ce qu'un intermédiaire logerait à côté, `indent`
+    réécrit le document comme le ferait un proxy qui réindente ce qu'il relaie.
+    """
+    document = {"name": name, "version": version, "uuid": uuid}
+    for key in drop:
+        document.pop(key, None)
+    if extra is not None:
+        document.update(extra)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def roboflow_registry_body(models=None, legacy=False):
+    """
+    Ce que rend GET /model/registry : un ModelsDescriptions, dont « models »
+    ouvre le document parce que le modèle le déclare en premier.
+
+    `legacy` rend la forme des publications 0.9.x, où ModelsDescriptions ne
+    portait que cette seule clé ; le défaut y ajoute les champs de mémoire
+    graphique des publications récentes, nuls quand aucune carte n'est vue.
+    """
+    entries = []
+    for model_id, task_type in models or []:
+        entries.append({"model_id": model_id, "task_type": task_type,
+                        "batch_size": None, "input_height": 640,
+                        "input_width": 640, "vram_bytes": 148897792,
+                        "request_aliases": [], "request_paths": []})
+    document = {"models": entries}
+    if not legacy:
+        document.update({"total_vram_bytes": None, "gpu_memory_used": None,
+                         "gpu_memory_total": None, "torch_cuda_allocated": None})
+    return json.dumps(document, separators=(",", ":"))
+
+
+ROBOFLOW_INFO_BODY = roboflow_info_body()
+
+# L'inventaire d'un déploiement qui sert : un projet Roboflow, sa version, sa
+# tâche.
+ROBOFLOW_REGISTRY_BODY = roboflow_registry_body(
+    models=[("door-glyph-locator/10", "object-detection")])
+
+# Le même serveur, mais qui n'a encore rien chargé. Il est tout aussi exposé :
+# ce que la route établit n'est pas qu'il y a des modèles, c'est qu'elle les
+# rendrait.
+ROBOFLOW_REGISTRY_EMPTY_BODY = roboflow_registry_body()
+
+# Le refus de _unauthorized_response, que sert un déploiement dédié : « /info »
+# est dans sa liste skip_check, « /model/registry » ne l'est pas.
+ROBOFLOW_REGISTRY_DENIED_BODY = json.dumps(
+    {"status": 401, "message": "Unauthorized"}, separators=(",", ":"))
+
+# Ce que rend FastAPI quand la route n'existe pas — GET_MODEL_REGISTRY_ENABLED
+# posé à False, ou une publication où elle n'est pas montée.
+ROBOFLOW_REGISTRY_ABSENT_BODY = json.dumps({"detail": "Not Found"},
+                                           separators=(",", ":"))
+
+# La charge utile entière au fond du document d'une supervision qui l'agrégerait
+# sous une clé à elle.
+ROBOFLOW_COMPOSITE_BODY = '{"inference":%s,"scraped_at":0}' % ROBOFLOW_INFO_BODY
+
+# Une passerelle qui republie les métadonnées du serveur qu'elle proxifie : les
+# trois clés y sont en tête, mot pour mot, mais logées à côté d'un objet à elle.
+# C'est ce corps qui rend nécessaire de tenir le document pour plat.
+ROBOFLOW_GATEWAY_QUOTING_BODY = roboflow_info_body(
+    extra={"upstream": {"host": "inference-0.internal", "port": 9001}})
+
+# Une page qui cite le produit sans être lui — inventaire, tableau de bord.
+ROBOFLOW_MENTION_BODY = json.dumps(
+    {"service": "vision", "note": "backed by Roboflow Inference Server 1.5.2",
+     "name": "inventaire"}, separators=(",", ":"))
+
+
+def roboflow_block():
+    doc = load(ROBOFLOW_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % ROBOFLOW_INFO_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /info — c'est pourtant la seule route "
+        "dont la réponse porte la littérale du handler, donc la seule qui "
+        "puisse identifier le produit"
+    )
+    return blocks[0]
+
+
+def roboflow_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = roboflow_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def roboflow_fires(info=(200, ROBOFLOW_INFO_BODY),
+                   registry=(200, ROBOFLOW_REGISTRY_BODY)):
+    scenario = {
+        ROBOFLOW_INFO_ROUTE: info,
+        ROBOFLOW_REGISTRY_ROUTE: registry,
+    }
+    block = roboflow_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in roboflow_requests():
+        assert route in scenario, (
+            "le template interroge un chemin que Roboflow Inference ne sert "
+            f"pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_roboflow_probe_reads_the_two_read_only_routes_and_touches_nothing_else():
+    """
+    Les deux routes de lecture, dans l'ordre, et rien de plus. Le même routeur
+    nu sert POST /model/add, POST /model/remove, POST /model/clear — qui appelle
+    « self.model_manager.clear() » et décharge tous les modèles — et la famille
+    POST /infer/*, qui les ferait tourner sur le matériel de l'exploitant.
+    Constater une exposition ne demande d'en toucher aucune.
+    """
+    doc = load(ROBOFLOW_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", ROBOFLOW_INFO_ROUTE),
+        ("GET", ROBOFLOW_REGISTRY_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert roboflow_requests() == [
+        ("GET", ROBOFLOW_INFO_ROUTE),
+        ("GET", ROBOFLOW_REGISTRY_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {roboflow_requests()}"
+    )
+
+    assert roboflow_block().get("method") == "GET", (
+        "les deux routes sont déclarées en @app.get : toute autre méthode ne "
+        "mesurerait que le 405 de FastAPI"
+    )
+
+    assert roboflow_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et « un serveur se nomme » conclurait "
+        "sans « le déploiement se lit »"
+    )
+
+
+def test_roboflow_matcher_needs_the_server_literal_not_a_generic_info_route():
+    assert roboflow_fires(), (
+        "le template ne reconnaît pas la réponse que le handler construit sur "
+        "une instance ouverte"
+    )
+
+    assert not roboflow_fires(info=(200, TGI_INFO_BODY)), (
+        "le template déclenche sur le /info du routeur TGI, qui répond sur la "
+        "même route et que le pack couvre déjà : deux lignes pour une seule "
+        "instance n'en disent pas plus qu'une"
+    )
+
+    assert not roboflow_fires(info=(200, ACTUATOR_INFO_BODY)), (
+        "le template déclenche sur un /info sans rapport avec l'inférence — "
+        "c'est un nom de route banal"
+    )
+
+    assert not roboflow_fires(
+        info=(200, roboflow_info_body(name="Inference Server"))), (
+        "le template déclenche sur un serveur qui ne se nomme pas comme le "
+        "handler le nomme : « name », « version » et « uuid » sont des clés "
+        "banales, seule la littérale désigne le produit"
+    )
+
+    assert not roboflow_fires(info=(200, ROBOFLOW_COMPOSITE_BODY)), (
+        "le template déclenche sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage sur l'ouverture du corps est "
+        "ce qui dit que l'instance a répondu d'elle-même"
+    )
+
+    assert not roboflow_fires(info=(200, ROBOFLOW_GATEWAY_QUOTING_BODY)), (
+        "le template déclenche sur une passerelle qui republie les "
+        "métadonnées du serveur qu'elle proxifie : la littérale y est en tête, "
+        "mais ServerVersionInfo n'a que trois chaînes — aucune paire { } ne "
+        "peut apparaître à l'intérieur du corps"
+    )
+
+    assert not roboflow_fires(info=(200, ROBOFLOW_MENTION_BODY)), (
+        "le template déclenche sur une page qui cite le produit sans être lui"
+    )
+
+    assert not roboflow_fires(
+        info=(200, roboflow_info_body(drop=("uuid",)))), (
+        "le template conclut sans l'identifiant d'instance : les trois champs "
+        "de ServerVersionInfo sont requis, aucun ne peut manquer d'une réponse "
+        "que le handler a construite"
+    )
+
+    assert not roboflow_fires(
+        info=(200, roboflow_info_body(first="uuid"))), (
+        "le template admet un ordre de clés que FastAPI n'émet pas : un "
+        "response_model est sérialisé dans l'ordre de déclaration du modèle"
+    )
+
+
+def test_roboflow_matcher_admits_the_instance_identifier_the_server_emits():
+    """
+    Le champ s'appelle « uuid » et le modèle en donne un pour exemple, mais
+    get_inference_server_id() n'appelle jamais uuid.uuid4(). Contraindre sa
+    forme ferait manquer la totalité du parc.
+    """
+    for identifier, origine in (
+        ("aB3xY9", "random_string(6), le cas courant"),
+        ("aB3xY9-GPU-0", "le suffixe posé quand pynvml voit une carte"),
+        ("aB3xY9-JETSON-1423020123456", "le numéro de série lu sur une Jetson"),
+        ("UNKNOWN", "ce que rend la détection quand elle échoue"),
+        ("edge-lab-3", "INFERENCE_SERVER_ID, quand l'exploitant l'a fixé"),
+        ("9c18c6f4-2266-41fb-8a0f-c12ae28f6fbe", "l'exemple du modèle"),
+    ):
+        assert roboflow_fires(
+            info=(200, roboflow_info_body(uuid=identifier))), (
+            f"le template refuse l'identifiant que rend {origine} : "
+            f"{identifier}"
+        )
+
+    assert roboflow_fires(info=(200, roboflow_info_body(version="0.9.18"))), (
+        "le template contraint le numéro de publication : __version__ change à "
+        "chaque publication, et la forme de la réponse n'a pas bougé depuis "
+        "les 0.9.x"
+    )
+
+    assert roboflow_fires(info=(200, roboflow_info_body(indent=2))), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : la JSONResponse de FastAPI écrit compact, un proxy ne s'y "
+        "tient pas"
+    )
+
+    assert not roboflow_fires(info=(401, ROBOFLOW_INFO_BODY)), (
+        "le template conclut sur un corps servi sous un statut de refus — un "
+        "cache peut relayer l'ancienne réponse sous le statut du proxy qui la "
+        "garde désormais"
+    )
+
+
+def test_roboflow_registry_arm_proves_read_access_not_a_named_port():
+    assert roboflow_fires(registry=(200, ROBOFLOW_REGISTRY_EMPTY_BODY)), (
+        "le template exige un modèle chargé : un serveur qui n'a encore rien "
+        "chargé rend « {\"models\":[]} », et il est tout aussi exposé — ce que "
+        "la route établit est qu'elle rendrait l'inventaire"
+    )
+
+    assert roboflow_fires(
+        registry=(200, roboflow_registry_body(
+            models=[("site-a-ppe-detector/3", "object-detection")],
+            legacy=True))), (
+        "le template exige les champs de mémoire graphique des publications "
+        "récentes : ModelsDescriptions ne portait que « models » dans les "
+        "0.9.x, et ce sont ces instances-là qu'on trouve oubliées sur un port "
+        "ouvert"
+    )
+
+    assert not roboflow_fires(
+        registry=(401, ROBOFLOW_REGISTRY_DENIED_BODY)), (
+        "le template conclut sur un déploiement dédié, qui sert /info sans "
+        "identifiants — la route est dans sa liste skip_check — mais refuse "
+        "/model/registry, qui n'y est pas"
+    )
+
+    assert not roboflow_fires(
+        registry=(404, ROBOFLOW_REGISTRY_ABSENT_BODY)), (
+        "le template conclut sans que l'inventaire ait été servi : la route "
+        "n'est montée que sous « if not LAMBDA and GET_MODEL_REGISTRY_ENABLED »"
+    )
+
+    assert not roboflow_fires(
+        registry=(200, "<html><body>Connexion requise</body></html>")), (
+        "le template conclut sur un portail captif qui répond 200 et sa page à "
+        "tout ce qu'on lui demande"
+    )
+
+    assert not roboflow_fires(registry=(200, ROBOFLOW_INFO_BODY)), (
+        "le template conclut sur un serveur qui rend le même document sur "
+        "toutes ses routes : la seconde réponse doit être l'inventaire, pas "
+        "l'écho de la première"
+    )
+
+
+def test_roboflow_conclusion_is_carried_by_the_dsl_alone():
+    block = roboflow_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_roboflow_extractor_reports_the_exact_release():
+    extractors = roboflow_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur les évalue contre chaque réponse, et la même instance serait "
+        "signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — « .version » n'existe pas "
+        "dans l'inventaire que rend /model/registry"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant ce qui dit quels "
+        "correctifs manquent au serveur"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_roboflow_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et `dsl_matcher_hits`
+    réévalue le motif en Python plutôt qu'avec le lexer de nuclei : seul un scan
+    contre un vrai serveur ferme la boucle. Le refus du déploiement dédié en est
+    l'enjeu propre — c'est lui qui sépare le constat de « un serveur d'inférence
+    se nomme quelque part derrière un proxy ».
+    """
+    def scan(registry_status, registry_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == ROBOFLOW_INFO_ROUTE:
+                    self.reply(200, ROBOFLOW_INFO_BODY)
+                elif self.path == ROBOFLOW_REGISTRY_ROUTE:
+                    self.reply(registry_status, registry_body)
+                else:
+                    self.reply(404, ROBOFLOW_REGISTRY_ABSENT_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", ROBOFLOW_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "roboflow-inference-server-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, ROBOFLOW_REGISTRY_BODY)
+    assert sorted(set(seen)) == sorted([ROBOFLOW_INFO_ROUTE,
+                                        ROBOFLOW_REGISTRY_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == [ROBOFLOW_VERSION], (
+        f"le scan ne remonte pas le numéro de publication du serveur — "
+        f"{extracted}"
+    )
+
+    _, refused = scan(401, ROBOFLOW_REGISTRY_DENIED_BODY)
+    assert refused == [], (
+        "le scan conclut sur un déploiement dédié, qui sert /info sans "
+        "identifiants mais refuse l'inventaire"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

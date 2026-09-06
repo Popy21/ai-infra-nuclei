@@ -1,0 +1,240 @@
+id: roboflow-inference-server-exposed
+
+info:
+  name: Roboflow Inference Server - Unauthenticated Server Info and Model Registry Exposure
+  author: popy21
+  severity: high
+  description: |
+    Roboflow Inference (roboflow/inference) est le serveur d'inférence de vision
+    par ordinateur que Roboflow distribue pour l'auto-hébergement — « Inference
+    turns any computer or edge device into a command center for your computer
+    vision projects », annonce son README — lancé par « inference server start »
+    et servi par défaut sur le port 9001, que inference/core/env.py pose avec
+    « PORT = int(os.getenv("PORT", 9001)) ».
+    GET /info nomme le produit, et il le nomme littéralement. La route est
+    déclarée sans condition dans
+    inference/core/interfaces/http/http_api.py — « @app.get("/info",
+    response_model=ServerVersionInfo, summary="Info", description="Get the server
+    name and version number") » — et son handler tient en une expression :
+    « return ServerVersionInfo(name="Roboflow Inference Server",
+    version=__version__, uuid=GLOBAL_INFERENCE_SERVER_ID) ». Le nom n'est ni un
+    titre de configuration ni une bannière : c'est une chaîne écrite dans le
+    corps de la fonction, qu'aucune variable d'environnement et aucun drapeau ne
+    remplace.
+    Le modèle de réponse commande la forme du matcher.
+    inference/core/entities/responses/server_state.py déclare « class
+    ServerVersionInfo(BaseModel) » avec exactement trois champs, tous requis et
+    dans cet ordre — « name: str », « version: str », « uuid: str ». FastAPI
+    sérialise un response_model dans l'ordre de déclaration et sa JSONResponse
+    écrit compact, donc le corps est
+    {"name":"Roboflow Inference Server","version":"...","uuid":"..."} : trois
+    chaînes, aucune clé imbriquée. Cette forme n'a pas bougé depuis les
+    publications 0.9.x, où le même fichier déclarait déjà les mêmes trois champs.
+    Le troisième mérite d'être laissé libre. Son nom annonce un UUID et l'exemple
+    du modèle en montre un, mais inference/core/devices/utils.py n'appelle jamais
+    uuid.uuid4() : get_inference_server_id() rend INFERENCE_SERVER_ID quand
+    l'exploitant l'a fixé, sinon « random_string(6) », suffixé « -GPU-0 » sur une
+    machine à carte graphique ou « -JETSON-<numéro de série> » sur une Jetson, et
+    « UNKNOWN » si la détection échoue. Exiger la forme d'un UUID ferait manquer
+    la totalité du parc.
+    L'absence d'authentification est un défaut de configuration, et elle se lit
+    au montage des middlewares. L'application n'en porte que deux qui contrôlent
+    l'accès, et chacun est conditionné à un mode hébergé : « if GCP_SERVERLESS: »
+    monte check_authorization_serverless, « if DEDICATED_DEPLOYMENT_WORKSPACE_URL
+    or WORKSPACES_WHITELISTED_FOR_LOCAL_DEPLOYMENT: » monte check_authorization.
+    inference/core/env.py donne leurs défauts — « GCP_SERVERLESS =
+    str2bool(os.getenv("GCP_SERVERLESS", "False")) » et
+    « DEDICATED_DEPLOYMENT_WORKSPACE_URL =
+    os.environ.get("DEDICATED_DEPLOYMENT_WORKSPACE_URL", None) » — donc sur un
+    déploiement auto-hébergé aucun des deux n'est ajouté à l'application. Il n'y
+    a pas de contrôle à contourner : il n'y en a aucun.
+    GET /model/registry est ce qui sépare « un port répond » de « le déploiement
+    se lit ». La route — « @app.get("/model/registry",
+    response_model=ModelsDescriptions, summary="Get model keys",
+    description="Get the ID of each loaded model") » — est déclarée sous « if not
+    LAMBDA and GET_MODEL_REGISTRY_ENABLED: », deux défauts qui la laissent
+    présente (« LAMBDA = str2bool(os.getenv("LAMBDA", False)) »,
+    « GET_MODEL_REGISTRY_ENABLED = str2bool(os.getenv(
+    "GET_MODEL_REGISTRY_ENABLED", "True")) »). Elle rend un ModelsDescriptions,
+    dont « models » ouvre le document et porte une entrée ModelDescriptionEntity
+    par modèle chargé — model_id, task_type, input_height, input_width,
+    vram_bytes.
+    Elle discrimine aussi les modes hébergés, et c'est la seconde raison de la
+    lire. « /info » figure dans la liste skip_check des deux middlewares, donc un
+    déploiement dédié le sert lui aussi sans identifiants ; « /model/registry »
+    ne figure que dans celle de check_authorization_serverless. Sur un
+    déploiement dédié, la route rend donc le 401 de _unauthorized_response —
+    {"status":401,"message":...} — là où l'instance auto-hébergée rend son
+    inventaire. Conclure sur les deux réponses plutôt que sur la première seule,
+    c'est ne signaler que le second cas.
+  impact: |
+    Le premier corps date l'instance au correctif près : __version__ est le
+    numéro de publication du paquet, donc quels correctifs manquent. Le champ
+    « uuid » en dit parfois davantage que son nom ne le laisse croire — sur une
+    Jetson, get_jetson_id() lit /proc/device-tree/serial-number, et le numéro de
+    série de la carte se retrouve tel quel dans la réponse.
+    Le second est l'inventaire du déploiement. Un model_id de Roboflow est un
+    couple projet/version, et le nom d'un projet dit en général ce qui est
+    détecté, pour qui, et parfois sur quel site ; task_type dit la nature de la
+    tâche, input_height et input_width la géométrie attendue, vram_bytes la
+    taille du modèle en mémoire graphique. Les publications récentes ajoutent
+    request_paths, décrit dans le modèle comme « HTTP request paths that
+    triggered inference on this model » : les chemins réellement appelés, donc la
+    façon dont le déploiement est piloté.
+    Le même routeur nu sert tout le reste. POST /model/add charge un modèle, POST
+    /model/remove en décharge un, POST /model/clear appelle
+    « self.model_manager.clear() » et les décharge tous — une requête anonyme
+    suffit, et le service qui en dépend paie ensuite le rechargement à froid. La
+    famille POST /infer/* — object_detection, instance_segmentation,
+    classification, keypoints_detection, lmm — fait tourner les modèles sur le
+    matériel de l'exploitant, et le nom à leur passer est précisément celui que
+    /model/registry vient de donner. Toutes sont déclarées sous « if not LAMBDA
+    and not GCP_SERVERLESS: » ou « if not (LAMBDA or GCP_SERVERLESS): », donc
+    présentes sur un déploiement auto-hébergé, et le fichier porte au-dessus
+    d'elles un commentaire qui ne laisse pas de doute sur ce qui manque : « these
+    NEW endpoints need authentication protection ».
+    Rien de tout cela n'est attribué. La requête ne porte aucune identité,
+    puisque le serveur n'en réclame aucune.
+  remediation: |
+    Aucun réglage ne ferme /info sur un déploiement auto-hébergé. Les deux
+    middlewares de contrôle ne sont montés que sous GCP_SERVERLESS ou
+    DEDICATED_DEPLOYMENT_WORKSPACE_URL, et « /info » figure de toute façon dans
+    leurs deux listes skip_check. GET_MODEL_REGISTRY_ENABLED=False retire la
+    route d'inventaire, mais n'authentifie rien : /model/add, /model/clear et
+    /infer/* restent ouverts.
+    La fermeture est donc réseau. Quand l'instance n'a pas à être atteinte depuis
+    l'extérieur de la machine, ne pas publier son port sur toutes les interfaces
+    : inference_cli/lib/container_adapter.py pose « environment["HOST"] =
+    "0.0.0.0" » et publie « ports = {str(port): port} », ce que Docker traduit
+    par une liaison sur chaque interface de l'hôte — « -p 127.0.0.1:9001:9001 »
+    quand le serveur doit rester local.
+    Quand elle doit être atteinte, authentifier le préfixe entier derrière un
+    proxy, pas seulement /info : /model/registry, POST /model/add, POST
+    /model/remove, POST /model/clear et toute la famille /infer/* répondent au
+    même routeur. Vérifier la prise en compte sur la route elle-même, depuis
+    l'extérieur du périmètre et sans identifiant : « curl -s
+    http://<hote>:9001/info » ne doit plus rendre le document.
+    Après une exposition, tenir la version du serveur pour lue et l'inventaire de
+    /model/registry pour connu — donc chaque model_id servi — puis vérifier si
+    des modèles ont été chargés, déchargés ou appelés depuis une adresse
+    inattendue. Les journaux d'accès de l'application n'y aideront pas
+    beaucoup : API_LOGGING_ENABLED et STRUCTURED_API_LOGGING valent tous deux
+    "False" par défaut, et quand la journalisation structurée est active, /info
+    appartient à HEALTH_CHECK_LOG_PATHS, dont les lignes sont rétrogradées en
+    DEBUG. Aucune trace ne portera d'identité d'appelant : il n'y en a jamais eu
+    à porter.
+  reference:
+    - https://github.com/roboflow/inference/blob/v1.5.2/inference/core/interfaces/http/http_api.py
+    - https://github.com/roboflow/inference/blob/v1.5.2/inference/core/entities/responses/server_state.py
+    - https://github.com/roboflow/inference/blob/v1.5.2/inference/core/env.py
+    - https://github.com/roboflow/inference/blob/v1.5.2/inference/core/devices/utils.py
+    - https://github.com/roboflow/inference/blob/v1.5.2/inference_cli/lib/container_adapter.py
+    - https://github.com/roboflow/inference/blob/v1.5.2/README.md
+    - https://github.com/roboflow/inference/blob/v0.9.18/inference/core/entities/responses/server_state.py
+  metadata:
+    max-request: 2
+    vendor: roboflow
+    product: roboflow-inference
+  tags: ai,ml,roboflow,inference,computer-vision,model-server,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit, la seconde dit que le
+  # déploiement se lit vraiment.
+  #
+  # GET /info est la route la moins chère qui identifie l'instance : son handler
+  # ne consulte ni la requête, ni le gestionnaire de modèles, ni le système de
+  # fichiers — il construit un ServerVersionInfo à partir d'une littérale, d'une
+  # constante de paquet et d'un identifiant calculé au démarrage.
+  #
+  # GET /model/registry est la corroboration. Elle prouve l'accès en lecture au
+  # déploiement plutôt que la seule présence d'un binaire sur un port, et elle
+  # écarte le déploiement dédié : /info figure dans la liste skip_check des deux
+  # middlewares de contrôle, /model/registry seulement dans celle du mode
+  # serverless — un dédié rend donc ici le 401 de _unauthorized_response.
+  #
+  # GET, et rien d'autre : les deux routes sont déclarées en @app.get, et
+  # FastAPI répond 405 à toute autre méthode.
+  #
+  # En lecture seule, et strictement : le même routeur sert POST /model/add,
+  # POST /model/remove, POST /model/clear — « self.model_manager.clear() », qui
+  # décharge tous les modèles — et la famille POST /infer/*, qui ferait tourner
+  # les modèles sur le matériel de l'exploitant. Signaler une exposition ne
+  # demande d'en toucher aucune.
+  - method: GET
+    path:
+      - "{{BaseURL}}/info"
+      - "{{BaseURL}}/model/registry"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # ni « un serveur se nomme » ni « une liste de modèles existe » ne suffit
+    # seul.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'identification, et elle tient dans une valeur littérale écrite dans
+          # le corps du handler. « name », « version » et « uuid » sont des clés
+          # banales — /info est un nom de route banal, et le pack couvre déjà un
+          # autre produit qui le sert — donc seule la chaîne « Roboflow Inference
+          # Server » désigne celui-ci.
+          #
+          # L'ordre des trois champs suit leur déclaration dans
+          # ServerVersionInfo, que FastAPI respecte en sérialisant le
+          # response_model. Les trois sont requis : aucun ne peut manquer.
+          #
+          # L'ancrage sur l'ouverture du corps écarte la même charge utile
+          # retrouvée au fond du document d'une supervision qui l'agrégerait sous
+          # une clé à elle : c'est lui qui dit que l'instance a répondu
+          # d'elle-même.
+          #
+          # Ni la version ni l'identifiant ne sont contraints. La première change
+          # à chaque publication ; le second n'est un UUID que dans l'exemple du
+          # modèle — get_inference_server_id() rend « random_string(6) », suffixé
+          # « -GPU-0 » ou « -JETSON-<série> » selon le matériel, et « UNKNOWN »
+          # en dernier recours.
+          #
+          # Les \s* sont là parce que la JSONResponse de FastAPI écrit compact,
+          # mais qu'un intermédiaire qui réindente ce qu'il relaie ne s'y tient
+          # pas.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"name\"\\s*:\\s*\"Roboflow Inference Server\"\\s*,\\s*\"version\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"uuid\"\\s*:\\s*\"[^\"]+\"", trim_space(body_1))'
+
+          # Le document est tenu pour plat, et il l'est par construction :
+          # ServerVersionInfo n'a que trois chaînes, dont aucune n'ouvre
+          # d'accolade. Aucune paire { } ne doit donc apparaître à l'intérieur du
+          # corps.
+          #
+          # C'est ce qui sépare la réponse du serveur du document d'une passerelle
+          # qui republierait la même littérale en la logeant à côté d'un objet à
+          # elle — l'ancrage de la première expression ne le ferait pas, puisqu'un
+          # tel document peut très bien commencer par les trois mêmes clés.
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_1))'
+
+          # L'inventaire a été servi à un appelant anonyme, et c'est le constat
+          # lui-même : ModelsDescriptions déclare « models » en premier, donc la
+          # liste ouvre le document.
+          #
+          # La liste vide passe, et elle doit passer : un serveur qui n'a encore
+          # chargé aucun modèle rend « {"models":[]} », et il est tout aussi
+          # exposé. Ce que cette expression établit n'est pas qu'il y a des
+          # modèles, c'est que la route les rendrait.
+          #
+          # Le statut est l'autre moitié : un déploiement dédié rend ici le 401
+          # de _unauthorized_response, puisque « /model/registry » ne figure pas
+          # dans sa liste skip_check, et une instance qui a posé
+          # GET_MODEL_REGISTRY_ENABLED=False rend le 404 de FastAPI. Ni l'un ni
+          # l'autre n'est le constat.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"models\"\\s*:\\s*\\[", trim_space(body_2))'
+
+    extractors:
+      # Le numéro de publication du serveur, donc quels correctifs lui manquent.
+      #
+      # Borné à body_1 : sous req-condition le moteur évalue les extracteurs
+      # contre chaque réponse, et « .version » n'existe pas dans l'inventaire.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.version'
