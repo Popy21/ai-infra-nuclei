@@ -1,0 +1,238 @@
+id: unstructured-api-exposed
+
+info:
+  name: Unstructured API - Unauthenticated Health Endpoint and Open Partitioning API
+  author: popy21
+  severity: medium
+  description: |
+    Unstructured API (Unstructured-IO/unstructured-api) est l'API HTTP de la
+    bibliothèque unstructured, le pré-traitement de documents le plus employé en
+    amont des pipelines RAG : c'est lui qui découpe un PDF, un DOCX ou un e-mail
+    en éléments avant que le texte parte à l'embedding. L'image
+    quay.io/unstructured-io/unstructured-api le distribue tel quel.
+    Deux lectures, parce qu'aucune des deux ne dit tout.
+    La première nomme le produit, et elle le nomme par une phrase. GET
+    /healthcheck est déclarée dans prepline_general/api/app.py —
+    « @app.get("/healthcheck", status_code=status.HTTP_200_OK,
+    include_in_schema=False) » — et son corps est un dictionnaire d'une seule
+    clé rendu tel quel : « return {"healthcheck": "HEALTHCHECK STATUS:
+    EVERYTHING OK!"} ». La littérale est la signature. « healthy », « ok » et
+    « status » sont le vocabulaire de toutes les sondes de vivacité du monde ;
+    « HEALTHCHECK STATUS: EVERYTHING OK! », majuscules et point d'exclamation
+    compris, n'appartient qu'à ce fichier. C'est elle qu'il faut lire et non le
+    200 — status.HTTP_200_OK est le code que rend n'importe quel serveur vivant,
+    et une sonde de vivacité est ce qu'un répartiteur de charge interroge le
+    plus.
+    include_in_schema=False place cette route hors du document OpenAPI, d'où la
+    seconde lecture. GET /general/openapi.json — « openapi_url =
+    "/general/openapi.json" » dans le constructeur FastAPI — est le document que
+    charge /general/docs. Il porte le titre de l'application,
+    « title="Unstructured Pipeline API" », et la clé de chemin
+    « /general/v0/general », que set_custom_openapi() indexe nommément dans
+    prepline_general/api/openapi.py pour y réécrire le schéma de réponse. C'est
+    la route d'ingestion, et c'est elle le constat.
+    Aucun intergiciel d'authentification n'est monté sur l'application. app.py
+    n'appelle add_middleware() qu'une fois, sous « if allowed_origins: », et
+    c'est pour CORS. Le contrôle de clé est ailleurs, et il est entièrement
+    conditionnel : dans prepline_general/api/general.py, general_partition()
+    ouvre sur « if api_key_env := os.environ.get("UNSTRUCTURED_API_KEY"):
+    api_key = request.headers.get("unstructured-api-key"); if api_key !=
+    api_key_env: raise HTTPException(detail="API key is invalid",
+    status_code=status.HTTP_401_UNAUTHORIZED) ». Tant que la variable
+    d'environnement n'est pas posée, le bloc entier est sauté — le README ne la
+    décrit qu'en option, « When set, requests must supply the same value in the
+    unstructured-api-key header » — et POST /general/v0/general accepte le dépôt
+    de documents arbitraires sans identifiant.
+    Le document OpenAPI, lui, annonce le contraire. _apply_customizations() y
+    écrit « openapi_schema["security"] = [{"ApiKeyAuth": []}] » et un
+    securitySchemes qui nomme l'en-tête « unstructured-api-key » ; le
+    commentaire qui précède l'admet, la sécurité reste à implémenter selon la
+    documentation FastAPI. La déclaration est un contrat de client, pas un
+    contrôle de serveur — et c'est pourquoi la lire ne suffit pas à conclure que
+    la route est fermée.
+    La liaison va dans le même sens : scripts/app-start.sh, l'ENTRYPOINT de
+    l'image, pose « HOST=${HOST:-"0.0.0.0"} » et « PORT=${PORT:-8000} » avant de
+    lancer uvicorn.
+  impact: |
+    POST /general/v0/general d'abord, parce que c'est ce que le port ouvre. Le
+    handler reçoit « files: List[UploadFile] » et fait tourner le pipeline
+    complet d'unstructured sur chacun — détection de type, analyse de mise en
+    page, reconnaissance de caractères par Tesseract, reconstruction des
+    tableaux par le modèle table-transformer que le Dockerfile précharge — puis
+    rend les éléments extraits dans la réponse. Sur le matériel de l'exploitant,
+    pour qui a trouvé le port, sans compte à débiter et sans limite de débit : le
+    paramètre de formulaire « strategy » suffit à demander hi_res à chaque appel,
+    donc l'inférence lourde. C'est un vol de calcul, et c'est un déni de service
+    par le même geste.
+    Ce n'est pas un vol de documents, et c'est ce qui borne la sévérité : le
+    serveur ne partitionne que ce qu'on lui dépose et ne conserve rien qu'on
+    puisse relire. Ce qui fuit, ce sont les documents que l'exploitant y envoie
+    lui-même s'ils transitent en clair, et le renseignement ci-dessous.
+    Le document OpenAPI est ce renseignement, et il donne plus que le schéma. Son
+    champ info.version ne porte pas le numéro de publication qu'on y attend mais
+    le chemin d'installation. app.py écrit « version=str(api_version) » après
+    « from prepline_general.api import __version__ as api_version », et
+    prepline_general/api/__init__.py est vide : le nom ne résout donc pas vers la
+    chaîne de __version__.py mais vers le sous-module lui-même, dont str() est sa
+    représentation — « <module 'prepline_general.api.__version__' from
+    '/home/notebook-user/prepline_general/api/__version__.py'> » sur l'image
+    officielle. Le document publie ainsi le chemin absolu du paquet sur le disque
+    de l'instance, et avec lui le compte sous lequel elle tourne : notebook-user,
+    celui que le Dockerfile crée. Le reste du schéma achève l'inventaire — chaque
+    paramètre de formulaire accepté par la route d'ingestion, donc toute la
+    surface d'appel, y compris ceux qui commandent le coût de traitement.
+    Rien de tout cela ne laissera de trace utile. app.py greffe un filtre sur le
+    journal d'accès d'uvicorn — « class HealthCheckFilter(logging.Filter) »,
+    monté par « logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+    » — dont le seul rôle est de supprimer les lignes qui contiennent
+    « /healthcheck ». La route qui identifie le produit est donc précisément
+    celle qu'on peut interroger sans qu'il en reste rien. Et les appels
+    d'ingestion, eux journalisés, ne porteront aucune identité d'appelant : le
+    serveur n'en a jamais réclamé.
+    Le gestionnaire d'exceptions génériques ferme la liste — « JSONResponse(
+    status_code=500, content={"detail": str(e)}) » : le message d'exception part
+    tel quel dans la réponse, quel qu'il soit, et un document malformé suffit à
+    en provoquer un.
+  remediation: |
+    UNSTRUCTURED_API_KEY est le réglage, et il faut savoir ce qu'il ne ferme pas.
+    Posé, il fait échouer POST /general/v0/general sans l'en-tête
+    unstructured-api-key. Il ne touche ni /healthcheck, ni /general/docs, ni
+    /general/openapi.json : aucune de ces routes ne lit la variable, donc le
+    produit continue de se nommer et son schéma de se lire.
+    Il ne ferme pas non plus l'analyse du corps. La clé est vérifiée dans le
+    corps de general_partition(), après que FastAPI a résolu
+    « files: List[UploadFile] » et « Depends(GeneralFormParams.as_form) » —
+    c'est-à-dire après avoir lu et déversé le multipart entier. Un appelant
+    anonyme peut donc encore faire consommer la bande passante et le disque de
+    l'instance jusqu'au 401. Ce qui ferme cela est en amont : une
+    authentification portée par le proxy inverse, avant l'application.
+    La liaison ensuite, parce que le défaut ne la fait pas : HOST=127.0.0.1 quand
+    l'instance n'a pas à être atteinte depuis l'extérieur de la machine, et
+    « -p 127.0.0.1:8000:8000 » côté conteneur — le « -p 8000:8000 » du README
+    publie le port sur toutes les interfaces de l'hôte.
+    Vérifier la prise en compte sur la route elle-même, depuis l'extérieur du
+    périmètre et sans en-tête : « curl -s -o /dev/null -w '%{http_code}'
+    -F files=@/dev/null http://<hote>:8000/general/v0/general » doit rendre 401.
+    Après une exposition, tenir le chemin d'installation et le schéma complet
+    pour lus. Chercher ensuite dans le journal d'accès les POST sur
+    /general/v0/general — aucun ne portera d'identité d'appelant, il n'y en a
+    jamais eu à porter — et ne pas espérer y trouver la trace de la
+    reconnaissance : HealthCheckFilter a effacé les lignes /healthcheck au fil de
+    l'eau. Mesurer plutôt la consommation processeur de la période, puisque c'est
+    elle que l'abus dépense.
+  reference:
+    - https://github.com/Unstructured-IO/unstructured-api/blob/main/prepline_general/api/app.py
+    - https://github.com/Unstructured-IO/unstructured-api/blob/main/prepline_general/api/general.py
+    - https://github.com/Unstructured-IO/unstructured-api/blob/main/prepline_general/api/openapi.py
+    - https://github.com/Unstructured-IO/unstructured-api/blob/main/scripts/app-start.sh
+    - https://github.com/Unstructured-IO/unstructured-api/blob/main/README.md
+    - https://github.com/Unstructured-IO/unstructured-api
+  metadata:
+    max-request: 2
+    vendor: unstructured-io
+    product: unstructured-api
+  tags: ai,llm,rag,unstructured,unstructured-api,document-parsing,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit par une phrase qui n'appartient
+  # qu'à lui, la seconde montre le document qui décrit la route d'ingestion.
+  #
+  # Elles ne peuvent pas être une seule : /healthcheck est déclarée
+  # include_in_schema=False, donc elle n'apparaît pas dans le document OpenAPI,
+  # et le document OpenAPI ne porte nulle part la littérale du healthcheck.
+  #
+  # GET, et rien d'autre. Le même routeur nu sert POST /general/v0/general, qui
+  # ferait tourner le pipeline de partitionnement — mise en page, Tesseract,
+  # table-transformer — aux frais de l'exploitant, ce qui est précisément l'abus
+  # que le template signale. Constater l'exposition ne demande pas d'y toucher :
+  # les deux routes lues ici ne font que rendre un littéral et un document
+  # calculé une fois puis mémorisé dans app.openapi_schema.
+  - method: GET
+    path:
+      - "{{BaseURL}}/healthcheck"
+      - "{{BaseURL}}/general/openapi.json"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # « cette phrase est celle d'un Unstructured API » et « l'instance sert le
+    # schéma de sa route d'ingestion » sont deux faits distincts, et c'est leur
+    # conjonction qui fait le constat.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La phrase, et le corps entier n'est qu'elle. healthcheck() rend un
+          # dictionnaire d'une seule clé dont la valeur est une littérale du
+          # fichier source : la réponse de FastAPI est donc close, et l'ancrage
+          # des deux côtés est ici sans risque de dérive — il n'y a pas de
+          # numéro de publication à l'intérieur, rien que le moteur puisse
+          # allonger d'une sortie à l'autre.
+          #
+          # C'est cet ancrage qui écarte la même phrase citée au fond du document
+          # d'une supervision qui agrégerait la sonde sous une clé à elle, et la
+          # page qui parle du produit sans être lui.
+          #
+          # Les \s* sont là parce que FastAPI sérialise compact mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          #
+          # Le 200 est joint à la lecture, pas substitué à elle : il ne prouve
+          # rien seul — c'est le code de tout serveur vivant — mais il écarte le
+          # corps que relaierait un cache sous le statut du proxy qui le garde
+          # désormais.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"healthcheck\"\\s*:\\s*\"HEALTHCHECK STATUS: EVERYTHING OK!\"\\s*\\}$", trim_space(body_1))'
+
+          # La clé de chemin de la route d'ingestion dans le document OpenAPI.
+          # C'est elle le constat : ce que le document décrit là est le POST qui
+          # accepte le dépôt de documents, et openapi.py l'indexe nommément —
+          # « openapi_schema["paths"]["/general/v0/general"]["post"] » — donc
+          # elle est présente par construction, sur toute publication où
+          # set_custom_openapi() s'exécute.
+          #
+          # Guillemets compris des deux côtés : la clé est un chemin absolu et
+          # complet dans le document, là où le mot nu se retrouverait dans
+          # n'importe quelle URL d'exemple.
+          #
+          # Le préfixe /general/{api_version}/general, lui, n'est pas exigé : ses
+          # deux routes sont déclarées include_in_schema=False et n'entrent donc
+          # jamais dans le document.
+          - 'status_code_2 == 200 && contains(body_2, "\"/general/v0/general\"")'
+
+          # Le titre de l'application, tel que get_openapi() le recopie depuis
+          # app.title. Il est écrit en dur dans le constructeur FastAPI — aucune
+          # variable d'environnement ne le réécrit — et il se lit inchangé
+          # jusqu'aux publications 0.0.x, là où le contenu du schéma, lui, suit
+          # les paramètres de formulaire du moment.
+          #
+          # Il est exigé sous sa clé et non comme un mot libre : « Unstructured
+          # Pipeline API » cité dans une description ou une valeur d'exemple ne
+          # dit pas que le document est celui de l'instance interrogée.
+          #
+          # securitySchemes et son en-tête « unstructured-api-key » auraient fait
+          # une signature plus étroite, mais openapi.py est une addition tardive
+          # — la publication 0.0.61 ne porte pas le fichier, quand elle porte
+          # déjà ce titre — et ce sont précisément les anciennes instances qui
+          # traînent exposées.
+          - 'regex("\"title\"\\s*:\\s*\"Unstructured Pipeline API\"", body_2)'
+
+    extractors:
+      # info.version, qui ne porte pas ce que son nom annonce. app.py écrit
+      # « version=str(api_version) » après « from prepline_general.api import
+      # __version__ as api_version », et prepline_general/api/__init__.py est
+      # vide : le nom résout vers le sous-module et non vers la chaîne qu'il
+      # définit, si bien que le champ publie la représentation du module —
+      # le chemin absolu de __version__.py sur le disque de l'instance, et le
+      # compte qui la fait tourner. C'est ce qu'il faut remonter à l'exploitant.
+      # Une publication qui corrigerait l'import y remettrait le numéro attendu,
+      # et l'extracteur resterait juste.
+      #
+      # Un seul extracteur, et borné à body_2 — sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, et le corps du healthcheck n'a de
+      # toute façon pas de champ à en tirer.
+      - type: json
+        part: body_2
+        name: version
+        json:
+          - '.info.version'

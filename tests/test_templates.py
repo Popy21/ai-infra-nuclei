@@ -21229,6 +21229,450 @@ def test_llama_deploy_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Unstructured API : l'API HTTP de la bibliothèque unstructured, celle qui
+# découpe les documents avant qu'ils partent à l'embedding. Trois points sont à
+# amarrer ici.
+#
+# La phrase d'abord. healthcheck() rend « {"healthcheck": "HEALTHCHECK STATUS:
+# EVERYTHING OK!"} », et c'est la seule chose de cette réponse qu'aucun autre
+# produit ne peut avoir par hasard : « ok », « healthy » et « status » sont le
+# vocabulaire de toutes les sondes de vivacité du monde, et le 200 de
+# status.HTTP_200_OK est le code de tout serveur vivant. Le corps est clos — une
+# clé, une littérale du fichier source, aucun numéro de publication à
+# l'intérieur — donc l'ancrage des deux côtés est ici sans dérive possible, et
+# c'est lui qui écarte la phrase citée au fond du document d'une supervision.
+#
+# La seconde lecture ensuite, et elle n'est pas redondante : /healthcheck est
+# déclarée include_in_schema=False, donc elle n'entre pas dans le document
+# OpenAPI, et le document OpenAPI ne porte nulle part la littérale du
+# healthcheck. Aucune des deux ne peut donc être déduite de l'autre.
+#
+# Ce sur quoi cette seconde lecture repose enfin. « /general/v0/general » est
+# indexée nommément par openapi.py, donc présente par construction ; le titre est
+# écrit en dur dans le constructeur FastAPI et se lit inchangé jusqu'aux
+# publications 0.0.x. Le reste du document — securitySchemes, les paramètres de
+# formulaire, jusqu'au fichier openapi.py lui-même — est arrivé plus tard ou
+# bouge d'une sortie à l'autre, et les cas ci-dessous disent que le template ne
+# doit pas s'y accrocher : ce sont les instances anciennes qui traînent exposées.
+
+UNSTRUCTURED_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                     "unstructured-api-exposed.yaml")
+
+UNSTRUCTURED_HEALTH_ROUTE = "/healthcheck"
+UNSTRUCTURED_OPENAPI_ROUTE = "/general/openapi.json"
+
+# La littérale de app.py, majuscules et point d'exclamation compris.
+UNSTRUCTURED_HEALTH_BODY = json.dumps(
+    {"healthcheck": "HEALTHCHECK STATUS: EVERYTHING OK!"},
+    separators=(",", ":"))
+
+# Ce que publie info.version : « from prepline_general.api import __version__ as
+# api_version » avec un __init__.py vide résout vers le sous-module, et
+# str(module) est sa représentation — donc le chemin d'installation, et le compte
+# que le Dockerfile crée.
+UNSTRUCTURED_INSTALL_PATH = (
+    "<module 'prepline_general.api.__version__' from "
+    "'/home/notebook-user/prepline_general/api/__version__.py'>")
+
+
+def unstructured_openapi_body(title="Unstructured Pipeline API",
+                              version=UNSTRUCTURED_INSTALL_PATH,
+                              partition_route="/general/v0/general",
+                              security_schemes=True, extra_paths=(),
+                              indent=None):
+    """
+    Ce que rend GET /general/openapi.json : le document que get_openapi()
+    construit depuis app.title, app.version et les routes, puis que
+    _apply_customizations() retouche.
+
+    `security_schemes` retire le bloc ApiKeyAuth, que les publications
+    antérieures à openapi.py ne portaient pas ; `partition_route` réécrit la clé
+    de chemin de la route d'ingestion, `extra_paths` en ajoute d'autres,
+    `indent` réécrit le document comme le ferait un proxy qui réindente ce qu'il
+    relaie.
+    """
+    document = {
+        "openapi": "3.1.0",
+        "info": {
+            "title": title,
+            "summary": "Partition documents with the Unstructured library",
+            "version": version,
+        },
+        "servers": [{"url": "https://api.unstructured.io",
+                     "description": "Hosted API"}],
+        "paths": {
+            partition_route: {
+                "post": {
+                    "tags": ["general"],
+                    "summary": "Summary",
+                    "operationId": "partition_parameters",
+                    "x-speakeasy-name-override": "partition",
+                }
+            }
+        },
+        "components": {"schemas": {"Element": {"type": "object"}}},
+    }
+    for route in extra_paths:
+        document["paths"][route] = {"get": {"summary": "Summary"}}
+    if security_schemes:
+        document["security"] = [{"ApiKeyAuth": []}]
+        document["components"]["securitySchemes"] = {
+            "ApiKeyAuth": {"type": "apiKey", "name": "unstructured-api-key",
+                           "in": "header"}
+        }
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+UNSTRUCTURED_OPENAPI_BODY = unstructured_openapi_body()
+
+# Le 404 de FastAPI sur une route qui n'est pas montée.
+UNSTRUCTURED_ABSENT_BODY = json.dumps({"detail": "Not Found"},
+                                      separators=(",", ":"))
+
+# Le 401 de general_partition() quand UNSTRUCTURED_API_KEY est posée. Il ne se
+# lit pas sur les deux routes de ce template — aucune des deux ne consulte la
+# variable — mais un proxy placé devant l'instance, lui, refuse tout.
+UNSTRUCTURED_DENIED_BODY = json.dumps({"detail": "API key is invalid"},
+                                      separators=(",", ":"))
+
+# La sonde d'un autre produit sur la même route : /healthcheck est un nom banal,
+# et c'est la phrase qui sépare, pas le chemin.
+UNSTRUCTURED_OTHER_HEALTH_BODY = json.dumps({"status": "ok"},
+                                            separators=(",", ":"))
+
+# La même phrase, mais rendue par une supervision qui agrège la sonde sous une
+# clé à elle.
+UNSTRUCTURED_COMPOSITE_HEALTH_BODY = (
+    '{"upstream":%s,"scraped_at":0}' % UNSTRUCTURED_HEALTH_BODY)
+
+# Une page qui cite le produit sans être lui.
+UNSTRUCTURED_MENTION_BODY = json.dumps(
+    {"service": "rag-ingest",
+     "note": "probe returns HEALTHCHECK STATUS: EVERYTHING OK! when ready"},
+    separators=(",", ":"))
+
+# Le document OpenAPI d'une autre application FastAPI, qui sert la même route
+# et la même forme.
+UNSTRUCTURED_OTHER_OPENAPI_BODY = unstructured_openapi_body(
+    title="Ingest Gateway", version="1.4.0",
+    partition_route="/general/v0/ingest", security_schemes=False)
+
+
+def unstructured_block():
+    doc = load(UNSTRUCTURED_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % UNSTRUCTURED_HEALTH_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /healthcheck — c'est pourtant la seule "
+        "route qui porte la phrase, donc la seule qui nomme le produit"
+    )
+    return blocks[0]
+
+
+def unstructured_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = unstructured_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def unstructured_fires(health=(200, UNSTRUCTURED_HEALTH_BODY),
+                       openapi=(200, UNSTRUCTURED_OPENAPI_BODY)):
+    scenario = {
+        UNSTRUCTURED_HEALTH_ROUTE: health,
+        UNSTRUCTURED_OPENAPI_ROUTE: openapi,
+    }
+    block = unstructured_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in unstructured_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que l'API ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_unstructured_probe_reads_two_routes_and_partitions_nothing():
+    """
+    Deux lectures, dans l'ordre, et rien de plus. Le même routeur nu sert POST
+    /general/v0/general, qui ferait tourner le pipeline complet — mise en page,
+    Tesseract, table-transformer — aux frais de l'exploitant : c'est l'abus que
+    le template signale, et le constater ne demande pas d'y toucher.
+    """
+    doc = load(UNSTRUCTURED_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", UNSTRUCTURED_HEALTH_ROUTE),
+        ("GET", UNSTRUCTURED_OPENAPI_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert unstructured_requests() == [
+        ("GET", UNSTRUCTURED_HEALTH_ROUTE),
+        ("GET", UNSTRUCTURED_OPENAPI_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {unstructured_requests()}"
+    )
+
+    assert unstructured_block().get("method") == "GET", (
+        "les deux routes sont servies en GET — @app.get pour le healthcheck, le "
+        "document OpenAPI pour l'autre ; toute autre méthode ne mesurerait que "
+        "le 405 de FastAPI, et POST sur la route d'ingestion ferait tourner le "
+        "pipeline"
+    )
+
+    assert unstructured_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N ni "
+        "status_code_N n'existent, et « la phrase est celle d'un Unstructured "
+        "API » conclurait sans « l'instance sert le schéma de sa route "
+        "d'ingestion »"
+    )
+
+
+def test_unstructured_matcher_rests_on_the_phrase_not_on_a_banal_healthcheck():
+    assert unstructured_fires(), (
+        "le template ne reconnaît pas les réponses que rendent healthcheck() et "
+        "le document OpenAPI sur une instance ouverte"
+    )
+
+    assert not unstructured_fires(
+        health=(200, UNSTRUCTURED_OTHER_HEALTH_BODY)), (
+        "le template déclenche sur la sonde de vivacité d'un autre produit, qui "
+        "répond sur la même route : « /healthcheck » est un nom banal, et c'est "
+        "la phrase qui sépare"
+    )
+
+    assert not unstructured_fires(
+        health=(200, json.dumps({"healthcheck": "HEALTHCHECK STATUS: OK"},
+                                separators=(",", ":")))), (
+        "le template admet une valeur approchante sous la bonne clé : c'est la "
+        "littérale entière de app.py qui est propre au produit, point "
+        "d'exclamation compris"
+    )
+
+    assert not unstructured_fires(
+        health=(200, UNSTRUCTURED_COMPOSITE_HEALTH_BODY)), (
+        "le template déclenche sur la phrase republiée au fond du document "
+        "d'une supervision : l'ancrage du corps entier est ce qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+    assert not unstructured_fires(health=(200, UNSTRUCTURED_MENTION_BODY)), (
+        "le template déclenche sur une page qui cite la phrase sans être le "
+        "produit"
+    )
+
+    assert not unstructured_fires(health=(404, UNSTRUCTURED_ABSENT_BODY)), (
+        "le template conclut sans que la route de sonde réponde — rien ne nomme "
+        "alors le produit"
+    )
+
+    assert not unstructured_fires(health=(401, UNSTRUCTURED_HEALTH_BODY)), (
+        "le template conclut sur un corps servi sous un statut de refus — un "
+        "cache peut relayer l'ancienne réponse sous le statut du proxy qui la "
+        "garde désormais"
+    )
+
+
+def test_unstructured_openapi_arm_names_the_ingestion_route():
+    assert not unstructured_fires(
+        openapi=(200, UNSTRUCTURED_OTHER_OPENAPI_BODY)), (
+        "le template déclenche sur le document OpenAPI d'une autre application "
+        "FastAPI : toutes ont la même forme, et seuls le titre et la clé de "
+        "chemin de la route d'ingestion disent lequel répond"
+    )
+
+    assert not unstructured_fires(
+        openapi=(200, unstructured_openapi_body(
+            partition_route="/general/v0/ingest"))), (
+        "le template conclut sans la clé de chemin de la route d'ingestion — "
+        "c'est pourtant elle le constat : le POST qui accepte le dépôt de "
+        "documents"
+    )
+
+    assert not unstructured_fires(
+        openapi=(200, unstructured_openapi_body(title="Ingest Gateway"))), (
+        "le template conclut sans le titre de l'application, qui est écrit en "
+        "dur dans le constructeur FastAPI et qu'aucune variable "
+        "d'environnement ne réécrit"
+    )
+
+    assert not unstructured_fires(openapi=(404, UNSTRUCTURED_ABSENT_BODY)), (
+        "le template conclut alors que le document OpenAPI n'est pas servi : "
+        "l'instance ne montre pas la route d'ingestion, et le healthcheck seul "
+        "ne la décrit pas"
+    )
+
+    assert not unstructured_fires(openapi=(401, UNSTRUCTURED_DENIED_BODY)), (
+        "le template conclut sur une instance dont un proxy placé devant refuse "
+        "tout sauf la sonde de vivacité"
+    )
+
+    assert not unstructured_fires(openapi=(200, UNSTRUCTURED_HEALTH_BODY)), (
+        "le template conclut sur un serveur qui rend le même document sur "
+        "toutes ses routes : la seconde réponse doit être le schéma, pas l'écho "
+        "de la première"
+    )
+
+
+def test_unstructured_matcher_survives_the_shapes_the_document_has_taken():
+    assert unstructured_fires(
+        openapi=(200, unstructured_openapi_body(security_schemes=False))), (
+        "le template exige le bloc securitySchemes, que les publications "
+        "antérieures à openapi.py ne portaient pas — 0.0.61 sert déjà ce titre "
+        "et cette route sans le fichier, et ce sont les instances anciennes qui "
+        "traînent exposées"
+    )
+
+    assert unstructured_fires(
+        openapi=(200, unstructured_openapi_body(version="0.1.10"))), (
+        "le template s'accroche à la représentation de module que publie "
+        "info.version : c'est un défaut d'import, et une publication qui le "
+        "corrigerait ne cesserait pas pour autant d'être un Unstructured API"
+    )
+
+    assert unstructured_fires(
+        openapi=(200, unstructured_openapi_body(
+            extra_paths=("/general/v0/general/batch",)))), (
+        "le template refuse un document qui décrit une route de plus : le "
+        "schéma suit les publications, la clé de la route d'ingestion non"
+    )
+
+    assert unstructured_fires(
+        health=(200, "  " + UNSTRUCTURED_HEALTH_BODY + "\n"),
+        openapi=(200, unstructured_openapi_body(indent=2))), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : la JSONResponse de FastAPI écrit compact, un proxy ne s'y "
+        "tient pas"
+    )
+
+
+def test_unstructured_conclusion_is_carried_by_the_dsl_alone():
+    block = unstructured_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_unstructured_extractor_reports_the_install_path():
+    extractors = unstructured_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "les évalue contre chaque réponse, et la même instance serait signalée "
+        "plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — le corps du healthcheck n'a "
+        "aucun champ de version à en tirer"
+    )
+    assert extractor.get("json") == ['.info.version'], (
+        "l'extracteur ne lit pas info.version — c'est pourtant lui qui, du fait "
+        "de l'import vers le sous-module, publie le chemin d'installation du "
+        "paquet et le compte qui fait tourner l'instance"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_unstructured_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs en Python plutôt
+    qu'avec le lexer de nuclei : seul un scan contre un vrai serveur ferme la
+    boucle. Le point d'exclamation de la phrase en est l'enjeu propre — il vit
+    dans une expression régulière traversée par deux niveaux d'échappement — et
+    le refus de l'instance dont le document OpenAPI n'est pas servi en est
+    l'autre.
+    """
+    def scan(openapi_status, openapi_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == UNSTRUCTURED_HEALTH_ROUTE:
+                    self.reply(200, UNSTRUCTURED_HEALTH_BODY)
+                elif self.path == UNSTRUCTURED_OPENAPI_ROUTE:
+                    self.reply(openapi_status, openapi_body)
+                else:
+                    self.reply(404, UNSTRUCTURED_ABSENT_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", UNSTRUCTURED_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "unstructured-api-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, UNSTRUCTURED_OPENAPI_BODY)
+    assert sorted(set(seen)) == sorted([UNSTRUCTURED_HEALTH_ROUTE,
+                                        UNSTRUCTURED_OPENAPI_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == [UNSTRUCTURED_INSTALL_PATH], (
+        f"le scan ne remonte pas le chemin d'installation — {extracted}"
+    )
+
+    _, refused = scan(404, UNSTRUCTURED_ABSENT_BODY)
+    assert refused == [], (
+        "le scan conclut sur une instance qui répond à la sonde de vivacité "
+        "mais ne sert pas le document OpenAPI, donc ne montre pas la route "
+        "d'ingestion"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
