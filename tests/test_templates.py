@@ -20773,6 +20773,462 @@ def test_docling_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# LlamaDeploy : le serveur qui héberge et exécute les workflows d'agents
+# LlamaIndex, et dont app.py n'inclut que deux routeurs, tous deux nus. Ce que
+# cette section amarre tient en trois points.
+#
+# Le couple d'abord. « status » et une valeur « Healthy » sont le vocabulaire de
+# toutes les sondes de santé du monde, et le code HTTP ne dit rien du tout : ce
+# qui désigne le produit, c'est max_deployments — le plafond que le Manager
+# s'impose, « max_deployments: int = 10 » — posé à côté de deployments, qui nomme
+# les workflows d'agents que l'instance fait tourner. Séparément, ni l'un ni
+# l'autre ne prouve quoi que ce soit.
+#
+# La forme du document ensuite. Le modèle Status déclare quatre champs et dans
+# cet ordre — status, status_message, max_deployments, deployments —, pydantic
+# sérialise dans l'ordre des champs, et aucune valeur n'est un objet : « status »
+# ouvre donc le corps, et aucune accolade n'apparaît à l'intérieur. Les deux
+# derniers champs sont annotés « | None », donc leur valeur nulle appartient au
+# modèle autant que l'entier et le tableau.
+#
+# La seconde lecture enfin, qui est tout l'enjeu. deployments_router est celui
+# qui porte POST /deployments/create — clone, « uv pip install », puis
+# importlib.import_module() — et POST /deployments/{nom}/tasks/run. Que
+# read_deployments() réponde à l'anonyme, c'est que ce routeur entier lui répond.
+# C'est ce fait-là que la sixième expression doit exiger, et c'est lui qui sépare
+# « un LlamaDeploy publie son état » de « son plan de contrôle répond au premier
+# venu ».
+
+LLAMA_DEPLOY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                     "llama-deploy-apiserver-exposed.yaml")
+
+# Les deux routes sont déclarées « @router.get("/") » sous un préfixe : leur
+# chemin complet porte la barre finale, et sans elle FastAPI ne rend qu'un 307
+# que nuclei ne suit pas.
+LLAMA_DEPLOY_STATUS_ROUTE = "/status/"
+LLAMA_DEPLOY_DEPLOYMENTS_ROUTE = "/deployments/"
+
+LLAMA_DEPLOY_NAMES = ["support-agent", "invoice-triage"]
+
+
+def llama_deploy_status_body(status="Healthy", status_message="",
+                             max_deployments=10, deployments=LLAMA_DEPLOY_NAMES,
+                             drop=(), first=None, extra=None, indent=None):
+    """
+    Ce que rend GET /status/ : la charge utile de Status, dans l'ordre de
+    déclaration des champs et sérialisée compact par FastAPI.
+
+    `drop` retire une clé, `first` en remonte une autre en tête pour défaire
+    l'ancrage, `extra` ajoute ce qu'une passerelle logerait à côté, `indent`
+    réécrit le document comme le ferait un proxy qui réindente ce qu'il relaie.
+    """
+    document = {
+        "status": status,
+        "status_message": status_message,
+        "max_deployments": max_deployments,
+        "deployments": list(deployments) if deployments is not None else None,
+    }
+
+    for key in drop:
+        document.pop(key, None)
+    if extra is not None:
+        document.update(extra)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def llama_deploy_deployments_body(names=LLAMA_DEPLOY_NAMES, legacy=False):
+    """
+    Ce que rend GET /deployments/. Depuis la publication 0.4.0 la route est
+    annotée « -> list[DeploymentDefinition] » et rend une liste d'objets dont
+    « name » est l'unique champ ; avant elle, read_deployments() rendait une
+    JSONResponse {"deployments": [...]}.
+    """
+    if legacy:
+        return json.dumps({"deployments": list(names)}, separators=(",", ":"))
+    return json.dumps([{"name": name} for name in names], separators=(",", ":"))
+
+
+LLAMA_DEPLOY_STATUS_BODY = llama_deploy_status_body()
+LLAMA_DEPLOY_DEPLOYMENTS_BODY = llama_deploy_deployments_body()
+
+# Une instance qui ne sert encore aucun workflow : le Manager démarre avec un
+# registre vide, et c'est exactement l'état d'où l'on part pour y déposer un
+# déploiement.
+LLAMA_DEPLOY_IDLE_STATUS_BODY = llama_deploy_status_body(deployments=[])
+LLAMA_DEPLOY_IDLE_DEPLOYMENTS_BODY = llama_deploy_deployments_body([])
+
+# Une sonde de santé quelconque : elle a un statut, elle a même un message, mais
+# elle ne connaît ni plafond de déploiements ni inventaire.
+LLAMA_DEPLOY_OTHER_HEALTH_BODY = json.dumps(
+    {"status": "Healthy", "status_message": "all checks passed",
+     "uptime": 91234}, separators=(",", ":"))
+
+# Une plateforme de déploiement quelconque énumère elle aussi ce qu'elle fait
+# tourner : « deployments » est le mot de tout le monde, et seul le plafond du
+# Manager le rattache au produit.
+LLAMA_DEPLOY_OTHER_PLATFORM_BODY = json.dumps(
+    {"status": "Healthy", "status_message": "", "cluster": "eu-west-1",
+     "deployments": ["web", "api"]}, separators=(",", ":"))
+
+# La charge utile entière au fond du document d'une supervision qui l'agrégerait
+# sous une clé à elle.
+LLAMA_DEPLOY_COMPOSITE_BODY = ('{"llama_deploy":%s,"scraped_at":0}'
+                               % LLAMA_DEPLOY_STATUS_BODY)
+
+# Une passerelle qui republie l'état du serveur qu'elle proxifie : les quatre
+# clés y sont, dans l'ordre, mais logées à côté d'un objet à elle.
+LLAMA_DEPLOY_GATEWAY_QUOTING_BODY = llama_deploy_status_body(
+    extra={"upstream": {"host": "llama-deploy-0.internal", "port": 4501}})
+
+# Ce que rend un proxy placé devant l'instance, et ce que rend FastAPI quand la
+# route n'est pas montée : dans les deux cas le routeur de déploiements n'a pas
+# répondu.
+LLAMA_DEPLOY_DENIED_BODY = json.dumps({"detail": "Unauthorized"},
+                                      separators=(",", ":"))
+LLAMA_DEPLOY_ABSENT_BODY = json.dumps({"detail": "Not Found"},
+                                      separators=(",", ":"))
+
+
+def llama_deploy_block():
+    doc = load(LLAMA_DEPLOY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LLAMA_DEPLOY_STATUS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /status/ — c'est pourtant la seule "
+        "route qui porte le couple max_deployments + deployments, donc la seule "
+        "qui identifie le produit"
+    )
+    return blocks[0]
+
+
+def llama_deploy_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = llama_deploy_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def llama_deploy_fires(status=(200, LLAMA_DEPLOY_STATUS_BODY),
+                       deployments=(200, LLAMA_DEPLOY_DEPLOYMENTS_BODY)):
+    scenario = {
+        normalise_route("GET", LLAMA_DEPLOY_STATUS_ROUTE): status,
+        normalise_route("GET", LLAMA_DEPLOY_DEPLOYMENTS_ROUTE): deployments,
+    }
+    block = llama_deploy_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for request in llama_deploy_requests():
+        assert request in scenario, (
+            f"le template interroge un chemin que LlamaDeploy ne sert pas : {request}"
+        )
+        responses.append(scenario[request])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_llama_deploy_probe_reads_two_routes_and_never_deploys_nor_runs():
+    """
+    Deux lectures, dans l'ordre, et rien de plus. Le même routeur nu sert POST
+    /deployments/create — qui clone une source, lance « uv pip install » sur ce
+    que la configuration réclame puis importe le module de workflow — et POST
+    /deployments/{nom}/tasks/run, qui ferait tourner un agent aux frais de
+    l'exploitant. Constater l'exposition ne demande d'en toucher aucun.
+    """
+    doc = load(LLAMA_DEPLOY_TEMPLATE)
+    expected = [normalise_route("GET", LLAMA_DEPLOY_STATUS_ROUTE),
+                normalise_route("GET", LLAMA_DEPLOY_DEPLOYMENTS_ROUTE)]
+
+    assert request_routes(doc) == set(expected), (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert llama_deploy_requests() == expected, (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {llama_deploy_requests()}"
+    )
+
+    assert llama_deploy_block().get("method") == "GET", (
+        "les deux routes sont déclarées en @router.get : toute autre méthode ne "
+        "mesurerait que le 405 de FastAPI"
+    )
+
+    assert llama_deploy_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N ni "
+        "status_code_N n'existent, et « un LlamaDeploy publie son état » "
+        "conclurait sans « son routeur de déploiements répond à l'anonyme »"
+    )
+
+    for target in llama_deploy_block().get("path") or []:
+        assert target.endswith("/"), (
+            f"le chemin déclaré {target!r} a perdu sa barre finale. Les deux "
+            "routes sont des « @router.get(\"/\") » sous un préfixe : sans "
+            "elle, FastAPI ne rend qu'une redirection 307, que nuclei ne suit "
+            "pas par défaut, et la lecture ne mesure que la redirection"
+        )
+        assert "/create" not in target and "/tasks/" not in target, (
+            "le template touche une route qui déploie ou exécute : elle "
+            "installerait des dépendances et importerait un module, ou ferait "
+            "tourner un agent — c'est l'abus qu'il est censé signaler"
+        )
+
+
+def test_llama_deploy_matcher_rests_on_the_deployment_pair_not_on_a_health_probe():
+    assert llama_deploy_fires(), (
+        "le template ne reconnaît pas la réponse que status() rend sur une "
+        "instance ouverte"
+    )
+
+    assert not llama_deploy_fires(
+        status=(200, llama_deploy_status_body(drop=("max_deployments",)))), (
+        "le template conclut sans max_deployments. C'est pourtant le seul champ "
+        "propre au produit — le plafond que le Manager s'impose — et sans lui il "
+        "ne reste qu'un statut et une liste de déploiements, que publie "
+        "n'importe quelle plateforme"
+    )
+
+    assert not llama_deploy_fires(
+        status=(200, llama_deploy_status_body(drop=("deployments",)))), (
+        "le template conclut sans deployments : c'est le couple qui désigne le "
+        "produit, pas le plafond seul"
+    )
+
+    assert not llama_deploy_fires(status=(200, LLAMA_DEPLOY_OTHER_HEALTH_BODY)), (
+        "le template déclenche sur une sonde de santé quelconque : « status », "
+        "« status_message » et « Healthy » sont le vocabulaire de toutes les "
+        "sondes du monde"
+    )
+
+    assert not llama_deploy_fires(status=(200, LLAMA_DEPLOY_OTHER_PLATFORM_BODY)), (
+        "le template déclenche sur une plateforme de déploiement qui n'est pas "
+        "LlamaDeploy : « deployments » est le mot de tout le monde"
+    )
+
+    assert not llama_deploy_fires(status=(200, HAYHOOKS_STATUS_BODY)), (
+        "le template déclenche sur le /status de Hayhooks, déjà couvert par son "
+        "propre template : lui aussi rend un statut et un inventaire de ce qu'il "
+        "fait tourner, et deux lignes pour une seule instance n'en disent pas "
+        "plus qu'une"
+    )
+
+    assert not llama_deploy_fires(status=(200, LLAMA_DEPLOY_COMPOSITE_BODY)), (
+        "le template déclenche sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage sur l'ouverture du corps est ce "
+        "qui dit que l'instance a répondu d'elle-même"
+    )
+
+    assert not llama_deploy_fires(status=(200, LLAMA_DEPLOY_GATEWAY_QUOTING_BODY)), (
+        "le template déclenche sur une passerelle qui republie l'état du serveur "
+        "qu'elle proxifie : la charge utile de Status n'a que deux chaînes, un "
+        "entier et un tableau de chaînes — aucune paire { } ne peut apparaître à "
+        "l'intérieur du corps"
+    )
+
+    assert not llama_deploy_fires(
+        status=(200, llama_deploy_status_body(first="deployments"))), (
+        "le template admet un ordre de champs que pydantic n'émet pas : le "
+        "modèle Status déclare « status » en premier, et la sérialisation suit "
+        "l'ordre de déclaration"
+    )
+
+    assert not llama_deploy_fires(status=(401, LLAMA_DEPLOY_STATUS_BODY)), (
+        "le template conclut sur un corps servi sous un statut de refus — un "
+        "cache peut relayer l'ancienne réponse sous le statut du proxy qui la "
+        "garde désormais"
+    )
+
+
+def test_llama_deploy_matcher_holds_across_the_shapes_the_model_admits():
+    assert llama_deploy_fires(
+        status=(200, LLAMA_DEPLOY_IDLE_STATUS_BODY),
+        deployments=(200, LLAMA_DEPLOY_IDLE_DEPLOYMENTS_BODY)), (
+        "le template exige un inventaire peuplé : une instance qui ne sert "
+        "encore aucun workflow est exactement aussi ouverte, et c'est même "
+        "l'état d'où l'on part pour y déposer un déploiement"
+    )
+
+    assert llama_deploy_fires(
+        status=(200, llama_deploy_status_body(max_deployments=None,
+                                              deployments=None))), (
+        "le template refuse la valeur nulle des deux champs facultatifs, que le "
+        "modèle déclare pourtant « int | None » et « list[str] | None »"
+    )
+
+    assert llama_deploy_fires(
+        status=(200, llama_deploy_status_body(status="Unhealthy"))), (
+        "le template épingle « Healthy », que le handler pose en dur : une "
+        "instance qui se dirait « Unhealthy » ou « Down » — les deux autres "
+        "valeurs de StatusEnum — n'en serait pas moins ouverte"
+    )
+
+    assert llama_deploy_fires(
+        status=(200, llama_deploy_status_body(extra={"queue_size": 0}))), (
+        "le template refuse un champ ajouté par une publication ultérieure : la "
+        "platitude du document suffit à écarter les documents composites, il "
+        "n'y a pas à compter les clés"
+    )
+
+    assert llama_deploy_fires(
+        status=(200, llama_deploy_status_body(indent=2))), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : FastAPI écrit compact, un proxy ne s'y tient pas"
+    )
+
+
+def test_llama_deploy_deployments_arm_proves_the_control_plane_answers():
+    assert llama_deploy_fires(
+        deployments=(200, llama_deploy_deployments_body(legacy=True))), (
+        "le template n'accepte que la sérialisation posée en 0.4.0 : avant elle "
+        "read_deployments() rendait une JSONResponse {\"deployments\": [...]}, "
+        "et une instance ancienne est précisément celle qui traîne exposée"
+    )
+
+    assert not llama_deploy_fires(deployments=(401, LLAMA_DEPLOY_DENIED_BODY)), (
+        "le template conclut sur une instance dont le routeur de déploiements "
+        "est fermé par un proxy placé devant : c'est pourtant lui qui porte "
+        "POST /deployments/create et les routes d'exécution"
+    )
+
+    assert not llama_deploy_fires(deployments=(404, LLAMA_DEPLOY_ABSENT_BODY)), (
+        "le template conclut alors que la route n'est pas montée"
+    )
+
+    assert not llama_deploy_fires(
+        deployments=(404, "<html><body><h1>404 Not Found</h1></body></html>")), (
+        "le template conclut sur la page d'un proxy qui ne connaît pas le chemin"
+    )
+
+    assert not llama_deploy_fires(
+        deployments=(200, LLAMA_DEPLOY_STATUS_BODY)), (
+        "le template conclut sur un portail captif qui rend le même document "
+        "sur toutes ses routes : la seconde réponse doit être celle de "
+        "read_deployments(), pas l'écho de la première"
+    )
+
+
+def test_llama_deploy_conclusion_is_carried_by_the_dsl_alone():
+    block = llama_deploy_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_llama_deploy_extractor_reports_the_deployed_workflows():
+    extractors = llama_deploy_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "les évalue contre chaque réponse, et les deux lectures énumèrent les "
+        "mêmes noms — la même instance serait signalée deux fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — sous req-condition le moteur "
+        "l'évaluerait aussi contre la seconde réponse"
+    )
+    assert extractor.get("json") == ['.deployments[]'], (
+        "l'extracteur ne lit pas les noms de déploiement — c'est pourtant ce "
+        "qui nomme la surface d'appel, un déploiement « x » ouvrant POST "
+        "/deployments/x/tasks/run"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_llama_deploy_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs en Python plutôt
+    qu'avec le lexer de nuclei : seul un scan contre un vrai serveur ferme la
+    boucle. La barre finale des deux chemins en est l'enjeu propre — c'est elle
+    qui décide si le moteur lit une réponse ou une redirection 307 —, et le refus
+    de l'instance dont le routeur de déploiements est fermé en est l'autre.
+    """
+    def scan(deployments_status, deployments_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == LLAMA_DEPLOY_STATUS_ROUTE:
+                    self.reply(200, LLAMA_DEPLOY_STATUS_BODY)
+                elif self.path == LLAMA_DEPLOY_DEPLOYMENTS_ROUTE:
+                    self.reply(deployments_status, deployments_body)
+                else:
+                    self.reply(404, LLAMA_DEPLOY_ABSENT_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LLAMA_DEPLOY_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "llama-deploy-apiserver-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, LLAMA_DEPLOY_DEPLOYMENTS_BODY)
+    assert sorted(set(seen)) == sorted([LLAMA_DEPLOY_STATUS_ROUTE,
+                                        LLAMA_DEPLOY_DEPLOYMENTS_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert sorted(extracted) == sorted(LLAMA_DEPLOY_NAMES), (
+        f"le scan ne remonte pas les noms de déploiement — {extracted}"
+    )
+
+    _, refused = scan(401, LLAMA_DEPLOY_DENIED_BODY)
+    assert refused == [], (
+        "le scan conclut sur une instance dont le routeur de déploiements est "
+        "fermé par un proxy placé devant, alors que c'est lui qui porte le plan "
+        "de contrôle"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

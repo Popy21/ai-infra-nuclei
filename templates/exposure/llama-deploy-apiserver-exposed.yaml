@@ -1,0 +1,233 @@
+id: llama-deploy-apiserver-exposed
+
+info:
+  name: LlamaDeploy API Server - Unauthenticated Status and Deployment Control
+  author: popy21
+  severity: high
+  description: |
+    LlamaDeploy (run-llama/llama_deploy) est le serveur qui héberge et exécute en
+    production les workflows d'agents LlamaIndex — « Deploy your agentic
+    workflows to production » —, et l'application qu'il construit n'a aucune
+    notion d'appelant. llama_deploy/apiserver/app.py tient en quelques lignes :
+    « app = FastAPI(lifespan=lifespan) », un CORSMiddleware ajouté sous condition
+    d'environnement et avec « allow_origins=["*"] », puis
+    « app.include_router(deployments_router) » et
+    « app.include_router(status_router) ». Aucun include_router() ne reçoit de
+    dependencies=, aucune dépendance d'authentification n'est déclarée sur
+    l'application, et llama_deploy/apiserver/settings.py — ApiserverSettings,
+    préfixe d'environnement LLAMA_DEPLOY_APISERVER_ — ne porte aucun champ de clé
+    d'API, de jeton ni de mot de passe : hôte, port, chemins, TLS, Prometheus,
+    traçage, et rien d'autre. Il n'y a pas de garde à activer, il n'y en a pas.
+    Le constat se lit sur GET /status/, servi par status()
+    (llama_deploy/apiserver/routers/status.py, « status_router =
+    APIRouter(prefix="/status") » puis « @status_router.get("/") »), dont le
+    corps entier est « Status(status=StatusEnum.HEALTHY,
+    max_deployments=manager._max_deployments,
+    deployments=list(manager._deployments.keys()), status_message="") ». Le
+    modèle Status (llama_deploy/types/apiserver.py) déclare quatre champs et dans
+    cet ordre — « status: StatusEnum », « status_message: str »,
+    « max_deployments: int | None », « deployments: list[str] | None » —, si bien
+    que la réponse est
+    {"status":"Healthy","status_message":"","max_deployments":10,"deployments":["<nom
+    de déploiement>", ...]}. StatusEnum sérialise littéralement « Healthy »,
+    « Unhealthy » ou « Down ».
+    C'est le couple max_deployments + deployments qui désigne le produit, pas le
+    reste : « status » et un « Healthy » sont le vocabulaire de toutes les sondes
+    de santé du monde, et le code HTTP ne dit rien du tout. max_deployments est
+    le plafond que le Manager s'impose — « def __init__(self, max_deployments:
+    int = 10) », deployment.py — et il n'a de sens que pour lui ; deployments à
+    côté de lui nomme les workflows d'agents que l'instance fait tourner.
+    La seconde lecture confirme, et elle porte sur le routeur qui compte.
+    GET /deployments/ est déclarée « deployments_router =
+    APIRouter(prefix="/deployments") » puis « @deployments_router.get("/") async
+    def read_deployments() -> list[DeploymentDefinition] », sans dépendance
+    d'authentification : elle énumère les mêmes déploiements, sous
+    [{"name":"<nom>"}, ...] depuis la publication 0.4.0 et sous
+    {"deployments":["<nom>", ...]} avant elle. Les routes d'exécution sont
+    montées sur ce même routeur nu. Le tableau peut être vide sans rien changer
+    au constat — une instance qui ne sert encore aucun workflow est exactement
+    aussi ouverte, et c'est même l'état d'où l'on part pour en déposer un.
+    Le défaut de liaison est « host: str = Field(default="127.0.0.1") » et
+    « port: int = Field(default=4501) », mais l'image officielle le défait :
+    docker/Dockerfile.base pose « ENV LLAMA_DEPLOY_APISERVER_HOST=0.0.0.0 » et
+    EXPOSE le port de l'API. L'exposition survient donc dès que l'exploitant
+    publie ce port — conteneur, déploiement serverless, où l'exemple
+    examples/google_cloud_run/Dockerfile repose lui aussi sur 0.0.0.0.
+  impact: |
+    Le renseignement d'abord : les noms des déploiements sont ceux des workflows
+    d'agents que l'exploitant fait tourner, donc les routes que l'instance sert —
+    un déploiement nommé « x » ouvre POST /deployments/x/tasks/run. Les nommer,
+    c'est nommer la surface d'appel. max_deployments donne au passage la marge
+    qui reste avant que le Manager refuse d'en accepter un de plus.
+    Le risque ensuite, et il est ailleurs. POST /deployments/create
+    (routers/deployments.py) prend un fichier de configuration en pièce jointe,
+    le passe à DeploymentConfig.from_yaml_bytes() puis à manager.deploy() : la
+    configuration désigne une source — GitSourceManager pour le type git —, et
+    Deployment._install_dependencies() lance un « subprocess.check_call » de
+    « uv pip install » sur ce que le fichier réclame, avant que _load_services()
+    fasse un « importlib.import_module(module_name) » du module de workflow.
+    Déployer, ici, c'est cloner, installer et exécuter — sous le compte du
+    processus LlamaDeploy, avec ses variables d'environnement, donc ses clés
+    d'API de fournisseurs de modèles et ses accès aux magasins de vecteurs. Rien
+    dans app.py ne conditionne cette route : c'est le premier appel anonyme qui
+    prend la main.
+    Le reste du routeur suit. POST /deployments/{nom}/tasks/run fait tourner un
+    workflow d'agent existant et rend son résultat — donc les outils que cet
+    agent a le droit d'appeler, aux frais de l'exploitant et sans compte à
+    débiter ; les variantes /tasks/create et /tasks/run_nowait mettent en file, et
+    les routes d'événements et de sessions du même routeur donnent à lire l'état
+    des conversations en cours. Le renseignement de /status/ fournit précisément
+    les noms qui manquent pour viser.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera. Et l'intergiciel d'origine croisée ne
+    rattrapera rien — app.py le monte avec « allow_origins=["*"] »,
+    « allow_credentials=True » et les méthodes GET et POST, si bien qu'une page
+    ouverte par un poste du réseau interne peut piloter l'instance depuis le
+    navigateur.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à poser : ApiserverSettings n'en
+    déclare aucun sous son préfixe LLAMA_DEPLOY_APISERVER_, et le seul
+    intergiciel monté par app.py est celui d'origine croisée, qui ne filtre rien
+    d'autre que les appels de navigateur. La fermeture est donc entièrement en
+    amont de l'application.
+    Ramener la liaison à sa valeur de code — LLAMA_DEPLOY_APISERVER_HOST=127.0.0.1
+    — parce que l'image officielle la défait : docker/Dockerfile.base pose
+    0.0.0.0. Côté conteneur, publier le port sur la boucle locale
+    (« -p 127.0.0.1:4501:4501 ») plutôt que sur toutes les interfaces
+    (« -p 4501:4501 »). En environnement serverless, où le port doit être public
+    pour que la plateforme route le trafic, l'authentification de la plateforme
+    elle-même est la seule barrière qui existe : sans elle, l'URL est l'API.
+    Quand l'instance doit être atteinte depuis un autre hôte, la placer derrière
+    un proxy qui exige une authentification sur tout le préfixe, et non sur les
+    seules routes dont on se méfie : /status/, /deployments/ et toutes les routes
+    d'exécution passent par les deux mêmes routeurs nus.
+    Poser DISABLE_CORS dans l'environnement quand aucun navigateur n'a à
+    atteindre l'instance : c'est la seule condition qui empêche app.py de monter
+    le CORSMiddleware à « allow_origins=["*"] » avec « allow_credentials=True ».
+    Vérifier depuis l'extérieur du périmètre : « curl -s http://<hote>:4501/status/ »
+    ne doit plus rendre max_deployments et deployments.
+    Après une exposition, tenir les déploiements pour suspects : comparer
+    l'inventaire de GET /deployments/ aux workflows attendus, chercher dans le
+    deployments_path un dépôt cloné que l'équipe n'a pas déposé, relire les
+    journaux à la recherche d'un POST /deployments/create, et faire tourner les
+    secrets que le processus porte — un module importé par le serveur les lit
+    comme le ferait le code légitime.
+  reference:
+    - https://github.com/run-llama/llama_deploy/blob/main/llama_deploy/apiserver/routers/status.py
+    - https://github.com/run-llama/llama_deploy/blob/main/llama_deploy/types/apiserver.py
+    - https://github.com/run-llama/llama_deploy/blob/main/llama_deploy/apiserver/app.py
+    - https://github.com/run-llama/llama_deploy/blob/main/llama_deploy/apiserver/settings.py
+    - https://github.com/run-llama/llama_deploy/blob/main/llama_deploy/apiserver/routers/deployments.py
+    - https://github.com/run-llama/llama_deploy/blob/main/llama_deploy/apiserver/deployment.py
+    - https://github.com/run-llama/llama_deploy/blob/main/docker/Dockerfile.base
+  metadata:
+    max-request: 2
+    vendor: run-llama
+    product: llama-deploy
+  tags: ai,llm,llamaindex,llama-deploy,run-llama,agent,workflow,exposure,unauth,rce,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit et rend l'inventaire, la seconde
+  # dit que le routeur qui porte les routes d'exécution répond au même anonyme.
+  #
+  # La barre finale des deux chemins n'est pas une coquetterie : les deux routes
+  # sont déclarées « @router.get("/") » sous un préfixe, donc leur chemin complet
+  # est « /status/ » et « /deployments/ ». Sans elle, FastAPI répond 307 vers la
+  # forme barrée, que nuclei ne suit pas par défaut — la lecture ne mesurerait
+  # que la redirection.
+  #
+  # GET, et rien d'autre. Le même routeur nu sert POST /deployments/create, qui
+  # clone une source, lance « uv pip install » sur ce que la configuration
+  # réclame et importe le module de workflow — déployer est exécuter —, et POST
+  # /deployments/{nom}/tasks/run, qui ferait tourner un agent aux frais de
+  # l'exploitant. C'est précisément ce que le constat signale ; ce n'est pas ce
+  # qu'un scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/status/"
+      - "{{BaseURL}}/deployments/"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # « un LlamaDeploy publie son état » et « son routeur de déploiements répond
+    # à l'anonyme » sont deux faits distincts, et c'est leur conjonction qui fait
+    # le constat.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture du document. Le modèle Status déclare « status » en
+          # premier et pydantic sérialise dans l'ordre des champs, donc cette clé
+          # ouvre le corps. La valeur est laissée libre parmi les trois que
+          # StatusEnum écrit — le handler pose HEALTHY en dur, mais une instance
+          # qui se dirait « Unhealthy » serait tout aussi ouverte.
+          #
+          # L'ancrage écarte la même charge utile retrouvée au fond du document
+          # d'une supervision qui l'agrégerait sous une clé à elle : c'est lui
+          # qui dit que l'instance a répondu d'elle-même. Les \s* sont là parce
+          # que FastAPI sérialise compact mais qu'un intermédiaire qui réindente
+          # ce qu'il relaie ne s'y tient pas.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"status\"\\s*:\\s*\"[A-Za-z]+\"", trim_space(body_1))'
+
+          # Le second champ du modèle, requis et donc toujours sérialisé. Il ne
+          # désigne rien à lui seul, mais il sépare la charge utile de Status de
+          # la sonde de santé d'un produit quelconque qui aurait par ailleurs
+          # emprunté le vocabulaire des deux clés suivantes.
+          - 'regex("\"status_message\"\\s*:", trim_space(body_1))'
+
+          # Le couple, et c'est lui la signature. max_deployments est le plafond
+          # que le Manager s'impose — « max_deployments: int = 10 » — et n'a de
+          # sens que pour lui ; deployments à côté de lui nomme les workflows
+          # d'agents déployés. Ni l'un ni l'autre séparément : « deployments »
+          # est le mot de toutes les plateformes de déploiement du monde.
+          #
+          # Les deux champs sont annotés « | None » : leur valeur nulle est admise
+          # au même titre que l'entier et le tableau, puisque le handler ne
+          # renseigne pas ce que le modèle laisse facultatif.
+          - 'regex("\"max_deployments\"\\s*:\\s*([0-9]+|null)", trim_space(body_1))'
+          - 'regex("\"deployments\"\\s*:\\s*(\\[|null)", trim_space(body_1))'
+
+          # Le corps entier tenu pour un objet plat. La charge utile de Status n'a
+          # que quatre champs, dont aucun n'est un objet : deux chaînes, un
+          # entier et un tableau de chaînes — donc aucune accolade intérieure.
+          #
+          # Cet ancrage écarte d'un coup l'index d'un SPA rendu en 200 par un
+          # catch-all et le document composite d'une passerelle qui logerait la
+          # réponse de LlamaDeploy à côté d'un objet à elle — ce que l'ancrage de
+          # la première expression ne ferait pas, puisqu'un tel document peut
+          # très bien commencer par « status ».
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_1))'
+
+          # La seconde lecture, et elle porte sur le routeur qui compte : c'est
+          # sur deployments_router que sont montées POST /deployments/create et
+          # les routes d'exécution. Que read_deployments() réponde à l'anonyme,
+          # c'est que le routeur entier lui répond.
+          #
+          # Les deux sérialisations que la route a réellement eues sont admises :
+          # la liste de DeploymentDefinition depuis la publication 0.4.0 — donc
+          # « [] » sur une instance vide, ou un premier objet dont « name » est
+          # l'unique champ — et la JSONResponse {"deployments":[...]} des
+          # publications antérieures. Une instance ancienne est précisément celle
+          # qui traîne exposée.
+          #
+          # L'ancrage sur l'ouverture n'est pas décoratif : il écarte le portail
+          # captif qui rend le même document sur toutes ses routes, puisque la
+          # charge utile de Status ouvre sur « status » et non sur « deployments ».
+          - 'status_code_2 == 200 && regex("^(\\[\\s*(\\]|\\{\\s*\"name\"\\s*:\\s*\")|\\{\\s*\"deployments\"\\s*:\\s*\\[)", trim_space(body_2))'
+
+    extractors:
+      # Les workflows d'agents déployés, et par eux les routes d'exécution que
+      # l'instance sert : un déploiement nommé « x » ouvre POST
+      # /deployments/x/tasks/run.
+      #
+      # Un seul extracteur, et borné à body_1 — sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, or les deux lectures énumèrent les
+      # mêmes noms.
+      - type: json
+        part: body_1
+        name: deployment
+        json:
+          - '.deployments[]'
