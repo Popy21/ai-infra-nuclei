@@ -1,0 +1,235 @@
+id: mineru-api-exposed
+
+info:
+  name: MinerU API - Unauthenticated Health Disclosure and Open Document Parsing API
+  author: popy21
+  severity: medium
+  description: |
+    MinerU (opendatalab/MinerU) est l'extracteur de documents PDF et bureautiques
+    le plus déployé en amont des pipelines RAG. Son serveur HTTP est la commande
+    « mineru-api », déclarée dans pyproject.toml sous [project.scripts] comme
+    « mineru-api = "mineru.cli.fast_api:main" », et tout ce qui suit se lit dans
+    ce seul fichier.
+    GET /health y est écrite « @app.get(path="/health") » et son handler est
+    « async def health_check(): » — une signature sans le moindre paramètre,
+    donc sans dépendance à traverser. Quand le gestionnaire de tâches est levé,
+    elle rend littéralement le dictionnaire « status », « version »,
+    « protocol_version », « queued_tasks », « processing_tasks »,
+    « completed_tasks », « failed_tasks », « max_concurrent_requests »,
+    « processing_window_size », « task_retention_seconds » et
+    « task_cleanup_interval_seconds ». Les quatre compteurs viennent de
+    task_manager.get_stats(), indexé par TASK_PENDING, TASK_PROCESSING,
+    TASK_COMPLETED et TASK_FAILED — les chaînes "pending", "processing",
+    "completed", "failed" ; les deux suivants de get_max_concurrent_requests() et
+    de get_processing_window_size(default=DEFAULT_PROCESSING_WINDOW_SIZE) ; les
+    deux derniers des attributs du gestionnaire, que get_task_retention_seconds()
+    et get_task_cleanup_interval_seconds() lisent dans l'environnement avec pour
+    défauts DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60 et
+    DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60. « protocol_version » est la
+    constante API_PROTOCOL_VERSION = 2 de mineru/cli/api_protocol.py, où vivent
+    aussi DEFAULT_MAX_CONCURRENT_REQUESTS = 3 et DEFAULT_PROCESSING_WINDOW_SIZE
+    = 64, et « version » est le __version__ de mineru/version.py.
+    L'absence d'authentification est un défaut du produit, et il se vérifie à la
+    source dans le même fichier plutôt qu'il ne se déduit d'une réponse :
+    create_app() n'ajoute qu'un intergiciel, « app.add_middleware(GZipMiddleware,
+    minimum_size=1000) », et le fichier ne contient ni api_key, ni vérification
+    de jeton, ni Security(...). Le seul « Depends( » qu'on y trouve est
+    « Annotated[ParseRequestOptions, Depends(parse_request_form)] », porté par
+    POST /file_parse et POST /tasks, et il ne fait que parser le formulaire
+    multipart. Aucune route n'a donc de garde à contourner : il n'y en a aucune à
+    poser.
+    Le quatuor « queued_tasks » + « processing_window_size » +
+    « task_retention_seconds » + « task_cleanup_interval_seconds » est ce qui
+    nomme le produit. « status » seul est le vocabulaire de toutes les routes de
+    santé du web, et le code HTTP ne dit rien du tout ; c'est la conjonction des
+    compteurs de file et des deux durées de rétention qui n'appartient qu'à ce
+    gestionnaire de tâches, et qui sépare ce constat du GET /version de Docling
+    Serve que le pack couvre déjà.
+    La branche d'échec ne porte pas cette charge utile : quand le gestionnaire
+    n'est pas initialisé ou n'est pas sain, health_check() rend une JSONResponse
+    de statut 503 dont le contenu n'a que « status » à "unhealthy", « version » et
+    « error ». Le constat porte donc sur l'instance qui sert, pas sur celle qui
+    démarre mal.
+    Les valeurs par défaut du CLI vont dans l'autre sens que l'exposition :
+    « --host » vaut "127.0.0.1" et « --port » vaut 8000. L'exposition survient
+    quand l'exploitant passe « --host 0.0.0.0 » ou publie le port du conteneur.
+    MinerU tient d'ailleurs la liaison publique pour un danger et le dit dans son
+    propre code : is_public_bind_host() reconnaît "0.0.0.0" et "::", et
+    validate_public_http_client_request() refuse alors les backends
+    « *-http-client » et « server_url » par un 400, sauf si
+    --allow-public-http-client a été passé. Le vecteur de requête sortante est
+    donc fermé par défaut sur une instance publiée — les routes de dépôt de
+    documents, elles, ne le sont pas.
+  impact: |
+    Le renseignement d'abord, et il ne se limite pas à dater l'instance.
+    « version » donne la publication exacte, donc quels avis de sécurité la
+    visent et lesquels ont déjà été appliqués, et « protocol_version » la
+    génération de l'API. Les quatre compteurs décrivent le trafic réel : une
+    instance qui a des tâches en file et des tâches terminées est une instance
+    dont on se sert, et une tâche de plus n'y sera pas remarquée ; une instance à
+    zéro est un service oublié. « failed_tasks » dit en prime la santé du
+    pipeline. « max_concurrent_requests » et « processing_window_size » donnent
+    la taille de la file, c'est-à-dire combien un appelant peut engager avant de
+    saturer le service, et les deux valeurs de rétention disent combien de temps
+    les résultats restent sur le disque de l'exploitant.
+    Le risque, lui, est sur les routes que la lecture du fichier établit comme
+    ouvertes, puisqu'aucune n'a de dépendance d'authentification. POST
+    /file_parse reçoit des fichiers téléversés, lance l'analyse et rend le
+    résultat dans la même réponse ; POST /tasks met le même travail en file et
+    rend un 202 avec un identifiant de tâche. Déposer des documents arbitraires
+    fait donc tourner le pipeline MinerU — analyse de mise en page,
+    reconnaissance de caractères, reconstruction des tableaux — sur le matériel
+    de l'exploitant, accélérateur compris, sans compte à débiter et sans limite
+    autre que la profondeur de file que /health vient de publier.
+    Les routes de restitution répondent au même anonyme. GET /tasks/{task_id}
+    rend to_status_payload() : « task_id », « status », « backend »,
+    « file_names » — les noms des documents déposés par les autres utilisateurs
+    de l'instance — les horodatages, l'erreur éventuelle, « status_url » et
+    « result_url ». GET /tasks/{task_id}/result rend le contenu extrait
+    lui-même : markdown, middle json, sortie de modèle, liste de contenus,
+    images, et le fichier d'origine quand return_original_file a été demandé,
+    en archive zip ou en JSON. Ces deux routes ne s'énumèrent pas — task_id est
+    un « str(uuid.uuid4()) » — mais un identifiant qui fuit par un journal, une
+    trace d'intermédiaire ou un lien partagé suffit, et les compteurs de /health
+    disent s'il y a quelque chose à chercher.
+    Le document OpenAPI complète le tableau sans rien demander : create_app()
+    pose « openapi_url="/openapi.json" if enable_docs else None » avec
+    « enable_docs = env_flag_enabled("MINERU_API_ENABLE_FASTAPI_DOCS",
+    default=True) », plus docs_url="/docs" et redoc_url="/redoc". Par défaut,
+    l'API entière — POST /file_parse, POST /tasks, les routes de tâches et leurs
+    paramètres — est décrite à l'appelant anonyme.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à poser : le fichier n'en contient
+    aucun. La fermeture se fait donc à la liaison et devant, pas dans la
+    configuration du produit.
+    Garder « --host 127.0.0.1 », qui est le défaut, quand l'instance n'a pas à
+    être atteinte depuis l'extérieur de la machine, et publier le port du
+    conteneur en « -p 127.0.0.1:8000:8000 » : « -p 8000:8000 » le publie sur
+    toutes les interfaces de l'hôte.
+    Quand l'API doit être joignable, la placer derrière un intermédiaire qui
+    authentifie et ne rien laisser passer sans identité — /health compris,
+    puisque c'est lui qui nomme le produit, donne la publication et décrit la
+    file.
+    MINERU_API_ENABLE_FASTAPI_DOCS=0 ferme /openapi.json, /docs et /redoc, et
+    rien d'autre : ni /health, ni aucune route de traitement.
+    Ne pas passer --allow-public-http-client sur une instance liée publiquement.
+    Sans lui, validate_public_http_client_request() refuse par un 400 les
+    backends « *-http-client » et « server_url » dès que is_public_bind_host()
+    reconnaît la liaison ; avec lui, l'appelant choisit le point d'inférence
+    distant et le service devient une primitive de requête sortante — c'est le
+    risque de falsification de requête côté serveur que MinerU journalise
+    lui-même en avertissement au démarrage.
+    Vérifier la prise en compte depuis l'extérieur du périmètre :
+    « curl -s http://<hote>:8000/health » ne doit plus rendre le dictionnaire.
+    Après une exposition, tenir la publication et les compteurs pour lus.
+    Chercher ensuite dans le journal d'accès d'uvicorn — actif tant que
+    MINERU_API_DISABLE_ACCESS_LOG n'est pas posé — les POST /file_parse et POST
+    /tasks qu'on ne s'explique pas : chacun est un document déposé et une analyse
+    passée sur le matériel de l'exploitant. Vérifier de même les GET
+    /tasks/*/result, et inspecter la racine de sortie — MINERU_API_OUTPUT_ROOT,
+    un répertoire par task_id — pour les tâches qu'on ne reconnaît pas. Aucune de
+    ces lignes ne portera d'identité d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/opendatalab/MinerU/blob/master/mineru/cli/fast_api.py
+    - https://github.com/opendatalab/MinerU/blob/master/mineru/cli/api_protocol.py
+    - https://github.com/opendatalab/MinerU/blob/master/mineru/cli/public_http_client_policy.py
+    - https://github.com/opendatalab/MinerU/blob/master/mineru/utils/config_reader.py
+    - https://github.com/opendatalab/MinerU/blob/master/pyproject.toml
+    - https://github.com/opendatalab/MinerU
+  metadata:
+    max-request: 1
+    vendor: opendatalab
+    product: mineru
+  tags: ai,llm,rag,mineru,opendatalab,document-parsing,pdf,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la moins coûteuse de l'API. health_check() ne
+  # touche ni le disque ni la file : elle lit deux constantes, un dictionnaire de
+  # compteurs déjà tenu en mémoire par le gestionnaire de tâches, et deux
+  # attributs de ce gestionnaire.
+  #
+  # En lecture, et rien d'autre. Le même serveur nu sert POST /file_parse et POST
+  # /tasks, qui déposent des fichiers et font tourner le pipeline d'extraction
+  # sur le matériel de l'exploitant — c'est l'abus que le constat signale, ce
+  # n'est pas ce qu'un scanner a le droit de faire pour l'établir.
+  #
+  # Les routes de tâches ne sont pas jointes non plus, et pas seulement par
+  # prudence : elles ne discrimineraient rien. GET /tasks/{task_id} sur un
+  # identifiant qui n'existe pas rend « {"detail":"Task not found"} », c'est-à-dire
+  # la forme d'une HTTPException de FastAPI, que n'importe quelle application du
+  # même cadre peut rendre sur n'importe quel chemin. Aucune garde n'est posée
+  # devant elle qu'un 404 permettrait de distinguer d'un 401 : c'est justement le
+  # constat — il n'y a rien à traverser.
+  - method: GET
+    path:
+      - "{{BaseURL}}/health"
+
+    matchers-condition: and
+    matchers:
+      # Des expressions plutôt que des mots, et le constat tient dans le quatuor
+      # du milieu.
+      #
+      # L'ancrage sur l'ouverture du document vient d'abord. Le handler rend un
+      # littéral de dictionnaire dont « status » est la première clé, et FastAPI
+      # sérialise un dict tel quel — jsonable_encoder préserve l'ordre
+      # d'insertion — donc cette clé ouvre le corps. L'exiger en ouverture écarte
+      # la même charge utile retrouvée au fond du document d'une supervision qui
+      # l'agrégerait sous une clé à elle : c'est cet ancrage qui dit que
+      # l'instance a répondu d'elle-même.
+      #
+      # La valeur "healthy" est exigée telle quelle, et le guillemet ouvrant
+      # qui la précède est ce qui écarte "unhealthy" : la branche d'échec rend un
+      # 503 dont le contenu n'a que trois clés et pas un seul compteur, donc rien
+      # à signaler ici.
+      #
+      # « status » seul ne désigne pourtant rien — c'est le vocabulaire de toutes
+      # les routes de santé — et les quatre expressions suivantes sont ce qui
+      # nomme MinerU. « queued_tasks » avec « processing_window_size » disent le
+      # gestionnaire de tâches et sa fenêtre ; « task_retention_seconds » avec
+      # « task_cleanup_interval_seconds » disent la purge différée des résultats.
+      # Aucun autre produit du pack ne publie cette conjonction, et le GET
+      # /version de Docling Serve — l'autre convertisseur de documents couvert
+      # ici — n'en porte aucune.
+      #
+      # Les valeurs sont laissées libres mais tenues pour des entiers non
+      # guillemetés : get_stats() compte des tâches, get_processing_window_size()
+      # et les deux lecteurs de durées sont annotés « -> int ». Un document qui
+      # citerait ces noms en face de chaînes ou d'objets ne serait pas la réponse
+      # du handler.
+      #
+      # Le numéro de publication est laissé au seul extracteur : il change à
+      # chaque publication.
+      #
+      # Les \s* sont là parce que FastAPI sérialise compact mais qu'un
+      # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+      #
+      # Le corps entier tenu pour un objet plat enfin : la charge utile n'est
+      # faite que de deux chaînes et de neuf entiers, donc aucune accolade
+      # intérieure. Cet ancrage écarte d'un coup le schéma que la même instance
+      # décrit sur /openapi.json, où ces noms sont des propriétés suivies
+      # d'objets, et le document composite d'une passerelle qui recopierait la
+      # charge utile en tête avant d'y ajouter un objet à elle — ce que l'ancrage
+      # de la première expression ne ferait pas seul.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"status"\s*:\s*"healthy"'
+          - '"queued_tasks"\s*:\s*[0-9]+'
+          - '"processing_window_size"\s*:\s*[0-9]+'
+          - '"task_retention_seconds"\s*:\s*[0-9]+'
+          - '"task_cleanup_interval_seconds"\s*:\s*[0-9]+'
+          - '^\s*\{[^{}]*\}\s*$'
+        condition: and
+
+    extractors:
+      # La publication de l'instance, donc les correctifs qui lui manquent.
+      # « protocol_version » ne bouge qu'à une refonte de l'API et les compteurs
+      # ne valent que le temps de la lecture : ni l'un ni les autres ne
+      # renseignent sur ce qu'il faut mettre à jour.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'

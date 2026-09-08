@@ -22063,6 +22063,418 @@ def test_evidently_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Chez MinerU, il n'y a aucune garde à contourner et c'est le constat lui-même :
+# create_app() (mineru/cli/fast_api.py) n'ajoute que
+# « app.add_middleware(GZipMiddleware, minimum_size=1000) », le fichier ne porte
+# ni api_key, ni vérification de jeton, ni Security(...), et le seul « Depends( »
+# qu'on y lit est « Annotated[ParseRequestOptions, Depends(parse_request_form)] »
+# — le parseur du formulaire multipart de POST /file_parse et POST /tasks. Le
+# handler de la route lue, « async def health_check(): », n'a pas même un
+# paramètre.
+#
+# Toute la difficulté du template est donc de reconnaissance, et elle est vive :
+# la charge utile ouvre sur « "status": "healthy" », c'est-à-dire le mot que
+# publie la moitié des sondes de santé du web, et le pack en couvre déjà
+# plusieurs. Ce qui sépare MinerU est le quatuor du gestionnaire de tâches —
+# queued_tasks, processing_window_size, task_retention_seconds,
+# task_cleanup_interval_seconds — que le littéral de health_check() sérialise
+# d'un bloc. C'est ce quatuor, et la platitude qui l'escorte, que cette section
+# amarre.
+
+MINERU_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "mineru-api-exposed.yaml")
+
+MINERU_HEALTH_ROUTE = "/health"
+
+
+def mineru_health_body(version="3.4.5", protocol_version=2, queued=0,
+                       processing=0, completed=0, failed=0,
+                       max_concurrent_requests=3, processing_window_size=64,
+                       task_retention_seconds=86400,
+                       task_cleanup_interval_seconds=300, extra=None,
+                       drop=()):
+    """
+    Réponse de GET /health telle que FastAPI sérialise le littéral que
+    health_check() rend : onze clés, dans l'ordre du dictionnaire source, deux
+    chaînes et neuf entiers, écrites compact.
+
+    Les défauts sont ceux du produit — API_PROTOCOL_VERSION = 2,
+    DEFAULT_MAX_CONCURRENT_REQUESTS = 3, DEFAULT_PROCESSING_WINDOW_SIZE = 64,
+    DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60,
+    DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60.
+    """
+    document = {
+        "status": "healthy",
+        "version": version,
+        "protocol_version": protocol_version,
+        "queued_tasks": queued,
+        "processing_tasks": processing,
+        "completed_tasks": completed,
+        "failed_tasks": failed,
+        "max_concurrent_requests": max_concurrent_requests,
+        "processing_window_size": processing_window_size,
+        "task_retention_seconds": task_retention_seconds,
+        "task_cleanup_interval_seconds": task_cleanup_interval_seconds,
+    }
+    for key in drop:
+        document.pop(key)
+    document.update(extra or {})
+    return json.dumps(document, separators=(",", ":"))
+
+
+MINERU_HEALTH_BODY = mineru_health_body()
+
+# Une instance qui travaille : c'est celle qui compte, puisque ses compteurs
+# disent qu'une tâche de plus n'y sera pas remarquée. Le template doit la
+# reconnaître aussi bien que l'instance au repos.
+MINERU_BUSY_BODY = mineru_health_body(queued=4, processing=3, completed=1274,
+                                      failed=12)
+
+# L'exploitant qui a resserré la rétention par MINERU_API_TASK_RETENTION_SECONDS
+# =0 : get_int_env() admet le zéro, minimum=0, et la boucle de purge n'est alors
+# pas lancée. L'instance est exposée au même titre.
+MINERU_NO_RETENTION_BODY = mineru_health_body(task_retention_seconds=0)
+
+# La branche d'échec de health_check() : quand task_manager est None ou n'est pas
+# sain, le handler rend une JSONResponse de statut 503 dont le contenu n'a que
+# trois clés — pas un seul compteur. Rien à signaler ici : ce n'est pas une
+# instance qui sert.
+MINERU_UNHEALTHY_BODY = json.dumps(
+    {"status": "unhealthy", "version": "3.4.5",
+     "error": "Task manager is not initialized"},
+    separators=(",", ":"))
+
+# La sonde de santé d'un service quelconque : même mot d'ouverture, même version,
+# et rien du gestionnaire de tâches de MinerU.
+MINERU_OTHER_HEALTH_BODY = '{"status":"healthy","version":"1.4.2","uptime":8123}'
+
+# Une file de travaux quelconque qui publie sa profondeur : « queued_tasks » y
+# est, mais aucune des trois autres clés du quatuor.
+MINERU_OTHER_QUEUE_BODY = json.dumps(
+    {"status": "healthy", "version": "2.1.0", "queued_tasks": 4,
+     "workers": 8, "uptime": 8123},
+    separators=(",", ":"))
+
+# Le même produit décrit par un tiers qui reconstruit la charge utile en
+# guillemetant tout : les onze noms y sont, dans l'ordre, mais les compteurs sont
+# des chaînes — ce que le handler ne peut pas écrire, puisque get_stats() compte
+# et que les deux lecteurs de durées sont annotés « -> int ».
+MINERU_STRINGIFIED_BODY = json.dumps(
+    {key: str(value) for key, value in json.loads(MINERU_HEALTH_BODY).items()},
+    separators=(",", ":"))
+
+# Un tableau de supervision qui agrège la réponse de l'instance sous une clé à
+# lui : la charge utile est là, entière, mais ce n'est pas l'instance qui a
+# répondu d'elle-même.
+MINERU_COMPOSITE_BODY = '{"mineru":%s,"scraped_at":0}' % MINERU_HEALTH_BODY
+
+# La même supervision, mais qui recopie la charge utile en tête plutôt que de
+# l'imbriquer, et n'ajoute son objet à elle qu'ensuite. L'ancrage sur l'ouverture
+# ne l'écarte pas — le document commence bien par la bonne clé et la bonne
+# valeur — et c'est la platitude, et elle seule, qui dit que ce n'est pas
+# l'instance qui a répondu.
+MINERU_ANNOTATED_BODY = mineru_health_body(
+    extra={"probe": {"latency_ms": 12, "checked_at": 0}})
+
+# L'entrée d'un registre de services, ou la réponse d'un relais qui préfixe la
+# charge utile d'une clé de routage à lui. Le document est plat et porte le
+# quatuor : seul l'ancrage sur l'ouverture dit que ce n'est pas l'instance qui a
+# répondu, puisque « status » ouvre le littéral de health_check().
+MINERU_REGISTRY_BODY = (
+    '{"service":"doc-extract","status":"healthy","version":"3.4.5",'
+    '"protocol_version":2,"queued_tasks":0,"processing_tasks":0,'
+    '"completed_tasks":0,"failed_tasks":0,"max_concurrent_requests":3,'
+    '"processing_window_size":64,"task_retention_seconds":86400,'
+    '"task_cleanup_interval_seconds":300}'
+)
+
+# Le schéma que la même instance sert sur /openapi.json quand
+# MINERU_API_ENABLE_FASTAPI_DOCS n'est pas coupé : les noms y sont, mais comme
+# propriétés — donc suivis d'objets.
+MINERU_OPENAPI_SCHEMA_BODY = (
+    '{"Health":{"properties":{"status":{"type":"string"},'
+    '"queued_tasks":{"type":"integer"},'
+    '"processing_window_size":{"type":"integer"},'
+    '"task_retention_seconds":{"type":"integer"},'
+    '"task_cleanup_interval_seconds":{"type":"integer"}},"type":"object"}}'
+)
+
+# Refus d'un proxy authentifiant placé devant l'instance — la seule fermeture
+# possible, puisque le produit n'a aucun réglage d'authentification.
+MINERU_PROXY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+
+def mineru_health_block():
+    doc = load(MINERU_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MINERU_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /health — c'est pourtant la seule route de "
+        "lecture dont la réponse nomme le produit"
+    )
+    return blocks[0]
+
+
+def mineru_fires(status=200, body=MINERU_HEALTH_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même
+    si le bloc n'a pas à en dépendre.
+    """
+    block = mineru_health_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_mineru_probe_reads_the_health_route_and_never_deposits_a_document():
+    """
+    Une lecture, et la moins coûteuse : health_check() lit deux constantes, des
+    compteurs déjà tenus en mémoire et deux attributs du gestionnaire. Le même
+    serveur nu sert POST /file_parse et POST /tasks, qui déposent des fichiers et
+    font tourner le pipeline d'extraction sur le matériel de l'exploitant — c'est
+    l'abus que le constat signale, ce n'est pas ce qu'un scanner a le droit de
+    faire pour l'établir.
+    """
+    doc = load(MINERU_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", MINERU_HEALTH_ROUTE)}, (
+        "le template n'interroge pas exactement la route de santé — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la santé se lit en GET : sur ce serveur, POST /file_parse et POST "
+            "/tasks déposent un document et engagent une analyse que "
+            "l'exploitant paie en calcul"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande d'écrire à l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/file_parse", "le template appelle la route d'analyse "
+                                "synchrone : il déposerait un document et "
+                                "ferait tourner l'extraction sur le matériel "
+                                "de l'exploitant"),
+                ("/tasks", "les routes de tâches déposent un travail en file — "
+                           "ou rendent les noms et le contenu extrait des "
+                           "documents des autres utilisateurs de l'instance"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_mineru_matcher_rests_on_the_task_manager_quartet_not_on_a_health_route():
+    assert mineru_fires(), (
+        "le template ne reconnaît pas une instance MinerU dont /health répond à "
+        "l'anonyme"
+    )
+    assert mineru_fires(body=MINERU_BUSY_BODY), (
+        "le template ne reconnaît pas une instance dont la file travaille — "
+        "c'est pourtant celle qui compte, puisque ses compteurs disent qu'une "
+        "tâche de plus n'y sera pas remarquée"
+    )
+    assert mineru_fires(body=MINERU_NO_RETENTION_BODY), (
+        "le template exige une rétention non nulle : MINERU_API_TASK_RETENTION"
+        "_SECONDS=0 est admis par get_int_env(minimum=0), et l'instance est "
+        "exposée au même titre"
+    )
+    assert mineru_fires(
+        body=json.dumps(json.loads(MINERU_HEALTH_BODY), indent=2)), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer la route"
+    )
+    assert mineru_fires(body=mineru_health_body(extra={"backend": "pipeline"})), (
+        "le template compte les champs : une publication ultérieure qui "
+        "ajouterait un scalaire au littéral de health_check() le rendrait muet, "
+        "alors que la route resterait exactement aussi ouverte"
+    )
+
+    assert not mineru_fires(body=MINERU_UNHEALTHY_BODY), (
+        "le template déclenche sur la branche d'échec, qui rend un 503 sans un "
+        "seul compteur : « unhealthy » contient « healthy », et c'est le "
+        "guillemet ouvrant exigé devant la valeur qui les sépare"
+    )
+    assert not mineru_fires(body=MINERU_OTHER_HEALTH_BODY), (
+        "le template déclenche sur la sonde de santé d'un produit quelconque : "
+        "« status » et « version » sont le vocabulaire de toutes les routes de "
+        "santé, et c'est le quatuor du gestionnaire de tâches qui nomme MinerU"
+    )
+    assert not mineru_fires(body=MINERU_OTHER_QUEUE_BODY), (
+        "le template conclut sur une file de travaux qui publie sa profondeur : "
+        "« queued_tasks » seul ne désigne rien, les quatre clés sont exigées "
+        "ensemble parce que le littéral les sérialise d'un bloc"
+    )
+    assert not mineru_fires(body=MINERU_STRINGIFIED_BODY), (
+        "le template admet des compteurs guillemetés, que le handler ne peut "
+        "pas écrire — get_stats() compte, et les lecteurs de durées sont "
+        "annotés « -> int » — donc une charge utile reconstruite par un tiers"
+    )
+    assert not mineru_fires(body=MINERU_COMPOSITE_BODY), (
+        "le template retrouve la charge utile au fond du document d'une "
+        "supervision : elle n'est faite que de scalaires, donc sans accolade "
+        "intérieure, et l'ancrage sur l'ouverture est ce qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not mineru_fires(body=MINERU_ANNOTATED_BODY), (
+        "le template déclenche sur une supervision qui recopie la charge utile "
+        "en tête avant d'y ajouter un objet à elle : l'ancrage sur l'ouverture "
+        "la laisse passer, et seule la platitude du document l'écarte"
+    )
+    assert not mineru_fires(body=MINERU_REGISTRY_BODY), (
+        "le template déclenche sur l'entrée d'un registre de services, plate et "
+        "porteuse du quatuor, mais qui n'ouvre pas dessus : « status » ouvre le "
+        "littéral de health_check(), et l'ancrage est ce qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not mineru_fires(body=MINERU_OPENAPI_SCHEMA_BODY), (
+        "le template retrouve ses noms dans le schéma que la même instance "
+        "décrit sur /openapi.json : ils y sont propriétés, donc suivis d'objets"
+    )
+
+    # Collisions internes au pack : d'autres produits couverts ici publient une
+    # route de santé, et le convertisseur de documents voisin publie ses
+    # versions. Aucun ne doit être revendiqué par ce template.
+    for other, name in ((LANGFUSE_HEALTH_BODY, "Langfuse"),
+                        (TABBY_HEALTH_BODY, "Tabby"),
+                        (HAYHOOKS_STATUS_BODY, "Hayhooks"),
+                        (UNSTRUCTURED_HEALTH_BODY, "Unstructured"),
+                        (DOCLING_VERSIONS_BODY, "Docling Serve")):
+        assert not mineru_fires(body=other), (
+            f"le template déclenche sur {name}, déjà couvert par son propre "
+            "template"
+        )
+
+
+def test_mineru_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le littéral sain ne sort de l'application que sous un 200 : health_check()
+    ne pose de statut explicite que sur sa branche d'échec, la JSONResponse 503,
+    dont le contenu n'a pas un compteur. Exiger le 200 n'écarterait donc rien
+    que le corps n'écarte déjà, et ferait manquer l'instance dont un
+    intermédiaire réécrit le statut.
+    """
+    block = mineru_health_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : c'est le quatuor du "
+        "gestionnaire de tâches conjoint à la platitude du document qui nomme "
+        "le produit, aucun des deux seul"
+    )
+
+    assert not mineru_fires(status=401, body=MINERU_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà la route à "
+        "l'anonyme — c'est la seule fermeture possible, puisque le produit n'a "
+        "aucun réglage d'authentification à poser"
+    )
+
+
+def test_mineru_extractor_reports_the_release_the_anonymous_caller_reads():
+    block = mineru_health_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement durable — la publication de "
+        f"l'instance — et {len(extractors)} extracteurs feraient remonter "
+        "autant de fois la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant lui qui dit quels "
+        "correctifs manquent à l'instance ; « protocol_version » ne bouge qu'à "
+        "une refonte de l'API et les compteurs ne valent que le temps de la "
+        "lecture"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_mineru_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    module `re` de Python plutôt qu'avec RE2 : seul un scan contre un vrai
+    serveur ferme la boucle. Le refus du document composite en est l'enjeu
+    propre, puisque c'est la platitude — et elle seule — qui l'écarte.
+    """
+    def scan(body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                payload = (body if self.path == MINERU_HEALTH_ROUTE
+                           else '{"detail":"Not Found"}')
+                status = 200 if self.path == MINERU_HEALTH_ROUTE else 404
+                encoded = payload.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MINERU_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "mineru-api-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(MINERU_HEALTH_BODY)
+    assert set(seen) == {MINERU_HEALTH_ROUTE}, (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == ["3.4.5"], (
+        f"le scan ne remonte pas la publication de l'instance — {extracted}"
+    )
+
+    _, refused = scan(MINERU_COMPOSITE_BODY)
+    assert refused == [], (
+        "le scan conclut sur le document d'une supervision qui republie la "
+        "charge utile sous une clé à elle, donc sur une instance qui n'a pas "
+        "répondu d'elle-même"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
