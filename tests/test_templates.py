@@ -21673,6 +21673,396 @@ def test_unstructured_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Chez Evidently UI, la route lue n'a pas de garde à contourner : service_api()
+# (src/evidently/ui/service/api/service.py) rend « Router("",
+# route_handlers=[version]) » nu, là où local_service.py l'enregistre à côté de
+# create_projects_api(guard), artifacts_router(guard) et prompts_router(guard).
+# Et le garde lui-même ne refuse personne tant qu'aucun secret n'est posé :
+# LocalConfig déclare « security: SecurityComponent = NoSecurityComponent() », et
+# NoSecurityService.authenticate() rend « User(id=self.security_config
+# .dummy_user_id, name="") » sans rien vérifier — l'intergiciel écrit alors
+# « authenticated: True » pour tout appelant.
+#
+# La difficulté du template est donc entièrement de reconnaissance, et elle est
+# vive : la charge utile est un objet de trois chaînes dont deux s'appellent
+# « version » et « commit », c'est-à-dire la forme et le vocabulaire de la moitié
+# des routes de diagnostic du pack. Un seul fait du code la sépare — la constante
+# EVIDENTLY_APPLICATION_NAME = "Evidently UI", rendue en VALEUR de la clé
+# « application » qui ouvre le document. C'est ce fait, et la platitude qui
+# l'escorte, que cette section amarre.
+
+EVIDENTLY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "evidently-ui-exposed.yaml")
+
+EVIDENTLY_VERSION_ROUTE = "/api/version"
+
+
+def evidently_version_body(application="Evidently UI", version="0.7.14",
+                           commit="9f3c1ab", extra=None):
+    """
+    Réponse de GET /api/version telle que Litestar sérialise le modèle Version
+    que version() construit : trois champs str requis, dans l'ordre où
+    src/evidently/legacy/ui/api/models.py les déclare — application, version,
+    commit — écrits compact.
+    """
+    document = {"application": application, "version": version,
+                "commit": commit}
+    document.update(extra or {})
+    return json.dumps(document, separators=(",", ":"))
+
+
+EVIDENTLY_VERSION_BODY = evidently_version_body()
+
+# Le cas nominal d'une installation par paquet : sans GIT_COMMIT dans
+# l'environnement et sans dépôt sous le répertoire d'installation,
+# get_git_revision_short_hash() rend None et le handler écrit le « - » de son
+# « or "-" ».
+EVIDENTLY_NO_CHECKOUT_BODY = evidently_version_body(commit="-")
+
+# La route de version d'un service quelconque : mêmes trois clés, même ordre,
+# même forme — seule la valeur de « application » sépare.
+EVIDENTLY_OTHER_APPLICATION_BODY = evidently_version_body(
+    application="Prompt Studio", version="1.4.0")
+
+# La même valeur, mais dans une autre casse que celle de la constante écrite en
+# dur.
+EVIDENTLY_LOWERCASE_BODY = evidently_version_body(application="evidently ui")
+
+# Une passerelle interne qui cite le produit qu'elle relaie : « Evidently UI » y
+# est, mot pour mot, mais pas comme valeur de « application ».
+EVIDENTLY_MENTION_BODY = evidently_version_body(
+    application="ml-monitor-gateway",
+    extra={"upstream": "Evidently UI"})
+
+# Un tableau de supervision qui agrège la réponse de l'instance sous une clé à
+# lui : les trois champs y sont, avec leurs valeurs exactes, mais ce n'est pas
+# l'instance qui a répondu d'elle-même.
+EVIDENTLY_COMPOSITE_BODY = ('{"evidently":%s,"scraped_at":0}'
+                            % EVIDENTLY_VERSION_BODY)
+
+# La même supervision, mais qui recopie la charge utile en tête plutôt que de
+# l'imbriquer, et n'ajoute son objet à elle qu'ensuite. L'ancrage sur l'ouverture
+# ne l'écarte pas — le document commence bien par la bonne clé et la bonne
+# valeur — et c'est la platitude, et elle seule, qui dit que ce n'est pas
+# l'instance qui a répondu : Version n'a que trois chaînes.
+EVIDENTLY_ANNOTATED_BODY = evidently_version_body(
+    extra={"probe": {"latency_ms": 12, "checked_at": 0}})
+
+# L'entrée d'un registre de services, ou la réponse d'un relais qui préfixe la
+# charge utile d'une clé de routage à lui. Le document est plat et porte la
+# constante sous la bonne clé : seul l'ancrage sur l'ouverture dit que ce n'est
+# pas l'instance qui a répondu, puisque Version déclare « application » en
+# premier et que pydantic sérialise dans l'ordre des champs.
+EVIDENTLY_REGISTRY_BODY = (
+    '{"service":"ml-monitor","application":"Evidently UI",'
+    '"version":"0.7.14","commit":"9f3c1ab"}'
+)
+
+# Le build-info d'une image qui empaquette le produit : elle le nomme, elle
+# épingle la révision qu'elle a construite, mais elle ne publie pas la
+# publication du paquet. Le document est plat et ouvre sur la bonne clé — seuls
+# les trois champs exigés ensemble le séparent de la charge utile de Version,
+# qui les déclare tous requis.
+EVIDENTLY_TRUNCATED_BODY = '{"application":"Evidently UI","commit":"9f3c1ab"}'
+
+# Le schéma que la même instance sert sur son document OpenAPI : les trois noms y
+# sont nommés, mais comme propriétés — donc suivis d'objets.
+EVIDENTLY_OPENAPI_SCHEMA_BODY = (
+    '{"Version":{"properties":{"application":{"type":"string"},'
+    '"version":{"type":"string"},"commit":{"type":"string"}},'
+    '"type":"object"}}'
+)
+
+# L'index de l'application front, que assets_router() sert et qu'un catch-all
+# rend en 200 sur un chemin qu'il ne connaît pas.
+EVIDENTLY_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>Evidently UI</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# Refus d'un proxy placé devant l'instance pour fermer ce que le secret ne ferme
+# pas : la route ne répond plus à l'anonyme, il n'y a rien à signaler.
+EVIDENTLY_PROXY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+
+def evidently_version_block():
+    doc = load(EVIDENTLY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % EVIDENTLY_VERSION_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/version — c'est pourtant la seule "
+        "route sans garde dont la réponse nomme le produit"
+    )
+    return blocks[0]
+
+
+def evidently_fires(status=200, body=EVIDENTLY_VERSION_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même
+    si le bloc n'a pas à en dépendre.
+    """
+    block = evidently_version_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_evidently_probe_reads_the_version_route_and_never_writes_the_workspace():
+    """
+    Une lecture, et la moins coûteuse : version() ne touche ni le disque ni
+    l'espace de travail. Le même préfixe /api porte pourtant POST /api/projects,
+    DELETE sur un projet et la route d'ajout de snapshot, que NoSecurityComponent
+    laisse tout aussi ouvertes — c'est l'abus que le template signale, et le
+    constater ne demande pas d'y toucher.
+    """
+    doc = load(EVIDENTLY_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", EVIDENTLY_VERSION_ROUTE)}, (
+        "le template n'interroge pas exactement la route de version — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la version se lit en GET : sur ce préfixe, POST crée un projet et "
+            "dépose un snapshot dans l'espace de travail de l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/projects", "le template énumère ou crée des projets : la "
+                              "route de lecture rend les noms des projets de "
+                              "l'exploitant, et celle d'écriture en ajoute un "
+                              "dans l'espace de travail qu'il audite"),
+                ("/snapshots", "les routes de snapshots rendent — ou déposent — "
+                               "les instantanés eux-mêmes, qui portent les "
+                               "invites, les réponses du modèle et les colonnes "
+                               "du jeu de données évalué"),
+                ("/artifacts", "le routeur d'artefacts sert les fichiers "
+                               "déposés par l'exploitant"),
+                ("/prompts", "le routeur de prompts sert les invites de "
+                             "l'exploitant"),
+                ("/dashboards", "la route de tableau de bord fait recalculer et "
+                                "rendre les séries de métriques de "
+                                "l'exploitant"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_evidently_matcher_rests_on_the_application_constant_not_on_a_version_route():
+    assert evidently_fires(), (
+        "le template ne reconnaît pas une instance Evidently UI dont "
+        "/api/version répond à l'anonyme"
+    )
+    assert evidently_fires(
+        body='{\n  "application": "Evidently UI",\n  "version": "0.7.14",\n'
+             '  "commit": "9f3c1ab"\n}'), (
+        "le template exige la sérialisation compacte de Litestar : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer la route"
+    )
+    assert evidently_fires(body=evidently_version_body(extra={"edition": "oss"})), (
+        "le template compte les champs : une publication ultérieure qui "
+        "ajouterait un scalaire à Version le rendrait muet, alors que la route "
+        "resterait exactement aussi ouverte"
+    )
+
+    assert not evidently_fires(body=EVIDENTLY_OTHER_APPLICATION_BODY), (
+        "le template déclenche sur la route de version d'un autre produit : "
+        "« version » et « commit » sont le vocabulaire de tous les endpoints de "
+        "diagnostic, et c'est la valeur d'« application » qui nomme celui-ci"
+    )
+    assert not evidently_fires(body=EVIDENTLY_LOWERCASE_BODY), (
+        "le template se passe de la casse d'EVIDENTLY_APPLICATION_NAME, qui est "
+        "pourtant une constante écrite en dur"
+    )
+    assert not evidently_fires(body=EVIDENTLY_MENTION_BODY), (
+        "le template déclenche sur une passerelle qui cite le produit qu'elle "
+        "relaie : « Evidently UI » doit être la valeur d'« application », pas "
+        "une sous-chaîne du corps"
+    )
+    assert not evidently_fires(body=EVIDENTLY_COMPOSITE_BODY), (
+        "le template retrouve la charge utile au fond du document d'une "
+        "supervision : Version n'a que trois chaînes, donc aucune accolade "
+        "intérieure, et l'ancrage sur l'ouverture est ce qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not evidently_fires(body=EVIDENTLY_REGISTRY_BODY), (
+        "le template déclenche sur l'entrée d'un registre de services, plate et "
+        "porteuse de la constante, mais qui n'ouvre pas dessus : Version "
+        "déclare « application » en premier, et l'ancrage sur l'ouverture est "
+        "ce qui dit que l'instance a répondu d'elle-même"
+    )
+    assert not evidently_fires(body=EVIDENTLY_TRUNCATED_BODY), (
+        "le template conclut sur un document qui nomme l'application sans "
+        "porter la charge utile : les trois champs de Version sont requis, donc "
+        "toujours sérialisés ensemble"
+    )
+    assert not evidently_fires(body=EVIDENTLY_ANNOTATED_BODY), (
+        "le template déclenche sur une supervision qui recopie la charge utile "
+        "en tête avant d'y ajouter un objet à elle : l'ancrage sur l'ouverture "
+        "la laisse passer, et seule la platitude du document l'écarte"
+    )
+    assert not evidently_fires(body=EVIDENTLY_OPENAPI_SCHEMA_BODY), (
+        "le template retrouve ses trois noms dans le schéma que la même "
+        "instance décrit : ils y sont propriétés, donc suivis d'objets"
+    )
+    assert not evidently_fires(body=EVIDENTLY_SPA_BODY), (
+        "le template déclenche sur l'index de l'application front, que "
+        "assets_router() sert et qu'un catch-all rend en 200 sur un chemin "
+        "qu'il ne connaît pas — le titre y porte pourtant le nom du produit"
+    )
+
+
+def test_evidently_reports_an_instance_installed_without_a_git_checkout():
+    """
+    Le « - » n'est pas un cas dégradé, c'est le cas courant.
+    get_git_revision_short_hash() ne rend un sha que si GIT_COMMIT est posé ou
+    si un dépôt existe sous le répertoire d'installation ; une installation
+    depuis PyPI n'a ni l'un ni l'autre, et le handler écrit alors le tiret de
+    son « or "-" ». Exiger une empreinte hexadécimale tairait précisément les
+    instances les plus banales.
+    """
+    assert evidently_fires(body=EVIDENTLY_NO_CHECKOUT_BODY), (
+        "le template exige un sha de commit pour conclure : il tait alors les "
+        "instances installées par paquet, dont le champ vaut « - » et qui sont "
+        "tout aussi ouvertes"
+    )
+
+    assert not evidently_fires(body=evidently_version_body(commit="")), (
+        "le template admet un champ commit vide, que le handler ne peut pas "
+        "écrire — « or \"-\" » garantit une valeur non vide — et qui trahit "
+        "donc une charge utile reconstruite par un tiers"
+    )
+
+
+def test_evidently_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    version() n'a pas de branche d'échec : ni HTTPException, ni statut
+    explicite, donc la charge utile ne peut sortir de l'application que sous un
+    200. Exiger ce 200 n'écarterait rien que le corps n'écarte déjà, et ferait
+    manquer l'instance dont un intermédiaire réécrit le statut.
+    """
+    block = evidently_version_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : c'est la constante "
+        "« Evidently UI » conjointe à la platitude du document qui nomme le "
+        "produit, aucune des deux seule"
+    )
+
+    assert not evidently_fires(status=401, body=EVIDENTLY_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà la route à "
+        "l'anonyme — c'est la seule fermeture complète, puisque le secret du "
+        "CLI ne garde que les routeurs d'écriture"
+    )
+
+
+def test_evidently_extractor_reports_the_release_the_anonymous_caller_reads():
+    block = evidently_version_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement exploitable — la publication "
+        f"de l'instance — et {len(extractors)} extracteurs feraient remonter "
+        "autant de fois la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant lui qui dit quels "
+        "correctifs manquent à l'instance ; « application » est une constante "
+        "et ne varie pas d'une instance à l'autre"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_evidently_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    module `re` de Python plutôt qu'avec RE2 : seul un scan contre un vrai
+    serveur ferme la boucle. L'espace de « Evidently UI » en est l'enjeu propre —
+    il vit au milieu d'une expression régulière — et le refus du document
+    composite en est l'autre.
+    """
+    def scan(body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                payload = (body if self.path == EVIDENTLY_VERSION_ROUTE
+                           else '{"status_code":404,"detail":"Not Found"}')
+                status = 200 if self.path == EVIDENTLY_VERSION_ROUTE else 404
+                encoded = payload.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", EVIDENTLY_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "evidently-ui-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(EVIDENTLY_VERSION_BODY)
+    assert set(seen) == {EVIDENTLY_VERSION_ROUTE}, (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == ["0.7.14"], (
+        f"le scan ne remonte pas la publication de l'instance — {extracted}"
+    )
+
+    _, refused = scan(EVIDENTLY_COMPOSITE_BODY)
+    assert refused == [], (
+        "le scan conclut sur le document d'une supervision qui republie la "
+        "charge utile sous une clé à elle, donc sur une instance qui n'a pas "
+        "répondu d'elle-même"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

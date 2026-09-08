@@ -1,0 +1,205 @@
+id: evidently-ui-exposed
+
+info:
+  name: Evidently UI - Unauthenticated Version Disclosure
+  author: popy21
+  severity: medium
+  description: |
+    Evidently UI (evidentlyai/evidently) est le service auto-hébergé qui sert les
+    tableaux de bord de monitoring ML et les évaluations LLM, celui que lance
+    « evidently ui ». Son API n'a aucune notion d'appelant tant qu'un secret
+    n'est pas posé, et le constat le moins coûteux se lit sur GET /api/version.
+    Le handler tient en cinq lignes dans
+    src/evidently/ui/service/api/service.py : « @get("/version") async def
+    version() -> Version » puis « return Version(application=
+    EVIDENTLY_APPLICATION_NAME, version=evidently.__version__,
+    commit=get_git_revision_short_hash(os.path.dirname(evidently.__file__)) or
+    "-") ». Aucune garde n'y est déclarée, et c'est ce qui le sépare de ses
+    voisins : service_api() rend « Router("", route_handlers=[version]) » nu,
+    là où local_service.py l'enregistre à côté de create_projects_api(guard),
+    artifacts_router(guard) et prompts_router(guard), qui reçoivent tous le
+    garde de la composante de sécurité. Le préfixe vient d'ailleurs —
+    AppBuilder.build_api_router() (src/evidently/ui/service/components/base.py)
+    rend « Router(path="/api", route_handlers=self.api_route_handlers) » — d'où
+    le chemin complet /api/version. Le projet le confirme lui-même : le CLI
+    attend que le serveur démarre en interrogeant « f"{base_url}/api/version" »
+    (src/evidently/cli/ui.py).
+    Le corps est le modèle Version (src/evidently/legacy/ui/api/models.py), un
+    BaseModel de trois champs str requis déclarés dans cet ordre —
+    « application », « version », « commit » —, donc
+    {"application":"Evidently UI","version":"<publication>","commit":"<sha
+    court>"}. Le premier est la constante EVIDENTLY_APPLICATION_NAME = "Evidently
+    UI", écrite en dur ; le deuxième est evidently.__version__ ; le troisième est
+    le GIT_COMMIT de l'environnement, sinon la sortie de « git rev-parse --short
+    HEAD » lancée dans le répertoire d'installation, sinon « - ».
+    C'est la valeur « Evidently UI » sous la clé « application » qui nomme le
+    produit, et rien d'autre. Le statut ne dit rien — n'importe quelle route
+    servie rend 200 —, « version » et « commit » sont le vocabulaire de tous les
+    endpoints de diagnostic du monde, et /api/version est un chemin banal.
+    L'absence d'authentification est un défaut de configuration par défaut, pas
+    un oubli d'exploitant. LocalConfig déclare « security: SecurityComponent =
+    NoSecurityComponent() », et src/evidently/ui/service/security/no_security.py
+    définit « def authenticate(self, request: Request) -> User: return User(
+    id=self.security_config.dummy_user_id, name="") » — aucune vérification, un
+    utilisateur rendu à chaque requête. Le CLI ne propose « secret:
+    Optional[str] = Option(None, help="Secret for writing operations") » qu'en
+    option, et get_config() ne remplace la composante par TokenSecurityComponent
+    que si ce secret ou la variable EVIDENTLY_SECRET est posé. Tant qu'aucun ne
+    l'est, l'intergiciel de sécurité écrit « authenticated: True » pour tout
+    appelant et le garde is_authenticated ne lève jamais : les routeurs projets,
+    artefacts et prompts laissent donc passer l'anonyme au même titre que la
+    route de version.
+    Le défaut de liaison est « host: str = Option("127.0.0.1", help="Service
+    host") » et « port: int = Option(8000, help="Service port") » : l'exposition
+    survient dès que l'exploitant passe --host 0.0.0.0 ou publie le port du
+    conteneur.
+  impact: |
+    Le renseignement d'abord, et il est daté. « version » est la publication
+    exacte de l'instance, donc les correctifs qui lui manquent ; « commit » est
+    le sha court de la copie de travail ou la valeur de GIT_COMMIT, si bien
+    qu'une instance construite depuis un dépôt interne publie une révision
+    interne à qui la demande.
+    Le reste suit du même défaut de configuration, et il est plus large que la
+    seule route lue. Sous NoSecurityComponent, authenticate() rend un utilisateur
+    à tout le monde, donc le garde monté sur les routeurs d'écriture ne refuse
+    personne : POST /api/projects crée un projet, DELETE en efface un, la route
+    d'ajout de snapshot dépose un instantané, et les routeurs d'artefacts et de
+    prompts répondent au même anonyme. Les routes de lecture, elles, ne portent
+    aucun garde même quand un secret est posé — create_projects_api() les monte
+    sous un « Router("") » sans guards= — si bien que la liste des projets, les
+    rapports, les métadonnées de snapshots et le téléchargement d'un snapshot
+    restent atteignables dans tous les cas.
+    Ce que ces lectures rendent est le sujet du monitoring lui-même : noms de
+    projets et de rapports, séries de métriques de dérive, et les instantanés que
+    l'équipe a déposés — qui, pour une évaluation LLM, portent les invites, les
+    réponses du modèle et les colonnes du jeu de données évalué. C'est le corpus
+    d'évaluation, pas seulement son résumé.
+    Rien de tout cela ne sera attribué : le service n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera. Le dummy_user_id que NoSecurityService rend
+    est la même constante pour tous les appelants.
+  remediation: |
+    Poser un secret ferme la moitié qui compte : « evidently ui --secret <valeur> »
+    ou la variable EVIDENTLY_SECRET, que get_config() lit toutes deux pour
+    remplacer NoSecurityComponent par TokenSecurityComponent. Les clients
+    présentent alors l'en-tête « evidently-secret », et le garde des routeurs
+    d'écriture refuse ceux qui ne l'ont pas.
+    Ne pas s'y arrêter : le secret ne referme pas les lectures. Les routeurs de
+    lecture de create_projects_api() ne reçoivent pas guards=, et service_api()
+    n'en reçoit pas non plus — la liste des projets, les snapshots et
+    /api/version répondent à l'anonyme dans les deux configurations. La
+    fermeture est donc en amont de l'application.
+    Ramener la liaison à sa valeur par défaut — « evidently ui --host 127.0.0.1 »,
+    ce que le CLI fait déjà quand on ne lui dit rien — et, côté conteneur,
+    publier le port sur la boucle locale (« -p 127.0.0.1:8000:8000 ») plutôt que
+    sur toutes les interfaces (« -p 8000:8000 »).
+    Quand l'instance doit être atteinte depuis un autre hôte, la placer derrière
+    un proxy qui exige une authentification sur tout le préfixe /api, et non sur
+    les seules routes d'écriture : c'est la lecture qui rend le corpus.
+    Vérifier depuis l'extérieur du périmètre : « curl -s http://<hote>:8000/api/version »
+    ne doit plus rendre {"application":"Evidently UI",...}.
+    Après une exposition, tenir l'espace de travail pour suspect : comparer la
+    liste de projets aux projets attendus, et chercher un snapshot déposé que
+    l'équipe n'a pas envoyé — la route d'ajout était ouverte au même anonyme.
+  reference:
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/ui/service/api/service.py
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/ui/service/components/base.py
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/ui/service/local_service.py
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/ui/service/api/projects.py
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/ui/service/security/no_security.py
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/ui/service/components/security.py
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/ui/service/app.py
+    - https://github.com/evidentlyai/evidently/blob/main/src/evidently/cli/ui.py
+  metadata:
+    max-request: 1
+    vendor: evidentlyai
+    product: evidently
+  tags: ai,llm,ml,mlops,evidently,evidentlyai,monitoring,observability,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la moins coûteuse de l'API. version() ne touche
+  # ni le disque ni l'espace de travail : elle lit une constante,
+  # evidently.__version__, et un sha que get_git_revision_short_hash() a résolu
+  # depuis l'environnement ou le répertoire d'installation.
+  #
+  # En lecture seule, et strictement. Le même préfixe /api porte POST
+  # /api/projects, qui crée un projet, DELETE, qui en efface un, la route
+  # d'ajout de snapshot et les routeurs d'artefacts et de prompts — tous ouverts
+  # au même anonyme sous NoSecurityComponent. C'est précisément ce que le
+  # constat signale ; ce n'est pas ce qu'un scanner a le droit de faire pour
+  # l'établir.
+  #
+  # L'énumération des projets n'est pas jointe, et ce n'est pas faute de savoir
+  # où elle vit : sur une instance 0.7.21, GET /api/projects répond 200 à
+  # l'anonyme, et /api/v2/projects avec elle. Elle n'est pas jointe parce qu'elle
+  # ne discrimine rien. Sur un espace de travail neuf son corps est « [] », que
+  # rend n'importe quelle route de collection ; et les routeurs de lecture de
+  # create_projects_api() ne portent pas guards=, si bien qu'ils répondent à
+  # l'anonyme que le secret soit posé ou non — la joindre ne séparerait donc pas
+  # une instance ouverte d'une instance gardée.
+  #
+  # Ce que ce template rapporte est ce qu'une lecture établit : l'instance est
+  # atteignable et se nomme, et elle publie sa publication. Prouver qu'aucun
+  # secret n'est posé demanderait d'appeler une route d'écriture — POST
+  # /api/projects, ou le dépôt d'un snapshot — puisque le garde n'est monté que
+  # sur celles-là. C'est précisément ce qu'un scanner n'a pas le droit de faire.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/version"
+
+    matchers-condition: and
+    matchers:
+      # Des expressions plutôt que des mots, et l'essentiel tient dans la
+      # première.
+      #
+      # « Evidently UI » y est exigée comme VALEUR de la clé « application », pas
+      # comme sous-chaîne du corps : c'est la constante EVIDENTLY_APPLICATION_NAME
+      # écrite en dur, et le nom du produit apparaîtrait tout aussi bien dans le
+      # catalogue d'un tiers qui documenterait l'API, dans une page qui la cite,
+      # ou dans le titre d'un tableau de bord. La casse et l'espace sont ceux du
+      # littéral source.
+      #
+      # L'ancrage sur l'ouverture du document n'est pas décoratif. Le modèle
+      # Version déclare « application » en premier et pydantic sérialise dans
+      # l'ordre des champs, donc cette clé ouvre le corps ; l'exiger écarte la
+      # même charge utile retrouvée au fond du document d'une supervision qui
+      # l'agrégerait sous une clé à elle. C'est cet ancrage qui dit que
+      # l'instance a répondu d'elle-même.
+      #
+      # Les \s* sont là parce que le sérialiseur écrit compact mais qu'un
+      # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+      #
+      # Les deux champs suivants sont requis par le modèle, donc toujours
+      # sérialisés. Ils ne désignent rien à eux seuls — « version » et « commit »
+      # sont le vocabulaire de tous les endpoints de diagnostic — mais leur
+      # présence sépare la charge utile de Version d'un document qui aurait par
+      # ailleurs emprunté la première clé. « commit » est admis à n'importe
+      # quelle valeur non vide : le handler écrit « or "-" », donc un tiret seul
+      # quand ni GIT_COMMIT ni git ne répondent, ce qui est le cas courant d'une
+      # installation par paquet.
+      #
+      # Le numéro de publication est laissé libre — il change à chaque
+      # publication, et c'est l'extracteur qui le rapporte.
+      #
+      # Le corps entier tenu pour un objet plat enfin : Version n'a que trois
+      # champs, tous des chaînes, donc aucune accolade intérieure. Cet ancrage
+      # écarte d'un coup l'index d'un SPA rendu en 200 par un catch-all et le
+      # document composite d'une passerelle qui logerait la réponse d'Evidently
+      # à côté d'un objet à elle — ce que l'ancrage de la première expression ne
+      # ferait pas seul, puisqu'un tel document peut très bien commencer par
+      # « application ».
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"application"\s*:\s*"Evidently UI"'
+          - '"version"\s*:\s*"[^"]+"'
+          - '"commit"\s*:\s*"[^"]+"'
+          - '^\s*\{[^{}]*\}\s*$'
+        condition: and
+
+    extractors:
+      # La publication de l'instance, donc les correctifs qui lui manquent.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
