@@ -1,0 +1,232 @@
+id: firecrawl-self-hosted-unauthenticated
+
+info:
+  name: Firecrawl Self-Hosted - Unauthenticated API and Open Scraping Proxy
+  author: popy21
+  severity: high
+  description: |
+    Firecrawl (firecrawl/firecrawl) est l'API de crawl qui convertit des pages
+    web en markdown la plus employée pour alimenter un index RAG. Auto-hébergée,
+    elle s'annonce d'elle-même sur sa racine : apps/api/src/index.ts déclare
+    « app.get("/", (_, res) => { res.json({ message: "Firecrawl API",
+    documentation_url: "https://docs.firecrawl.dev" }); }); », un littéral posé
+    avant tout routeur, donc rendu tel quel et dans cet ordre — Express sérialise
+    par JSON.stringify, qui suit l'ordre d'insertion.
+    Ce corps nomme le produit et ne prouve rien d'autre : l'API hébergée le rend
+    à l'identique. Ce qui sépare l'instance ouverte de celle qui ne l'est pas,
+    c'est la seconde lecture. GET /v1/concurrency-check est enregistrée dans
+    apps/api/src/routes/v1.ts comme « v1Router.get("/concurrency-check",
+    authMiddleware(RateLimiterMode.CrawlStatus), wrap(concurrencyCheckController));
+    » — une route explicitement placée derrière le middleware d'authentification,
+    et, à la différence de POST /v1/scrape et de POST /v1/search, sans l'option
+    « allowKeyless: true » qui ouvrirait une voie sans clé. Un appelant sans
+    en-tête Authorization ne devrait donc jamais la traverser.
+    Il la traverse pourtant sur une installation par défaut, et cela se lit à la
+    source plutôt que cela ne se déduit d'une réponse. authenticateUser
+    (apps/api/src/controllers/auth.ts) est écrite « return
+    withAuth(supaAuthenticateUser, { success: true, chunk: bypassChunk, team_id:
+    bypassChunk.team_id, org_id: null })(req, res, mode, options); », et withAuth
+    (apps/api/src/lib/withAuth.ts) court-circuite la fonction réelle dès que le
+    drapeau est absent : « if (!useDbAuthentication) { ... return { success:
+    true, ...(mockSuccess || {}) } as T; } ». getACUC applique la même règle,
+    « if (config.USE_DB_AUTHENTICATION !== true) { const acuc = mockACUC();
+    acuc.is_extract = isExtract; return acuc; } », et mockACUC() produit
+    « { api_key: "bypass", api_key_id: 0, team_id: "bypass", org_id: "bypass",
+    flags: null, is_banned: false, is_extract: false } ». Le middleware reçoit
+    donc un succès qu'aucune identité n'a payé, et laisse passer.
+    Le drapeau est absent par défaut, et c'est le produit qui le documente.
+    SELF_HOST.md pose « API authentication: `USE_DB_AUTHENTICATION=false`. Add
+    authentication after provisioning the required database schema and
+    application configuration. » puis, sous « Before production », l'avertissement
+    « The default API is unauthenticated. » Le docker-compose.yaml de la racine
+    le grave dans l'environnement commun — « USE_DB_AUTHENTICATION:
+    ${USE_DB_AUTHENTICATION:-false} » — et publie le service : le bloc api pose
+    « HOST: "0.0.0.0" » et « ports: - "${PORT:-3002}:${INTERNAL_PORT:-3002}" »,
+    c'est-à-dire sur toutes les interfaces de l'hôte, alors que le défaut du code
+    est « HOST: z.string().default("localhost") » avec
+    « PORT: z.coerce.number().default(3002) ».
+    Ce que rend concurrencyCheckController (apps/api/src/controllers/v1/concurrency-check.ts)
+    est « res.status(200).json({ success: true, concurrency: activeJobsOfTeam,
+    maxConcurrency: await getEffectiveConcurrencyLimit(...) }) », et le type
+    ConcurrencyCheckResponse le déclare « { success: true; concurrency: number;
+    maxConcurrency: number } ». Trois clés, deux entiers, aucun objet imbriqué.
+    Le refus, lui, ne porte pas cette charge utile : authMiddleware
+    (apps/api/src/routes/shared.ts) rend « res.status(auth.status).json({
+    success: false, error: auth.error, ... }) », et l'API hébergée répond bien
+    401 sur cette route. C'est cette différence, et elle seule, qui fait le
+    constat.
+  impact: |
+    Le contournement établi sur /v1/concurrency-check n'est pas un bavardage de
+    supervision : c'est le même middleware qui garde les routes de traitement, et
+    « bypass » est le team_id que toutes reçoivent. Ce qui suit est donc ouvert
+    au premier venu.
+    POST /v1/scrape et POST /v1/crawl font récupérer par le serveur une URL que
+    l'appelant choisit. C'est un proxy de scraping ouvert — le trafic sort de
+    l'adresse de l'exploitant, avec sa réputation d'adresse et ses éventuels
+    identifiants de proxy sortant (PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD
+    sont des variables du compose) —, et c'est une primitive de falsification de
+    requête côté serveur : rien n'oblige l'URL demandée à être publique, et le
+    rendu par navigateur passe par le service Playwright du même réseau interne.
+    Une URL de métadonnées d'instance ou un service interne joignable depuis le
+    conteneur est récupéré, converti en markdown et rendu dans la réponse.
+    Le coût de calcul est le second effet, et il est direct. Chaque scrape lance
+    un navigateur, chaque crawl en lance autant que la concurrence l'autorise —
+    et /v1/concurrency-check vient précisément de publier ce plafond, donc combien
+    de travail un appelant peut engager avant que le service sature. Les
+    fonctionnalités adossées à un modèle sont sur le même routeur nu : quand
+    OPENAI_API_KEY ou OLLAMA_BASE_URL sont renseignés, l'extraction structurée
+    consomme le quota du fournisseur de l'exploitant.
+    Le reste du routeur suit sans identité non plus : POST /v1/map énumère les
+    URL d'un domaine, POST /v1/search sort une recherche par le service configuré,
+    et les routes de statut — GET /v1/crawl/{jobId}, GET /v1/batch/scrape/{jobId}
+    — rendent le contenu déjà extrait. Ces identifiants ne s'énumèrent pas, mais
+    le team_id, lui, est constant : toutes les instances en contournement
+    partagent « bypass », si bien que GET /v1/crawl/active et GET /v1/crawl/ongoing
+    rendent à l'anonyme les crawls en cours de l'exploitant, c'est-à-dire les
+    domaines qu'il moissonne.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera — les journaux ne connaîtront que l'équipe
+    « bypass ». Et l'intergiciel d'origine croisée n'y changera rien : index.ts
+    monte « app.use(cors()) » sans restriction, donc une page ouverte par un
+    poste du réseau interne peut piloter l'instance depuis le navigateur.
+  remediation: |
+    Poser USE_DB_AUTHENTICATION=true ne suffit pas et le produit le dit :
+    « Changing this variable alone is not a complete authenticated deployment. »
+    Le drapeau fait basculer withAuth sur supaAuthenticateUser, qui interroge le
+    schéma de base de données des clés d'API — sans ce schéma provisionné,
+    l'authentification échoue au lieu de fonctionner. La fermeture immédiate est
+    donc à la liaison et devant, et le durcissement vient ensuite.
+    Ramener la publication du port sur la boucle locale — « -p 127.0.0.1:3002:3002 »
+    plutôt que le « ${PORT:-3002}:${INTERNAL_PORT:-3002} » du compose, qui publie
+    sur toutes les interfaces — quand l'API n'a pas à être atteinte depuis
+    l'extérieur de la machine. Le défaut du code, « HOST » à "localhost", va dans
+    ce sens ; c'est le bloc api du compose qui le défait avec « HOST: "0.0.0.0" ».
+    Quand l'API doit être joignable, la placer derrière un intermédiaire qui
+    authentifie et ne rien laisser passer sans identité : la racine comprise,
+    puisque c'est elle qui nomme le produit, et /v1 entier, puisque le middleware
+    qui garde /v1/concurrency-check est celui qui garde /v1/scrape.
+    Provisionner ensuite le schéma et les variables que réclame
+    supaAuthenticateUser, puis vérifier depuis l'extérieur du périmètre :
+    « curl -s http://<hote>:3002/v1/concurrency-check » doit rendre un refus, et
+    non « success » avec « concurrency » et « maxConcurrency ».
+    Ne pas laisser BULL_AUTH_KEY vide en croyant fermer l'administration : sans
+    lui index.ts ne monte pas le tableau de bord des files, mais s'il porte une
+    valeur devinable, /admin/<clé>/queues devient une console sur les travaux.
+    Après une exposition, tenir le service pour avoir travaillé pour un tiers.
+    Relire le journal d'accès à la recherche des POST /v1/scrape, /v1/crawl,
+    /v1/batch/scrape, /v1/map et /v1/search que l'équipe ne s'explique pas —
+    chacun est une URL récupérée depuis l'adresse de l'exploitant, et une URL
+    interne parmi elles est une falsification de requête réussie. Comparer
+    l'inventaire de GET /v1/crawl/ongoing aux moissons attendues, et faire tourner
+    les secrets que le processus porte : clés de fournisseurs de modèles,
+    identifiants du proxy sortant, jetons de webhook. Aucune de ces lignes ne
+    portera d'identité d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/firecrawl/firecrawl/blob/main/apps/api/src/index.ts
+    - https://github.com/firecrawl/firecrawl/blob/main/apps/api/src/routes/v1.ts
+    - https://github.com/firecrawl/firecrawl/blob/main/apps/api/src/controllers/v1/concurrency-check.ts
+    - https://github.com/firecrawl/firecrawl/blob/main/apps/api/src/controllers/auth.ts
+    - https://github.com/firecrawl/firecrawl/blob/main/apps/api/src/lib/withAuth.ts
+    - https://github.com/firecrawl/firecrawl/blob/main/apps/api/src/routes/shared.ts
+    - https://github.com/firecrawl/firecrawl/blob/main/SELF_HOST.md
+    - https://github.com/firecrawl/firecrawl/blob/main/docker-compose.yaml
+  metadata:
+    max-request: 2
+    vendor: firecrawl
+    product: firecrawl
+  tags: ai,llm,rag,firecrawl,crawler,scraper,ssrf,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit, la seconde dit que le middleware
+  # d'authentification a été traversé sans identité. Aucune des deux ne conclut
+  # seule : l'API hébergée rend la première à l'identique et refuse la seconde,
+  # et c'est exactement l'écart qu'on mesure.
+  #
+  # GET, et rien d'autre. Le même routeur nu sert POST /v1/scrape et POST
+  # /v1/crawl, qui font récupérer par le serveur une URL arbitraire — c'est
+  # l'abus que le constat signale, ce n'est pas ce qu'un scanner a le droit de
+  # faire pour l'établir. Aucun scrape n'est donc déclenché ici :
+  # concurrencyCheckController ne fait que compter les travaux actifs de l'équipe
+  # et lire son plafond.
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+      - "{{BaseURL}}/v1/concurrency-check"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, chacune conclurait de son côté — or « c'est un
+    # Firecrawl » et « il répond à l'anonyme sur une route gardée » sont deux
+    # faits distincts, et le premier seul désigne aussi bien l'API hébergée.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La racine, ancrée sur l'ouverture du document. Le handler rend un
+          # littéral dont « message » est la première clé, et Express sérialise
+          # par JSON.stringify, qui suit l'ordre d'insertion : cette clé ouvre
+          # donc le corps. L'exiger en ouverture écarte la même charge utile
+          # retrouvée au fond du document d'une supervision qui l'agrégerait sous
+          # une clé à elle — c'est cet ancrage qui dit que l'instance a répondu
+          # d'elle-même.
+          #
+          # Les \s* sont là parce qu'Express sérialise compact mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          - 'regex("^\\{\\s*\"message\"\\s*:\\s*\"Firecrawl API\"", trim_space(body_1))'
+
+          # Le second champ du littéral, exigé conjointement. « Firecrawl API »
+          # seul se retrouverait dans la page d'une passerelle qui nomme le
+          # service qu'elle proxifie ou dans un document qui cite le produit ;
+          # l'URL de documentation posée en dur à côté de lui est ce que rend
+          # l'application elle-même. Le préfixe suffit — un exploitant qui aurait
+          # ajouté une barre finale rend la même chose.
+          - 'regex("\"documentation_url\"\\s*:\\s*\"https://docs\\.firecrawl\\.dev", trim_space(body_1))'
+
+          # Le corps entier tenu pour un objet plat : le littéral n'a que deux
+          # chaînes, donc aucune accolade intérieure. Cet ancrage écarte le
+          # document composite d'une passerelle qui recopierait la charge utile
+          # en tête avant d'y ajouter un objet à elle — ce que l'ancrage de la
+          # première expression ne ferait pas seul.
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_1))'
+
+          # La seconde lecture, et c'est elle le constat. La route est déclarée
+          # derrière authMiddleware(RateLimiterMode.CrawlStatus) et sans
+          # « allowKeyless », donc cette charge utile ne sort de l'application
+          # que si withAuth a court-circuité l'authentification. Le refus, lui,
+          # ouvre sur « success » à false — authMiddleware rend « { success:
+          # false, error: ... } » — et ne peut donc pas satisfaire l'expression.
+          #
+          # L'ordre des clés est celui du littéral rendu par le contrôleur, que
+          # JSON.stringify préserve, et la virgule exigée après « concurrency »
+          # dit que le plafond suit. Les deux valeurs sont tenues pour des
+          # entiers non guillemetés : ConcurrencyCheckResponse les déclare
+          # « number », et getEffectiveConcurrencyLimit est annotée
+          # « Promise<number> ».
+          #
+          # L'ancrage écarte au passage le portail captif qui rend le même
+          # document sur toutes ses routes : la charge utile de la racine ouvre
+          # sur « message », pas sur « success ».
+          - 'regex("^\\{\\s*\"success\"\\s*:\\s*true\\s*,\\s*\"concurrency\"\\s*:\\s*[0-9]+\\s*,", trim_space(body_2))'
+          - 'regex("\"maxConcurrency\"\\s*:\\s*[0-9]+", trim_space(body_2))'
+
+          # La même platitude sur la seconde réponse : le contrôleur rend trois
+          # clés, deux entiers et un booléen, donc aucune accolade intérieure.
+          # Elle écarte la passerelle qui republierait la réponse du serveur
+          # qu'elle proxifie à côté d'un objet à elle.
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_2))'
+
+    extractors:
+      # Le seul renseignement durable des deux réponses : le plafond de
+      # concurrence de l'instance, c'est-à-dire combien de travail un appelant
+      # anonyme peut engager avant de la saturer. « concurrency » ne vaut que le
+      # temps de la lecture, et la racine ne dit rien qu'un numéro de publication
+      # aurait pu dater.
+      #
+      # Un seul extracteur, et borné à body_2 — sous req-condition le moteur les
+      # évalue contre chaque réponse.
+      - type: json
+        part: body_2
+        name: max_concurrency
+        json:
+          - '.maxConcurrency'

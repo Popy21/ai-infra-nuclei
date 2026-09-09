@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-77 templates, 74 produits.
+78 templates, 75 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -49,6 +49,7 @@ amont.
 | docling-serve | [`docling-serve-version-exposed`](templates/exposure/docling-serve-version-exposed.yaml) | medium |
 | evidently | [`evidently-ui-exposed`](templates/exposure/evidently-ui-exposed.yaml) | medium |
 | feast | [`feast-vector-stores-exposed`](templates/exposure/feast-vector-stores-exposed.yaml) | high |
+| firecrawl | [`firecrawl-self-hosted-unauthenticated`](templates/exposure/firecrawl-self-hosted-unauthenticated.yaml) | high |
 | flowise | [`flowise-unauthenticated-api`](templates/exposure/flowise-unauthenticated-api.yaml) | critical |
 | flyteadmin | [`flyteadmin-api-exposed`](templates/exposure/flyteadmin-api-exposed.yaml) | high |
 | gradio | [`gradio-app-exposed`](templates/exposure/gradio-app-exposed.yaml) | medium |

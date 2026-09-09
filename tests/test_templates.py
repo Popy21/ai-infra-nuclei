@@ -22475,6 +22475,533 @@ def test_mineru_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Firecrawl : l'API de crawl qui convertit des pages web en markdown pour les
+# index RAG, et dont l'installation par défaut n'authentifie rien. Ce que cette
+# section amarre tient en trois points, et le premier est ce qui la distingue de
+# tout le reste du pack.
+#
+# La racine ne prouve rien. « {"message":"Firecrawl API","documentation_url":
+# "https://docs.firecrawl.dev"} » est le littéral d'index.ts, et l'API hébergée
+# le rend à l'identique — l'exiger seul signalerait api.firecrawl.dev, qui n'est
+# pas une instance exposée. Elle nomme le produit, et c'est tout ce qu'on lui
+# demande.
+#
+# Le constat est porté par la seconde lecture. GET /v1/concurrency-check est
+# déclarée « authMiddleware(RateLimiterMode.CrawlStatus) » sans « allowKeyless »,
+# à la différence de POST /v1/scrape et POST /v1/search : sa charge utile ne sort
+# de l'application que si withAuth a court-circuité l'authentification, ce que
+# « if (!useDbAuthentication) { ... return { success: true, ...mockSuccess } } »
+# fait dès que USE_DB_AUTHENTICATION est absent — c'est-à-dire par défaut, comme
+# le posent SELF_HOST.md et le docker-compose.yaml de la racine. Le refus, lui,
+# ouvre sur « success » à false, et l'API hébergée le rend bien : c'est cet écart
+# que les expressions doivent mesurer, et rien d'autre.
+#
+# La forme des deux documents enfin. Express sérialise par JSON.stringify, qui
+# suit l'ordre d'insertion, donc « message » ouvre le premier corps et
+# « success » le second ; ni l'un ni l'autre n'a de valeur qui soit un objet,
+# donc aucune accolade n'apparaît à l'intérieur.
+
+FIRECRAWL_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "firecrawl-self-hosted-unauthenticated.yaml")
+
+FIRECRAWL_ROOT_ROUTE = "/"
+FIRECRAWL_CONCURRENCY_ROUTE = "/v1/concurrency-check"
+
+
+def firecrawl_root_body(message="Firecrawl API",
+                        documentation_url="https://docs.firecrawl.dev",
+                        drop=(), first=None, extra=None, indent=None):
+    """
+    Ce que rend « app.get("/", ...) » : les deux clés du littéral d'index.ts,
+    dans l'ordre d'insertion et sérialisées compact par Express.
+
+    `drop` retire une clé, `first` en remonte une autre en tête pour défaire
+    l'ancrage, `extra` ajoute ce qu'une passerelle logerait à côté, `indent`
+    réécrit le document comme le ferait un proxy qui réindente ce qu'il relaie.
+    """
+    document = {"message": message, "documentation_url": documentation_url}
+
+    for key in drop:
+        document.pop(key, None)
+    if extra is not None:
+        document.update(extra)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def firecrawl_concurrency_body(success=True, concurrency=0, max_concurrency=2,
+                               drop=(), first=None, extra=None, indent=None):
+    """
+    Ce que rend concurrencyCheckController : « res.status(200).json({ success:
+    true, concurrency: activeJobsOfTeam, maxConcurrency: ... }) », que le type
+    ConcurrencyCheckResponse déclare « { success: true; concurrency: number;
+    maxConcurrency: number } ».
+    """
+    document = {"success": success, "concurrency": concurrency,
+                "maxConcurrency": max_concurrency}
+
+    for key in drop:
+        document.pop(key, None)
+    if extra is not None:
+        document.update(extra)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+FIRECRAWL_ROOT_BODY = firecrawl_root_body()
+FIRECRAWL_CONCURRENCY_BODY = firecrawl_concurrency_body()
+
+# Une instance qui ne fait rien à l'instant de la lecture : elle est exactement
+# aussi ouverte, et c'est même l'état d'où l'on part pour lui faire récupérer une
+# URL.
+FIRECRAWL_IDLE_CONCURRENCY_BODY = firecrawl_concurrency_body(concurrency=0,
+                                                             max_concurrency=100)
+
+# Ce que rend réellement api.firecrawl.dev sur /v1/concurrency-check à un
+# appelant sans en-tête Authorization, relevé le 9 septembre 2026 : un 401 dont
+# le corps ouvre sur « success » à false. C'est le cas qui compte le plus — l'API
+# hébergée sert la même racine que l'instance auto-hébergée, et le template ne
+# doit la signaler sous aucun prétexte.
+FIRECRAWL_HOSTED_DENIED_BODY = json.dumps(
+    {"success": False,
+     "error": "This endpoint is not supported by the keyless free tier. Sign "
+              "up for a free API key at https://www.firecrawl.dev/signin for "
+              "more endpoints, more usage, and higher rate limits.\n\nThen "
+              "authenticate with:\nAuthorization: Bearer YOUR_API_KEY"},
+    separators=(",", ":"))
+
+# Ce que rend authMiddleware quand supaAuthenticateUser refuse : « res.status(
+# auth.status).json({ success: false, error: auth.error, ... }) ». C'est la
+# réponse d'une instance auto-hébergée dont l'exploitant a provisionné
+# l'authentification.
+FIRECRAWL_DENIED_BODY = json.dumps({"success": False, "error": "Unauthorized"},
+                                   separators=(",", ":"))
+
+# Un proxy placé devant l'instance, et une route absente : dans les deux cas le
+# routeur v1 n'a pas répondu.
+FIRECRAWL_PROXY_DENIED_BODY = json.dumps({"detail": "Unauthorized"},
+                                         separators=(",", ":"))
+FIRECRAWL_ABSENT_BODY = ("<html><head><title>404 Not Found</title></head>"
+                         "<body><h1>404 Not Found</h1></body></html>")
+
+# La racine republiée au fond du document d'une supervision qui l'agrégerait
+# sous une clé à elle.
+FIRECRAWL_COMPOSITE_ROOT_BODY = ('{"firecrawl":%s,"scraped_at":0}'
+                                 % FIRECRAWL_ROOT_BODY)
+
+# Une passerelle qui republie l'identité du service qu'elle proxifie : les deux
+# clés y sont, dans l'ordre, mais logées à côté d'un objet à elle.
+FIRECRAWL_GATEWAY_ROOT_BODY = firecrawl_root_body(
+    extra={"upstream": {"host": "firecrawl-api-0.internal", "port": 3002}})
+
+# La même chose sur la seconde réponse.
+FIRECRAWL_GATEWAY_CONCURRENCY_BODY = firecrawl_concurrency_body(
+    extra={"limits": {"source": "autumn"}})
+
+# Un service quelconque qui cite le produit sans être lui : le nom apparaît, mais
+# pas en ouverture d'un document que l'application aurait rendu.
+FIRECRAWL_NAMEDROP_BODY = json.dumps(
+    {"service": "crawler-gateway", "backend": "Firecrawl API",
+     "documentation_url": "https://docs.firecrawl.dev"},
+    separators=(",", ":"))
+
+# Une API quelconque qui répond « success » à true : le mot est le vocabulaire de
+# la moitié des API JSON du monde, et seul le couple concurrency +
+# maxConcurrency le rattache au contrôleur.
+FIRECRAWL_OTHER_SUCCESS_BODY = json.dumps(
+    {"success": True, "data": [], "took": 3}, separators=(",", ":"))
+
+
+def firecrawl_block():
+    doc = load(FIRECRAWL_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % FIRECRAWL_CONCURRENCY_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /v1/concurrency-check — c'est pourtant "
+        "la seule route de lecture que le middleware d'authentification garde "
+        "sans « allowKeyless », donc la seule dont la réponse démontre le "
+        "contournement"
+    )
+    return blocks[0]
+
+
+def firecrawl_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = firecrawl_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def firecrawl_fires(root=(200, FIRECRAWL_ROOT_BODY),
+                    concurrency=(200, FIRECRAWL_CONCURRENCY_BODY)):
+    scenario = {
+        normalise_route("GET", FIRECRAWL_ROOT_ROUTE): root,
+        normalise_route("GET", FIRECRAWL_CONCURRENCY_ROUTE): concurrency,
+    }
+    block = firecrawl_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for request in firecrawl_requests():
+        assert request in scenario, (
+            f"le template interroge un chemin que Firecrawl ne sert pas : {request}"
+        )
+        responses.append(scenario[request])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_firecrawl_probe_reads_two_routes_and_scrapes_nothing():
+    """
+    Deux lectures, dans l'ordre, et rien de plus. Le même routeur nu sert POST
+    /v1/scrape et POST /v1/crawl, qui font récupérer par le serveur une URL que
+    l'appelant choisit — proxy de scraping ouvert et falsification de requête
+    côté serveur aux frais de l'exploitant. C'est l'abus que le constat signale ;
+    ce n'est pas ce qu'un scanner a le droit de faire pour l'établir.
+    """
+    doc = load(FIRECRAWL_TEMPLATE)
+    expected = [normalise_route("GET", FIRECRAWL_ROOT_ROUTE),
+                normalise_route("GET", FIRECRAWL_CONCURRENCY_ROUTE)]
+
+    assert request_routes(doc) == set(expected), (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert firecrawl_requests() == expected, (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {firecrawl_requests()}"
+    )
+
+    assert firecrawl_block().get("method") == "GET", (
+        "les deux routes sont des app.get / v1Router.get : toute autre méthode "
+        "ne mesurerait que le refus d'Express"
+    )
+
+    assert firecrawl_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, body_N "
+        "n'existe pas, et « c'est un Firecrawl » conclurait sans « il répond à "
+        "l'anonyme sur une route gardée » — or la racine seule désigne aussi "
+        "bien l'API hébergée"
+    )
+
+    for target in firecrawl_block().get("path") or []:
+        for route in ("/scrape", "/crawl", "/map", "/search", "/batch"):
+            assert route not in target, (
+                f"le template touche {target!r}, une route qui fait récupérer "
+                "par le serveur une URL arbitraire — c'est précisément ce qu'il "
+                "est censé signaler"
+            )
+
+
+def test_firecrawl_root_names_the_product_but_never_concludes_alone():
+    """
+    Le point qui sépare ce template de tout le reste du pack : la racine est
+    servie à l'identique par api.firecrawl.dev, où GET / rend les mêmes
+    soixante-seize octets. Elle nomme le produit et n'a le droit de rien faire de
+    plus.
+    """
+    assert not firecrawl_fires(concurrency=(401, FIRECRAWL_HOSTED_DENIED_BODY)), (
+        "le template signale l'API hébergée : elle rend la même racine, et son "
+        "refus sur /v1/concurrency-check — relevé tel quel — est exactement ce "
+        "qui la sépare d'une instance auto-hébergée en contournement"
+    )
+
+    assert not firecrawl_fires(concurrency=(401, FIRECRAWL_DENIED_BODY)), (
+        "le template signale une instance auto-hébergée dont l'exploitant a "
+        "provisionné l'authentification : authMiddleware rend alors « success » "
+        "à false, et le contournement n'a pas eu lieu"
+    )
+
+    assert not firecrawl_fires(concurrency=(401, FIRECRAWL_PROXY_DENIED_BODY)), (
+        "le template conclut sur une instance qu'un proxy placé devant ferme "
+        "déjà à l'anonyme"
+    )
+
+    assert not firecrawl_fires(concurrency=(404, FIRECRAWL_ABSENT_BODY)), (
+        "le template conclut alors que la route n'a pas répondu"
+    )
+
+    assert not firecrawl_fires(concurrency=(200, FIRECRAWL_ROOT_BODY)), (
+        "le template conclut sur un portail captif qui rend le même document sur "
+        "toutes ses routes : la seconde réponse doit être celle du contrôleur, "
+        "pas l'écho de la première"
+    )
+
+    assert not firecrawl_fires(concurrency=(200, FIRECRAWL_OTHER_SUCCESS_BODY)), (
+        "le template conclut sur une API quelconque qui répond « success » à "
+        "true : c'est le couple concurrency + maxConcurrency qui rattache la "
+        "réponse au contrôleur"
+    )
+
+    assert not firecrawl_fires(
+        concurrency=(200, firecrawl_concurrency_body(drop=("maxConcurrency",)))), (
+        "le template conclut sans maxConcurrency, alors que le contrôleur rend "
+        "toujours les trois clés"
+    )
+
+    assert not firecrawl_fires(
+        concurrency=(200, firecrawl_concurrency_body(success=False))), (
+        "le template admet « success » à false, que le contrôleur n'écrit "
+        "jamais — il pose le littéral true — et qui est au contraire la marque "
+        "du refus rendu par authMiddleware"
+    )
+
+
+def test_firecrawl_matcher_rests_on_the_literal_not_on_a_banal_index():
+    assert firecrawl_fires(), (
+        "le template ne reconnaît pas les deux réponses d'une instance "
+        "auto-hébergée par défaut"
+    )
+
+    assert not firecrawl_fires(
+        root=(200, firecrawl_root_body(drop=("documentation_url",)))), (
+        "le template conclut sur « message » seul : le mot est le vocabulaire "
+        "de toutes les API JSON du monde, et c'est l'URL de documentation posée "
+        "en dur à côté de lui qui dit que l'application a répondu"
+    )
+
+    assert not firecrawl_fires(
+        root=(200, firecrawl_root_body(message="Crawler API"))), (
+        "le template conclut sans le littéral « Firecrawl API », qui est "
+        "pourtant tout ce que la racine apporte"
+    )
+
+    assert not firecrawl_fires(
+        root=(200, firecrawl_root_body(
+            documentation_url="https://docs.internal.crawler"))), (
+        "le template admet une URL de documentation que le littéral d'index.ts "
+        "n'écrit pas"
+    )
+
+    assert not firecrawl_fires(root=(200, FIRECRAWL_NAMEDROP_BODY)), (
+        "le template déclenche sur une passerelle qui nomme le service qu'elle "
+        "proxifie : l'ancrage sur l'ouverture du corps est ce qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+    assert not firecrawl_fires(root=(200, FIRECRAWL_COMPOSITE_ROOT_BODY)), (
+        "le template déclenche sur la charge utile republiée au fond du document "
+        "d'une supervision"
+    )
+
+    assert not firecrawl_fires(root=(200, FIRECRAWL_GATEWAY_ROOT_BODY)), (
+        "le template déclenche sur une passerelle qui loge la racine à côté d'un "
+        "objet à elle : le littéral n'a que deux chaînes, donc aucune paire { } "
+        "ne peut apparaître à l'intérieur du corps"
+    )
+
+    assert not firecrawl_fires(
+        concurrency=(200, FIRECRAWL_GATEWAY_CONCURRENCY_BODY)), (
+        "le template déclenche sur une passerelle qui republie la réponse du "
+        "contrôleur à côté d'un objet à elle : ConcurrencyCheckResponse déclare "
+        "un booléen et deux entiers, et rien d'imbriqué"
+    )
+
+    assert not firecrawl_fires(
+        root=(200, firecrawl_root_body(first="documentation_url"))), (
+        "le template admet un ordre de clés qu'Express n'émet pas : le littéral "
+        "d'index.ts écrit « message » en premier, et JSON.stringify suit l'ordre "
+        "d'insertion"
+    )
+
+    assert not firecrawl_fires(
+        concurrency=(200, firecrawl_concurrency_body(first="maxConcurrency"))), (
+        "le template admet un ordre de clés que le contrôleur n'émet pas"
+    )
+
+
+def test_firecrawl_matcher_holds_across_the_shapes_the_instance_emits():
+    assert firecrawl_fires(concurrency=(200, FIRECRAWL_IDLE_CONCURRENCY_BODY)), (
+        "le template exige un travail en cours : une instance au repos est "
+        "exactement aussi ouverte, et c'est même l'état d'où l'on part pour lui "
+        "faire récupérer une URL"
+    )
+
+    assert firecrawl_fires(
+        concurrency=(200, firecrawl_concurrency_body(concurrency=7,
+                                                     max_concurrency=50))), (
+        "le template épingle des valeurs de concurrence : ce sont des entiers "
+        "que ConcurrencyCheckResponse déclare « number », et rien n'en fixe la "
+        "grandeur"
+    )
+
+    assert firecrawl_fires(
+        root=(200, firecrawl_root_body(
+            documentation_url="https://docs.firecrawl.dev/"))), (
+        "le template refuse la barre finale de l'URL de documentation : seul le "
+        "préfixe est un fait du code"
+    )
+
+    assert firecrawl_fires(
+        root=(200, firecrawl_root_body(indent=2)),
+        concurrency=(200, firecrawl_concurrency_body(indent=2))), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : Express écrit compact, un proxy ne s'y tient pas"
+    )
+
+    assert firecrawl_fires(
+        root=(200, firecrawl_root_body(extra={"version": "2.4.0"})),
+        concurrency=(200, firecrawl_concurrency_body(extra={"queued": 0}))), (
+        "le template refuse une clé ajoutée par une publication ultérieure : la "
+        "platitude des documents suffit à écarter les documents composites, il "
+        "n'y a pas à compter les clés"
+    )
+
+
+def test_firecrawl_conclusion_rests_on_the_payloads_not_on_the_http_status():
+    """
+    Les deux charges utiles ne sortent de l'application que sous un 200 — la
+    racine n'a pas de branche d'échec, et le contrôleur écrit « res.status(200) »
+    en dur. Exiger le code n'écarterait donc rien que les corps n'écartent déjà,
+    et ferait manquer l'instance dont un intermédiaire réécrit le statut. Le
+    refus, lui, est reconnu à son corps : il ouvre sur « success » à false.
+    """
+    block = firecrawl_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro, et un matcher "
+        "de statut conclurait sur un code plutôt que sur ce que l'instance rend"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : la racine nomme le "
+            "produit et la seconde lecture démontre le contournement, aucune "
+            "des deux seule"
+        )
+        for expression in matcher.get("dsl") or []:
+            assert "status_code" not in expression, (
+                f"l'expression {expression!r} conclut sur le code HTTP — les "
+                "deux corps le font déjà, et un intermédiaire qui réécrit le "
+                "statut ferait alors manquer l'instance"
+            )
+
+    assert firecrawl_fires(root=(304, FIRECRAWL_ROOT_BODY)), (
+        "le template dépend du code rendu sur la racine, alors qu'un cache "
+        "intermédiaire peut servir le même corps sous un autre"
+    )
+
+
+def test_firecrawl_extractor_reports_the_budget_the_anonymous_caller_obtains():
+    extractors = firecrawl_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "les évalue contre chaque réponse, et la même instance serait signalée "
+        "autant de fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à la seconde réponse — c'est pourtant "
+        "elle seule qui porte le plafond, la racine n'ayant que deux chaînes "
+        "constantes"
+    )
+    assert extractor.get("json") == ['.maxConcurrency'], (
+        "l'extracteur ne lit pas le plafond de concurrence — c'est pourtant le "
+        "seul renseignement durable des deux réponses : combien de travail un "
+        "appelant anonyme peut engager avant de saturer l'instance. "
+        "« concurrency » ne vaut que le temps de la lecture"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_firecrawl_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs en Python plutôt
+    qu'avec le lexer de nuclei : seul un scan contre un vrai serveur ferme la
+    boucle. Le refus de l'API hébergée en est l'enjeu propre — elle sert la même
+    racine, et c'est la seconde réponse qui décide.
+    """
+    def scan(concurrency_status, concurrency_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == FIRECRAWL_ROOT_ROUTE:
+                    self.reply(200, FIRECRAWL_ROOT_BODY)
+                elif self.path == FIRECRAWL_CONCURRENCY_ROUTE:
+                    self.reply(concurrency_status, concurrency_body)
+                else:
+                    self.reply(404, FIRECRAWL_ABSENT_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", FIRECRAWL_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "firecrawl-self-hosted-unauthenticated"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, FIRECRAWL_CONCURRENCY_BODY)
+    assert sorted(set(seen)) == sorted([FIRECRAWL_ROOT_ROUTE,
+                                        FIRECRAWL_CONCURRENCY_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == ["2"], (
+        "le scan ne remonte pas le plafond de concurrence de l'instance — "
+        f"{extracted}"
+    )
+
+    _, refused = scan(401, FIRECRAWL_HOSTED_DENIED_BODY)
+    assert refused == [], (
+        "le scan conclut sur une instance qui refuse la route à l'anonyme — "
+        "c'est la réponse de l'API hébergée, qui sert pourtant la même racine"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
