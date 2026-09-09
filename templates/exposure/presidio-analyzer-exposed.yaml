@@ -1,0 +1,225 @@
+id: presidio-analyzer-exposed
+
+info:
+  name: Microsoft Presidio Analyzer - Unauthenticated PII Detection Engine Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Presidio est le service de détection et d'anonymisation de données
+    personnelles le plus déployé de part et d'autre des pipelines LLM — en amont
+    pour caviarder ce qui part vers le modèle, en aval pour caviarder ce qui en
+    revient. Ouvert par Microsoft, le dépôt vit désormais sous
+    data-privacy-stack/presidio, où github.com/microsoft/presidio redirige.
+    Le serveur d'analyse est un Flask nu, et tout ce qui suit se lit dans
+    presidio-analyzer/app.py. Server.__init__ pose « self.app = Flask(__name__) »
+    puis déclare quatre routes dessus : « @self.app.route("/health") »,
+    « @self.app.route("/analyze", methods=["POST"]) »,
+    « @self.app.route("/recognizers", methods=["GET"]) » et
+    « @self.app.route("/supportedentities", methods=["GET"]) ». Le fichier ne
+    porte aucun décorateur d'authentification, aucune vérification de clé ni de
+    jeton : le seul autre décorateur qu'on y lit est
+    « @self.app.errorhandler(HTTPException) », qui rend « jsonify(error=
+    e.description), e.code ». Il n'y a donc aucune garde à contourner — il n'y en
+    a aucune à poser.
+    Le handler de la route de santé est « def health() -> str: return "Presidio
+    Analyzer service is up" », une constante que Flask rend telle quelle. C'est
+    cette chaîne, exacte, qui est la signature, et jamais le code HTTP : n'importe
+    quel serveur vivant rend 200 sur une route de santé. Elle sépare au passage
+    l'analyseur de ses deux voisins du même dépôt, tout aussi dépourvus de
+    contrôle d'authentification et servis sur le même chemin — presidio-anonymizer
+    /app.py rend « Presidio Anonymizer service is up » et presidio-image-redactor
+    /app.py « Presidio Image Redactor service is up ».
+    La chaîne seule ne prouverait pourtant que la constante, pas le moteur : un
+    intermédiaire qui ne laisse passer que la sonde de santé — la disposition la
+    plus courante devant ces conteneurs, dont le Dockerfile pose « HEALTHCHECK
+    ... CMD curl -f http://localhost:${PORT}/health » — rendrait exactement le
+    même corps. Ce sont les deux lectures suivantes qui disent que le moteur
+    d'analyse répond. GET /supportedentities lit « language =
+    request.args.get("language") », appelle « entities_list =
+    self.engine.get_supported_entities(language) » et rend « jsonify(
+    entities_list), 200 » : sans paramètre, language vaut None, et
+    AnalyzerEngine.get_supported_entities parcourt alors toutes les langues
+    déclarées avant de rendre « list(set(supported_entities)) » — un tableau de
+    noms d'entités, sans ordre stable. GET /recognizers appelle « recognizers_list
+    = self.engine.get_recognizers(language) », en tire « names = [o.name for o in
+    recognizers_list] » et rend « jsonify(names), 200 » ; get_recognizers rend elle
+    aussi « list(set(recognizers)) ». Le nom d'un reconnaisseur est celui de sa
+    classe tant que l'exploitant n'en pose pas d'autre, d'où les « ...Recognizer »
+    du registre prédéfini.
+    Le produit écoute sur toutes les interfaces des deux façons dont il démarre :
+    lancé à la main, « app.run(host="0.0.0.0", port=port) » avec « port =
+    int(os.environ.get("PORT", DEFAULT_PORT)) » et « DEFAULT_PORT = "3000" » ;
+    en conteneur, entrypoint.sh exécute « gunicorn -w "$WORKERS" -b
+    "0.0.0.0:$PORT" "app:create_app()" ». Ce qui sépare l'instance du réseau n'est
+    donc que la publication du port, et le docker-compose.yml du dépôt la fait
+    sans restreindre l'interface : « "5002:5001" » pour l'analyseur,
+    « "5001:5001" » pour l'anonymiseur, « "5003:5001" » pour l'image-redactor,
+    chaque conteneur recevant « PORT=5001 ». Le même fichier montre pourtant que
+    la restriction est connue : le service ollama qu'il embarque désormais — et
+    que l'analyseur joint par « OLLAMA_HOST=http://ollama:11434 » — est publié
+    « 127.0.0.1:11434:11434 ». La documentation d'installation, elle, ne préfixe
+    rien non plus : « docker run -d -p 5002:3000 ... presidio-analyzer:latest ».
+  impact: |
+    POST /analyze est sur le même Flask nu et reçoit du texte arbitraire :
+    « AnalyzerRequest(request.get_json()) » accepte une chaîne ou une liste de
+    chaînes, et « self.batch_engine.analyze_iterator(...) » fait traverser le lot
+    au moteur NLP, avec « BATCH_SIZE » (défaut 500) et « N_PROCESS » (défaut 1)
+    lus dans l'environnement. C'est du calcul NLP gratuit aux frais de
+    l'exploitant — spaCy, transformers ou ce que désigne NLP_CONF_FILE, et, sur
+    une instance montée avec le compose du dépôt, un ollama derrière l'analyseur.
+    Le renseignement, ensuite, est la carte de sensibilité de l'organisation. Le
+    registre prédéfini est public et n'apprend rien ; ce qui compte, ce sont les
+    ajouts. Un reconnaisseur maison porte le nom que l'exploitant lui a donné et
+    déclare l'entité qu'il détecte, et ces deux noms se lisent tels quels sur
+    /recognizers et /supportedentities : ils disent ce que l'organisation traite
+    et ce qu'elle tient pour sensible — un format de matricule interne, une
+    référence de dossier, un identifiant client maison.
+    La même liste se lit dans l'autre sens, et c'est l'effet le plus direct quand
+    Presidio est le filtre posé devant un modèle : les entités énumérées sont
+    exactement ce que le caviardage attrape, donc tout le reste passe. L'appelant
+    anonyme n'a même pas à le déduire — /analyze répond sur le texte qu'on lui
+    soumet, ce qui en fait un oracle de détection : on mesure contre l'instance
+    elle-même ce qui déclenche et ce qui ne déclenche pas.
+    Les branches d'erreur ajoutent leur part : /analyze rend « jsonify(error=
+    e.args[0]), 500 » et le gestionnaire d'exceptions HTTP « jsonify(error=
+    e.description), e.code », donc le message de l'exception telle que
+    l'application l'a levée.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à poser : app.py n'en contient
+    aucun. La fermeture se fait donc à la publication du port et devant, pas dans
+    la configuration du produit.
+    Publier sur la boucle locale quand le service n'a pas à être atteint depuis
+    l'extérieur de la machine — « -p 127.0.0.1:5002:5001 » plutôt que le
+    « "5002:5001" » du compose du dépôt, qui publie sur toutes les interfaces de
+    l'hôte, et de même pour l'anonymiseur (5001) et l'image-redactor (5003), que
+    la même exposition atteint. Le service ollama du même fichier montre
+    l'écriture attendue : « 127.0.0.1:11434:11434 ».
+    Quand l'API doit être joignable, la placer derrière un intermédiaire qui
+    authentifie et ne rien laisser passer sans identité — la route de santé
+    comprise, puisque c'est elle qui nomme le produit et distingue l'analyseur de
+    ses deux voisins. Le HEALTHCHECK du conteneur interroge
+    « http://localhost:${PORT}/health » depuis l'intérieur : la fermer à
+    l'extérieur ne le casse pas.
+    Vérifier la prise en compte depuis l'extérieur du périmètre :
+    « curl -s http://<hote>:5002/health » ne doit plus rendre « Presidio Analyzer
+    service is up », et « curl -s http://<hote>:5002/recognizers » ne doit plus
+    énumérer le registre.
+    Après une exposition, tenir l'inventaire des reconnaisseurs et des entités
+    pour lu — donc la carte de sensibilité de l'organisation, noms des
+    reconnaisseurs maison compris — et revoir ce que ce catalogue révèle des
+    données traitées. Chercher ensuite dans le journal d'accès de gunicorn les
+    POST /analyze qu'on ne s'explique pas : chacun est un texte soumis par un
+    tiers et un passage du moteur NLP payé par l'exploitant. Aucune de ces lignes
+    ne portera d'identité d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/data-privacy-stack/presidio/blob/main/presidio-analyzer/app.py
+    - https://github.com/data-privacy-stack/presidio/blob/main/presidio-analyzer/presidio_analyzer/analyzer_engine.py
+    - https://github.com/data-privacy-stack/presidio/blob/main/presidio-analyzer/entrypoint.sh
+    - https://github.com/data-privacy-stack/presidio/blob/main/presidio-analyzer/Dockerfile
+    - https://github.com/data-privacy-stack/presidio/blob/main/presidio-anonymizer/app.py
+    - https://github.com/data-privacy-stack/presidio/blob/main/docker-compose.yml
+    - https://github.com/data-privacy-stack/presidio/blob/main/docs/installation.md
+    - https://github.com/data-privacy-stack/presidio
+  metadata:
+    max-request: 3
+    vendor: microsoft
+    product: presidio
+  tags: ai,llm,pii,presidio,microsoft,nlp,anonymization,exposure,unauth,misconfig
+
+http:
+  # Trois lectures, et les trois sont les moins coûteuses de l'API. La route de
+  # santé rend une constante ; les deux autres parcourent le registre déjà
+  # construit au démarrage — get_recognizers() interroge la registry en mémoire,
+  # get_supported_entities() ne fait qu'agréger ce qu'elle rend. Aucun texte
+  # n'est analysé, aucun modèle n'est sollicité.
+  #
+  # En lecture, et rien d'autre. Le même serveur nu sert POST /analyze, qui fait
+  # traverser au moteur NLP le texte qu'on lui donne, sur le matériel de
+  # l'exploitant — c'est l'abus que le constat signale, ce n'est pas ce qu'un
+  # scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/health"
+      - "{{BaseURL}}/supportedentities"
+      - "{{BaseURL}}/recognizers"
+
+    # req-condition accumule body_N pour que la preuve porte sur les trois
+    # réponses à la fois. Sans lui, chacune conclurait de son côté — or « la
+    # constante de santé est celle de l'analyseur » et « le moteur d'analyse
+    # répond à l'anonyme » sont deux faits distincts, et le premier seul est
+    # aussi bien rendu par un intermédiaire qui ne laisse passer que la sonde.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La constante, exigée seule et entière. Le handler est « def health()
+          # -> str: return "Presidio Analyzer service is up" » : Flask rend la
+          # chaîne telle quelle, sans rien avant ni après. L'égalité de bout en
+          # bout est donc ce que l'application écrit, et c'est elle qui sépare
+          # l'analyseur de ses deux voisins du même dépôt — « Presidio Anonymizer
+          # service is up » et « Presidio Image Redactor service is up » sont
+          # servis sur le même chemin par des applications tout aussi ouvertes.
+          #
+          # L'ancrage des deux côtés écarte du même coup la page d'un portail ou
+          # le document d'une supervision qui citerait la chaîne au milieu du
+          # sien : ici, elle est tout le corps.
+          #
+          # trim_space parce qu'un intermédiaire qui relaie une réponse de trente
+          # octets peut lui ajouter une fin de ligne.
+          - 'regex("^Presidio Analyzer service is up$", trim_space(body_1))'
+
+          # La deuxième lecture : le catalogue des entités. jsonify() d'une liste
+          # rend un tableau JSON, donc le corps ouvre sur un crochet suivi d'une
+          # chaîne — c'est cet ancrage qui dit que l'instance a répondu
+          # d'elle-même, et non qu'un document plus grand la cite. Il exige au
+          # passage un catalogue non vide : un moteur sans une seule entité ne
+          # détecterait rien.
+          - 'regex("^\\[\\s*\"", trim_space(body_2))'
+
+          # Au moins un nom d'entité, où qu'il soit dans le tableau : Presidio
+          # les écrit en capitales — PERSON, EMAIL_ADDRESS, IBAN_CODE — et
+          # get_supported_entities rend « list(set(...)) », donc sans ordre
+          # stable. Exiger une position, ou un nom précis que l'exploitant peut
+          # avoir retiré de son registre, ferait manquer l'instance.
+          - 'regex("\"[A-Z][A-Z0-9_]*\"", trim_space(body_2))'
+
+          # Le corps tenu pour un tableau plat de chaînes : ni objet, ni tableau
+          # imbriqué. Cet ancrage écarte d'un coup le document composite d'une
+          # passerelle qui recopierait le catalogue avant d'y ajouter un objet à
+          # elle, et le refus JSON d'un intermédiaire, qui est un objet.
+          - 'regex("^\\[[^\\[\\]{}]*\\]$", trim_space(body_2))'
+
+          # La troisième lecture, et c'est elle qui nomme le moteur. Même forme :
+          # un tableau plat, non vide, ouvert par une chaîne.
+          - 'regex("^\\[\\s*\"", trim_space(body_3))'
+          - 'regex("^\\[[^\\[\\]{}]*\\]$", trim_space(body_3))'
+
+          # Le mot du produit, et il ne se trouve que là. « names = [o.name for o
+          # in recognizers_list] » rend le nom de classe de chaque reconnaisseur
+          # tant que l'exploitant n'en pose pas d'autre, et le registre prédéfini
+          # n'en contient que des « ...Recognizer » — CreditCardRecognizer,
+          # EmailRecognizer, SpacyRecognizer. Un seul suffit : la liste n'a pas
+          # d'ordre stable, et un exploitant qui ajoute des reconnaisseurs
+          # maison n'enlève pas pour autant ceux du registre.
+          - 'regex("\"[A-Za-z0-9_]*Recognizer\"", trim_space(body_3))'
+
+    extractors:
+      # Le seul renseignement durable des trois réponses. Les deux premières ne
+      # portent qu'une constante et un catalogue d'entités, tandis que le nombre
+      # de reconnaisseurs chargés dit la taille du registre de l'instance :
+      # au-delà du registre prédéfini, ce sont des reconnaisseurs que
+      # l'exploitant a écrits, et c'est cette part-là qui décrit ce qu'il tient
+      # pour sensible. Il ne bouge qu'à une reconfiguration du registre, là où
+      # les noms eux-mêmes rempliraient le rapport d'une ligne par reconnaisseur.
+      #
+      # Un seul extracteur, et borné à body_3 — sous req-condition le moteur les
+      # évalue contre chaque réponse.
+      - type: json
+        part: body_3
+        name: recognizers
+        json:
+          - 'length'

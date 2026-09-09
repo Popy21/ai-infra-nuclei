@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-78 templates, 75 produits.
+79 templates, 76 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -91,6 +91,7 @@ amont.
 | optuna-dashboard | [`optuna-dashboard-exposed`](templates/exposure/optuna-dashboard-exposed.yaml) | high |
 | phoenix | [`arize-phoenix-exposed`](templates/exposure/arize-phoenix-exposed.yaml) | high |
 | prefect | [`prefect-server-admin-exposed`](templates/exposure/prefect-server-admin-exposed.yaml) | high |
+| presidio | [`presidio-analyzer-exposed`](templates/exposure/presidio-analyzer-exposed.yaml) | medium |
 | qdrant | [`qdrant-no-api-key`](templates/exposure/qdrant-no-api-key.yaml) | high |
 | ragflow | [`ragflow-config-exposed`](templates/exposure/ragflow-config-exposed.yaml) | medium |
 | ray | [`ray-dashboard-job-submission`](templates/exposure/ray-dashboard-job-submission.yaml) | critical |

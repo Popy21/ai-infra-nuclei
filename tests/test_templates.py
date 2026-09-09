@@ -23002,6 +23002,498 @@ def test_firecrawl_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Presidio : le détecteur de données personnelles posé de part et d'autre des
+# pipelines LLM. Comme chez MinerU, il n'y a aucune garde à contourner et c'est
+# le constat lui-même — presidio-analyzer/app.py déclare quatre routes sur un
+# « Flask(__name__) » nu, sans un décorateur d'authentification, sans une
+# vérification de clé ni de jeton, et le seul autre décorateur du fichier est
+# « @self.app.errorhandler(HTTPException) ».
+#
+# La difficulté est de reconnaissance, et elle se joue en deux temps. La route de
+# santé rend une constante, « Presidio Analyzer service is up », que le produit
+# écrit en toutes lettres : c'est la signature la plus nette du pack, et c'est
+# elle qui sépare l'analyseur de ses deux voisins du même dépôt, dont les
+# constantes ne diffèrent que d'un mot. Mais elle ne prouve qu'une constante — un
+# intermédiaire qui ne laisse passer que la sonde de santé, disposition courante
+# devant ces conteneurs, rend le même corps. Ce sont /supportedentities et
+# /recognizers qui disent que le moteur d'analyse a répondu, et cette section
+# amarre les deux moitiés : la constante exacte, puis les deux catalogues.
+
+PRESIDIO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "presidio-analyzer-exposed.yaml")
+
+PRESIDIO_HEALTH_ROUTE = "/health"
+PRESIDIO_ENTITIES_ROUTE = "/supportedentities"
+PRESIDIO_RECOGNIZERS_ROUTE = "/recognizers"
+
+# La constante de « def health() -> str », rendue telle quelle par Flask.
+PRESIDIO_HEALTH_BODY = "Presidio Analyzer service is up"
+
+# Celles des deux voisins du même dépôt, servies sur le même chemin par des
+# applications tout aussi dépourvues d'authentification. Le template ne parle que
+# de l'analyseur : les signaler sous son identifiant serait nommer le mauvais
+# produit, et sa réponse contient d'ailleurs le mot « Presidio ... service is up »
+# comme les deux autres.
+PRESIDIO_ANONYMIZER_HEALTH_BODY = "Presidio Anonymizer service is up"
+PRESIDIO_IMAGE_REDACTOR_HEALTH_BODY = "Presidio Image Redactor service is up"
+
+# Le registre prédéfini, tel que get_supported_entities() et get_recognizers() le
+# rendent : « list(set(...)) » des deux côtés, donc sans ordre stable.
+PRESIDIO_DEFAULT_ENTITIES = ["EMAIL_ADDRESS", "IBAN_CODE", "PERSON", "US_SSN",
+                             "NRP", "DATE_TIME", "CREDIT_CARD"]
+PRESIDIO_DEFAULT_RECOGNIZERS = ["UrlRecognizer", "CreditCardRecognizer",
+                                "SpacyRecognizer", "EmailRecognizer",
+                                "IbanRecognizer"]
+
+
+def presidio_list_body(values, indent=None):
+    """
+    Ce que rend « jsonify(entities_list), 200 » comme « jsonify(names), 200 » :
+    un tableau JSON écrit compact — le fournisseur JSON de Flask sépare sans
+    espace hors mode debug — et suivi d'une fin de ligne, que
+    DefaultJSONProvider.response ajoute.
+    """
+    if indent is not None:
+        return json.dumps(values, indent=indent) + "\n"
+    return json.dumps(values, separators=(",", ":")) + "\n"
+
+
+PRESIDIO_ENTITIES_BODY = presidio_list_body(PRESIDIO_DEFAULT_ENTITIES)
+PRESIDIO_RECOGNIZERS_BODY = presidio_list_body(PRESIDIO_DEFAULT_RECOGNIZERS)
+
+# L'instance qui compte le plus : celle dont l'exploitant a étendu le registre.
+# Les noms qu'il a donnés à ses reconnaisseurs et aux entités qu'ils déclarent
+# sont ce que le constat signale — la carte de ce que l'organisation tient pour
+# sensible — et le template doit la reconnaître aussi bien que l'instance nue.
+PRESIDIO_CUSTOM_ENTITIES_BODY = presidio_list_body(
+    ["MATRICULE_INTERNE", "NUMERO_DOSSIER", "PERSON", "EMAIL_ADDRESS"])
+PRESIDIO_CUSTOM_RECOGNIZERS_BODY = presidio_list_body(
+    ["matricule-interne", "dossier patient", "EmailRecognizer"])
+
+# Le refus de l'application elle-même sur une route absente :
+# « @self.app.errorhandler(HTTPException) » rend « jsonify(error=e.description),
+# e.code ». C'est un objet, pas un tableau.
+PRESIDIO_NOT_FOUND_BODY = json.dumps(
+    {"error": "The requested URL was not found on the server. If you entered "
+              "the URL manually please check your spelling and try again."},
+    separators=(",", ":")) + "\n"
+
+# Un proxy authentifiant placé devant l'instance — la seule fermeture possible,
+# puisque le produit n'a aucun réglage d'authentification à poser.
+PRESIDIO_PROXY_DENIED_BODY = json.dumps({"detail": "Unauthorized"},
+                                        separators=(",", ":"))
+
+# Un portail captif qui rend sa page de connexion sur tout ce qu'on lui demande.
+PRESIDIO_CAPTIVE_PORTAL_BODY = ("<html><body><h1>Connexion requise</h1>"
+                                "</body></html>")
+
+# La supervision qui republie la constante au milieu du sien : la chaîne y est,
+# entière, mais ce n'est pas l'instance qui a répondu d'elle-même.
+PRESIDIO_HEALTH_IN_PAGE_BODY = json.dumps(
+    {"service": "presidio-analyzer", "probe": "Presidio Analyzer service is up",
+     "checked_at": 0}, separators=(",", ":"))
+
+# Une passerelle qui enveloppe le catalogue sous une clé à elle.
+PRESIDIO_WRAPPED_ENTITIES_BODY = ('{"entities":%s,"source":"presidio"}'
+                                  % PRESIDIO_ENTITIES_BODY.strip())
+
+# Une autre API qui décrit ses reconnaisseurs par des objets plutôt que par leurs
+# noms : le mot « Recognizer » y est, mais le corps n'est pas ce que rend
+# « names = [o.name for o in recognizers_list] ».
+PRESIDIO_OBJECT_RECOGNIZERS_BODY = json.dumps(
+    [{"name": "EmailRecognizer", "supported_entity": "EMAIL_ADDRESS"},
+     {"name": "IbanRecognizer", "supported_entity": "IBAN_CODE"}],
+    separators=(",", ":")) + "\n"
+
+# Le catalogue vide : un moteur sans une seule entité ne détecte rien, et le
+# registre vide ne dit pas non plus quel produit a répondu.
+PRESIDIO_EMPTY_LIST_BODY = "[]\n"
+
+
+def presidio_block():
+    doc = load(PRESIDIO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % PRESIDIO_RECOGNIZERS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /recognizers — c'est pourtant la seule "
+        "route dont la réponse vient du registre du moteur, donc la seule qui "
+        "prouve que l'analyseur répond et pas seulement sa sonde de santé"
+    )
+    return blocks[0]
+
+
+def presidio_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = presidio_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def presidio_fires(health=(200, PRESIDIO_HEALTH_BODY),
+                   entities=(200, PRESIDIO_ENTITIES_BODY),
+                   recognizers=(200, PRESIDIO_RECOGNIZERS_BODY)):
+    scenario = {
+        normalise_route("GET", PRESIDIO_HEALTH_ROUTE): health,
+        normalise_route("GET", PRESIDIO_ENTITIES_ROUTE): entities,
+        normalise_route("GET", PRESIDIO_RECOGNIZERS_ROUTE): recognizers,
+    }
+    block = presidio_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for request in presidio_requests():
+        assert request in scenario, (
+            f"le template interroge un chemin que Presidio ne sert pas : {request}"
+        )
+        responses.append(scenario[request])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les trois réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_presidio_probe_reads_three_routes_and_never_submits_a_text():
+    """
+    Trois lectures, dans l'ordre, et rien de plus. Le même Flask nu sert POST
+    /analyze, qui fait traverser au moteur NLP le texte qu'on lui donne sur le
+    matériel de l'exploitant — c'est l'abus que le constat signale, ce n'est pas
+    ce qu'un scanner a le droit de faire pour l'établir.
+    """
+    doc = load(PRESIDIO_TEMPLATE)
+    expected = [normalise_route("GET", PRESIDIO_HEALTH_ROUTE),
+                normalise_route("GET", PRESIDIO_ENTITIES_ROUTE),
+                normalise_route("GET", PRESIDIO_RECOGNIZERS_ROUTE)]
+
+    assert request_routes(doc) == set(expected), (
+        "le template n'interroge pas exactement les trois routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert presidio_requests() == expected, (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {presidio_requests()}"
+    )
+
+    block = presidio_block()
+    assert block.get("method") == "GET", (
+        "les trois routes sont des lectures — /health sans méthode déclarée, "
+        "donc GET, et les deux autres en methods=[\"GET\"] : toute autre méthode "
+        "ne mesurerait que le refus de Flask"
+    )
+    assert not block.get("body"), (
+        "le bloc envoie un corps : rien de ce que le template établit ne demande "
+        "d'écrire à l'instance auditée"
+    )
+    assert block.get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, body_N "
+        "n'existe pas, et « la constante de santé est celle de l'analyseur » "
+        "conclurait sans « le moteur d'analyse répond » — or un intermédiaire "
+        "qui ne laisse passer que la sonde rend la même constante"
+    )
+
+    for target in block.get("path") or []:
+        for forbidden, why in (
+            ("/analyze", "le template appelle la route d'analyse : il "
+                         "soumettrait un texte et ferait tourner le moteur NLP "
+                         "sur le matériel de l'exploitant"),
+            ("/anonymize", "c'est la route du service voisin, et elle écrit"),
+            ("/redact", "c'est la route de l'image-redactor, et elle écrit"),
+        ):
+            assert forbidden not in target, f"{target} : {why}"
+
+
+def test_presidio_health_names_the_analyzer_and_not_its_two_siblings():
+    """
+    Le point qui sépare ce template du reste : la constante de santé ne diffère
+    d'un service à l'autre que d'un mot. presidio-anonymizer/app.py rend
+    « Presidio Anonymizer service is up » et presidio-image-redactor/app.py
+    « Presidio Image Redactor service is up », tous deux sur /health, tous deux
+    sans le moindre contrôle d'authentification. Un constat qui les confondrait
+    nommerait le mauvais produit et enverrait l'exploitant fermer le mauvais port.
+    """
+    assert presidio_fires(), (
+        "le template ne reconnaît pas une instance Presidio Analyzer dont les "
+        "trois routes de lecture répondent à l'anonyme"
+    )
+
+    assert not presidio_fires(health=(200, PRESIDIO_ANONYMIZER_HEALTH_BODY)), (
+        "le template signale l'anonymiseur sous l'identifiant de l'analyseur : "
+        "les deux constantes ne diffèrent que d'un mot, et c'est ce mot qui "
+        "nomme le service"
+    )
+    assert not presidio_fires(health=(200, PRESIDIO_IMAGE_REDACTOR_HEALTH_BODY)), (
+        "le template signale l'image-redactor sous l'identifiant de l'analyseur"
+    )
+    assert not presidio_fires(health=(200, PRESIDIO_HEALTH_IN_PAGE_BODY)), (
+        "le template retrouve la constante au milieu du document d'une "
+        "supervision : le handler rend la chaîne seule, et c'est l'ancrage des "
+        "deux côtés qui dit que l'instance a répondu d'elle-même"
+    )
+    assert not presidio_fires(health=(200, PRESIDIO_HEALTH_BODY + " (proxied)")), (
+        "le template admet du texte après la constante, que « return \"Presidio "
+        "Analyzer service is up\" » n'écrit pas"
+    )
+    assert not presidio_fires(health=(200, PRESIDIO_CAPTIVE_PORTAL_BODY)), (
+        "le template conclut sur un portail captif qui rend sa page de connexion"
+    )
+
+    # Collisions internes au pack : d'autres produits couverts ici publient une
+    # route de santé, et aucun ne doit être revendiqué par ce template.
+    for other, name in ((LANGFUSE_HEALTH_BODY, "Langfuse"),
+                        (TABBY_HEALTH_BODY, "Tabby"),
+                        (HAYHOOKS_STATUS_BODY, "Hayhooks"),
+                        (UNSTRUCTURED_HEALTH_BODY, "Unstructured"),
+                        (MINERU_HEALTH_BODY, "MinerU")):
+        assert not presidio_fires(health=(200, other)), (
+            f"le template déclenche sur {name}, déjà couvert par son propre "
+            "template"
+        )
+
+
+def test_presidio_matcher_needs_the_engine_to_answer_not_just_the_health_string():
+    """
+    La constante est un fait du code, donc une signature parfaite — et c'est
+    précisément pour cela qu'elle ne suffit pas : elle est aussi ce qu'un
+    intermédiaire relaie quand il ne laisse passer que la sonde de santé, la
+    disposition la plus courante devant ces conteneurs, dont le Dockerfile pose
+    « HEALTHCHECK ... curl -f http://localhost:${PORT}/health ». Les deux
+    catalogues sont ce qui dit que le moteur, lui, a répondu.
+    """
+    for scenario, why in (
+        ({"entities": (401, PRESIDIO_PROXY_DENIED_BODY),
+          "recognizers": (401, PRESIDIO_PROXY_DENIED_BODY)},
+         "un proxy qui ne laisse passer que la sonde de santé et refuse les "
+         "deux catalogues à l'anonyme — c'est la fermeture attendue, puisque le "
+         "produit n'a aucun réglage d'authentification"),
+        ({"entities": (404, PRESIDIO_NOT_FOUND_BODY),
+          "recognizers": (404, PRESIDIO_NOT_FOUND_BODY)},
+         "un service qui rend la constante mais ne sert aucune des deux routes "
+         "du moteur"),
+        ({"entities": (200, PRESIDIO_CAPTIVE_PORTAL_BODY),
+          "recognizers": (200, PRESIDIO_CAPTIVE_PORTAL_BODY)},
+         "un portail captif qui répond 200 et sa page à tout ce qu'on lui "
+         "demande"),
+        ({"entities": (200, PRESIDIO_EMPTY_LIST_BODY)},
+         "un catalogue d'entités vide : le moteur ne détecterait rien, et un "
+         "tableau vide ne dit pas quel produit a répondu"),
+        ({"recognizers": (200, PRESIDIO_EMPTY_LIST_BODY)},
+         "un registre vide, qui ne porte pas même le mot du produit"),
+        ({"entities": (200, PRESIDIO_WRAPPED_ENTITIES_BODY)},
+         "un catalogue enveloppé par une passerelle sous une clé à elle : "
+         "jsonify() d'une liste ouvre sur un crochet, et c'est cet ancrage qui "
+         "dit que l'instance a répondu d'elle-même"),
+        ({"recognizers": (200, PRESIDIO_OBJECT_RECOGNIZERS_BODY)},
+         "une API qui décrit ses reconnaisseurs par des objets : « names = "
+         "[o.name for o in recognizers_list] » ne rend que des chaînes, et le "
+         "tableau que Presidio sérialise n'a donc aucune accolade"),
+        ({"recognizers": (200, PRESIDIO_ENTITIES_BODY)},
+         "l'écho du catalogue d'entités sur la route des reconnaisseurs : c'est "
+         "le mot « Recognizer » qui nomme le registre du moteur"),
+    ):
+        assert not presidio_fires(**scenario), (
+            "le template conclut sur %s" % why
+        )
+
+    # La limite est assumée, et c'est le prix de ne pas déclencher sur n'importe
+    # quel tableau de chaînes : un exploitant qui aurait nommé chacun de ses
+    # reconnaisseurs sans le suffixe de classe — donc sans un seul
+    # « ...Recognizer » dans la réponse — ne serait pas signalé.
+    assert not presidio_fires(recognizers=(200, presidio_list_body(
+        ["matricule-interne", "dossier-patient"]))), (
+        "le template déclenche sur un tableau de chaînes quelconque : le mot "
+        "« Recognizer » est tout ce qui rattache cette réponse au registre de "
+        "Presidio"
+    )
+
+
+def test_presidio_matcher_holds_across_the_shapes_the_instance_emits():
+    assert presidio_fires(entities=(200, PRESIDIO_CUSTOM_ENTITIES_BODY),
+                          recognizers=(200, PRESIDIO_CUSTOM_RECOGNIZERS_BODY)), (
+        "le template exige le registre prédéfini tel quel : l'instance dont "
+        "l'exploitant a ajouté ses propres reconnaisseurs est celle qui compte, "
+        "puisque leurs noms sont ce que le constat signale"
+    )
+
+    assert presidio_fires(
+        entities=(200, presidio_list_body(["NRP"])),
+        recognizers=(200, presidio_list_body(["SpacyRecognizer"]))), (
+        "le template exige plusieurs entrées : un registre restreint à un seul "
+        "reconnaisseur est exposé au même titre"
+    )
+
+    assert presidio_fires(
+        entities=(200, presidio_list_body(list(reversed(PRESIDIO_DEFAULT_ENTITIES)))),
+        recognizers=(200, presidio_list_body(
+            ["dossier-patient", "matricule-interne", "EmailRecognizer"]))), (
+        "le template épingle une position : get_supported_entities() comme "
+        "get_recognizers() rendent « list(set(...)) », donc sans ordre stable, "
+        "et le nom de classe peut tomber n'importe où dans le tableau"
+    )
+
+    assert presidio_fires(
+        entities=(200, presidio_list_body(PRESIDIO_DEFAULT_ENTITIES, indent=2)),
+        recognizers=(200, presidio_list_body(PRESIDIO_DEFAULT_RECOGNIZERS,
+                                             indent=2))), (
+        "le template exige la sérialisation compacte de Flask : un intermédiaire "
+        "qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+    assert presidio_fires(health=(200, "  %s\n" % PRESIDIO_HEALTH_BODY)), (
+        "le template refuse la constante escortée d'espaces : un intermédiaire "
+        "qui relaie trente octets peut leur ajouter une fin de ligne"
+    )
+
+
+def test_presidio_conclusion_rests_on_the_payloads_not_on_the_http_status():
+    """
+    Les trois charges utiles ne sortent de l'application que sous un 200 : le
+    handler de santé rend une chaîne nue, et les deux autres écrivent « return
+    jsonify(...), 200 » en dur. Exiger le code n'écarterait donc rien que les
+    corps n'écartent déjà, et ferait manquer l'instance dont un intermédiaire
+    réécrit le statut.
+    """
+    block = presidio_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les trois réponses par leur numéro, et un matcher "
+        "de statut conclurait sur un code plutôt que sur ce que l'instance rend"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : la constante nomme "
+            "le service et les deux catalogues démontrent que le moteur répond, "
+            "aucune des deux moitiés seule"
+        )
+        for expression in matcher.get("dsl") or []:
+            assert "status_code" not in expression, (
+                f"l'expression {expression!r} conclut sur le code HTTP — les "
+                "trois corps le font déjà, et un intermédiaire qui réécrit le "
+                "statut ferait alors manquer l'instance"
+            )
+
+    assert presidio_fires(health=(304, PRESIDIO_HEALTH_BODY)), (
+        "le template dépend du code rendu sur la route de santé, alors qu'un "
+        "cache intermédiaire peut servir le même corps sous un autre"
+    )
+
+
+def test_presidio_extractor_reports_the_size_of_the_registry_that_answered():
+    extractors = presidio_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "les évalue contre chaque réponse, et la même instance serait signalée "
+        "autant de fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un tableau JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_3", (
+        "l'extracteur n'est pas borné à la troisième réponse — la constante de "
+        "santé ne porte rien à extraire, et le catalogue d'entités se déduit du "
+        "registre"
+    )
+    assert extractor.get("json") == ['length'], (
+        "l'extracteur ne compte pas les reconnaisseurs chargés — c'est pourtant "
+        "le seul renseignement durable des trois réponses : au-delà du registre "
+        "prédéfini, ce sont des reconnaisseurs que l'exploitant a écrits. Les "
+        "noms eux-mêmes rempliraient le rapport d'une ligne par reconnaisseur"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_presidio_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs en Python plutôt
+    qu'avec le lexer de nuclei : seul un scan contre un vrai serveur ferme la
+    boucle. Le refus de l'instance dont un proxy ne laisse passer que la sonde de
+    santé en est l'enjeu propre, puisque la constante, elle, est bien là.
+    """
+    def scan(entities, recognizers):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == PRESIDIO_HEALTH_ROUTE:
+                    # Flask rend la chaîne nue d'un handler annoté « -> str »
+                    # comme du texte, pas comme du JSON.
+                    self.reply(200, PRESIDIO_HEALTH_BODY,
+                               "text/html; charset=utf-8")
+                elif self.path == PRESIDIO_ENTITIES_ROUTE:
+                    self.reply(*entities)
+                elif self.path == PRESIDIO_RECOGNIZERS_ROUTE:
+                    self.reply(*recognizers)
+                else:
+                    self.reply(404, PRESIDIO_NOT_FOUND_BODY)
+
+            def reply(self, status, body, content_type="application/json"):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", PRESIDIO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "presidio-analyzer-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan((200, PRESIDIO_ENTITIES_BODY),
+                           (200, PRESIDIO_RECOGNIZERS_BODY))
+    assert sorted(set(seen)) == sorted([PRESIDIO_HEALTH_ROUTE,
+                                        PRESIDIO_ENTITIES_ROUTE,
+                                        PRESIDIO_RECOGNIZERS_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == [str(len(PRESIDIO_DEFAULT_RECOGNIZERS))], (
+        "le scan ne remonte pas le nombre de reconnaisseurs chargés — "
+        f"{extracted}"
+    )
+
+    _, refused = scan((401, PRESIDIO_PROXY_DENIED_BODY),
+                      (401, PRESIDIO_PROXY_DENIED_BODY))
+    assert refused == [], (
+        "le scan conclut sur une instance dont un proxy ne laisse passer que la "
+        "sonde de santé : la constante est bien celle de l'analyseur, mais le "
+        "moteur, lui, n'a pas répondu"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
