@@ -1,0 +1,245 @@
+id: vane-config-exposed
+
+info:
+  name: Vane - Unauthenticated Instance Configuration Exposure
+  author: popy21
+  severity: high
+  description: |
+    Vane — le dépôt ItzCrazyKns/Vane, anciennement Perplexica — se présente dans
+    son propre README comme « a privacy-focused AI answering engine that runs
+    entirely on your own hardware » : un moteur de réponse qui interroge le web
+    par SearXNG et rédige avec le modèle de l'exploitant, local par Ollama ou
+    distant chez OpenAI, Anthropic, Gemini ou Groq. La première commande
+    d'installation que ce même README donne — « docker run -d -p 3000:3000 -v
+    vane-data:/home/vane/data --name vane itzcrazykns1337/vane:latest » —
+    publie le port 3000 sur toutes les interfaces de l'hôte.
+    GET /api/config est déclaré par src/app/api/config/route.ts, un route
+    handler de l'App Router, donc servi tel quel sur /api/config. Le handler
+    tient en trois temps : « const values = configManager.getCurrentConfig(); »,
+    « const fields = configManager.getUIConfigSections(); », puis « return
+    NextResponse.json({ values, fields, }) ». Le fichier entier ne porte ni
+    contrôle de session, ni jeton, ni clé — ni sur ce GET, ni sur le POST qu'il
+    déclare juste en dessous. Ce n'est pas un réglage manqué mais une
+    fonctionnalité absente du produit : le README range « Adding
+    authentication » parmi ses « Upcoming Features ».
+    Rien n'est masqué en chemin. src/lib/config/index.ts déclare
+    « getCurrentConfig(): Config { return JSON.parse(JSON.stringify(
+    this.currentConfig)); } » — une copie profonde de l'état, servie telle
+    quelle — et « getUIConfigSections(): UIConfigSections { return
+    this.uiConfigSections; } ». La forme des deux moitiés se lit dans
+    src/lib/config/types.ts : « type Config = { version: number; setupComplete:
+    boolean; preferences: {...}; personalization: {...}; modelProviders:
+    ConfigModelProvider[]; search: {...}; } » d'un côté, « type UIConfigSections
+    = { preferences: UIConfigField[]; personalization: UIConfigField[];
+    modelProviders: ModelProviderUISection[]; search: UIConfigField[]; } » de
+    l'autre — les mêmes sections, décrites plutôt que remplies.
+    Le constat porte sur l'enveloppe et sur le couple qu'elle transporte, jamais
+    sur le statut HTTP. « NextResponse.json({ values, fields }) » sérialise dans
+    l'ordre d'insertion, donc « values » ouvre le document et « fields » en est
+    la seconde clé ; « setupComplete » et « modelProviders » sont deux champs
+    obligatoires de Config, et les voir ensemble sous cette enveloppe
+    n'appartient qu'à ce produit. Le chemin, lui, est partagé : deux autres
+    templates du pack lisent /api/config — Open WebUI et LibreChat le servent
+    aussi — et aucun des deux ne rend cette forme.
+  impact: |
+    Le bloc « config » de chaque fournisseur est ce que la réponse livre de plus
+    sensible. « type ConfigModelProvider = { id: string; name: string; type:
+    string; chatModels: Model[]; embeddingModels: Model[]; config: { [key:
+    string]: any }; hash: string; } » : « config » porte les valeurs saisies
+    dans l'écran de configuration, et les champs que les fournisseurs y
+    déclarent en « type: 'password' » — le PasswordUIConfigField de
+    src/lib/config/types.ts — sont leurs clés d'API. Le fournisseur Anthropic
+    n'a qu'un champ, « { type: 'password', name: 'API Key', key: 'apiKey', ...,
+    env: 'ANTHROPIC_API_KEY' } », et initializeFromEnv() le remplit depuis
+    l'environnement du conteneur : « newProvider.config[field.key] =
+    process.env[field.env!] || field.default || '' ». La clé lue n'est donc pas
+    seulement celle qu'on a tapée dans l'interface, c'est aussi celle qu'on a
+    passée au « docker run ». Le nom des clés à l'intérieur de « config » varie
+    d'un fournisseur à l'autre — openai déclare apiKey et baseURL, ollama et
+    lmstudio un baseURL seul, transformers aucun — et le constat ne suppose rien
+    de ces noms.
+    Le reste de « values » décrit le déploiement : « modelProviders » dit quels
+    fournisseurs sont branchés et quels modèles chacun expose,
+    « search.searxngURL » donne l'adresse de l'instance SearXNG — souvent une
+    machine interne — et « personalization » rend les instructions que
+    l'exploitant a écrites pour son modèle.
+    Et le même chemin écrit. POST /api/config accepte « { key, value } », refuse
+    en 400 quand l'un des deux manque, puis appelle
+    « configManager.updateConfig(body.key, body.value) » et rend
+    « {"message":"Config updated successfully."} ». updateConfig() découpe la
+    clé sur les points, crée les objets intermédiaires manquants, écrit la
+    feuille, et saveConfig() réécrit data/config.json : un appelant anonyme
+    réécrit donc n'importe quel chemin de la configuration, et il persiste. La
+    lecture qui suit est immédiate — getSearxngURL(), dans
+    src/lib/config/serverRegistry.ts, rend « configManager.getConfig(
+    'search.searxngURL', '') » à chaque appel, donc poser cette clé sur un
+    serveur qu'on contrôle fait passer par lui toutes les recherches web de
+    l'instance, sans que rien ne change dans l'interface.
+    Rien de tout cela ne sera attribué : le produit ne réclame jamais d'identité,
+    donc aucun journal n'en portera.
+  remediation: |
+    Ne pas publier le port. Le produit n'a pas d'écran de connexion et son README
+    le dit lui-même en rangeant « Adding authentication » parmi les évolutions à
+    venir : il n'existe aucun réglage qui ferme /api/config. Publier le
+    conteneur sur la boucle locale — « -p 127.0.0.1:3000:3000 » plutôt que le
+    « -p 3000:3000 » de la commande du README — et poser devant un intermédiaire
+    qui authentifie quand l'instance doit être atteinte depuis ailleurs.
+    Tenir les clés pour compromises. Toute clé d'API de fournisseur ayant vécu
+    dans la configuration d'une instance exposée est lisible par quiconque a
+    atteint le port, qu'elle ait été saisie dans l'interface ou passée en
+    variable d'environnement au « docker run » — initializeFromEnv() la recopie
+    dans config.json, que getCurrentConfig() sert sans masquage. Les révoquer
+    chez leur émetteur, puis les remplacer.
+    Vérifier la prise en compte depuis l'extérieur du périmètre :
+    « curl -s http://<hote>:3000/api/config » ne doit plus rendre l'enveloppe
+    values/fields.
+    Après une exposition, relire data/config.json dans le volume vane-data,
+    puisque le même chemin accepte les écritures anonymes.
+    « search.searxngURL » est le premier à contrôler — pointé ailleurs, il fait
+    passer chaque recherche de l'instance par un tiers. Comparer ensuite les
+    fournisseurs déclarés à ceux qu'on a réellement configurés, et les
+    instructions de « personalization » à celles qu'on a écrites.
+  reference:
+    - https://github.com/ItzCrazyKns/Vane/blob/master/src/app/api/config/route.ts
+    - https://github.com/ItzCrazyKns/Vane/blob/master/src/lib/config/index.ts
+    - https://github.com/ItzCrazyKns/Vane/blob/master/src/lib/config/types.ts
+    - https://github.com/ItzCrazyKns/Vane/blob/master/src/lib/config/serverRegistry.ts
+    - https://github.com/ItzCrazyKns/Vane/blob/master/src/lib/models/registry.ts
+    - https://github.com/ItzCrazyKns/Vane/blob/master/src/lib/models/providers/anthropic/index.ts
+    - https://github.com/ItzCrazyKns/Vane
+  metadata:
+    max-request: 1
+    vendor: itzcrazykns
+    product: vane
+  tags: ai,llm,vane,perplexica,search,rag,config,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et la seule qui porte le constat : la configuration n'est
+  # servie que là. Le handler ne consulte ni la requête ni l'identité de
+  # l'appelant, il recopie l'état déjà en mémoire — getCurrentConfig() n'est
+  # qu'un JSON.parse(JSON.stringify(...)) — et n'écrit rien.
+  #
+  # Ce que cette lecture coûte tout de même à l'instance, dit franchement : le
+  # handler appelle « await modelRegistry.getActiveProviders() », et
+  # src/lib/models/registry.ts y fait un getModelList() par fournisseur
+  # configuré. Chacun est une requête sortante depuis la machine auditée vers
+  # l'API du fournisseur — « fetch('https://api.anthropic.com/v1/models?
+  # limit=999') » côté Anthropic, « fetch(`${this.config.baseURL}/api/tags`) »
+  # côté Ollama — faite avec la clé de l'exploitant. C'est exactement ce que
+  # le produit fait à chaque ouverture de son écran de configuration : une
+  # énumération de modèles, pas une inférence, donc aucun jeton consommé et
+  # aucun calcul engagé sur le matériel. getActiveProviders() rattrape d'ailleurs
+  # l'échec de chacune — « m = { chat: [{ key: 'error', name: err.message }] } »
+  # — donc une clé absente ou un fournisseur injoignable n'empêche pas la
+  # réponse.
+  #
+  # En lecture seule, et strictement. Le même fichier déclare POST /api/config,
+  # aussi peu gardé, qui appelle updateConfig() puis saveConfig() : réécrire la
+  # configuration de l'instance et la persister sur son disque. Le signaler ne
+  # demande pas de le faire, et un scanner qui poserait ne serait-ce qu'une clé
+  # pour prouver l'écriture modifierait ce qu'il audite.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/config"
+
+    matchers-condition: and
+    matchers:
+      # L'ancrage sur l'ouverture. « NextResponse.json({ values, fields }) »
+      # sérialise l'objet dans l'ordre d'insertion du littéral, donc « values »
+      # ouvre le document et sa valeur est un objet — Config est un objet, pas
+      # un tableau. Cet ancrage écarte la même charge utile retrouvée au fond du
+      # document d'une supervision qui l'agrégerait sous une clé à elle : c'est
+      # lui qui dit que l'instance a répondu d'elle-même.
+      #
+      # Rien n'est exigé du statut HTTP. L'enveloppe ne sort du handler que sous
+      # un 200 — la seule autre branche est le « catch » qui rend
+      # « {"message":"An error has occurred."} » en 500 — donc exiger le code
+      # n'écarterait rien que le corps n'écarte déjà, et ferait manquer
+      # l'instance dont un cache ou un intermédiaire réécrit le statut.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"values"\s*:\s*\{'
+
+      # Le couple qui nomme le produit, exigé d'un seul tenant. « type Config »
+      # déclare « setupComplete: boolean » et « modelProviders:
+      # ConfigModelProvider[] » ; ni l'un ni l'autre n'est optionnel, et
+      # JSON.stringify les écrit donc toujours. Pris séparément chacun se
+      # retrouve ailleurs — un booléen d'installation et une liste de
+      # fournisseurs ne désignent aucun produit — mais les voir ensemble sous
+      # une enveloppe qui ouvre sur « values » n'arrive que là. C'est ce qui
+      # sépare cette réponse des deux autres /api/config du pack : celui d'Open
+      # WebUI ouvre sur « status » et décrit des drapeaux de fonctionnalités,
+      # celui de LibreChat ouvre sur « appTitle », et aucun des deux ne porte
+      # ces deux clés.
+      #
+      # Leur adjacence n'est pas exigée : « preferences » et « personalization »
+      # s'intercalent entre les deux dans le littéral par défaut, et l'ordre
+      # réel est celui du config.json que l'instance a relu au démarrage —
+      # « this.currentConfig = JSON.parse(fs.readFileSync(this.configPath,
+      # 'utf-8')) » — donc celui de la version qui l'a écrit.
+      #
+      # La valeur de setupComplete n'est contrainte qu'à être un booléen. Une
+      # instance encore à installer est exposée au même titre : c'est la même
+      # route qui la sert, et POST /api/config suffit à la configurer.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"setupComplete"\s*:\s*(true|false)'
+          - '"modelProviders"\s*:\s*\['
+
+      # La seconde moitié de l'enveloppe, celle qui dit que le document décrit
+      # la configuration autant qu'il la rend. « fields » est la seconde et
+      # dernière clé du littéral du handler, et sa valeur est l'objet
+      # UIConfigSections. L'accolade est ici le discriminant : le seul autre
+      # « fields » du document est celui de ModelProviderUISection, et
+      # celui-là est un tableau — « fields: UIConfigField[] ».
+      #
+      # Rien n'est exigé du nom des sections, et c'est délibéré : celles de
+      # UIConfigSections ont été renommées entre deux versions — v1.11.0 déclare
+      # une section « general » unique, v1.12.0 la scinde en « preferences » et
+      # « personalization ». S'ancrer sur « preferences » ferait manquer toutes
+      # les instances plus anciennes, qui sont exposées au même titre. Ce qui
+      # traverse les deux générations, c'est l'enveloppe elle-même et les deux
+      # clés obligatoires de Config.
+      #
+      # Il n'y a pas d'ancrage de fermeture à opposer à celui de l'ouverture :
+      # le document se termine sur la dernière section de « fields », dont le
+      # contenu dépend de la version. Une passerelle qui recopierait « values »
+      # en tête puis ajouterait ses propres clés derrière passerait donc — mais
+      # elle devrait avoir recopié l'enveloppe entière pour cela, et le constat
+      # porterait toujours sur une instance qui a bien rendu sa configuration.
+      - type: regex
+        part: body
+        regex:
+          - '"fields"\s*:\s*\{'
+
+    extractors:
+      # A-t-elle déjà été configurée ? C'est le renseignement qui décide de tout
+      # le reste : markSetupComplete() ne pose ce drapeau qu'une fois l'écran
+      # d'installation terminé, donc une instance à true est une instance dont
+      # le bloc « config » de chaque fournisseur porte des valeurs saisies —
+      # clés d'API comprises.
+      - type: json
+        part: body
+        name: setup_complete
+        json:
+          - '.values.setupComplete'
+
+      # Les fournisseurs branchés, nommés par leur type. Ce sont les clés du
+      # registre de src/lib/models/providers/index.ts — openai, ollama, gemini,
+      # transformers, groq, lemonade, anthropic, lmstudio — donc ce que
+      # l'exploitant fait tourner et chez qui.
+      #
+      # Rien de plus n'est remonté du fournisseur, et surtout pas son bloc
+      # « config » : c'est là que sont les champs déclarés « type: 'password' »,
+      # c'est-à-dire les clés d'API. Un extracteur qui les ferait apparaître les
+      # recopierait dans le rapport de scan et dans tout ce qui le relaie ; le
+      # constat n'en a pas besoin pour tenir, puisque l'accès en lecture est
+      # déjà prouvé par les matchers.
+      - type: json
+        part: body
+        name: model_providers
+        json:
+          - '.values.modelProviders[]?.type'

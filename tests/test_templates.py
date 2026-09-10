@@ -23953,6 +23953,589 @@ def test_speaches_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Vane — ItzCrazyKns/Vane, anciennement Perplexica : le moteur de réponse IA que
+# son README décrit comme tournant « entirely on your own hardware ». GET
+# /api/config y rend « NextResponse.json({ values, fields, }) », c'est-à-dire la
+# configuration entière de l'instance et la description de ses champs, sans
+# aucun contrôle de session, de jeton ni de clé.
+#
+# Le chemin est le plus partagé du pack après /v1/models : Open WebUI et
+# LibreChat servent eux aussi /api/config, et deux templates le lisent déjà.
+# Cette section vérifie les trois moitiés du constat — que l'enveloppe
+# values/fields et le couple setupComplete/modelProviders séparent Vane de ces
+# deux-là, que les ancrages refusent la même charge utile republiée par un
+# intermédiaire, et que ni la sonde ni les extracteurs ne touchent à ce que la
+# réponse porte de dangereux : POST /api/config réécrit la configuration, et le
+# bloc « config » de chaque fournisseur porte ses clés d'API.
+
+VANE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                             "vane-config-exposed.yaml")
+
+VANE_CONFIG_ROUTE = "/api/config"
+
+# Les clés du registre de src/lib/models/providers/index.ts, dans l'ordre où
+# l'objet « providers » les déclare : c'est celui qu'Object.entries() rend à
+# getModelProvidersUIConfigSection(), donc celui des sections de
+# `fields.modelProviders`.
+VANE_PROVIDER_TYPES = ("openai", "ollama", "gemini", "transformers", "groq",
+                       "lemonade", "anthropic", "lmstudio")
+
+# `values.preferences` et `values.personalization` tels que l'écran de
+# configuration les remplit : ce sont des « { [key: string]: any } », donc les
+# clés déclarées par uiConfigSections et rien d'imposé au-delà.
+VANE_PREFERENCES = {"theme": "dark", "measureUnit": "Metric",
+                    "autoMediaSearch": True, "showWeatherWidget": True,
+                    "showNewsWidget": True}
+VANE_PERSONALIZATION = {"systemInstructions": "Réponds en français."}
+
+
+def vane_provider(type_="anthropic", name="Anthropic", config=None,
+                  chat=(("claude-sonnet-4-5", "Claude Sonnet 4.5"),),
+                  embedding=(), provider_id="8c1f4d2a-3b55-4e07-9af1-6d0e"):
+    """
+    Une entrée de `values.modelProviders`, dans l'ordre des clés que le handler
+    rend. « type ConfigModelProvider » les déclare id, name, type, chatModels,
+    embeddingModels, config, hash, et le « { ...mp, chatModels,
+    embeddingModels } » du route handler réécrit deux clés existantes sans les
+    déplacer.
+
+    `config` porte ce que l'exploitant a saisi — ou ce qu'initializeFromEnv() a
+    recopié depuis l'environnement du conteneur — donc les champs déclarés
+    « type: 'password' » par le fournisseur, c'est-à-dire ses clés d'API.
+    """
+    if config is None:
+        config = {"apiKey": "sk-ant-api03-dGVzdC1jbGUtZmFjdGljZQ"}
+    return {"id": provider_id, "name": name, "type": type_,
+            "chatModels": [{"key": k, "name": n} for k, n in chat],
+            "embeddingModels": [{"key": k, "name": n} for k, n in embedding],
+            "config": config, "hash": "b3a1c7de9f024815"}
+
+
+VANE_ANTHROPIC_PROVIDER = vane_provider()
+VANE_OLLAMA_PROVIDER = vane_provider(
+    type_="ollama", name="Ollama",
+    config={"baseURL": "http://host.docker.internal:11434"},
+    chat=(("llama3.1:8b", "llama3.1:8b"),),
+    embedding=(("nomic-embed-text:latest", "nomic-embed-text:latest"),),
+    provider_id="5d90ab31-7c24-4f18-8e6b-21af")
+
+
+def vane_values(setup_complete=True, providers=None, legacy_general=False,
+                searxng_url="http://searxng.interne.lan:8080"):
+    """
+    `values`, c'est-à-dire getCurrentConfig() : « JSON.parse(JSON.stringify(
+    this.currentConfig)) », une copie profonde servie telle quelle. L'ordre des
+    clés est celui du config.json que l'instance a relu au démarrage, donc celui
+    du littéral de la version qui l'a écrit — version, setupComplete, puis les
+    sections, modelProviders et search.
+
+    `legacy_general` rend la forme des v1.11.x, où les sections de préférences
+    n'en font qu'une, nommée « general ». v1.12.0 l'a scindée en
+    « preferences » et « personalization ».
+    """
+    if providers is None:
+        providers = [VANE_ANTHROPIC_PROVIDER, VANE_OLLAMA_PROVIDER]
+    values = {"version": 1, "setupComplete": setup_complete}
+    if legacy_general:
+        values["general"] = dict(VANE_PREFERENCES, **VANE_PERSONALIZATION)
+    else:
+        values["preferences"] = VANE_PREFERENCES
+        values["personalization"] = VANE_PERSONALIZATION
+    values["modelProviders"] = list(providers)
+    values["search"] = {"searxngURL": searxng_url}
+    return values
+
+
+def vane_provider_section(type_="openai", name="OpenAI", fields=None):
+    """
+    Une section de `fields.modelProviders`, telle que
+    getModelProvidersUIConfigSection() la construit : « { fields, key, name } »,
+    où `fields` est le tableau de UIConfigField du fournisseur. C'est le seul
+    autre « fields » du document, et il est un tableau — le discriminant du
+    troisième matcher.
+    """
+    if fields is None:
+        fields = [{"type": "password", "name": "API Key", "key": "apiKey",
+                   "description": "Your OpenAI API key", "required": True,
+                   "placeholder": "OpenAI API Key", "env": "OPENAI_API_KEY",
+                   "scope": "server"},
+                  {"type": "string", "name": "Base URL", "key": "baseURL",
+                   "description": "The base URL for the OpenAI API",
+                   "required": True, "placeholder": "OpenAI Base URL",
+                   "default": "https://api.openai.com/v1",
+                   "env": "OPENAI_BASE_URL", "scope": "server"}]
+    return {"fields": fields, "key": type_, "name": name}
+
+
+VANE_SEARCH_FIELDS = [{"name": "SearXNG URL", "key": "searxngURL",
+                       "type": "string", "required": False,
+                       "description": "The URL of your SearXNG instance",
+                       "placeholder": "http://localhost:4000", "default": "",
+                       "scope": "server", "env": "SEARXNG_API_URL"}]
+
+VANE_THEME_FIELD = {"name": "Theme", "key": "theme", "type": "select",
+                    "options": [{"name": "Light", "value": "light"},
+                                {"name": "Dark", "value": "dark"}],
+                    "required": False,
+                    "description": "Choose between light and dark layouts "
+                                   "for the app.",
+                    "default": "dark", "scope": "client"}
+
+VANE_INSTRUCTIONS_FIELD = {"name": "System Instructions",
+                           "key": "systemInstructions", "type": "textarea",
+                           "required": False,
+                           "description": "Add custom behavior or tone for "
+                                          "the model.",
+                           "scope": "client"}
+
+
+def vane_fields(legacy_general=False):
+    """
+    `fields`, c'est-à-dire getUIConfigSections() : l'objet `uiConfigSections` de
+    src/lib/config/index.ts, rendu tel quel, dont seule la clé modelProviders a
+    été remplie par initializeFromEnv().
+    """
+    if legacy_general:
+        sections = {"general": [VANE_THEME_FIELD, VANE_INSTRUCTIONS_FIELD]}
+    else:
+        sections = {"preferences": [VANE_THEME_FIELD],
+                    "personalization": [VANE_INSTRUCTIONS_FIELD]}
+    sections["modelProviders"] = [
+        vane_provider_section(),
+        vane_provider_section(
+            type_="ollama", name="Ollama",
+            fields=[{"type": "string", "name": "Base URL", "key": "baseURL",
+                     "description": "The base URL for the Ollama",
+                     "required": True,
+                     "placeholder": "http://localhost:11434",
+                     "env": "OLLAMA_BASE_URL", "scope": "server"}]),
+    ]
+    sections["search"] = VANE_SEARCH_FIELDS
+    return sections
+
+
+def vane_config_body(values=None, fields=None, indent=None):
+    """
+    Ce que rend « NextResponse.json({ values, fields, }) » : l'ordre
+    d'insertion du littéral — donc « values » d'abord, « fields » ensuite et en
+    dernier — et la sérialisation compacte de JSON.stringify.
+    """
+    content = {"values": vane_values() if values is None else values,
+               "fields": vane_fields() if fields is None else fields}
+    if indent is not None:
+        return json.dumps(content, indent=indent, ensure_ascii=False)
+    return json.dumps(content, separators=(",", ":"), ensure_ascii=False)
+
+
+VANE_CONFIG_BODY = vane_config_body()
+
+# L'instance encore à installer : markSetupComplete() n'a jamais été appelé,
+# donc setupComplete vaut false. Elle est exposée au même titre — c'est la même
+# route qui la sert, et POST /api/config suffit à la configurer.
+VANE_FRESH_BODY = vane_config_body(
+    values=vane_values(setup_complete=False,
+                       providers=[vane_provider(
+                           type_="transformers", name="Transformers",
+                           config={}, chat=(),
+                           provider_id="1a7c0e45-8b93-4d62-bf10-5c77")],
+                       searxng_url=""))
+
+# Aucun fournisseur n'a passé le contrôle d'initializeFromEnv() : le tableau est
+# vide, mais les deux clés obligatoires de Config sont toujours là.
+VANE_NO_PROVIDER_BODY = vane_config_body(
+    values=vane_values(setup_complete=False, providers=[], searxng_url=""))
+
+# La forme des v1.11.x : une seule section « general », que v1.12.0 a scindée en
+# « preferences » et « personalization ». Ces instances traînent exposées au
+# même titre, et le constat ne doit pas dépendre du nom des sections.
+VANE_LEGACY_BODY = vane_config_body(
+    values=vane_values(legacy_general=True), fields=vane_fields(
+        legacy_general=True))
+
+# Un config.json écrit par une version dont le littéral ordonnait autrement, ou
+# réécrit à la main : updateConfig() ajoute la feuille manquante à la fin de son
+# objet, donc l'ordre interne de `values` n'est pas garanti. Seule l'ouverture
+# sur « values » l'est.
+VANE_REORDERED_VALUES_BODY = vane_config_body(
+    values={"modelProviders": [VANE_OLLAMA_PROVIDER],
+            "search": {"searxngURL": "http://searxng.interne.lan:8080"},
+            "preferences": VANE_PREFERENCES,
+            "personalization": VANE_PERSONALIZATION,
+            "version": 1, "setupComplete": True})
+
+# La réponse du POST. Le même chemin l'accepte sans plus de contrôle, mais la
+# sonde ne l'émet jamais : le constat ne doit pas non plus conclure sur elle.
+VANE_POST_ACK_BODY = '{"message":"Config updated successfully."}'
+
+# La branche « catch » du même handler — « return Response.json({ message: 'An
+# error has occurred.' }, { status: 500 }) ».
+VANE_HANDLER_ERROR_BODY = '{"message":"An error has occurred."}'
+
+# Un intermédiaire qui refuse la configuration à l'anonyme : c'est la fermeture
+# attendue, puisque le produit n'a aucun réglage pour l'obtenir lui-même.
+VANE_PROXY_DENIED_BODY = '{"detail":"Unauthorized"}'
+
+# La supervision qui republie la réponse sous une clé à elle : la charge utile y
+# est entière, mais ce n'est pas l'instance qui a répondu d'elle-même.
+VANE_COMPOSITE_BODY = '{"vane":%s,"checked_at":0}' % VANE_CONFIG_BODY
+
+# Les deux moitiés prises séparément. La première est ce qu'une autre route
+# pourrait rendre de la configuration seule ; la seconde sa seule description,
+# qui ne prouve aucun accès aux valeurs.
+VANE_VALUES_ONLY_BODY = json.dumps({"values": vane_values()},
+                                   separators=(",", ":"), ensure_ascii=False)
+VANE_FIELDS_ONLY_BODY = json.dumps({"fields": vane_fields()},
+                                   separators=(",", ":"), ensure_ascii=False)
+
+# Une passerelle qui aplatit `fields` en tableau de sections : le nom y est, la
+# forme n'y est plus. « fields » vaut un objet chez ce produit — l'autre
+# « fields » du document, celui de ModelProviderUISection, est le tableau.
+VANE_FLATTENED_FIELDS_BODY = json.dumps(
+    {"values": vane_values(), "fields": vane_fields()["modelProviders"]},
+    separators=(",", ":"), ensure_ascii=False)
+
+# Une application de formulaires quelconque, servie sur le même chemin : elle
+# rend bien un couple values/fields, mais ni « setupComplete » ni
+# « modelProviders » ne décrivent un moteur de réponse IA.
+VANE_FORM_APP_BODY = json.dumps(
+    {"values": {"nom": "Dupont", "service": "achats"},
+     "fields": {"nom": {"type": "text", "required": True},
+                "service": {"type": "select", "required": False}}},
+    separators=(",", ":"), ensure_ascii=False)
+
+# Le même couple de clés chez un produit qui décrirait une installation sans
+# être celui-là : c'est « modelProviders » qui manque, et c'est le couple qui
+# nomme Vane.
+VANE_OTHER_SETUP_APP_BODY = json.dumps(
+    {"values": {"version": 3, "setupComplete": True,
+                "database": {"driver": "sqlite"}},
+     "fields": {"database": [{"key": "driver", "type": "select"}]}},
+    separators=(",", ":"), ensure_ascii=False)
+
+
+def vane_block():
+    doc = load(VANE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % VANE_CONFIG_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /api/config — c'est pourtant la seule "
+        "route du produit qui rende la configuration de l'instance"
+    )
+    return blocks[0]
+
+
+def vane_fires(status=200, body=VANE_CONFIG_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même
+    si le bloc n'a pas à en dépendre.
+    """
+    block = vane_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_vane_probe_never_rewrites_the_configuration_it_reads():
+    """
+    Le danger propre à ce template : le chemin qu'il lit est celui qui écrit.
+    src/app/api/config/route.ts déclare un POST aussi peu gardé que le GET, qui
+    appelle « configManager.updateConfig(body.key, body.value) » puis
+    saveConfig() — donc réécrit data/config.json sur le disque de l'instance.
+    Une sonde qui poserait ne serait-ce qu'une clé pour prouver l'écriture
+    modifierait durablement ce qu'elle audite, et « search.searxngURL »
+    suffirait à détourner toutes les recherches de l'exploitant.
+    """
+    doc = load(VANE_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la configuration se lit en GET : sur ce chemin, toute autre "
+            "méthode est l'écriture que le template est censé signaler"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : POST /api/config n'attend "
+            "qu'un « { key, value } » pour réécrire la configuration"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+
+
+def test_vane_matcher_rests_on_the_envelope_not_on_the_shared_route():
+    """
+    Le point qui fait ce template : /api/config n'appartient à personne. Le pack
+    le lit déjà pour Open WebUI et pour LibreChat, et un constat qui les
+    confondrait nommerait le mauvais produit — donc enverrait l'exploitant
+    révoquer les mauvaises clés.
+    """
+    assert vane_fires(), (
+        "le template ne reconnaît pas une instance Vane dont /api/config rend "
+        "sa configuration à l'anonyme"
+    )
+
+    for other, name in (
+        (OPENWEBUI_CONFIG_SIGNUP_OPEN_BODY, "Open WebUI"),
+        (OPENWEBUI_ONBOARDING_BODY, "Open WebUI sans aucun utilisateur"),
+        (LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY, "LibreChat"),
+        (LIBRECHAT_FULLY_CONFIGURED_OPEN_BODY, "LibreChat tout configuré"),
+        (OTHER_APP_CONFIG_BODY, "une application quelconque"),
+        (LIBRECHAT_OTHER_APP_CONFIG_BODY, "un portail interne quelconque"),
+        (VANE_FORM_APP_BODY, "une application de formulaires, qui rend bien un "
+                             "couple values/fields"),
+        (VANE_OTHER_SETUP_APP_BODY, "un produit qui décrit son installation "
+                                    "sans être celui-là"),
+    ):
+        assert not vane_fires(body=other), (
+            f"le template déclenche sur {name}, servi sur le même chemin : "
+            "c'est l'enveloppe values/fields et le couple "
+            "setupComplete/modelProviders qui nomment Vane"
+        )
+
+
+def test_vane_matcher_needs_both_halves_of_the_envelope():
+    for body, why in (
+        (VANE_COMPOSITE_BODY,
+         "la charge utile republiée au fond du document d'une supervision : "
+         "c'est l'ancrage sur l'ouverture qui dit que l'instance a répondu "
+         "d'elle-même"),
+        (VANE_VALUES_ONLY_BODY,
+         "les valeurs sans leur description : le handler rend les deux, et "
+         "« fields » est la seconde clé de son littéral"),
+        (VANE_FIELDS_ONLY_BODY,
+         "la description sans les valeurs, qui ne prouve aucun accès à la "
+         "configuration — et qui n'ouvre pas sur « values »"),
+        (VANE_FLATTENED_FIELDS_BODY,
+         "un « fields » aplati en tableau : chez ce produit la clé vaut un "
+         "objet, et le tableau est l'autre « fields », celui de "
+         "ModelProviderUISection"),
+        (VANE_POST_ACK_BODY,
+         "l'accusé du POST, que le même chemin rend après avoir réécrit la "
+         "configuration"),
+        (VANE_HANDLER_ERROR_BODY,
+         "la branche « catch » du handler, qui ne rend aucune configuration"),
+        (VANE_PROXY_DENIED_BODY,
+         "un intermédiaire qui refuse la configuration à l'anonyme — c'est la "
+         "fermeture attendue"),
+    ):
+        assert not vane_fires(body=body), "le template conclut sur %s" % why
+
+
+def test_vane_matcher_holds_across_the_shapes_the_instance_emits():
+    assert vane_fires(body=VANE_FRESH_BODY), (
+        "le template rate l'instance encore à installer : setupComplete vaut "
+        "false jusqu'à markSetupComplete(), et c'est la plus exposée des deux "
+        "— POST /api/config suffit à la configurer"
+    )
+
+    assert vane_fires(body=VANE_NO_PROVIDER_BODY), (
+        "le template exige un fournisseur configuré : « modelProviders » est "
+        "déclaré obligatoire par « type Config » et JSON.stringify l'écrit même "
+        "vide"
+    )
+
+    assert vane_fires(body=VANE_LEGACY_BODY), (
+        "le template s'ancre sur le nom des sections : v1.11.0 n'en déclare "
+        "qu'une, « general », que v1.12.0 a scindée en « preferences » et "
+        "« personalization » — l'exiger ferait manquer les instances plus "
+        "anciennes"
+    )
+
+    assert vane_fires(body=VANE_REORDERED_VALUES_BODY), (
+        "le template exige un ordre de clés à l'intérieur de « values », alors "
+        "que getCurrentConfig() recopie le config.json relu au démarrage, donc "
+        "l'ordre de la version qui l'a écrit"
+    )
+
+    assert vane_fires(body=vane_config_body(indent=2)), (
+        "le template exige la sérialisation compacte de JSON.stringify : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+    assert vane_fires(body=VANE_CONFIG_BODY + "\n"), (
+        "le template refuse une fin de ligne ajoutée par un intermédiaire"
+    )
+
+    for type_ in VANE_PROVIDER_TYPES:
+        body = vane_config_body(values=vane_values(providers=[vane_provider(
+            type_=type_, name=type_, config={})]))
+        assert vane_fires(body=body), (
+            f"le template rate l'instance dont le seul fournisseur est "
+            f"« {type_} » : les huit clés du registre de "
+            "src/lib/models/providers/index.ts viennent du même produit"
+        )
+
+
+def test_vane_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    L'enveloppe ne sort du handler que sous un 200 — la seule autre branche est
+    le « catch » qui rend « {"message":"An error has occurred."} » en 500 — donc
+    exiger le code n'écarterait rien que le corps n'écarte déjà, et ferait
+    manquer l'instance dont un intermédiaire réécrit le statut.
+    """
+    block = vane_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : l'ancrage sur l'ouverture "
+        "dit que l'instance a répondu d'elle-même, le couple "
+        "setupComplete/modelProviders nomme le produit, et « fields » dit que "
+        "le document décrit la configuration autant qu'il la rend — aucune des "
+        "trois ne suffit seule"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : il conclurait sur un code que "
+        "n'importe quel serveur vivant rend"
+    )
+
+    assert vane_fires(status=304), (
+        "le template dépend du code rendu, alors qu'un cache intermédiaire peut "
+        "servir le même corps sous un autre"
+    )
+
+
+def test_vane_extractors_report_the_posture_without_copying_the_keys():
+    """
+    La réponse porte les clés d'API des fournisseurs : « config » est le bloc où
+    atterrissent les champs déclarés « type: 'password' », et
+    initializeFromEnv() y recopie les variables d'environnement du conteneur. Un
+    extracteur qui les ferait remonter les écrirait dans le rapport de scan et
+    dans tout ce qui le relaie — alors que l'accès en lecture est déjà prouvé
+    par les matchers.
+    """
+    extractors = vane_block().get("extractors") or []
+    assert len(extractors) == 2, (
+        "la réponse porte deux renseignements durables et non sensibles — "
+        "l'instance est-elle configurée, et chez qui — et le template doit s'y "
+        "tenir"
+    )
+
+    assert [e.get("type") for e in extractors] == ["json", "json"], (
+        "la réponse est un objet JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+
+    assert [e.get("json") for e in extractors] == [
+        ['.values.setupComplete'],
+        ['.values.modelProviders[]?.type'],
+    ], (
+        "les extracteurs ne remontent pas le couple qui décide de la suite : "
+        "setupComplete dit si le bloc « config » de chaque fournisseur porte "
+        "des valeurs saisies, et le type de chaque fournisseur dit chez qui "
+        "l'exploitant fait tourner son moteur"
+    )
+
+    for extractor in extractors:
+        for expression in extractor.get("json") or []:
+            for forbidden in (".config", "apiKey", "password", "baseURL",
+                              "searxngURL", "hash"):
+                assert forbidden not in expression, (
+                    f"l'expression « {expression} » remonte {forbidden} : le "
+                    "rapport de scan porterait alors les secrets de "
+                    "l'exploitant, et le constat n'en a pas besoin pour tenir"
+                )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_vane_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    moteur d'expressions de Python plutôt qu'avec celui de Go : seul un scan
+    contre un vrai serveur ferme la boucle. L'ancrage `^` en est l'enjeu propre,
+    et la sérialisation d'un booléen par l'extracteur avec lui.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == VANE_CONFIG_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, '{"message":"Not Found"}')
+
+            def do_POST(self):
+                seen.append("POST " + self.path)
+                self.reply(200, VANE_POST_ACK_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", VANE_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "vane-config-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, VANE_CONFIG_BODY)
+    assert sorted(set(seen)) == [VANE_CONFIG_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert sorted(extracted) == ["anthropic", "ollama", "true"], (
+        "le scan ne remonte pas la posture de l'instance — les fournisseurs "
+        f"branchés et le drapeau d'installation : {extracted}"
+    )
+
+    _, fresh = scan(200, VANE_FRESH_BODY)
+    assert sorted(fresh) == ["false", "transformers"], (
+        "le scan perd le drapeau de l'instance encore à installer : un booléen "
+        f"à false reste un renseignement — {fresh}"
+    )
+
+    _, refused = scan(401, VANE_PROXY_DENIED_BODY)
+    assert refused == [], (
+        "le scan conclut sur une instance placée derrière un intermédiaire qui "
+        "refuse la configuration à l'anonyme"
+    )
+
+    _, composite = scan(200, VANE_COMPOSITE_BODY)
+    assert composite == [], (
+        "le scan conclut sur la charge utile republiée au fond du document "
+        "d'une supervision : c'est l'ancrage sur l'ouverture qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
