@@ -1,0 +1,225 @@
+id: speaches-server-exposed
+
+info:
+  name: Speaches - Unauthenticated Speech-to-Text and Text-to-Speech API Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Speaches (speaches-ai/speaches, anciennement faster-whisper-server) se décrit
+    dans son propre README comme « an OpenAI API-compatible server supporting
+    streaming transcription, translation, and speech generation », et son
+    ambition comme « This project aims to be Ollama, but for TTS/STT models ».
+    La reconnaissance vocale y passe par faster-whisper, la synthèse par piper et
+    Kokoro.
+    GET /v1/models est déclaré dans src/speaches/routers/models.py par
+    « @router.get("/v1/models", response_model=ListModelsResponse) » et son
+    handler rend « JSONResponse(content={"data": [model.model_dump() for model in
+    models], "object": "list"}) » — un littéral de dictionnaire, donc une
+    enveloppe qui ouvre sur « data » et ferme sur « object ». La forme des objets
+    qu'elle porte se lit dans src/speaches/api_types.py : « class
+    ListModelsResponse » déclare « data: list[Model] » et « object:
+    Literal["list"] = "list" », et « class Model » déclare, dans cet ordre,
+    « id: str », « created: int = 0 », « object: Literal["model"] = "model" »,
+    « owned_by: str », « language: list[str] | None = None » — des codes ISO
+    639-3 — et « task: ModelTask ».
+    Ce sont les deux dernières clés qui nomment le produit. « task » est tenu
+    dans une union littérale close, « ModelTask = Literal["automatic-speech-
+    recognition", "text-to-speech", "speaker-embedding",
+    "voice-activity-detection", "speaker-diarization"] », et le commentaire de
+    « language » dit lui-même pourquoi il est là : « This field is not a part of
+    the OpenAI API spec and is added for convenience ». Aucune des deux
+    n'appartient à l'objet Model de la spécification OpenAI, donc aucune ne peut
+    venir des runtimes que le pack couvre déjà — vLLM, LocalAI et LM Studio
+    servent tous /v1/models et n'y écrivent ni l'une ni l'autre. Elles se suivent
+    d'ailleurs dans le corps, puisque pydantic sérialise les champs dans l'ordre
+    de leur déclaration et que « language » précède « task » dans la classe.
+    L'absence d'authentification est un défaut de configuration par défaut, et il
+    se vérifie à la source plutôt qu'il ne se déduit d'une réponse.
+    src/speaches/config.py déclare « api_key: SecretStr | None = None » — donc
+    aucune clé tant que l'exploitant n'en pose pas — puis « host: str =
+    Field(alias="UVICORN_HOST", default="0.0.0.0") » et « port: int =
+    Field(alias="UVICORN_PORT", default=8000) » : le serveur écoute sur toutes
+    les interfaces sans qu'aucun drapeau ne soit passé. src/speaches/main.py
+    construit la liste des gardes en deux lignes, « http_dependencies = [] » puis
+    « if config.api_key is not None: http_dependencies.append(ApiKeyDependency)
+    », et la passe telle quelle à « app.include_router(...,
+    dependencies=http_dependencies) » pour chat_router, stt_router,
+    models_router, misc_router, realtime_rtc_router, speech_router,
+    speech_embedding_router, vad_router et diarization_router. Tant qu'aucune clé
+    n'est configurée la liste reste vide, et l'API entière répond sans jeton — le
+    fichier l'annonce d'ailleurs au-dessus de l'application, « Create main app
+    WITHOUT global authentication ».
+    Le conteneur va dans le même sens : le Dockerfile pose
+    « ENV UVICORN_HOST=0.0.0.0 », « ENV UVICORN_PORT=8000 » et
+    « CMD ["uvicorn", "--factory", "speaches.main:create_app"] », et le
+    compose.yaml du dépôt publie « ports: - 8000:8000 », c'est-à-dire sur toutes
+    les interfaces de l'hôte. Ce qui sépare l'instance du réseau n'est donc que
+    la publication du port.
+    Le code HTTP ne dit rien ici — n'importe quel serveur vivant rend 200 sur une
+    liste de modèles — et la route de santé n'en dit pas plus :
+    src/speaches/routers/misc.py la pose sur le routeur public, hors
+    authentification en toutes circonstances, et son handler rend
+    « JSONResponse(status_code=200, content={"message": "OK"}) », deux mots que
+    publie la moitié du web. C'est la conjonction de l'enveloppe et du couple
+    language/task qui nomme Speaches.
+  impact: |
+    La liste est déjà du renseignement : elle dit quels modèles sont téléchargés
+    sur la machine, donc quelle taille de whisper et quelles voix l'exploitant
+    fait tourner, et « id » comme « owned_by » sont les identifiants de dépôt
+    Hugging Face d'où ils viennent.
+    Le risque, lui, est sur les routes voisines, et le même main.py les monte
+    toutes sans garde. POST /v1/audio/transcriptions et POST
+    /v1/audio/translations, déclarées dans src/speaches/routers/stt.py, reçoivent
+    un fichier audio et le font traverser faster-whisper ; POST /v1/audio/speech,
+    déclarée dans src/speaches/routers/speech.py, synthétise du texte arbitraire
+    avec Kokoro ou piper. C'est de la transcription, de la traduction et de la
+    synthèse vocale gratuites sur le matériel de l'exploitant, accélérateur
+    compris, sans compte à débiter et sans limite de débit.
+    Sur le routeur des modèles, celui-là même qui sert la liste, deux routes
+    écrivent. « @router.post("/v1/models/{model_id:path}") » appelle
+    « executor_registry.download_model_by_id(model_id) » : un appelant anonyme
+    fait installer le dépôt de son choix sur le disque de l'exploitant.
+    « @router.delete("/v1/models/{model_id:path}") » appelle
+    « delete_local_model_repo(model_id) », et le dépôt note à côté que la
+    suppression ne vérifie pas que le modèle est supporté par le produit. Le
+    premier remplit le disque, le second vide le cache que l'instance sert.
+    POST /v1/chat/completions, dans src/speaches/routers/chat.py, est sur la même
+    liste de routeurs et relaie vers « chat_completion_base_url », dont la valeur
+    par défaut est « http://localhost:11434/v1 » : l'instance exposée devient
+    alors un relais vers l'Ollama de la machine, que celui-ci n'ait pourtant
+    jamais quitté la boucle locale. Le reste suit — /api/ps charge et décharge
+    les modèles en mémoire, /v1/registry interroge Hugging Face depuis la machine
+    auditée, /v1/audio/voices énumère les voix installées.
+    L'interface Gradio, enfin, est montée à la racine — « enable_ui: bool = True
+    » puis « app = gr.mount_gradio_app(app, create_gradio_demo(config), path="")
+    » — et elle échappe à l'authentification même quand une clé est posée : le
+    champ api_key de config.py énumère lui-même ce qui reste public dans ce cas,
+    « /health », « /docs », « /openapi.json » et « Web UI (Gradio interface) ».
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera.
+  remediation: |
+    Poser une clé. « api_key » — la variable d'environnement API_KEY — suffit à
+    faire ajouter ApiKeyDependency à tous les routeurs HTTP d'un coup, puisque
+    main.py les monte avec la même liste. C'est le seul réglage du produit qui
+    ferme l'API, et il n'est pas posé par défaut.
+    Savoir ce qu'il ne ferme pas : /health, /docs, /openapi.json et l'interface
+    Gradio restent publics avec une clé posée, et config.py les énumère. Cette
+    interface est montée à la racine et parle à l'API depuis le serveur : la
+    laisser ouverte revient à laisser l'API ouverte. Poser ENABLE_UI=false quand
+    elle n'est pas nécessaire.
+    Restreindre l'écoute. UVICORN_HOST=127.0.0.1 quand l'instance n'a pas à être
+    atteinte depuis l'extérieur de la machine — le défaut est 0.0.0.0 — et
+    publier le port du conteneur en « -p 127.0.0.1:8000:8000 » plutôt que le
+    « 8000:8000 » du compose.yaml du dépôt, qui le publie sur toutes les
+    interfaces de l'hôte. Quand l'API doit être joignable, la placer derrière un
+    intermédiaire qui authentifie.
+    Vérifier la prise en compte depuis l'extérieur du périmètre :
+    « curl -s http://<hote>:8000/v1/models » ne doit plus rendre la liste.
+    Après une exposition, tenir l'inventaire des modèles pour lu, puis inspecter
+    le cache Hugging Face de l'instance — le volume hf-hub-cache du compose — à
+    la recherche des dépôts qu'on n'y a pas mis : chacun est un POST
+    /v1/models/... anonyme, et un modèle absent est une suppression du même
+    ordre. Chercher ensuite dans le journal d'accès d'uvicorn les POST
+    /v1/audio/transcriptions, /v1/audio/translations et /v1/audio/speech qu'on ne
+    s'explique pas : chacun est un calcul payé par l'exploitant, et le premier
+    est en prime un fichier audio qu'un tiers a déposé sur la machine. Aucune de
+    ces lignes ne portera d'identité d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/speaches-ai/speaches/blob/master/src/speaches/api_types.py
+    - https://github.com/speaches-ai/speaches/blob/master/src/speaches/routers/models.py
+    - https://github.com/speaches-ai/speaches/blob/master/src/speaches/main.py
+    - https://github.com/speaches-ai/speaches/blob/master/src/speaches/config.py
+    - https://github.com/speaches-ai/speaches/blob/master/src/speaches/routers/misc.py
+    - https://github.com/speaches-ai/speaches/blob/master/Dockerfile
+    - https://github.com/speaches-ai/speaches/blob/master/compose.yaml
+    - https://github.com/speaches-ai/speaches
+  metadata:
+    max-request: 1
+    vendor: speaches-ai
+    product: speaches
+  tags: ai,llm,speaches,whisper,stt,tts,speech,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et la moins coûteuse de l'API. list_local_models() ne fait
+  # que parcourir le cache Hugging Face déjà présent sur le disque : aucun modèle
+  # n'est chargé en mémoire, aucun calcul n'est engagé.
+  #
+  # En lecture, et rien d'autre. Le même serveur nu sert POST
+  # /v1/audio/transcriptions, POST /v1/audio/translations et POST
+  # /v1/audio/speech, qui font traverser faster-whisper un fichier audio ou
+  # synthétisent du texte sur le matériel de l'exploitant — c'est l'abus que le
+  # constat signale, ce n'est pas ce qu'un scanner a le droit de faire pour
+  # l'établir. Le routeur qui sert cette liste porte en prime POST et DELETE
+  # /v1/models/{model_id}, qui installent un dépôt arbitraire sur le disque et
+  # suppriment un modèle chargé : deux écritures, donc deux routes qu'on ne
+  # touche pas.
+  #
+  # Les deux autres routes propres au produit ne sont pas jointes non plus, et
+  # chacune pour sa raison. /v1/registry rend la même enveloppe, mais son handler
+  # appelle list_remote_models(), qui interroge huggingface_hub depuis la machine
+  # auditée : c'est du trafic sortant et de l'attente imposés à l'exploitant pour
+  # corroborer ce que /v1/models dit déjà. /v1/audio/models, lui, est une lecture
+  # locale et son enveloppe ouvre sur « models » plutôt que sur « data » — mais
+  # il est récent : la route est absente de models.py en v0.8.0 et présente en
+  # v0.8.3, et l'exiger ferait manquer les instances plus anciennes, qui sont
+  # exposées au même titre.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers:
+      # Trois expressions, et c'est celle du milieu qui nomme le produit.
+      #
+      # L'ancrage sur l'ouverture vient d'abord. Le handler rend le littéral
+      # « {"data": [...], "object": "list"} » et FastAPI sérialise un dict tel
+      # quel, donc « data » ouvre le corps et l'array suit immédiatement. Exiger
+      # cette ouverture écarte la même charge utile retrouvée au fond du document
+      # d'une passerelle qui l'agrégerait sous une clé à elle : c'est cet ancrage
+      # qui dit que l'instance a répondu d'elle-même.
+      #
+      # Le couple language/task ensuite, exigé d'un seul tenant. Pris séparément,
+      # chacun se retrouve ailleurs — « language » est un mot banal, et les cinq
+      # valeurs de ModelTask sont des étiquettes de pipeline Hugging Face que
+      # n'importe quel catalogue peut citer. Ce qui n'appartient qu'à Speaches,
+      # c'est de les voir adjacentes à l'intérieur d'un objet d'une liste de
+      # modèles compatible OpenAI : pydantic sérialise les champs dans l'ordre où
+      # la classe les déclare, et « language » y précède « task ». La valeur de
+      # « task » est tenue dans l'union littérale close de ModelTask, donc dans
+      # ces cinq chaînes et pas une autre ; « language » est admis en tableau
+      # comme à null, puisque le champ est « list[str] | None » et que
+      # model_dump() écrit le champ même quand il ne vaut rien.
+      #
+      # La fermeture sur l'enveloppe enfin, ancrée en fin de corps. « object »
+      # est la seconde et dernière clé du littéral, et sa valeur est figée par
+      # « object: Literal["list"] = "list" ». Cet ancrage écarte le document
+      # composite d'une passerelle qui recopierait la liste en tête avant d'y
+      # ajouter un objet à elle — ce que l'ancrage de la première expression ne
+      # ferait pas seul — et il écarte du même coup la description que la même
+      # instance publie sur /openapi.json, où ces noms sont des propriétés.
+      #
+      # Le code HTTP n'entre dans aucune des trois : la charge utile ne sort du
+      # handler que sous un 200, donc l'exiger n'écarterait rien que les corps
+      # n'écartent déjà, et ferait manquer l'instance dont un intermédiaire
+      # réécrit le statut.
+      #
+      # Les \s* sont là parce que FastAPI sérialise compact mais qu'un
+      # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"data"\s*:\s*\['
+          - '"language"\s*:\s*(\[[^\[\]]*\]|null)\s*,\s*"task"\s*:\s*"(automatic-speech-recognition|text-to-speech|speaker-embedding|voice-activity-detection|speaker-diarization)"'
+          - '"object"\s*:\s*"list"\s*\}\s*$'
+        condition: and
+
+    extractors:
+      # Le seul renseignement durable de la réponse. Les identifiants sont ceux
+      # des dépôts Hugging Face présents sur la machine : ils disent quelle
+      # taille de whisper et quelles voix l'exploitant fait tourner, donc ce que
+      # son matériel sert gratuitement. « created » et « owned_by » se déduisent
+      # d'eux, et « task » se lit dans le préfixe du dépôt.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'

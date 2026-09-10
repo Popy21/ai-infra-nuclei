@@ -23494,6 +23494,465 @@ def test_presidio_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Speaches : le serveur de transcription, de traduction et de synthèse vocale
+# que ses auteurs présentent comme « Ollama, but for TTS/STT models ». Il parle
+# le protocole OpenAI, donc GET /v1/models ne le distingue de rien à lui seul —
+# vLLM, LocalAI, LiteLLM, Infinity et LM Studio, tous couverts ici, servent la
+# même enveloppe {"data":[...],"object":"list"} sur le même chemin.
+#
+# Ce qui nomme le produit tient dans deux clés que la spécification OpenAI n'a
+# pas et que « class Model » d'api_types.py déclare l'une derrière l'autre :
+# « language: list[str] | None = None », dont le commentaire du champ dit
+# lui-même « This field is not a part of the OpenAI API spec and is added for
+# convenience », puis « task: ModelTask », tenu dans une union littérale de cinq
+# chaînes. Cette section vérifie les deux moitiés du constat : que le couple —
+# adjacent, puisque pydantic sérialise les champs dans l'ordre où la classe les
+# déclare — sépare Speaches des runtimes que le pack couvre déjà, et que les
+# ancrages d'enveloppe refusent la même charge utile republiée par un
+# intermédiaire.
+
+SPEACHES_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "speaches-server-exposed.yaml")
+
+SPEACHES_MODELS_ROUTE = "/v1/models"
+
+# L'union littérale de « ModelTask », dans l'ordre du fichier. Le template les
+# admet toutes : une instance qui n'a téléchargé qu'une voix est exposée au même
+# titre que celle qui sert whisper.
+SPEACHES_MODEL_TASKS = ("automatic-speech-recognition", "text-to-speech",
+                        "speaker-embedding", "voice-activity-detection",
+                        "speaker-diarization")
+
+
+def speaches_model_entry(model_id="Systran/faster-whisper-small",
+                         created=1740000000, owned_by="Systran",
+                         language=("eng",),
+                         task="automatic-speech-recognition", extra=None):
+    """
+    Une entrée de `data`, telle que « model.model_dump() » la rend : les champs
+    de « class Model » dans l'ordre où la classe les déclare — id, created,
+    object, owned_by, language, task — et ceux qu'une sous-classe ajoute
+    derrière, l'ordre de pydantic étant celui de la déclaration.
+    """
+    entry = {"id": model_id, "created": created, "object": "model",
+             "owned_by": owned_by,
+             "language": list(language) if language is not None else None,
+             "task": task}
+    if extra:
+        entry.update(extra)
+    return entry
+
+
+def speaches_models_body(entries=None, indent=None):
+    """
+    Ce que rend « JSONResponse(content={"data": [...], "object": "list"}) » :
+    l'ordre d'insertion du littéral, donc « data » d'abord et « object » en
+    dernier, et la sérialisation compacte de JSONResponse.render().
+    """
+    if entries is None:
+        entries = [speaches_model_entry()]
+    content = {"data": list(entries), "object": "list"}
+    if indent is not None:
+        return json.dumps(content, indent=indent)
+    return json.dumps(content, separators=(",", ":"))
+
+
+SPEACHES_MODELS_BODY = speaches_models_body()
+
+# Une instance qui sert les deux moitiés du produit : un whisper pour la
+# transcription, un Kokoro pour la synthèse. « class KokoroModel(Model) » ajoute
+# « sample_rate: int » et « voices: list[KokoroModelVoice] », donc deux champs
+# derrière « task ». Chaque voix porte au passage un « language » à elle, mais
+# c'est un « language: str » — la chaîne "en-us", pas un tableau de codes ISO
+# 639-3 — et le template ne doit pas s'y raccrocher.
+SPEACHES_KOKORO_ENTRY = speaches_model_entry(
+    model_id="speaches-ai/Kokoro-82M-v1.0-ONNX", owned_by="speaches-ai",
+    language=("eng",), task="text-to-speech",
+    extra={"sample_rate": 24000,
+           "voices": [{"name": "af_heart", "language": "en-us",
+                       "gender": "female", "id": "af_heart"},
+                      {"name": "pm_santa", "language": "pt-br",
+                       "gender": "male", "id": "pm_santa"}]})
+SPEACHES_TWO_MODELS_BODY = speaches_models_body(
+    [speaches_model_entry(model_id="Systran/faster-whisper-large-v3"),
+     SPEACHES_KOKORO_ENTRY])
+
+# « language » est « list[str] | None » et model_dump() écrit le champ même
+# quand il ne vaut rien : extract_language_list() rend None dès que la carte du
+# modèle ne déclare aucune langue.
+SPEACHES_NO_LANGUAGE_BODY = speaches_models_body(
+    [speaches_model_entry(language=None)])
+
+# L'instance neuve, dont le cache Hugging Face est encore vide. C'est la limite
+# assumée du constat : sans un seul modèle local, la réponse ne porte plus ni
+# « task » ni « language », et plus rien ne la sépare de n'importe quel serveur
+# compatible OpenAI sans modèle.
+SPEACHES_EMPTY_BODY = speaches_models_body([])
+
+# Un intermédiaire qui refuse à l'anonyme — la fermeture attendue, puisque
+# api_key n'est pas posé par défaut.
+SPEACHES_PROXY_DENIED_BODY = '{"detail":"Unauthorized"}'
+
+# La supervision qui republie la réponse sous une clé à elle : la charge utile y
+# est entière, mais ce n'est pas l'instance qui a répondu d'elle-même.
+SPEACHES_COMPOSITE_BODY = ('{"speaches":%s,"checked_at":0}'
+                           % SPEACHES_MODELS_BODY)
+
+# Une passerelle qui recopie la liste puis ajoute sa propre clé derrière
+# l'enveloppe : l'ouverture est intacte, la fermeture ne l'est plus.
+SPEACHES_PAGINATED_BODY = SPEACHES_MODELS_BODY[:-1] + ',"page":1}'
+
+# Une passerelle qui enveloppe la liste sous un nom à elle.
+SPEACHES_WRAPPED_BODY = ('{"models":%s,"object":"list"}'
+                         % json.dumps([speaches_model_entry()],
+                                      separators=(",", ":")))
+
+# Un catalogue Hugging Face servi sur le même chemin : l'étiquette de pipeline y
+# est, mais c'est tout ce qu'il partage avec Speaches — « language » manque, et
+# c'est le couple qui nomme le produit.
+SPEACHES_HF_CATALOGUE_BODY = json.dumps(
+    {"data": [{"id": "openai/whisper-large-v3", "object": "model",
+               "task": "automatic-speech-recognition",
+               "downloads": 4821003}],
+     "object": "list"}, separators=(",", ":"))
+
+# Les deux clés présentes, mais séparées par une troisième : ce n'est pas ce que
+# pydantic sérialise depuis « class Model », où « language » précède
+# immédiatement « task ».
+SPEACHES_SPLIT_PAIR_BODY = json.dumps(
+    {"data": [{"id": "asr-01", "object": "model", "owned_by": "acme",
+               "language": ["eng"], "pipeline": "whisper",
+               "task": "automatic-speech-recognition"}],
+     "object": "list"}, separators=(",", ":"))
+
+# La description que la même instance publie sur /openapi.json : les deux noms y
+# sont, mais en propriétés d'un schéma, et le document n'est pas une liste de
+# modèles.
+SPEACHES_OPENAPI_BODY = json.dumps(
+    {"openapi": "3.1.0", "info": {"title": "Speaches", "version": "0.8.3"},
+     "components": {"schemas": {"Model": {"properties": {
+         "language": {"type": "array"}, "task": {"type": "string"}}}}}},
+    separators=(",", ":"))
+
+
+def speaches_block():
+    doc = load(SPEACHES_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % SPEACHES_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /v1/models — c'est pourtant la seule route "
+        "de lecture dont la réponse porte le couple language/task, et la seule "
+        "que toutes les publications du produit servent"
+    )
+    return blocks[0]
+
+
+def speaches_fires(status=200, body=SPEACHES_MODELS_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même
+    si le bloc n'a pas à en dépendre.
+    """
+    block = speaches_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_speaches_probe_reads_the_model_list_and_never_makes_the_instance_work():
+    """
+    Une lecture, et la moins coûteuse : list_local_models() parcourt le cache
+    Hugging Face déjà présent sur le disque, sans charger un modèle ni engager un
+    calcul. Le même serveur nu sert POST /v1/audio/transcriptions, POST
+    /v1/audio/translations et POST /v1/audio/speech, qui font traverser
+    faster-whisper un fichier audio ou synthétisent du texte sur le matériel de
+    l'exploitant — c'est l'abus que le constat signale, ce n'est pas ce qu'un
+    scanner a le droit de faire pour l'établir. Le routeur qui sert la liste
+    porte en prime POST et DELETE /v1/models/{model_id}, deux écritures.
+    """
+    doc = load(SPEACHES_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", SPEACHES_MODELS_ROUTE)}, (
+        "le template n'interroge pas exactement la liste des modèles — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste se lit en GET : sur ce routeur, POST "
+            "/v1/models/{model_id} fait télécharger un dépôt arbitraire sur le "
+            "disque de l'exploitant et DELETE supprime un modèle chargé"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande d'écrire à l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/audio/transcriptions", "le template dépose un fichier audio "
+                                          "et fait tourner faster-whisper sur "
+                                          "le matériel de l'exploitant"),
+                ("/audio/translations", "même route de calcul, en traduction"),
+                ("/audio/speech", "le template fait synthétiser du texte par "
+                                  "Kokoro ou piper aux frais de l'exploitant"),
+                ("/chat/completions", "cette route relaie vers "
+                                      "chat_completion_base_url, dont le défaut "
+                                      "est l'Ollama de la machine auditée"),
+                ("/registry", "son handler appelle list_remote_models(), qui "
+                              "interroge huggingface_hub depuis la machine "
+                              "auditée : du trafic sortant imposé à "
+                              "l'exploitant pour corroborer ce que /v1/models "
+                              "dit déjà"),
+                ("/api/ps", "ces routes chargent et déchargent les modèles en "
+                            "mémoire"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_speaches_matcher_separates_it_from_the_openai_compatible_runtimes():
+    """
+    Le point qui fait ce template : /v1/models est le chemin le plus partagé de
+    l'écosystème, et cinq produits déjà couverts par le pack y servent la même
+    enveloppe. Un constat qui les confondrait nommerait le mauvais produit et
+    enverrait l'exploitant fermer le mauvais port.
+    """
+    assert speaches_fires(), (
+        "le template ne reconnaît pas une instance Speaches dont /v1/models "
+        "répond à l'anonyme"
+    )
+
+    for other, name in ((VLLM_MODELS_BODY, "vLLM"),
+                        (OTHER_OPENAI_API_BODY, "l'API OpenAI elle-même"),
+                        (LMSTUDIO_MODELS_BODY, "LM Studio"),
+                        (LOCALAI_OPENAI_MODELS_BODY, "LocalAI"),
+                        (LITELLM_OPENAI_MODELS_BODY, "LiteLLM"),
+                        (INFINITY_MODELS_BODY, "Infinity")):
+        assert not speaches_fires(body=other), (
+            f"le template déclenche sur {name}, qui sert la même enveloppe sur "
+            "le même chemin : l'objet Model de la spécification OpenAI n'a ni "
+            "« language » ni « task »"
+        )
+
+
+def test_speaches_matcher_needs_the_pair_that_pydantic_writes_side_by_side():
+    for body, why in (
+        (SPEACHES_HF_CATALOGUE_BODY,
+         "un catalogue qui cite l'étiquette de pipeline sans « language » : "
+         "les cinq valeurs de ModelTask sont des étiquettes Hugging Face, que "
+         "n'importe quel inventaire peut porter"),
+        (SPEACHES_SPLIT_PAIR_BODY,
+         "les deux clés séparées par une troisième : « class Model » déclare "
+         "« language » immédiatement avant « task », et pydantic sérialise dans "
+         "l'ordre de déclaration"),
+        (speaches_models_body([speaches_model_entry(task="text-generation")]),
+         "une valeur de tâche hors de l'union : « ModelTask » est un Literal "
+         "clos de cinq chaînes, et une sixième ne vient pas de ce serveur"),
+        (SPEACHES_OPENAPI_BODY,
+         "la description que la même instance publie sur /openapi.json, où ces "
+         "deux noms sont des propriétés d'un schéma"),
+        (SPEACHES_COMPOSITE_BODY,
+         "la charge utile republiée au fond du document d'une supervision : "
+         "c'est l'ancrage sur l'ouverture qui dit que l'instance a répondu "
+         "d'elle-même"),
+        (SPEACHES_PAGINATED_BODY,
+         "une passerelle qui ajoute sa propre clé derrière l'enveloppe : "
+         "« object » est la dernière clé du littéral du handler"),
+        (SPEACHES_WRAPPED_BODY,
+         "une passerelle qui enveloppe la liste sous un nom à elle : le handler "
+         "ouvre sur « data »"),
+        (SPEACHES_PROXY_DENIED_BODY,
+         "un intermédiaire qui refuse la liste à l'anonyme — c'est la "
+         "fermeture attendue"),
+    ):
+        assert not speaches_fires(body=body), "le template conclut sur %s" % why
+
+    # La limite est assumée, et c'est le prix de ne pas déclencher sur n'importe
+    # quelle liste de modèles : une instance dont le cache Hugging Face est
+    # encore vide rend « {"data":[],"object":"list"} », que rien ne sépare d'un
+    # autre serveur compatible OpenAI sans modèle. Elle est pourtant exposée, et
+    # POST /v1/models/{model_id} suffit à la peupler.
+    assert not speaches_fires(body=SPEACHES_EMPTY_BODY), (
+        "le template déclenche sur une enveloppe vide, que tout serveur "
+        "compatible OpenAI sans modèle rend à l'identique"
+    )
+
+
+def test_speaches_matcher_holds_across_the_shapes_the_instance_emits():
+    for task in SPEACHES_MODEL_TASKS:
+        assert speaches_fires(
+            body=speaches_models_body([speaches_model_entry(task=task)])), (
+            f"le template ne reconnaît pas une instance dont le seul modèle "
+            f"local porte « {task} » : les cinq valeurs de ModelTask viennent "
+            "du même serveur, et une instance qui ne fait que de la synthèse "
+            "est exposée au même titre que celle qui transcrit"
+        )
+
+    assert speaches_fires(body=SPEACHES_TWO_MODELS_BODY), (
+        "le template ne reconnaît pas l'instance qui sert les deux moitiés du "
+        "produit — « class KokoroModel(Model) » ajoute « sample_rate » et "
+        "« voices » derrière « task », et c'est la forme la plus courante"
+    )
+
+    assert speaches_fires(body=SPEACHES_NO_LANGUAGE_BODY), (
+        "le template exige un tableau de langues : « language: list[str] | None "
+        "= None » et model_dump() écrit le champ à null dès que la carte du "
+        "modèle n'en déclare aucune"
+    )
+
+    assert speaches_fires(body=speaches_models_body(
+        [speaches_model_entry(language=("eng", "fra", "deu", "spa"))])), (
+        "le template épingle une seule langue : extract_language_list() rend "
+        "autant de codes ISO 639-3 que la carte du modèle en déclare"
+    )
+
+    assert speaches_fires(
+        body=speaches_models_body([speaches_model_entry()], indent=2)), (
+        "le template exige la sérialisation compacte de JSONResponse : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+    assert speaches_fires(body=SPEACHES_MODELS_BODY + "\n"), (
+        "le template refuse une fin de ligne ajoutée par un intermédiaire, "
+        "alors que l'ancrage de fermeture n'a pas à en dépendre"
+    )
+
+
+def test_speaches_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    L'enveloppe ne sort du handler que sous un 200 : « JSONResponse(content=...)
+    » sans statut vaut 200, et il n'y a pas d'autre branche. Exiger le code
+    n'écarterait donc rien que le corps n'écarte déjà, et ferait manquer
+    l'instance dont un intermédiaire réécrit le statut.
+    """
+    block = speaches_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : il conclurait sur un code que "
+        "n'importe quel serveur vivant rend sur une liste de modèles"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : les deux ancrages "
+            "disent que l'instance a répondu d'elle-même et le couple "
+            "language/task nomme le produit, aucune des deux moitiés seule"
+        )
+
+    assert speaches_fires(status=304), (
+        "le template dépend du code rendu, alors qu'un cache intermédiaire peut "
+        "servir le même corps sous un autre"
+    )
+
+
+def test_speaches_extractor_reports_the_models_the_hardware_is_serving():
+    extractors = speaches_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs là où la réponse n'a qu'un "
+        "renseignement durable"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un objet JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == ['.data[].id'], (
+        "l'extracteur ne remonte pas les identifiants des modèles locaux — "
+        "c'est pourtant le seul renseignement durable de la réponse : ce sont "
+        "les dépôts Hugging Face présents sur la machine, donc ce que le "
+        "matériel de l'exploitant sert gratuitement"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_speaches_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    moteur d'expressions de Python plutôt qu'avec celui de Go : seul un scan
+    contre un vrai serveur ferme la boucle. Les ancrages `^` et `$` en sont
+    l'enjeu propre, puisque les deux moteurs ne les traitent pas de la même
+    façon en fin de corps.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == SPEACHES_MODELS_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}')
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", SPEACHES_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "speaches-server-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, SPEACHES_TWO_MODELS_BODY)
+    assert sorted(set(seen)) == [SPEACHES_MODELS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert sorted(extracted) == ["Systran/faster-whisper-large-v3",
+                                 "speaches-ai/Kokoro-82M-v1.0-ONNX"], (
+        f"le scan ne remonte pas les modèles locaux de l'instance — {extracted}"
+    )
+
+    _, refused = scan(401, SPEACHES_PROXY_DENIED_BODY)
+    assert refused == [], (
+        "le scan conclut sur une instance placée derrière un intermédiaire qui "
+        "refuse la liste à l'anonyme"
+    )
+
+    _, composite = scan(200, SPEACHES_COMPOSITE_BODY)
+    assert composite == [], (
+        "le scan conclut sur la charge utile republiée au fond du document "
+        "d'une supervision : c'est l'ancrage sur l'ouverture qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

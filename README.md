@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-79 templates, 76 produits.
+80 templates, 77 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -98,6 +98,7 @@ amont.
 | roboflow-inference | [`roboflow-inference-server-exposed`](templates/exposure/roboflow-inference-server-exposed.yaml) | high |
 | sglang | [`sglang-server-exposed`](templates/exposure/sglang-server-exposed.yaml) | high |
 | skypilot | [`skypilot-api-server-exposed`](templates/exposure/skypilot-api-server-exposed.yaml) | high |
+| speaches | [`speaches-server-exposed`](templates/exposure/speaches-server-exposed.yaml) | medium |
 | swarmui | [`swarmui-new-session-exposed`](templates/exposure/swarmui-new-session-exposed.yaml) | high |
 | tabby | [`tabby-health-exposed`](templates/exposure/tabby-health-exposed.yaml) | medium |
 | tensorboard | [`tensorboard-exposed`](templates/exposure/tensorboard-exposed.yaml) | medium |
