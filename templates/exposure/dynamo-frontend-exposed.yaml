@@ -1,0 +1,179 @@
+id: dynamo-frontend-exposed
+
+info:
+  name: NVIDIA Dynamo Frontend - Unauthenticated Worker Registry Disclosure
+  author: popy21
+  severity: high
+  description: |
+    NVIDIA Dynamo (ai-dynamo/dynamo) se décrit comme « the open-source,
+    datacenter-scale inference stack » : c'est la couche d'orchestration que
+    NVIDIA place au-dessus de vLLM, SGLang et TensorRT-LLM. Les moteurs sont
+    déjà couverts un par un dans ce pack ; le frontend Dynamo est un produit
+    distinct, qui ne sert pas des poids mais le plan de contrôle par lequel les
+    workers s'enregistrent.
+    GET /health (lib/llm/src/http/service/health.rs) en est la lecture. Le
+    handler n'a que deux branches : tant que state.is_ready() est faux il rend
+    « {"status":"not_ready","stage":...,"message":"Service is not ready"} » en
+    503, où `stage` vaut ready, draining ou stopping (le Display de
+    ServiceStage, lib/llm/src/http/service/service_v2.rs) ; sinon il appelle
+    list_all_instances(state.discovery()) et rend
+    « {"status":"healthy","endpoints":[...],"instances":[...]} » — c'est-à-dire
+    l'énumération des workers d'inférence enregistrés auprès du plan de
+    contrôle. `endpoints` est construit en projetant instance.endpoint_id()
+    .as_url() sur chaque instance, puis trié et dédupliqué ; as_url()
+    (lib/runtime/src/protocols.rs) rend « dyn://{namespace}.{component}.{name} »,
+    ce que son propre test unitaire fixe — assert_eq!(endpoint.as_url(),
+    "dyn://ns.cp.ep"). `instances` est le Vec<Instance> que rend
+    list_all_instances (lib/runtime/src/instances.rs), et Instance
+    (lib/runtime/src/component.rs) sérialise component, endpoint, namespace,
+    instance_id, transport, puis device_type et request_plane_codec quand ils
+    sont posés. Le même fichier déclare GET /live, rendu par un handler
+    disjoint qui ne touche ni la découverte ni la moindre table :
+    « {"status":"live","message":"Service is live"} », ou
+    « {"status":"shutting_down",...} » en 503 pendant l'arrêt. Aucun de ces
+    deux handlers ne consulte d'identifiant.
+    L'absence d'authentification est un défaut du produit, pas un réglage
+    oublié. Dans service_v2.rs, le routeur est assemblé en fusionnant un
+    system_router — métriques, modèles, health, live — et un inference_router,
+    et les seules couches montées dessus sont un TraceLayer de journalisation,
+    le suivi des requêtes en vol track_inflight_inference et l'intergiciel
+    echo_request_id_header, qui recopie l'en-tête x-request-id. Aucune
+    vérification de jeton ni de clé d'API n'est montée nulle part ; les options
+    enable_tls / tls_cert_path / tls_key_path du même builder chiffrent le
+    transport, elles n'identifient personne.
+    Le même builder donne les valeurs par défaut du service HTTP —
+    « #[builder(default = "8787")] port: u16 » et « String::from("0.0.0.0") »
+    pour l'hôte : sans qu'aucun drapeau ne soit passé, le frontend écoute sur
+    toutes les interfaces. Le frontend lancé selon le README expose, lui, le
+    port 8000 (« python3 -m dynamo.frontend --http-port 8000 »), réglable par
+    ce même drapeau. Les deux chemins lus ici se déplacent par
+    DYN_HTTP_SVC_HEALTH_PATH et DYN_HTTP_SVC_LIVE_PATH, mais valent /health et
+    /live tant que ces variables ne sont pas posées.
+  impact: |
+    POST /v1/chat/completions, que le README du dépôt documente comme la façon
+    d'interroger une instance, est servi par ce même routeur non protégé : un
+    tiers fait tourner le parc GPU de l'organisation à ses frais, sans compte,
+    sans quota et sans trace qui attribue l'appel. /health en est la carte —
+    il nomme les workers qui absorberont la requête.
+    Chaque entrée d'`instances` porte namespace, component, endpoint et
+    instance_id, c'est-à-dire la nomenclature interne du déploiement, et
+    surtout `transport` : l'adresse du plan de requête du worker, soit le
+    sujet NATS de l'instance, soit — en mode TCP — la chaîne
+    « host:port/instance_id_hex/endpoint » que construit build_transport_type
+    (lib/runtime/src/component/endpoint.rs), donc l'adresse et le port d'un
+    service interne qui n'avait aucune raison d'être publiés. `device_type`
+    dit au passage lesquels de ces workers tiennent un GPU.
+    Le couple endpoints/instances distingue ce produit : le schéma d'URL
+    « dyn:// » lui appartient en propre, et aucun autre serveur d'inférence du
+    pack ne publie l'annuaire de ses pairs sur sa route de santé.
+  remediation: |
+    Il n'y a aucun réglage à activer : le routeur de service_v2.rs ne monte
+    aucune couche d'authentification, donc aucune valeur de configuration ne
+    ferme /health ni /v1/chat/completions. La fermeture est réseau — lier le
+    frontend à 127.0.0.1 plutôt qu'au 0.0.0.0 du builder, ne pas publier le
+    port du conteneur (8787 par défaut côté bibliothèque, 8000 pour le
+    frontend du README) sur une interface non maîtrisée, et router le trafic
+    par un proxy qui authentifie avant de relayer. Déplacer /health par
+    DYN_HTTP_SVC_HEALTH_PATH ne ferme rien : le handler reste servi, sous un
+    autre nom.
+    Après une exposition, considérer comme lus la nomenclature du déploiement
+    et l'adresse de plan de requête de chaque worker listé, et vérifier dans
+    les journaux du frontend — le TraceLayer consigne méthode, URI et code de
+    chaque requête — si des appels d'inférence ont été servis à un tiers
+    pendant la fenêtre.
+  reference:
+    - https://github.com/ai-dynamo/dynamo
+    - https://github.com/ai-dynamo/dynamo/blob/main/lib/llm/src/http/service/health.rs
+    - https://github.com/ai-dynamo/dynamo/blob/main/lib/llm/src/http/service/service_v2.rs
+    - https://github.com/ai-dynamo/dynamo/blob/main/lib/runtime/src/instances.rs
+    - https://github.com/ai-dynamo/dynamo/blob/main/lib/runtime/src/component.rs
+    - https://github.com/ai-dynamo/dynamo/blob/main/lib/runtime/src/protocols.rs
+  metadata:
+    max-request: 2
+    vendor: ai-dynamo
+    product: dynamo
+  tags: ai,llm,dynamo,nvidia,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /live emprunte un chemin de code disjoint : son handler ne lit que le
+  # jeton d'annulation du service, jamais la découverte, et rend un littéral de
+  # deux clés. Il ne dit rien du parc — seulement que le processus qui répond
+  # est bien un frontend Dynamo vivant, par un code qui ne partage rien avec
+  # celui de /health.
+  #
+  # GET /health est le constat : « endpoints » et « instances » ensemble, sur
+  # une réponse healthy, c'est l'annuaire des workers rendu à l'anonyme.
+  #
+  # En lecture seule, et strictement. Le même routeur sans garde sert POST
+  # /v1/chat/completions, qui ferait tourner le parc que cette liste vient de
+  # nommer ; signaler l'exposition ne demande d'y toucher en rien.
+  - method: GET
+    path:
+      - "{{BaseURL}}/live"
+      - "{{BaseURL}}/health"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui chacune conclurait de son côté — or /live ne
+    # prouve aucun accès au plan de contrôle, et « healthy » seul ne nomme
+    # aucun produit.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le littéral de live_handler, exigé entier. C'est « Json(json!({
+          # "status": "live", "message": "Service is live" })) » et rien
+          # d'autre : l'ancrage des deux côtés écarte le document d'une
+          # supervision qui citerait la chaîne au milieu du sien, et les \s*
+          # laissent passer l'intermédiaire qui réindente ce qu'il relaie.
+          # L'ordre des clés est celui du littéral — serde_json est compilé
+          # avec preserve_order dans cet arbre, dynamo-renderer l'exigeant.
+          - 'regex("^\\{\\s*\"status\"\\s*:\\s*\"live\"\\s*,\\s*\"message\"\\s*:\\s*\"Service is live\"\\s*\\}$", trim_space(body_1))'
+
+          # L'ouverture de la réponse de santé, et c'est elle qui dit que
+          # l'instance a répondu d'elle-même plutôt qu'un document plus grand
+          # ne la cite. « healthy » est exigé ici parce qu'il est la branche
+          # qui rend l'annuaire : l'autre branche du handler rend not_ready en
+          # 503, sans endpoints ni instances.
+          - 'regex("^\\{\\s*\"status\"\\s*:\\s*\"healthy\"", trim_space(body_2))'
+
+          # Les deux tableaux, exigés ensemble et comme tableaux — pas comme
+          # simples mots quelque part dans le corps. « healthy » seul est
+          # générique, n'importe quelle route de santé le rend ; c'est la
+          # présence conjointe de l'annuaire des endpoints et de celui des
+          # instances qui fait de cette réponse un plan de contrôle
+          # d'inférence ouvert. Les deux sont exigés même vides : un frontend
+          # dont aucun worker ne s'est encore enregistré sert la même route
+          # sans plus de garde, et sert POST /v1/chat/completions avec.
+          - 'regex("\"endpoints\"\\s*:\\s*\\[", body_2)'
+          - 'regex("\"instances\"\\s*:\\s*\\[", body_2)'
+
+    extractors:
+      # Ce que l'exploitant a besoin de savoir, et rien qui ne le desserve.
+      #
+      # Les URL « dyn:// » nomment les workers enregistrés — namespace,
+      # composant, endpoint — donc ce que le frontend exposé met à disposition.
+      # Le compte d'instances dit la taille du parc derrière.
+      #
+      # Ce que les extracteurs ne touchent pas : `transport`, qui porte
+      # l'adresse du plan de requête de chaque worker, et `instance_id`. Les
+      # écrire dans le rapport de scan reviendrait à publier l'adressage
+      # interne du déploiement dans tout ce qui relaie ce rapport, alors que
+      # l'accès en lecture est déjà prouvé par les matchers.
+      #
+      # Bornés à body_2 : sous req-condition le moteur évalue chaque extracteur
+      # contre chaque réponse, et /live n'a rien à en rendre.
+      - type: json
+        part: body_2
+        name: endpoint
+        json:
+          - '.endpoints[]?'
+
+      - type: json
+        part: body_2
+        name: instances
+        json:
+          - '.instances | length'

@@ -24536,6 +24536,510 @@ def test_vane_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# NVIDIA Dynamo — ai-dynamo/dynamo, « the open-source, datacenter-scale
+# inference stack » : la couche d'orchestration que NVIDIA place au-dessus de
+# vLLM, SGLang et TensorRT-LLM. Les trois moteurs ont déjà leur template ici ;
+# le frontend Dynamo est un produit distinct, et ce qu'il expose n'est pas un
+# modèle mais l'annuaire des workers enregistrés auprès du plan de contrôle.
+#
+# GET /health (lib/llm/src/http/service/health.rs) rend
+# « {"status":"healthy","endpoints":[...],"instances":[...]} », et le mot
+# « healthy » y est la part générique — à peu près toute route de santé le rend.
+# Cette section vérifie que le constat repose sur les deux annuaires pris
+# ensemble et jamais sur ce mot seul, qu'il tient sur le frontend encore sans
+# worker comme sur celui qui en porte huit, et que ni la sonde ni les
+# extracteurs ne touchent à ce que la réponse porte de dangereux : le même
+# routeur sert POST /v1/chat/completions sans garde, et `transport` donne
+# l'adresse de plan de requête de chaque worker.
+
+DYNAMO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "dynamo-frontend-exposed.yaml")
+
+DYNAMO_LIVE_ROUTE = "/live"
+DYNAMO_HEALTH_ROUTE = "/health"
+
+# live_handler, branche nominale : « Json(json!({ "status": "live", "message":
+# "Service is live" })) ». L'ordre est celui du littéral — serde_json est
+# compilé avec preserve_order dans cet arbre, dynamo-renderer l'exigeant.
+DYNAMO_LIVE_BODY = '{"status":"live","message":"Service is live"}'
+
+# L'autre branche du même handler, quand state.is_cancelled() : 503 pendant
+# l'arrêt. Le processus répond encore, mais il ne sert plus rien.
+DYNAMO_SHUTTING_DOWN_BODY = ('{"status":"shutting_down",'
+                             '"message":"Service is shutting down"}')
+
+# health_handler avant is_ready() : ni endpoints ni instances, et c'est tout le
+# point — le constat porte sur l'annuaire, pas sur la route.
+DYNAMO_NOT_READY_BODY = ('{"status":"not_ready","stage":"draining",'
+                         '"message":"Service is not ready"}')
+
+
+def dynamo_instance(namespace="dynamo", component="backend",
+                    endpoint="generate", instance_id=7587883553287249,
+                    transport=("tcp",
+                               "10.42.3.17:41521/1af3c2d90e5b7/generate"),
+                    device_type="cuda", codec="json"):
+    """
+    Une entrée de `instances`, dans l'ordre où « pub struct Instance »
+    (lib/runtime/src/component.rs) déclare ses champs : component, endpoint,
+    namespace, instance_id, transport, puis device_type et request_plane_codec,
+    que « skip_serializing_if = "Option::is_none" » retire quand ils ne sont pas
+    posés.
+
+    `transport` est un TransportType, énumération étiquetée de l'extérieur dont
+    les deux variantes sont « nats_tcp » et « tcp ». En mode TCP,
+    build_transport_type_inner (lib/runtime/src/component/endpoint.rs) écrit
+    « host:port/instance_id_hex/endpoint » ; en mode NATS, instance_subject
+    écrit « namespace_component.endpoint-hex ».
+    """
+    entry = {"component": component, "endpoint": endpoint,
+             "namespace": namespace, "instance_id": instance_id,
+             "transport": {transport[0]: transport[1]}}
+    if device_type is not None:
+        entry["device_type"] = device_type
+    if codec is not None:
+        entry["request_plane_codec"] = codec
+    return entry
+
+
+DYNAMO_BACKEND_INSTANCE = dynamo_instance()
+DYNAMO_PREFILL_INSTANCE = dynamo_instance(
+    component="prefill", instance_id=7587883553287250,
+    transport=("nats_tcp", "dynamo_prefill.generate-1af3c2d90e5b8"))
+
+
+def dynamo_endpoint_url(instance):
+    """
+    EndpointId::as_url() (lib/runtime/src/protocols.rs) : « dyn://{namespace}.
+    {component}.{name} ». Son propre test unitaire le fixe —
+    assert_eq!(endpoint.as_url(), "dyn://ns.cp.ep").
+    """
+    return "dyn://%s.%s.%s" % (instance["namespace"], instance["component"],
+                               instance["endpoint"])
+
+
+def dynamo_health_body(instances=None, indent=None):
+    """
+    Ce que rend health_handler une fois prêt. `endpoints` est la projection de
+    endpoint_id().as_url() sur chaque instance, triée puis dédupliquée par le
+    handler lui-même ; `instances` est le Vec<Instance> que rend
+    list_all_instances, trié par « namespace/component/endpoint/instance_id ».
+    """
+    if instances is None:
+        instances = [DYNAMO_BACKEND_INSTANCE, DYNAMO_PREFILL_INSTANCE]
+    endpoints = sorted({dynamo_endpoint_url(i) for i in instances})
+    content = {"status": "healthy", "endpoints": endpoints,
+               "instances": list(instances)}
+    if indent is not None:
+        return json.dumps(content, indent=indent)
+    return json.dumps(content, separators=(",", ":"))
+
+
+DYNAMO_HEALTH_BODY = dynamo_health_body()
+
+# Le frontend qu'aucun worker n'a encore rejoint : list_all_instances rend un
+# Vec vide, donc les deux tableaux le sont. Il est exposé au même titre — la
+# même absence de garde couvre POST /v1/chat/completions.
+DYNAMO_EMPTY_REGISTRY_BODY = dynamo_health_body(instances=[])
+
+# Le worker minimal : ni device_type ni request_plane_codec, que serde retire
+# quand ils valent None. C'est la forme d'un enregistrement plus ancien.
+DYNAMO_MINIMAL_INSTANCE_BODY = dynamo_health_body(
+    instances=[dynamo_instance(device_type=None, codec=None)])
+
+# Un parc de huit workers sur deux composants, c'est-à-dire ce qu'une instance
+# réelle porte. `endpoints` y est plus court que `instances` : le handler
+# déduplique les URL, et huit instances de deux composants n'en font que deux.
+DYNAMO_FLEET_BODY = dynamo_health_body(instances=[
+    dynamo_instance(component=component, instance_id=7587883553287249 + offset,
+                    device_type="cuda" if offset % 2 == 0 else "cpu",
+                    transport=("tcp", "10.42.3.%d:41521/%x/generate"
+                               % (17 + offset, 7587883553287249 + offset)))
+    for component in ("backend", "prefill")
+    for offset in range(4)
+])
+
+# La charge utile entière republiée au fond du document d'une supervision : tout
+# y est, mais ce n'est pas l'instance qui a répondu d'elle-même.
+DYNAMO_COMPOSITE_BODY = '{"dynamo":%s,"checked_at":0}' % DYNAMO_HEALTH_BODY
+
+# Les deux moitiés prises séparément : le handler rend les deux annuaires
+# ensemble, et aucun des deux seul ne décrit un plan de contrôle d'inférence.
+DYNAMO_ENDPOINTS_ONLY_BODY = json.dumps(
+    {"status": "healthy",
+     "endpoints": [dynamo_endpoint_url(DYNAMO_BACKEND_INSTANCE)]},
+    separators=(",", ":"))
+DYNAMO_INSTANCES_ONLY_BODY = json.dumps(
+    {"status": "healthy", "instances": [DYNAMO_BACKEND_INSTANCE]},
+    separators=(",", ":"))
+
+# Une supervision de grappe quelconque : les deux mots y sont, mais ni l'un ni
+# l'autre ne vaut un tableau. C'est la forme des valeurs qui sépare les deux.
+DYNAMO_SCALAR_KEYS_BODY = json.dumps(
+    {"status": "healthy", "endpoints": {"api": "up", "worker": "up"},
+     "instances": 3},
+    separators=(",", ":"))
+
+# Un intermédiaire qui refuse le plan de contrôle à l'anonyme : c'est la
+# fermeture attendue, puisque le produit n'a aucun réglage pour l'obtenir.
+DYNAMO_PROXY_DENIED_BODY = '{"error":"unauthorized"}'
+
+
+def dynamo_block():
+    doc = load(DYNAMO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % DYNAMO_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /health — c'est pourtant la seule route "
+        "du produit qui rende l'annuaire des workers enregistrés"
+    )
+    return blocks[0]
+
+
+def dynamo_scenario(live=None, health=None):
+    return {
+        DYNAMO_LIVE_ROUTE: live if live is not None else (200, DYNAMO_LIVE_BODY),
+        DYNAMO_HEALTH_ROUTE: (health if health is not None
+                              else (200, DYNAMO_HEALTH_BODY)),
+    }
+
+
+def dynamo_fires(**kwargs):
+    """
+    Les réponses sont rangées dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    block = dynamo_block()
+    scenario = dynamo_scenario(**kwargs)
+
+    ordered = []
+    for path in block.get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que le frontend ne sert pas : "
+            f"{route}"
+        )
+        ordered.append(scenario[route])
+
+    verdicts = [dsl_matcher_hits(m, ordered)
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_dynamo_probe_only_reads_and_never_uses_the_fleet_it_finds():
+    """
+    Le danger propre à ce template : le routeur qui sert les deux routes lues
+    ici sert aussi, sans plus de garde, les routes d'inférence. Une sonde qui en
+    appellerait une ferait tourner le parc GPU de l'exploitant pour établir
+    qu'il est ouvert — c'est précisément l'abus qu'elle signale.
+    """
+    doc = load(DYNAMO_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'annuaire se lit en GET : le template ne doit rien envoyer à une "
+            "instance qu'il découvre"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : sur ce frontend, un corps "
+            "n'a de sens que pour une route d'inférence"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/chat/completions", "le template appelle la route de chat : "
+                                      "il ferait tourner le parc GPU de "
+                                      "l'exploitant, à ses frais, pour prouver "
+                                      "qu'il est ouvert"),
+                ("/completions", "le template appelle une route de génération, "
+                                 "servie par le même routeur sans garde"),
+                ("/embeddings", "le template appelle la route d'embeddings, "
+                                "servie par le même routeur sans garde"),
+                ("/responses", "le template appelle une route de génération, "
+                               "servie par le même routeur sans garde"),
+                ("/generate", "le template appelle la route de génération "
+                              "native du backend"),
+                ("busy_threshold", "le template appelle l'API d'administration "
+                                   "du frontend : elle règle l'admission des "
+                                   "requêtes, donc elle modifie l'instance "
+                                   "auditée"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_dynamo_matcher_rests_on_the_registry_not_on_a_generic_health_word():
+    """
+    Le point qui fait ce template. « healthy » ne désigne aucun produit : le
+    pack porte déjà plusieurs sondes de santé qui le rendent, et conclure
+    dessus remonterait tout serveur vivant. C'est la présence conjointe des deux
+    annuaires — endpoints et instances — qui fait de cette réponse un plan de
+    contrôle d'inférence ouvert.
+    """
+    assert dynamo_fires(), (
+        "le template ne reconnaît pas un frontend Dynamo dont /health rend "
+        "l'annuaire de ses workers à l'anonyme"
+    )
+
+    for body, name in (
+        (OTHER_HEALTH_BODY, "une sonde de santé quelconque"),
+        (OTHER_VERSIONED_HEALTH_BODY, "une sonde de santé versionnée"),
+        (MINERU_OTHER_HEALTH_BODY, "un service quelconque qui publie sa version"),
+        (MINERU_OTHER_QUEUE_BODY, "une file de travaux qui publie ses workers"),
+        (HAYHOOKS_OTHER_HEALTH_BODY, "un serveur de pipelines quelconque"),
+        (LETTA_HEALTH_BODY, "une sonde de santé qui ne rend que son statut"),
+        (DYNAMO_SCALAR_KEYS_BODY, "une supervision de grappe dont « endpoints » "
+                                  "et « instances » ne sont pas des tableaux"),
+    ):
+        assert not dynamo_fires(health=(200, body)), (
+            f"le template déclenche sur {name} : « healthy » seul est "
+            "générique, seuls les deux annuaires nomment ce plan de contrôle"
+        )
+
+
+def test_dynamo_matcher_needs_both_reads_and_both_registries():
+    for scenario, why in (
+        (dict(health=(200, DYNAMO_ENDPOINTS_ONLY_BODY)),
+         "l'annuaire des endpoints sans celui des instances : le handler rend "
+         "les deux, et le second est ce qui décrit les workers eux-mêmes"),
+        (dict(health=(200, DYNAMO_INSTANCES_ONLY_BODY)),
+         "l'annuaire des instances sans celui des endpoints"),
+        (dict(health=(200, DYNAMO_COMPOSITE_BODY)),
+         "la charge utile republiée au fond du document d'une supervision : "
+         "c'est l'ancrage sur l'ouverture qui dit que l'instance a répondu "
+         "d'elle-même"),
+        (dict(health=(503, DYNAMO_NOT_READY_BODY)),
+         "la branche not_ready du handler, qui ne rend aucun annuaire"),
+        (dict(health=(401, DYNAMO_PROXY_DENIED_BODY)),
+         "un intermédiaire qui refuse le plan de contrôle à l'anonyme — c'est "
+         "la fermeture attendue"),
+        (dict(live=(503, DYNAMO_SHUTTING_DOWN_BODY)),
+         "un processus en cours d'arrêt, qui ne sert plus rien"),
+        (dict(live=(200, LETTA_HEALTH_BODY)),
+         "une sonde de santé quelconque servie sur /live : le littéral de "
+         "live_handler est ce qui dit que le processus interrogé est bien ce "
+         "frontend"),
+        (dict(live=(200, DYNAMO_COMPOSITE_BODY)),
+         "un document qui cite le produit sur /live sans être son handler"),
+        (dict(live=(404, '{"error":"not found"}')),
+         "une instance qui ne sert pas /live du tout"),
+    ):
+        assert not dynamo_fires(**scenario), "le template conclut sur %s" % why
+
+
+def test_dynamo_matcher_holds_across_the_shapes_the_instance_emits():
+    assert dynamo_fires(health=(200, DYNAMO_EMPTY_REGISTRY_BODY)), (
+        "le template exige un worker enregistré : list_all_instances rend un "
+        "Vec vide tant qu'aucun n'a rejoint le frontend, et JSON.stringify "
+        "écrit les deux tableaux même vides — cette instance-là sert POST "
+        "/v1/chat/completions sous la même absence de garde"
+    )
+
+    assert dynamo_fires(health=(200, DYNAMO_MINIMAL_INSTANCE_BODY)), (
+        "le template exige device_type ou request_plane_codec, que "
+        "« skip_serializing_if = \"Option::is_none\" » retire dès qu'ils ne "
+        "sont pas posés"
+    )
+
+    assert dynamo_fires(health=(200, DYNAMO_FLEET_BODY)), (
+        "le template rate le parc réel : huit workers sur deux composants ne "
+        "font que deux URL, le handler dédupliquant `endpoints`"
+    )
+
+    assert dynamo_fires(health=(200, dynamo_health_body(indent=2))), (
+        "le template exige la sérialisation compacte : un intermédiaire qui "
+        "réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+    assert dynamo_fires(live=(200, DYNAMO_LIVE_BODY.replace(
+        '{"status":', '{\n  "status": ').replace(',"message":', ',\n  "message": ')
+        + "\n")), (
+        "le template refuse un /live réindenté par un intermédiaire, alors que "
+        "le littéral qu'il porte est le même"
+    )
+
+    assert dynamo_fires(live=(200, DYNAMO_LIVE_BODY + "\n"),
+                        health=(200, DYNAMO_HEALTH_BODY + "\n")), (
+        "le template refuse une fin de ligne ajoutée par un intermédiaire"
+    )
+
+
+def test_dynamo_conclusion_rests_on_the_payloads_not_on_the_http_status():
+    """
+    Les deux corps disent déjà tout ce qu'un code dirait : not_ready ne sort
+    qu'en 503 et n'a ni endpoints ni instances, shutting_down de même. Exiger le
+    statut n'écarterait donc rien de plus, et ferait manquer l'instance dont un
+    cache ou une passerelle réécrit le code.
+    """
+    block = dynamo_block()
+
+    assert block.get("req-condition") is True, (
+        "sans req-condition, chaque réponse conclurait de son côté — or /live "
+        "ne prouve aucun accès au plan de contrôle, et l'annuaire seul ne dit "
+        "pas que le processus interrogé est ce frontend"
+    )
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : il conclurait sur un code que "
+        "n'importe quel serveur vivant rend"
+    )
+
+    for matcher in (block.get("matchers") or []):
+        for expression in matcher.get("dsl") or []:
+            assert "status_code" not in expression, (
+                f"l'expression « {expression} » lit le code HTTP : le constat "
+                "doit tenir sur ce que les handlers écrivent"
+            )
+
+    assert dynamo_fires(live=(304, DYNAMO_LIVE_BODY),
+                        health=(304, DYNAMO_HEALTH_BODY)), (
+        "le template dépend du code rendu, alors qu'un cache intermédiaire peut "
+        "servir les mêmes corps sous un autre"
+    )
+
+
+def test_dynamo_extractors_report_the_fleet_without_copying_its_addressing():
+    """
+    La réponse porte l'adressage interne du déploiement : `transport` est
+    l'adresse de plan de requête de chaque worker — « host:port/id/endpoint » en
+    mode TCP, le sujet de l'instance en mode NATS — et instance_id la clé qui la
+    désigne. Les faire remonter les écrirait dans le rapport de scan et dans
+    tout ce qui le relaie, alors que l'accès en lecture est déjà prouvé par les
+    matchers.
+    """
+    extractors = dynamo_block().get("extractors") or []
+    assert len(extractors) == 2, (
+        "la réponse porte deux renseignements durables et non sensibles — quels "
+        "endpoints le frontend dessert, et combien de workers sont derrière — "
+        "et le template doit s'y tenir"
+    )
+
+    assert [e.get("type") for e in extractors] == ["json", "json"], (
+        "la réponse est un objet JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+
+    assert [e.get("json") for e in extractors] == [
+        ['.endpoints[]?'],
+        ['.instances | length'],
+    ], (
+        "les extracteurs ne remontent pas ce qui décide de la suite : les URL "
+        "« dyn:// » nomment ce que le frontend dessert, et le compte "
+        "d'instances dit la taille du parc derrière"
+    )
+
+    for extractor in extractors:
+        assert extractor.get("part") == "body_2", (
+            "sous req-condition le moteur évalue chaque extracteur contre "
+            "chaque réponse : sans part, /live serait interrogé pour un "
+            "annuaire qu'il ne rend pas"
+        )
+        for expression in extractor.get("json") or []:
+            for forbidden in ("transport", "instance_id", "tcp", "nats"):
+                assert forbidden not in expression, (
+                    f"l'expression « {expression} » remonte {forbidden} : le "
+                    "rapport de scan porterait alors l'adressage interne du "
+                    "déploiement, et le constat n'en a pas besoin pour tenir"
+                )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_dynamo_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `dsl_matcher_hits` réévalue les motifs avec le
+    moteur d'expressions de Python plutôt qu'avec celui de Go : seul un scan
+    contre un vrai serveur ferme la boucle. L'accumulation de body_1 et body_2
+    sous req-condition en est l'enjeu propre, et le « | length » de l'extracteur
+    avec lui.
+    """
+    def scan(scenario):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in scenario:
+                    self.reply(*scenario[self.path])
+                else:
+                    self.reply(404, '{"error":"not found"}')
+
+            def do_POST(self):
+                seen.append("POST " + self.path)
+                self.reply(200, '{"error":"not implemented"}')
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", DYNAMO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "dynamo-frontend-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(dynamo_scenario())
+    assert sorted(set(seen)) == [DYNAMO_HEALTH_ROUTE, DYNAMO_LIVE_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert sorted(extracted) == ["2", "dyn://dynamo.backend.generate",
+                                 "dyn://dynamo.prefill.generate"], (
+        "le scan ne remonte pas ce que le frontend dessert ni la taille du parc "
+        f"derrière : {extracted}"
+    )
+
+    _, empty = scan(dynamo_scenario(health=(200, DYNAMO_EMPTY_REGISTRY_BODY)))
+    assert empty == ["0"], (
+        "le scan perd le frontend qu'aucun worker n'a rejoint : un annuaire "
+        f"vide reste un renseignement, et l'instance reste ouverte — {empty}"
+    )
+
+    _, refused = scan(dynamo_scenario(
+        health=(401, DYNAMO_PROXY_DENIED_BODY)))
+    assert refused == [], (
+        "le scan conclut sur une instance placée derrière un intermédiaire qui "
+        "refuse le plan de contrôle à l'anonyme"
+    )
+
+    _, composite = scan(dynamo_scenario(health=(200, DYNAMO_COMPOSITE_BODY)))
+    assert composite == [], (
+        "le scan conclut sur la charge utile republiée au fond du document "
+        "d'une supervision : c'est l'ancrage sur l'ouverture qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
