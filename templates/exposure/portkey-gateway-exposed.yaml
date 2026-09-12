@@ -1,0 +1,205 @@
+id: portkey-gateway-exposed
+
+info:
+  name: Portkey AI Gateway - Unauthenticated Self-Hosted LLM Gateway Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Portkey AI Gateway (Portkey-AI/gateway) est une passerelle d'inférence
+    auto-hébergeable — « Route to 250+ LLMs with 1 fast & friendly API », dit son
+    propre README. Un seul processus Hono reçoit des requêtes au format OpenAI et
+    les relaie au fournisseur nommé dans l'en-tête. C'est un produit distinct du
+    proxy LiteLLM que le pack couvre déjà : autre dépôt, autre runtime, autre
+    modèle de configuration, et surtout aucune clé maîtresse à poser.
+    GET / est la lecture, et son handler tient sur une ligne de src/index.ts :
+    « app.get('/', (c) => c.text('AI Gateway says hey!')); ». c.text() rend le
+    littéral seul, en text/plain, sans en-tête ni corps de requête à fournir —
+    c'est la seule route du produit qui n'exige rien de l'appelant.
+    Ce que la réponse établit tient au fait qu'aucune couche d'authentification
+    n'existe dans ce dépôt. Le seul intergiciel monté sur les routes de l'API est
+    requestValidator (src/middlewares/requestValidator/index.ts), et il ne
+    contrôle que la forme de l'appel : que le content-type soit
+    application/json, multipart/form-data ou audio ; qu'un en-tête
+    « x-portkey-config » ou « x-portkey-provider » soit présent — sans quoi il
+    rend 400 « Either x-portkey-config or x-portkey-provider header is required
+    » ; que le fournisseur déclaré appartienne à VALID_PROVIDERS ; que le schéma
+    du config passé soit valide ; et, quand « x-portkey-custom-host » est posé,
+    que isValidCustomHost() l'accepte — cette fonction-là rejette les schémas
+    file:// et data:, les plages privées et réservées d'IPv4 et d'IPv6, les
+    points d'accès de métadonnées d'infrastructure (169.254.169.254,
+    metadata.google.internal) et tout hôte absent de TRUSTED_CUSTOM_HOSTS.
+    Ce sont des contrôles de forme et de destination ; aucun n'est un contrôle
+    d'identité, et le produit n'a pas d'identifiant propre à contrôler en
+    auto-hébergement. Deux routes ne portent d'ailleurs même pas cet intergiciel
+    de forme, la racine et « app.get('/v1/models', modelsHandler) ».
+    La seconde lecture ne cherche pas un accès de plus : elle confirme que le
+    processus qui a rendu le littéral est bien cette passerelle, et pas un tiers
+    qui le recopie. GET /public/ est la console que le README annonce, et
+    src/start-server.ts n'en sert que trois formes. En --headless, ou quand
+    NODE_ENV/ENVIRONMENT vaut production, les routes ne sont pas montées du tout
+    et la requête tombe sur le gestionnaire d'absence de src/index.ts, «
+    app.notFound((c) => c.json({ message: 'Not Found', ok: false }, 404)) ».
+    Sinon serveIndex répond, et sa première branche est « if (!hasAdminTokenKey)
+    » : sans clé admin_token dans conf.json — et le conf.json du dépôt n'en
+    porte pas —, elle rend la phrase « Admin token is required to access the
+    local gateway UI ». Avec la clé, elle rend l'index.html embarqué, dont le
+    titre est « Portkey AI Gateway ». Aucune de ces trois réponses n'est un
+    accès : la console se garde elle-même, adminAuthMiddleware tenant
+    /log/stream derrière un jeton. C'est précisément pour cela qu'elle sert de
+    fingerprint et non de constat.
+    Le code HTTP ne dit rien ici. La racine rend 200 sur toute instance vivante,
+    exposée ou non, et la console rend 200 comme 404 selon un drapeau de
+    lancement : le constat se lit dans les corps.
+  impact: |
+    Une passerelle atteignable sans identifiant est un relais d'inférence
+    ouvert. POST /v1/chat/completions, POST /v1/messages, POST /v1/embeddings,
+    POST /v1/images/generations et POST /v1/audio/speech sont toutes montées sur
+    le même app, derrière le seul requestValidator : un tiers qui apporte sa
+    propre clé de fournisseur fait transiter son trafic vers OpenAI, Anthropic,
+    Bedrock ou Vertex par l'infrastructure et l'adresse IP de l'exploitant. Le
+    fournisseur voit l'IP de la passerelle, pas celle de l'appelant ; la
+    facturation d'abus, le blocage de réputation et la réponse à réquisition
+    suivent cette IP-là. Les journaux de l'exploitant, eux, ne porteront aucune
+    identité d'appelant : le produit n'en a jamais demandé.
+    La surface ne s'arrête pas au relais. « app.post('/v1/*', requestValidator,
+    proxyHandler) » et « app.get('/v1/:path{(?!realtime).*}', requestValidator,
+    proxyHandler) » font de l'instance un proxy générique vers l'hôte du
+    fournisseur, et « x-portkey-custom-host » choisit cet hôte. isValidCustomHost
+    en écarte les plages privées, les métadonnées d'infrastructure et les hôtes
+    absents de TRUSTED_CUSTOM_HOSTS — mais cette liste vaut par défaut
+    « localhost, 127.0.0.1, ::1, host.docker.internal », c'est-à-dire que le
+    produit prévoit explicitement le relais vers la boucle locale de la machine
+    qui l'héberge, et que l'exploitant qui élargit la variable élargit ce qu'un
+    anonyme peut atteindre depuis l'intérieur du périmètre.
+    GET /v1/models répond sans même passer par le validateur de forme, donc
+    énumère à l'anonyme ce que l'instance sait router. Et si l'exploitant a posé
+    des identifiants de fournisseur dans le bloc « credentials » de conf.json ou
+    dans un config nommé par en-tête, ce n'est plus son infrastructure qu'un
+    tiers dépense, c'est son budget d'inférence.
+    Enfin, une passerelle est par construction un service interne : elle est
+    placée entre les applications de l'exploitant et les fournisseurs. La
+    trouver depuis l'extérieur, c'est trouver un point du réseau interne
+    joignable sans identifiant.
+  remediation: |
+    Il n'y a aucune clé à poser : ce dépôt ne contient pas de couche
+    d'authentification, et requestValidator ne lit aucun identifiant. Aucune
+    valeur de conf.json ni aucune variable d'environnement ne ferme
+    /v1/chat/completions — la fermeture est donc réseau, et elle seule.
+    Ne pas publier le port de la passerelle sur une interface non maîtrisée : le
+    défaut de src/start-server.ts est « const defaultPort = 8787 », et
+    « --port= » le déplace sans rien fermer. Placer l'instance derrière un
+    intermédiaire qui authentifie avant de relayer — proxy inverse avec mTLS,
+    jeton porté, ou maillage de service —, et ne laisser joindre le port que ce
+    proxy.
+    Lancer avec « --headless », ou poser NODE_ENV=production : src/start-server.ts
+    ne monte alors ni /public/, ni /public/logs, ni /public/auth, ni /log/stream.
+    Quand la console est nécessaire, poser admin_token dans conf.json — sans
+    cette clé serveIndex ne sert que sa phrase d'avertissement, et le gateway
+    n'a alors aucune UI utilisable à garder.
+    Restreindre le relais : poser TRUSTED_CUSTOM_HOSTS à la liste exacte des
+    hôtes que l'instance a le droit de joindre, plutôt que de laisser le défaut
+    « localhost, 127.0.0.1, ::1, host.docker.internal », et ne pas y ajouter
+    d'hôte interne tant que l'instance est joignable par un tiers.
+    Vérifier depuis l'extérieur du périmètre que « curl -s http://<hote>:8787/ »
+    ne rend plus « AI Gateway says hey! ».
+    Après une exposition, considérer comme lus l'inventaire de /v1/models et la
+    configuration qu'il reflète, et chercher dans les journaux du processus les
+    appels d'inférence qu'on ne s'explique pas — chacun est un relais servi à un
+    tiers sous l'adresse IP de l'exploitant. Si des identifiants de fournisseur
+    étaient posés dans conf.json ou dans un config nommé par en-tête, les tenir
+    pour utilisés et les faire tourner.
+  reference:
+    - https://github.com/Portkey-AI/gateway
+    - https://github.com/Portkey-AI/gateway/blob/main/src/index.ts
+    - https://github.com/Portkey-AI/gateway/blob/main/src/middlewares/requestValidator/index.ts
+    - https://github.com/Portkey-AI/gateway/blob/main/src/start-server.ts
+    - https://github.com/Portkey-AI/gateway/blob/main/src/middlewares/adminAuth/index.ts
+    - https://github.com/Portkey-AI/gateway/blob/main/conf.json
+  metadata:
+    max-request: 2
+    vendor: portkey-ai
+    product: portkey-gateway
+  tags: ai,llm,portkey,gateway,proxy,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et aucune ne fait travailler l'instance.
+  #
+  # GET / est le constat. Son handler est « c.text('AI Gateway says hey!') » :
+  # il ne consulte ni configuration, ni fournisseur, ni réseau. C'est la route
+  # la moins coûteuse du produit, et c'est aussi la seule qui n'exige rien de
+  # l'appelant — ni content-type, ni en-tête de fournisseur.
+  #
+  # GET /public/ est le fingerprint de confirmation. serveIndex lit un fichier
+  # déjà en mémoire (readFileSync au montage) ou rend une phrase constante ;
+  # quand les routes ne sont pas montées, la requête tombe sur le gestionnaire
+  # d'absence. Aucune des trois branches ne touche un fournisseur.
+  #
+  # Ce que le template ne touche pas, et qui est tout le reste du produit :
+  # POST /v1/chat/completions, /v1/messages, /v1/embeddings,
+  # /v1/images/generations, /v1/audio/speech et le proxy attrape-tout
+  # « app.post('/v1/*', requestValidator, proxyHandler) » relaient vers un
+  # fournisseur de modèles — c'est l'abus que le constat signale, pas ce qu'un
+  # scanner a le droit de faire pour l'établir. POST /public/auth n'est pas
+  # touché non plus : ce serait une tentative de connexion sur l'instance
+  # auditée.
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+      - "{{BaseURL}}/public/"
+
+    # req-condition accumule body_N pour que les deux réponses soient jugées
+    # ensemble. Sans lui, chacune conclurait de son côté — or /public/ ne prouve
+    # aucun accès, et c'est justement sa conjonction avec la racine qui dit que
+    # le littéral vient de la passerelle elle-même.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le corps de la racine, exigé entier et rien d'autre. c.text() rend
+          # le littéral seul, donc l'égalité est ici plus juste qu'une
+          # recherche : elle écarte d'un coup la page de documentation, le
+          # miroir de README et le tableau de bord de supervision qui citeraient
+          # la phrase au milieu du leur. trim_space absorbe le saut de ligne
+          # qu'un intermédiaire ajoute en relayant du text/plain.
+          #
+          # Le code HTTP n'entre pas dans l'expression : la racine rend 200 sur
+          # toute instance vivante, exposée ou non, donc il ne sépare rien — et
+          # l'exiger ferait manquer l'instance dont un cache réécrit le statut.
+          - 'trim_space(body_1) == "AI Gateway says hey!"'
+
+          # La confirmation, et elle est une alternative close : les trois
+          # formes sont les trois seules réponses que le produit écrit lui-même
+          # sur ce chemin.
+          #
+          # La phrase de serveIndex d'abord — « if (!hasAdminTokenKey) » —,
+          # parce que c'est la réponse du lancement par défaut : le conf.json du
+          # dépôt ne porte pas de clé admin_token.
+          #
+          # Le titre de l'index.html embarqué ensuite, pour l'instance dont
+          # l'exploitant a posé cette clé et dont la console est donc servie.
+          #
+          # Le gestionnaire d'absence de src/index.ts enfin, littéral d'un objet
+          # à deux clés dans cet ordre : c'est ce que rend une instance lancée
+          # en --headless ou en production, et c'est aussi ce que rend le
+          # déploiement workerd, où src/start-server.ts n'est jamais exécuté.
+          # L'ancrage des deux côtés est ce qui distingue cette enveloppe-là
+          # d'un document plus grand qui la citerait, et les \s* laissent passer
+          # l'intermédiaire qui réindente ce qu'il relaie.
+          #
+          # Ce que cette expression coûte, et il faut le savoir : un front qui
+          # remplace le 404 de l'application par sa propre page d'erreur fait
+          # perdre le constat. C'est le prix de ne pas conclure sur un tiers qui
+          # recopierait la phrase de la racine, et il est payé sciemment.
+          - '(contains(body_2, "Admin token is required to access the local gateway UI") || contains(body_2, "<title>Portkey AI Gateway</title>") || regex("^\\{\\s*\"message\"\\s*:\\s*\"Not Found\"\\s*,\\s*\"ok\"\\s*:\\s*false\\s*\\}$", trim_space(body_2)))'
+
+    # Pas d'extracteur, et c'est délibéré. Les deux corps sont des constantes du
+    # dépôt : la racine rend toujours la même phrase, et les trois formes de
+    # /public/ sont écrites en dur dans src/start-server.ts et src/index.ts.
+    # Aucune ne porte de numéro de version, de fournisseur configuré ni de
+    # modèle — le produit ne publie rien de tel sur ces deux chemins. Recopier
+    # l'une d'elles dans le rapport de scan n'y ajouterait pas un renseignement
+    # que les matchers ne portent déjà. Ce que l'instance sait router se lit sur
+    # GET /v1/models, que ce template n'interroge pas : établir l'exposition ne
+    # demande pas d'en énumérer le contenu.

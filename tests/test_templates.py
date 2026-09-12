@@ -25589,6 +25589,413 @@ def test_lightrag_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Portkey AI Gateway — Portkey-AI/gateway, « Route to 250+ LLMs with 1 fast &
+# friendly API ». Une passerelle d'inférence auto-hébergeable, distincte du
+# proxy LiteLLM que le pack couvre déjà, et qui se lit sur une seule ligne de
+# src/index.ts : « app.get('/', (c) => c.text('AI Gateway says hey!')); ».
+#
+# Ce que ce template a de particulier, c'est que le constat tient dans un
+# littéral de texte brut plutôt que dans une charge utile structurée. Il n'y a
+# donc ni version à dater, ni inventaire à énumérer : la phrase est la même sur
+# toutes les instances, et tout le travail du matcher consiste à établir qu'elle
+# vient bien de la passerelle et pas d'un document qui la cite.
+#
+# Cette section vérifie quatre choses. Que la sonde ne relaie jamais une
+# inférence — le même app sert POST /v1/chat/completions derrière le seul
+# requestValidator, qui ne lit aucun identifiant. Que la phrase soit exigée
+# entière, et non cherchée quelque part dans un corps. Que la seconde lecture
+# confirme le processus sans perdre l'instance --headless, qui ne monte pas la
+# console du tout. Et que le code HTTP n'entre nulle part : la racine rend 200
+# sur toute instance vivante, exposée ou non.
+
+PORTKEY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "portkey-gateway-exposed.yaml")
+
+PORTKEY_ROOT_ROUTE = "/"
+PORTKEY_CONSOLE_ROUTE = "/public/"
+
+# Ce que c.text() rend, et rien d'autre : le littéral seul, sans enveloppe.
+PORTKEY_ROOT_BODY = "AI Gateway says hey!"
+
+# La première branche de serveIndex (src/start-server.ts), « if
+# (!hasAdminTokenKey) ». C'est la réponse du lancement par défaut : le conf.json
+# du dépôt ne porte pas de clé admin_token.
+PORTKEY_ADMIN_NOTICE_BODY = (
+    'Admin token is required to access the local gateway UI. Please set '
+    'admin_token in conf.json. see <a href="https://github.com/Portkey-AI/'
+    'gateway/discussions/1656">github discussion</a> for more details.'
+)
+
+# L'autre branche : l'index.html embarqué, servi quand la clé est posée. Seuls
+# en sont repris le titre et la classe du body, qui sont ce que le template y
+# lit ; le fichier réel fait quatre-vingts kilooctets de style et de script.
+PORTKEY_CONSOLE_BODY = (
+    '<!DOCTYPE html>\n<html lang="en">\n\n<head>\n  <meta charset="UTF-8">\n'
+    '  <title>Portkey AI Gateway</title>\n</head>\n'
+    '<body class="admin-auth-pending">\n</body>\n</html>'
+)
+
+# Le gestionnaire d'absence de src/index.ts, « app.notFound((c) => c.json({
+# message: 'Not Found', ok: false }, 404)) » : ce que rend l'instance lancée en
+# --headless ou en production, qui ne monte pas les routes de la console, et
+# aussi le déploiement workerd, où src/start-server.ts n'est jamais exécuté.
+PORTKEY_NOT_FOUND_BODY = json.dumps({"message": "Not Found", "ok": False},
+                                    separators=(",", ":"))
+
+# Ce qu'un tiers rend sur la même racine. Aucun n'est la passerelle.
+PORTKEY_QUOTING_PAGE_BODY = (
+    "<html><body><h1>Runbook</h1><p>Un gateway sain répond « AI Gateway says "
+    "hey! » sur sa racine.</p></body></html>"
+)
+PORTKEY_WRAPPED_BODY = json.dumps({"status": "ok",
+                                   "upstream": "AI Gateway says hey!"},
+                                  separators=(",", ":"))
+PORTKEY_GENERIC_WELCOME_BODY = "<html><body><h1>Welcome to nginx!</h1></body></html>"
+
+# La console remplacée par autre chose que ce que le produit écrit : un portail
+# qui s'interpose, ou un front qui sert sa propre page d'erreur à la place du
+# 404 de l'application.
+PORTKEY_CAPTIVE_PORTAL_BODY = "<html><body>Connexion requise</body></html>"
+PORTKEY_BRANDED_404_BODY = "<html><body><h1>404 — page introuvable</h1></body></html>"
+
+
+def portkey_block():
+    doc = load(PORTKEY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne lit pas la racine — c'est pourtant la seule route du "
+        "produit qui n'exige rien de l'appelant, et la seule qui rende un "
+        "littéral propre à la passerelle"
+    )
+    return blocks[0]
+
+
+def portkey_scenario(root=None, console=None):
+    return {
+        PORTKEY_ROOT_ROUTE: (root if root is not None
+                             else (200, PORTKEY_ROOT_BODY)),
+        PORTKEY_CONSOLE_ROUTE: (console if console is not None
+                                else (404, PORTKEY_NOT_FOUND_BODY)),
+    }
+
+
+def portkey_fires(**kwargs):
+    """
+    Les réponses sont rangées dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    block = portkey_block()
+    scenario = portkey_scenario(**kwargs)
+
+    ordered = []
+    for path in block.get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{route}"
+        )
+        ordered.append(scenario[route])
+
+    verdicts = [dsl_matcher_hits(m, ordered)
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_portkey_probe_never_relays_an_inference_nor_tries_to_log_in():
+    """
+    Le danger propre à ce template : le processus qui rend la phrase est une
+    passerelle vers les fournisseurs de modèles, et le seul intergiciel monté
+    sur ses routes ne lit aucun identifiant. Une sonde qui appellerait POST
+    /v1/chat/completions ferait donc exactement ce que le constat dénonce —
+    relayer du trafic d'inférence par l'infrastructure de l'exploitant — pour
+    établir qu'elle le peut. Et POST /public/auth serait une tentative de
+    connexion sur l'instance auditée.
+    """
+    doc = load(PORTKEY_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les deux lectures se font en GET : le template ne doit rien "
+            "envoyer à une passerelle qu'il découvre"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : sur ce produit, un corps n'a "
+            "de sens que pour une requête d'inférence"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/v1/", "le template touche l'API de la passerelle : tout ce "
+                         "qui est sous /v1/ relaie vers un fournisseur de "
+                         "modèles, y compris le proxy attrape-tout "
+                         "« app.post('/v1/*', requestValidator, proxyHandler) »"),
+                ("/public/auth", "le template poste au formulaire de "
+                                 "connexion de la console : il tenterait de "
+                                 "s'authentifier sur l'instance auditée"),
+                ("/log/stream", "le template ouvre le flux de journaux : c'est "
+                                "une connexion SSE tenue ouverte sur "
+                                "l'instance, et son contenu est le trafic "
+                                "d'inférence de l'exploitant"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_portkey_matcher_takes_the_greeting_whole_not_a_mention_of_it():
+    """
+    Le point qui fait ce template. La phrase est un littéral de texte brut, donc
+    n'importe quel document peut la contenir — un runbook, un miroir de README,
+    un tableau de bord de supervision qui recopie le corps qu'il a reçu. Ce qui
+    nomme la passerelle, ce n'est pas que la phrase soit quelque part dans le
+    corps : c'est qu'elle soit le corps entier, ce que rend c.text() et rien
+    d'autre.
+    """
+    assert portkey_fires(), (
+        "le template ne reconnaît pas une passerelle Portkey dont la racine "
+        "rend sa phrase à l'anonyme"
+    )
+
+    for body, name in (
+        (PORTKEY_QUOTING_PAGE_BODY, "une page qui cite la phrase dans son texte"),
+        (PORTKEY_WRAPPED_BODY, "la phrase republiée sous une clé par un "
+                               "intermédiaire qui relaie ce qu'il a reçu"),
+        (PORTKEY_GENERIC_WELCOME_BODY, "une page d'accueil de serveur web"),
+        ("", "une racine vide"),
+        ("AI Gateway says hey", "la phrase sans son point d'exclamation — "
+                                "c'est-à-dire pas le littéral du handler"),
+        ("ai gateway says hey!", "la phrase en minuscules"),
+        (PORTKEY_ROOT_BODY + " v2", "la phrase suivie d'autre chose"),
+    ):
+        assert not portkey_fires(root=(200, body)), (
+            "le template conclut sur %s" % name
+        )
+
+
+def test_portkey_matcher_holds_across_the_shapes_the_instance_emits():
+    """
+    Ce que trim_space absorbe, et qu'il faut absorber : c.text() ne met pas de
+    saut de ligne, mais un intermédiaire qui relaie du text/plain en ajoute un,
+    et certains en encadrent le corps.
+    """
+    for body, why in (
+        (PORTKEY_ROOT_BODY + "\n", "un intermédiaire qui termine le text/plain "
+                                   "par un saut de ligne"),
+        (PORTKEY_ROOT_BODY + "\r\n", "le même, en fins de ligne Windows"),
+        ("\n" + PORTKEY_ROOT_BODY + "\n", "un intermédiaire qui encadre le "
+                                          "corps de sauts de ligne"),
+        ("  " + PORTKEY_ROOT_BODY + "  ", "un intermédiaire qui l'encadre "
+                                          "d'espaces"),
+    ):
+        assert portkey_fires(root=(200, body)), (
+            "le template perd l'instance derrière %s" % why
+        )
+
+
+def test_portkey_console_read_confirms_the_process_without_losing_headless():
+    """
+    La seconde lecture ne cherche aucun accès : la console se garde elle-même,
+    adminAuthMiddleware tenant /log/stream derrière un jeton. Elle confirme que
+    le processus qui a rendu la phrase est bien cette passerelle.
+
+    L'alternative doit donc être close sur ce que le produit écrit, et
+    exhaustive : les trois formes sont les trois seules réponses possibles de
+    src/start-server.ts et de src/index.ts sur ce chemin. Manquer la troisième
+    ferait perdre toutes les instances lancées en --headless ou en production —
+    c'est-à-dire précisément les déploiements sérieux, donc ceux qu'on cherche.
+    """
+    for console, why in (
+        ((404, PORTKEY_NOT_FOUND_BODY),
+         "l'instance --headless ou en production, dont les routes de la "
+         "console ne sont pas montées et dont la requête tombe sur le "
+         "gestionnaire d'absence de src/index.ts"),
+        ((200, PORTKEY_ADMIN_NOTICE_BODY),
+         "l'instance du lancement par défaut, dont le conf.json ne porte pas "
+         "de clé admin_token et dont serveIndex ne rend que son avertissement"),
+        ((200, PORTKEY_CONSOLE_BODY),
+         "l'instance dont l'exploitant a posé admin_token, et dont la console "
+         "est donc servie"),
+        ((404, "\n  " + PORTKEY_NOT_FOUND_BODY + "\n"),
+         "un intermédiaire qui encadre l'enveloppe d'absence de blancs"),
+        ((404, '{"message": "Not Found", "ok": false}'),
+         "un intermédiaire qui réindente le JSON qu'il relaie"),
+    ):
+        assert portkey_fires(console=console), (
+            "le template perd %s" % why
+        )
+
+    for console, why in (
+        ((200, PORTKEY_CAPTIVE_PORTAL_BODY),
+         "un portail captif qui répond à la place de la console"),
+        ((404, PORTKEY_BRANDED_404_BODY),
+         "un front qui sert sa propre page d'erreur à la place du 404 de "
+         "l'application — c'est le prix assumé de la confirmation"),
+        ((200, '{"message":"Not Found","ok":false,"upstream":"portkey"}'),
+         "un document plus grand qui cite l'enveloppe d'absence : l'ancrage "
+         "des deux côtés est ce qui dit que l'application a répondu "
+         "d'elle-même"),
+    ):
+        assert not portkey_fires(console=console), (
+            "le template conclut sur %s" % why
+        )
+
+
+def test_portkey_conclusion_rests_on_the_payloads_not_on_the_http_status():
+    """
+    La racine rend 200 sur toute instance vivante, exposée ou non : un matcher
+    de statut ne séparerait rien ici. Et la console rend 200 ou 404 selon un
+    drapeau de lancement, pas selon une posture de sécurité — lire son code
+    reviendrait à trier les instances sur « --headless » plutôt que sur ce
+    qu'elles laissent faire.
+    """
+    block = portkey_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas une expression : le constat se "
+        "lit dans les corps, et les deux codes HTTP ne distinguent rien — "
+        f"{sorted(kinds)}"
+    )
+
+    for expression in (block.get("matchers") or [])[0].get("dsl") or []:
+        for read in ("status_code_1", "status_code_2"):
+            assert read not in expression, (
+                f"l'expression « {expression} » lit {read} : la racine rend 200 "
+                "sur toute instance vivante, et le code de la console ne dit "
+                "que le drapeau de lancement"
+            )
+
+    assert portkey_fires(root=(203, PORTKEY_ROOT_BODY),
+                         console=(200, PORTKEY_NOT_FOUND_BODY)), (
+        "le template dépend des codes rendus, alors qu'un intermédiaire peut "
+        "servir les mêmes corps sous d'autres"
+    )
+
+
+def test_portkey_carries_no_extractor_because_both_bodies_are_constants():
+    """
+    Le reste du pack remonte ce que l'instance publie — un numéro de version,
+    un inventaire de modèles, la taille d'un parc. Ici il n'y a rien de tel :
+    les deux corps sont des littéraux du dépôt, identiques sur toutes les
+    instances. Un extracteur ne ferait que recopier dans le rapport de scan ce
+    que les matchers portent déjà.
+    """
+    assert not portkey_block().get("extractors"), (
+        "le bloc porte un extracteur : les deux corps sont des constantes du "
+        "dépôt, donc il ne remonterait rien que le constat ne dise. Ce que "
+        "l'instance sait router se lit sur GET /v1/models, que ce template "
+        "n'interroge pas"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_portkey_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher, et
+    `dsl_matcher_hits` les réévalue avec Python plutôt qu'avec le moteur de Go :
+    seul un scan contre un vrai serveur ferme la boucle. L'enjeu propre est ici
+    la comparaison de chaîne « trim_space(body_1) == ... », que le pack
+    n'employait pas encore — les autres templates cherchent des motifs dans des
+    charges utiles structurées, celui-ci exige un corps entier — et l'évaluation
+    de l'alternative à trois branches sur body_2.
+    """
+    def scan(scenario):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in scenario:
+                    self.reply(*scenario[self.path])
+                else:
+                    self.reply(404, PORTKEY_NOT_FOUND_BODY, "application/json")
+
+            def do_POST(self):
+                seen.append("POST " + self.path)
+                self.reply(404, PORTKEY_NOT_FOUND_BODY, "application/json")
+
+            def reply(self, code, payload, content_type="text/plain"):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", PORTKEY_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "portkey-gateway-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, headless = scan({PORTKEY_ROOT_ROUTE: (200, PORTKEY_ROOT_BODY)})
+    assert sorted(set(seen)) == [PORTKEY_ROOT_ROUTE, PORTKEY_CONSOLE_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert headless, (
+        "le scan perd l'instance --headless, dont la console n'est pas montée "
+        "et dont /public/ tombe sur le gestionnaire d'absence : c'est le "
+        "déploiement sérieux, donc celui qu'on cherche"
+    )
+
+    for console, why in (
+        ((200, PORTKEY_ADMIN_NOTICE_BODY, "text/html"),
+         "l'instance du lancement par défaut, sans clé admin_token"),
+        ((200, PORTKEY_CONSOLE_BODY, "text/html"),
+         "l'instance dont la console est servie"),
+    ):
+        _, hits = scan({PORTKEY_ROOT_ROUTE: (200, PORTKEY_ROOT_BODY),
+                        PORTKEY_CONSOLE_ROUTE: console})
+        assert hits, "le scan perd %s" % why
+
+    for root, why in (
+        ((200, PORTKEY_QUOTING_PAGE_BODY, "text/html"),
+         "une page qui cite la phrase dans son texte"),
+        ((200, PORTKEY_WRAPPED_BODY, "application/json"),
+         "la phrase republiée sous une clé par un intermédiaire"),
+    ):
+        _, hits = scan({PORTKEY_ROOT_ROUTE: root,
+                        PORTKEY_CONSOLE_ROUTE: (200,
+                                                PORTKEY_ADMIN_NOTICE_BODY,
+                                                "text/html")})
+        assert hits == [], (
+            "le scan conclut sur %s : la phrase doit être le corps entier" % why
+        )
+
+    _, branded = scan({PORTKEY_ROOT_ROUTE: (200, PORTKEY_ROOT_BODY),
+                       PORTKEY_CONSOLE_ROUTE: (404, PORTKEY_BRANDED_404_BODY,
+                                               "text/html")})
+    assert branded == [], (
+        "le scan conclut alors que /public/ n'a rendu aucune des trois formes "
+        "que le produit écrit : la confirmation ne tient plus"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
