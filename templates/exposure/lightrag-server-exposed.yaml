@@ -1,0 +1,210 @@
+id: lightrag-server-exposed
+
+info:
+  name: LightRAG Server - Unauthenticated Health Endpoint Exposure
+  author: popy21
+  severity: high
+  description: |
+    LightRAG (HKUDS/LightRAG) est un moteur RAG à graphe de connaissances issu
+    d'EMNLP 2025. Son serveur embarqué — « lightrag-server » — sert d'un seul
+    tenant l'API du moteur et les deux WebUI (/webui et /workspace) : c'est ce
+    processus-là qui porte l'insertion de documents, l'interrogation du corpus
+    et le graphe.
+    GET /health en est la lecture anonyme, et elle l'est par défaut. La route
+    est bien déclarée sous garde — « @app.get("/health",
+    dependencies=[Depends(combined_auth)]) » dans lightrag/api/lightrag_server.py
+    —, mais combined_dependency (lightrag/api/utils_api.py) ouvre par le
+    whitelist : « if respect_whitelist and path_is_whitelisted(request.scope):
+    return » est son premier pas, avant toute lecture de jeton ou de clé. Or
+    config.py pose « args.whitelist_paths = get_env_value("WHITELIST_PATHS",
+    "/health,/api/*") » : sans variable d'environnement, /health est exempté, et
+    la documentation le dit dans les mêmes termes — « `/health` stays
+    whitelisted as a liveness probe but only returns its full configuration to
+    authenticated callers ».
+    Ce que l'anonyme reçoit est donc la moitié basse du handler get_status, celle
+    que le code rend avant son « if not authenticated: return status_data » :
+    status, auth_mode, core_version, api_version, webui_available,
+    workspace_available, api_docs_available, webui_title, webui_description,
+    ai_content_notice_enabled, pipeline_busy et pipeline_active. Le reste —
+    working_directory, input_directory et tout le bloc `configuration`
+    (llm_binding_host, embedding_binding_host, modèles, backends de stockage,
+    files d'attente) — n'est ajouté qu'au caller authentifié. La documentation
+    fixe la même frontière : « It always returns HTTP 200 so it stays usable as
+    a liveness probe, but the configuration and operational diagnostics are
+    returned only to authenticated callers (valid JWT or `X-API-Key`) ».
+    Ce cloisonnement est récent, et c'est ce qui rend le corps réduit
+    distinctif plutôt que rassurant : sur la 1.4.0, le même handler, derrière le
+    même whitelist par défaut, rendait le bloc `configuration` entier à
+    l'anonyme. Une instance qui ne montre aujourd'hui que les signaux de vie est
+    une instance à jour — pas une instance fermée.
+    L'absence d'authentification est le défaut de configuration, pas un oubli
+    d'exploitant : la clé d'API (« --key », LIGHTRAG_API_KEY, en-tête
+    X-API-Key) vaut None par défaut dans config.py, AUTH_ACCOUNTS vaut la chaîne
+    vide et TOKEN_SECRET None. Les mêmes défauts posent « --host » à 0.0.0.0 et
+    « --port » à 9621 : sans qu'aucun drapeau ne soit passé, le serveur écoute
+    sur toutes les interfaces sans qu'aucune identité ne soit demandée.
+    Le constat repose sur ce que le corps porte, jamais sur le code HTTP, qui
+    vaut 200 par conception y compris sur une instance protégée. Le trio
+    core_version + api_version + auth_mode est propre au produit, et auth_mode
+    porte le verdict : le handler écrit « if not auth_configured: auth_mode =
+    "disabled" », où auth_configured vaut « bool(auth_handler.accounts) ». La
+    valeur littérale « disabled » dit donc exactement une chose — AUTH_ACCOUNTS
+    n'est pas posé.
+  impact: |
+    AUTH_ACCOUNTS non posé est ce que la documentation du serveur tient
+    elle-même pour l'état non sûr : « If Account credentials are not configured,
+    the Web UI will access the system as a Guest. Therefore, even if only an API
+    Key is configured, all APIs can still be accessed through the Guest account,
+    which remains insecure. Hence, to safeguard the API, it is necessary to
+    configure both authentication methods simultaneously. »
+    Ce que le même processus sert derrière cette absence de compte : POST
+    /documents/text et POST /documents/upload, qui insèrent dans le corpus ;
+    POST /query, /query/stream et /query/data, qui l'interrogent et font tourner
+    le LLM configuré aux frais de l'exploitant ; GET /graphs, /graph/label/list
+    et /graph/label/search, qui rendent le graphe de connaissances, c'est-à-dire
+    les entités extraites de chaque document ingéré ; et DELETE /documents, qui
+    vide la base. Lire l'intégralité de la base RAG de l'organisation et
+    consommer son LLM sont alors la même requête, sans compte et sans quota.
+    /health seul, pris comme renseignement, donne déjà core_version et
+    api_version — donc la version exacte à confronter aux avis du dépôt —, dit
+    par pipeline_busy et pipeline_active si un pipeline d'ingestion tourne à cet
+    instant, et par webui_available, workspace_available et api_docs_available
+    lesquelles des trois entrées (/webui, /workspace, /docs) sont servies,
+    c'est-à-dire par où continuer.
+  remediation: |
+    Poser les deux mécanismes, et pas un seul : AUTH_ACCOUNTS avec un
+    TOKEN_SECRET explicite — config.py refuse de démarrer si AUTH_ACCOUNTS est
+    posé alors que TOKEN_SECRET reste absent ou vaut le DEFAULT_TOKEN_SECRET du
+    dépôt — ET LIGHTRAG_API_KEY, puisque la documentation tient la clé seule
+    pour insuffisante tant que le compte Guest reste ouvert. C'est la
+    configuration des comptes qui fait basculer auth_mode de « disabled » à
+    « enabled ».
+    Cela ne referme pas /health, et rien dans le produit ne le referme : la
+    route reste exemptée tant que WHITELIST_PATHS vaut son défaut. Le réglage
+    existe — WHITELIST_PATHS s'écrit sans le préfixe de montage — mais retirer
+    /health prive l'orchestrateur de sa sonde de vie ; retirer « /api/* » est en
+    revanche recommandé par la documentation elle-même quand l'émulation Ollama
+    n'est pas utilisée, car ces routes-là servent des données. Le reste est
+    réseau : lier le serveur à 127.0.0.1 plutôt qu'au 0.0.0.0 par défaut, ne pas
+    publier le port 9621 sur une interface non maîtrisée, et authentifier au
+    proxy avant de relayer.
+    Après une exposition, tenir pour lus le corpus et le graphe, et pour
+    consommé le budget du LLM configuré : vérifier les journaux d'ingestion et
+    d'interrogation sur la fenêtre, et faire tourner les clés des fournisseurs
+    LLM et embedding, que le bloc `configuration` de /health rendait en clair à
+    l'anonyme sur les versions antérieures au cloisonnement.
+  reference:
+    - https://github.com/HKUDS/LightRAG
+    - https://github.com/HKUDS/LightRAG/blob/main/docs/LightRAG-API-Server.md
+    - https://github.com/HKUDS/LightRAG/blob/main/lightrag/api/lightrag_server.py
+    - https://github.com/HKUDS/LightRAG/blob/main/lightrag/api/utils_api.py
+    - https://github.com/HKUDS/LightRAG/blob/main/lightrag/api/config.py
+    - https://github.com/HKUDS/LightRAG/security/advisories/GHSA-2hjx-23vw-wvw4
+  metadata:
+    max-request: 2
+    vendor: hkuds
+    product: lightrag
+  tags: ai,llm,rag,lightrag,knowledge-graph,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune répond à une moitié de la question.
+  #
+  # GET /health identifie le produit et donne le verdict sur les comptes. C'est
+  # la seule route du serveur qui rende quoi que ce soit à l'anonyme par défaut,
+  # et elle le fait en 200 quelle que soit la configuration — le code HTTP n'y
+  # sépare donc rien, seul le corps le fait.
+  #
+  # GET /auth/verify est la contre-épreuve. Son handler est monté sur
+  # « get_combined_auth_dependency(api_key, respect_whitelist=False) » : il
+  # ignore délibérément WHITELIST_PATHS et ne rend « {"status":"ok"} » qu'au pas
+  # 3 de combined_dependency, « if not auth_configured and not
+  # api_key_configured: return » — c'est-à-dire uniquement quand aucune
+  # identité n'est demandée nulle part. Une clé posée le fait répondre 403
+  # (« API Key required »), un compte posé 401 (« No credentials provided »).
+  # La route est récente et absente des versions antérieures, où elle rend 404 :
+  # elle n'est donc pas lue comme une preuve d'ouverture, mais comme un refus
+  # quand elle refuse. C'est ce qui écarte le profil clé-seule d'une instance à
+  # jour, sans perdre les versions qui ne servent pas cette route.
+  #
+  # En lecture seule, et strictement. Le même serveur porte POST /documents/text,
+  # POST /query et DELETE /documents ; en toucher une écrirait dans le corpus,
+  # ferait tourner le LLM de l'exploitant ou viderait sa base — c'est l'abus que
+  # ce template signale, pas la façon de l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/health"
+      - "{{BaseURL}}/auth/verify"
+
+    # req-condition accumule body_N et status_code_N pour que le constat porte
+    # sur les deux réponses ensemble. Sans lui, /health conclurait seul — or
+    # « auth_mode: disabled » ne dit rien de la clé d'API.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture de la charge utile, et c'est elle qui dit que l'instance
+          # a répondu d'elle-même plutôt qu'un document plus grand ne la cite :
+          # « status » est la première clé insérée dans status_data, avant comme
+          # après le cloisonnement de la configuration. Les \s* laissent passer
+          # l'intermédiaire qui réindente ce qu'il relaie, et trim_space le
+          # saut de ligne qu'il ajoute.
+          - 'regex("^\\{\\s*\"status\"\\s*:\\s*\"healthy\"", trim_space(body_1))'
+
+          # Le couple de versions, exigé comme clés portant une chaîne. C'est lui
+          # qui nomme le produit : core_version est le __version__ du paquet
+          # lightrag, api_version le __api_version__ du serveur — deux numéros
+          # distincts sur la même route, qu'aucune autre sonde de santé ne rend.
+          # Leur valeur n'est pas contrainte : la première est un triplet, la
+          # seconde un compteur à quatre chiffres que le serveur suffixe d'un
+          # « ⚠️ » quand le frontend embarqué est plus ancien que lui.
+          - 'regex("\"core_version\"\\s*:\\s*\"", body_1)'
+          - 'regex("\"api_version\"\\s*:\\s*\"", body_1)'
+
+          # Le constat lui-même, et la seule valeur littérale que le template
+          # exige. Le handler n'écrit ces deux mots nulle part ailleurs :
+          # « if not auth_configured: auth_mode = "disabled" » sinon
+          # « "enabled" », sur « bool(auth_handler.accounts) ». « disabled » dit
+          # donc qu'AUTH_ACCOUNTS n'est pas posé — l'état que la documentation
+          # du produit tient elle-même pour non sûr.
+          - 'regex("\"auth_mode\"\\s*:\\s*\"disabled\"", body_1)'
+
+          # Le champ de pipeline, exigé sans sa valeur : il vaut true ou false
+          # selon qu'une ingestion tourne, et les deux états sont également
+          # exposés. Il est là pour ancrer le corps au handler de LightRAG
+          # plutôt qu'à une réponse tierce qui porterait par ailleurs un
+          # « auth_mode » et un numéro de version.
+          - 'regex("\"pipeline_busy\"\\s*:", body_1)'
+
+          # La contre-épreuve, écrite en refus plutôt qu'en acceptation. 401 et
+          # 403 sont les deux seules sorties d'échec de combined_dependency, et
+          # les obtenir ici prouve qu'une identité est réclamée quelque part —
+          # clé d'API posée, compte posé, ou intermédiaire qui garde tout sauf
+          # la sonde de vie. Tout autre code, 404 compris, laisse le constat
+          # tenir sur /health seul.
+          - 'status_code_2 != 401 && status_code_2 != 403'
+
+    extractors:
+      # Les deux numéros que l'anonyme obtient, et ce sont eux qui décident de la
+      # suite : ils datent l'instance, donc disent si le bloc `configuration` lui
+      # était encore rendu en clair et à quels avis du dépôt elle répond.
+      #
+      # Ce que les extracteurs ne touchent pas : webui_title et
+      # webui_description, que l'exploitant renseigne et qui nomment souvent le
+      # service interne, et les trois drapeaux d'entrées servies, qui
+      # écriraient dans le rapport de scan par où continuer.
+      #
+      # Bornés à body_1 : sous req-condition le moteur évalue chaque extracteur
+      # contre chaque réponse, et /auth/verify n'a aucun des deux champs.
+      - type: json
+        part: body_1
+        name: core_version
+        json:
+          - '.core_version'
+
+      - type: json
+        part: body_1
+        name: api_version
+        json:
+          - '.api_version'

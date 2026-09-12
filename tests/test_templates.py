@@ -25040,6 +25040,555 @@ def test_dynamo_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# LightRAG — HKUDS/LightRAG, moteur RAG à graphe de connaissances issu d'EMNLP
+# 2025. Son serveur embarqué sert d'un seul tenant l'API du moteur et ses deux
+# WebUI : c'est le même processus qui porte POST /documents/text, POST /query et
+# DELETE /documents.
+#
+# GET /health est la seule route qu'il rende à l'anonyme par défaut — non par
+# oubli, mais parce que config.py pose « WHITELIST_PATHS=/health,/api/* » et que
+# combined_dependency ouvre sur « if respect_whitelist and
+# path_is_whitelisted(request.scope): return ». Elle répond 200 dans tous les
+# cas, y compris sur une instance protégée : le code HTTP n'y sépare rien.
+#
+# Cette section vérifie les trois choses que le template doit tenir. Que le
+# constat repose sur le trio propre au produit — core_version, api_version,
+# auth_mode — et jamais sur le mot « healthy », que le pack porte déjà une
+# douzaine de fois. Que « auth_mode: disabled » soit lu comme le verdict qu'il
+# est, le handler n'écrivant ce littéral que sur « not auth_configured ». Et que
+# la contre-épreuve sur /auth/verify écarte l'instance à jour protégée par une
+# clé d'API, sans perdre les versions antérieures, qui ne servent pas cette
+# route et y répondent 404.
+
+LIGHTRAG_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "lightrag-server-exposed.yaml")
+
+LIGHTRAG_HEALTH_ROUTE = "/health"
+LIGHTRAG_VERIFY_ROUTE = "/auth/verify"
+
+
+def lightrag_health_body(auth_mode="disabled", core_version="1.5.8",
+                         api_version="0346", pipeline_busy=False,
+                         pipeline_active=False, indent=None):
+    """
+    Ce que get_status (lightrag/api/lightrag_server.py) rend à l'anonyme : le
+    dict `status_data`, dans l'ordre où le handler l'écrit, et rien de plus —
+    c'est là que tombe son « if not authenticated: return status_data », avant
+    l'ajout de working_directory, input_directory et du bloc `configuration`.
+
+    `webui_title` et `webui_description` valent None tant que WEBUI_TITLE et
+    WEBUI_DESCRIPTION ne sont pas posées : ce sont des os.getenv() nus.
+    """
+    content = {
+        "status": "healthy",
+        "auth_mode": auth_mode,
+        "core_version": core_version,
+        "api_version": api_version,
+        "webui_available": True,
+        "workspace_available": True,
+        "api_docs_available": True,
+        "webui_title": None,
+        "webui_description": None,
+        "ai_content_notice_enabled": False,
+        "pipeline_busy": pipeline_busy,
+        "pipeline_active": pipeline_active,
+    }
+    if indent is not None:
+        return json.dumps(content, indent=indent)
+    return json.dumps(content, separators=(",", ":"))
+
+
+LIGHTRAG_HEALTH_BODY = lightrag_health_body()
+
+# La même instance pendant une ingestion : les deux drapeaux de pipeline
+# basculent. Elle est exposée au même titre — et elle est même la preuve qu'un
+# corpus réel l'alimente.
+LIGHTRAG_BUSY_BODY = lightrag_health_body(pipeline_busy=True,
+                                          pipeline_active=True)
+
+# AUTH_ACCOUNTS posé : « if not auth_configured: auth_mode = "disabled" » prend
+# l'autre branche. Le corps ne change pas d'une clé par ailleurs — seul ce mot
+# le fait —, et c'est l'instance que le template ne doit pas signaler.
+LIGHTRAG_AUTH_ENABLED_BODY = lightrag_health_body(auth_mode="enabled")
+
+# Le frontend embarqué plus ancien que le serveur : api_version_display vaut
+# alors « f"{__api_version__}⚠️" ». La valeur n'est pas un numéro propre, et le
+# template ne doit rien en exiger d'autre que d'être une chaîne.
+LIGHTRAG_OUTDATED_FRONTEND_BODY = lightrag_health_body(api_version="0346⚠️")
+
+# La 1.4.0, derrière le même whitelist par défaut : le handler n'avait pas
+# encore son « if not authenticated », donc l'anonyme recevait le bloc
+# `configuration` entier — hôtes des fournisseurs LLM et embedding, modèles,
+# backends de stockage — et les deux chemins du disque avec. C'est la forme que
+# le template doit reconnaître aussi : elle est plus grave, pas moins.
+LIGHTRAG_LEGACY_BODY = json.dumps({
+    "status": "healthy",
+    "working_directory": "/app/rag_storage",
+    "input_directory": "/app/inputs",
+    "configuration": {
+        "llm_binding": "openai",
+        "llm_binding_host": "https://api.openai.com/v1",
+        "llm_model": "gpt-4o-mini",
+        "embedding_binding": "openai",
+        "embedding_binding_host": "https://api.openai.com/v1",
+        "embedding_model": "text-embedding-3-small",
+        "max_tokens": 32768,
+        "kv_storage": "JsonKVStorage",
+        "doc_status_storage": "JsonDocStatusStorage",
+        "graph_storage": "NetworkXStorage",
+        "vector_storage": "NanoVectorDBStorage",
+        "enable_llm_cache_for_extract": True,
+        "enable_llm_cache": True,
+        "workspace": "",
+        "max_graph_nodes": 1000,
+        "enable_rerank": False,
+        "rerank_model": None,
+        "rerank_binding_host": None,
+    },
+    "auth_mode": "disabled",
+    "pipeline_busy": False,
+    # cleanup_keyed_lock() avant initialisation du stockage partagé
+    # (lightrag/kg/shared_storage.py).
+    "keyed_locks": {
+        "process_id": 1,
+        "cleanup_performed": {"mp_cleaned": 0, "async_cleaned": 0},
+        "current_status": {
+            "total_mp_locks": 0, "pending_mp_cleanup": 0,
+            "total_async_locks": 0, "pending_async_cleanup": 0,
+        },
+    },
+    "core_version": "1.4.0",
+    "api_version": "0208",
+    "webui_title": None,
+    "webui_description": None,
+}, separators=(",", ":"))
+
+# La charge utile entière republiée au fond du document d'une supervision : tout
+# y est, mais ce n'est pas l'instance qui a répondu d'elle-même.
+LIGHTRAG_COMPOSITE_BODY = '{"lightrag":%s,"checked_at":0}' % LIGHTRAG_HEALTH_BODY
+
+# Une sonde de santé quelconque qui publierait le mot « auth_mode » sans être
+# LightRAG : le vocabulaire de l'authentification n'appartient à personne, et
+# c'est le couple de versions qui sépare les deux.
+LIGHTRAG_OTHER_AUTH_MODE_BODY = json.dumps({
+    "status": "healthy", "auth_mode": "disabled", "version": "2.41.0",
+}, separators=(",", ":"))
+
+# Un portail captif devant une vraie instance : il répond 200 à /health, mais
+# avec sa page de connexion.
+LIGHTRAG_CAPTIVE_PORTAL_BODY = "<html><body>Connexion requise</body></html>"
+
+# /auth/verify, et ses quatre réponses. Le handler est monté sur
+# « get_combined_auth_dependency(api_key, respect_whitelist=False) » : il ignore
+# WHITELIST_PATHS et ne rend son littéral qu'au pas 3 de combined_dependency,
+# « if not auth_configured and not api_key_configured: return ».
+LIGHTRAG_VERIFY_OPEN = (200, '{"status":"ok"}')
+
+# LIGHTRAG_API_KEY posé, en-tête absent : « if api_key_configured and not
+# api_key_header_value: raise HTTPException(403, "API Key required") ». C'est le
+# profil clé-seule d'une instance à jour — auth_mode vaut toujours « disabled »,
+# puisqu'il ne lit que les comptes, mais les routes de données refusent.
+LIGHTRAG_VERIFY_KEY_REQUIRED = (403, '{"detail":"API Key required"}')
+
+# AUTH_ACCOUNTS posé, jeton absent : « if auth_configured and not token: raise
+# HTTPException(401, "No credentials provided. Please login.") ».
+LIGHTRAG_VERIFY_LOGIN_REQUIRED = (
+    401, '{"detail":"No credentials provided. Please login."}')
+
+# La route est récente : les versions qui ne la servent pas rendent le 404 de
+# FastAPI. C'est le cas majoritaire du parc, et il ne doit rien coûter au
+# constat.
+LIGHTRAG_VERIFY_ABSENT = (404, '{"detail":"Not Found"}')
+
+
+def lightrag_block():
+    doc = load(LIGHTRAG_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LIGHTRAG_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /health — c'est pourtant la seule route "
+        "que le whitelist par défaut laisse rendre quoi que ce soit à l'anonyme"
+    )
+    return blocks[0]
+
+
+def lightrag_scenario(health=None, verify=None):
+    return {
+        LIGHTRAG_HEALTH_ROUTE: (health if health is not None
+                                else (200, LIGHTRAG_HEALTH_BODY)),
+        LIGHTRAG_VERIFY_ROUTE: (verify if verify is not None
+                                else LIGHTRAG_VERIFY_OPEN),
+    }
+
+
+def lightrag_fires(**kwargs):
+    """
+    Les réponses sont rangées dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N et status_code_N sous
+    req-condition.
+    """
+    block = lightrag_block()
+    scenario = lightrag_scenario(**kwargs)
+
+    ordered = []
+    for path in block.get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{route}"
+        )
+        ordered.append(scenario[route])
+
+    verdicts = [dsl_matcher_hits(m, ordered)
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_lightrag_probe_never_writes_to_the_corpus_nor_queries_it():
+    """
+    Le danger propre à ce template : le serveur qui sert /health sert aussi, et
+    sans garde quand les comptes ne sont pas posés, l'insertion de documents,
+    l'interrogation du corpus et sa suppression. Une sonde qui appellerait
+    /query ferait tourner le LLM de l'exploitant à ses frais pour établir qu'il
+    est ouvert ; une sonde qui appellerait DELETE /documents viderait la base
+    qu'elle audite.
+    """
+    doc = load(LIGHTRAG_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les deux lectures se font en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : sur ce serveur, un corps n'a "
+            "de sens que pour une insertion ou une interrogation"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/documents", "le template touche le routeur des documents : "
+                               "il y écrirait (POST /documents/text, "
+                               "/documents/upload) ou viderait la base "
+                               "(DELETE /documents)"),
+                ("/query", "le template appelle l'interrogation du corpus : "
+                           "elle fait tourner le LLM configuré aux frais de "
+                           "l'exploitant"),
+                ("/graph", "le template lit le graphe de connaissances : ce "
+                           "sont les entités extraites de chaque document "
+                           "ingéré, et le rapport de scan les porterait"),
+                ("/login", "le template poste au formulaire de connexion : il "
+                           "tenterait de s'authentifier sur l'instance auditée"),
+                ("/api/", "le template touche les routes d'émulation Ollama, "
+                          "que le whitelist par défaut expose aussi et qui "
+                          "servent de la génération"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_lightrag_matcher_rests_on_the_product_trio_not_on_a_generic_health_word():
+    """
+    Le point qui fait ce template. « healthy » ne désigne aucun produit — le
+    pack porte déjà plusieurs sondes de santé qui le rendent —, et « auth_mode »
+    pas davantage. C'est le couple core_version + api_version, deux numéros
+    distincts portés en chaînes par la même route, qui nomme LightRAG.
+    """
+    assert lightrag_fires(), (
+        "le template ne reconnaît pas un serveur LightRAG dont /health répond à "
+        "l'anonyme sans qu'aucun compte ne soit configuré"
+    )
+
+    for body, name in (
+        (OTHER_HEALTH_BODY, "une sonde de santé quelconque"),
+        (OTHER_VERSIONED_HEALTH_BODY, "une sonde de santé dont « api_version » "
+                                      "est un nombre, comme l'écrit à peu près "
+                                      "tout le monde sauf ce handler"),
+        (MINERU_OTHER_HEALTH_BODY, "un service quelconque qui publie sa version"),
+        (LETTA_HEALTH_BODY, "une sonde de santé qui ne rend que son statut"),
+        (HAYHOOKS_OTHER_HEALTH_BODY, "un serveur de pipelines quelconque"),
+        (LIGHTRAG_OTHER_AUTH_MODE_BODY, "une sonde de santé qui publie elle "
+                                        "aussi un « auth_mode », sans porter "
+                                        "le couple de versions"),
+        (LIGHTRAG_CAPTIVE_PORTAL_BODY, "un portail captif qui répond 200 avec "
+                                       "sa page de connexion"),
+        (LIGHTRAG_COMPOSITE_BODY, "la charge utile republiée au fond du "
+                                  "document d'une supervision"),
+    ):
+        assert not lightrag_fires(health=(200, body)), (
+            "le template conclut sur %s" % name
+        )
+
+
+def test_lightrag_matcher_reads_auth_mode_as_the_verdict_not_as_a_product_name():
+    """
+    auth_mode est le seul littéral que le template exige, et il porte tout le
+    constat : le handler écrit « if not auth_configured: auth_mode = "disabled"
+    » sinon « "enabled" », sur « bool(auth_handler.accounts) ». Une instance dont
+    AUTH_ACCOUNTS est posé sert exactement le même corps à un mot près — et ce
+    mot est la différence entre un serveur ouvert et un serveur fermé.
+    """
+    assert not lightrag_fires(health=(200, LIGHTRAG_AUTH_ENABLED_BODY)), (
+        "le template conclut sur une instance dont les comptes sont "
+        "configurés : il signalerait comme exposé un serveur qui refuse "
+        "l'anonyme sur toutes ses routes de données"
+    )
+
+    # Le mot seul ne suffit pas non plus dans l'autre sens : sans les deux
+    # numéros de version, « disabled » ne désigne aucun produit.
+    assert not lightrag_fires(health=(200, LIGHTRAG_OTHER_AUTH_MODE_BODY)), (
+        "le template conclut sur « auth_mode: disabled » sans le couple de "
+        "versions : le mot appartient à qui veut l'écrire"
+    )
+
+
+def test_lightrag_counter_proof_drops_the_key_protected_instance_only():
+    """
+    Le profil que /health ne sait pas distinguer, et la raison de la seconde
+    lecture. auth_mode ne lit que les comptes : une instance à jour protégée par
+    LIGHTRAG_API_KEY seul rend « disabled » tout en refusant l'anonyme sur
+    /documents et /query. /auth/verify tranche — son handler ignore
+    WHITELIST_PATHS et ne rend son littéral que lorsque ni compte ni clé ne sont
+    posés.
+
+    Elle est lue en refus, jamais en acceptation : la route est récente, et sur
+    les versions qui ne la servent pas le 404 doit laisser le constat tenir sur
+    /health seul.
+    """
+    for verify, why in (
+        (LIGHTRAG_VERIFY_KEY_REQUIRED,
+         "une instance à jour protégée par une clé d'API : ses routes de "
+         "données refusent l'anonyme, et « auth_mode: disabled » ne le dit pas"),
+        (LIGHTRAG_VERIFY_LOGIN_REQUIRED,
+         "une instance qui réclame une connexion — ou un intermédiaire qui "
+         "garde tout sauf la sonde de vie"),
+    ):
+        assert not lightrag_fires(verify=verify), (
+            "le template conclut sur %s" % why
+        )
+
+    for verify, why in (
+        (LIGHTRAG_VERIFY_OPEN,
+         "l'instance dont ni compte ni clé ne sont posés, que le pas 3 de "
+         "combined_dependency laisse passer"),
+        (LIGHTRAG_VERIFY_ABSENT,
+         "une version antérieure, qui ne sert pas encore cette route"),
+        ((200, "<html><body>Bienvenue</body></html>"),
+         "un SPA rendu en 200 par une route attrape-tout, qui ne refuse rien"),
+    ):
+        assert lightrag_fires(verify=verify), (
+            "le template perd %s" % why
+        )
+
+
+def test_lightrag_matcher_holds_across_the_shapes_the_server_emits():
+    """
+    Quatre formes que la même route rend selon la version et l'instant, et
+    aucune ne doit coûter le constat.
+    """
+    assert lightrag_fires(health=(200, LIGHTRAG_BUSY_BODY)), (
+        "le template perd l'instance en cours d'ingestion : pipeline_busy vaut "
+        "true ou false selon l'instant, et les deux états sont également exposés"
+    )
+
+    assert lightrag_fires(health=(200, LIGHTRAG_LEGACY_BODY),
+                          verify=LIGHTRAG_VERIFY_ABSENT), (
+        "le template perd la 1.4.0, dont le même handler derrière le même "
+        "whitelist rendait le bloc `configuration` entier à l'anonyme — hôtes "
+        "des fournisseurs et backends de stockage compris. Cette forme-là est "
+        "plus grave, pas moins"
+    )
+
+    assert lightrag_fires(health=(200, LIGHTRAG_OUTDATED_FRONTEND_BODY)), (
+        "le template perd l'instance dont le frontend embarqué est plus ancien "
+        "que le serveur : api_version_display y porte alors un « ⚠️ », et le "
+        "template n'a aucune raison d'exiger un numéro propre"
+    )
+
+    assert lightrag_fires(health=(200, lightrag_health_body(indent=2))), (
+        "le template perd l'instance derrière un intermédiaire qui réindente "
+        "ce qu'il relaie"
+    )
+
+    assert lightrag_fires(health=(200, "\n" + LIGHTRAG_HEALTH_BODY + "\n")), (
+        "le template perd l'instance derrière un intermédiaire qui encadre le "
+        "corps de sauts de ligne : c'est ce que trim_space absorbe"
+    )
+
+
+def test_lightrag_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    La route répond 200 par conception, y compris sur l'instance protégée : la
+    documentation l'écrit — « It always returns HTTP 200 so it stays usable as a
+    liveness probe ». Un matcher de statut ne séparerait donc rien ici, et
+    conclurait sur tout serveur vivant.
+    """
+    block = lightrag_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas une expression : le constat se "
+        "lit dans le corps, et le code HTTP vaut 200 sur l'instance protégée "
+        f"comme sur l'instance ouverte — {sorted(kinds)}"
+    )
+
+    for expression in (block.get("matchers") or [])[0].get("dsl") or []:
+        assert "status_code_1" not in expression, (
+            f"l'expression « {expression} » lit le code de /health : la route "
+            "rend 200 quelle que soit la configuration, donc ce code ne "
+            "distingue rien"
+        )
+
+    assert lightrag_fires(health=(304, LIGHTRAG_HEALTH_BODY)), (
+        "le template dépend du code rendu sur /health, alors qu'un cache "
+        "intermédiaire peut servir le même corps sous un autre"
+    )
+
+
+def test_lightrag_extractors_report_the_versions_without_naming_the_deployment():
+    """
+    Le corps porte deux renseignements que le rapport de scan n'a pas à relayer.
+    webui_title et webui_description sont renseignés par l'exploitant et nomment
+    souvent le service interne ; les trois drapeaux d'entrées servies disent par
+    où continuer. Les deux numéros de version, eux, sont ce dont l'exploitant a
+    besoin — ils datent l'instance, donc disent à quels avis du dépôt elle
+    répond et si le bloc `configuration` lui était encore rendu en clair.
+    """
+    extractors = lightrag_block().get("extractors") or []
+    assert [e.get("json") for e in extractors] == [
+        ['.core_version'],
+        ['.api_version'],
+    ], (
+        "les extracteurs ne remontent pas les deux numéros qui datent "
+        "l'instance, ou en remontent d'autres avec"
+    )
+
+    for extractor in extractors:
+        assert extractor.get("type") == "json", (
+            "la réponse est un objet JSON : une expression regex n'a pas à "
+            "s'en charger"
+        )
+        assert extractor.get("part") == "body_1", (
+            "sous req-condition le moteur évalue chaque extracteur contre "
+            "chaque réponse : sans part, /auth/verify serait interrogé pour "
+            "des champs qu'il ne rend pas"
+        )
+        for expression in extractor.get("json") or []:
+            for forbidden in ("webui_title", "webui_description",
+                              "webui_available", "workspace_available",
+                              "api_docs_available"):
+                assert forbidden not in expression, (
+                    f"l'expression « {expression} » remonte {forbidden} : le "
+                    "rapport de scan porterait le nom que l'exploitant donne à "
+                    "son service, ou la liste des entrées par où continuer — "
+                    "et l'accès en lecture est déjà prouvé par les matchers"
+                )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_lightrag_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `dsl_matcher_hits` réévalue les motifs avec le
+    moteur d'expressions de Python plutôt qu'avec celui de Go : seul un scan
+    contre un vrai serveur ferme la boucle. L'enjeu propre est ici la
+    comparaison de status_code_2 sous req-condition — c'est elle qui écarte
+    l'instance protégée par une clé —, et le fait qu'un 404 sur la seconde
+    lecture n'empêche pas la première de conclure.
+    """
+    def scan(scenario):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in scenario:
+                    self.reply(*scenario[self.path])
+                else:
+                    self.reply(404, '{"detail":"Not Found"}')
+
+            def do_POST(self):
+                seen.append("POST " + self.path)
+                self.reply(200, '{"detail":"not implemented"}')
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LIGHTRAG_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "lightrag-server-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(lightrag_scenario())
+    assert sorted(set(seen)) == [LIGHTRAG_VERIFY_ROUTE, LIGHTRAG_HEALTH_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert sorted(extracted) == ["0346", "1.5.8"], (
+        f"le scan ne remonte pas les deux numéros qui datent l'instance : "
+        f"{extracted}"
+    )
+
+    _, legacy = scan(lightrag_scenario(health=(200, LIGHTRAG_LEGACY_BODY),
+                                       verify=LIGHTRAG_VERIFY_ABSENT))
+    assert sorted(legacy) == ["0208", "1.4.0"], (
+        "le scan perd la version antérieure, qui ne sert pas /auth/verify et "
+        f"rendait pourtant sa configuration entière à l'anonyme : {legacy}"
+    )
+
+    _, key_protected = scan(lightrag_scenario(
+        verify=LIGHTRAG_VERIFY_KEY_REQUIRED))
+    assert key_protected == [], (
+        "le scan conclut sur une instance à jour protégée par une clé d'API : "
+        "« auth_mode: disabled » ne lit que les comptes, et c'est /auth/verify "
+        "qui devait trancher"
+    )
+
+    _, enabled = scan(lightrag_scenario(
+        health=(200, LIGHTRAG_AUTH_ENABLED_BODY)))
+    assert enabled == [], (
+        "le scan conclut sur une instance dont les comptes sont configurés"
+    )
+
+    _, composite = scan(lightrag_scenario(health=(200, LIGHTRAG_COMPOSITE_BODY)))
+    assert composite == [], (
+        "le scan conclut sur la charge utile republiée au fond du document "
+        "d'une supervision : c'est l'ancrage sur l'ouverture qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
