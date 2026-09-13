@@ -26482,6 +26482,502 @@ def test_rasa_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Infinity — infiniflow/infinity, la base de données « AI-native » de l'équipe de
+# RAGFlow, qui l'emploie comme moteur de documents. Son API HTTP écoute sur 23820
+# et conf/infinity_conf.toml pose « server_address = "0.0.0.0" ».
+#
+# Deux difficultés propres à ce template, et elles sont d'espèces différentes.
+#
+# La première est un homonyme : le pack couvre déjà michaelfeil/infinity, un
+# serveur d'embeddings sans aucun rapport, sur 7997 et sur GET /models. Rien dans
+# le constat ne doit être réutilisable de l'un à l'autre.
+#
+# La seconde est un piège de sérialisation. La documentation du produit imprime
+# « {"error_code":0,"databases":[…]} », mais le gestionnaire construit un
+# « nlohmann::json », dont le type par défaut range ses clés alphabétiquement :
+# le fil porte « databases » d'abord. Un constat ancré sur l'ordre documenté ne
+# verrait donc aucune instance réelle — et l'ancrer sur l'ordre observé serait
+# parier sur une propriété de la bibliothèque, pas du produit.
+#
+# Cette section vérifie six choses. Que la sonde ne touche ni les documents ni
+# les routes d'écriture du même routeur. Que le constat tienne à la conjonction
+# de l'enveloppe du produit et d'un inventaire de bases — aucune des deux ne
+# nommant personne toute seule. Que les deux ordres de clés soient admis. Que
+# /configs confirme sans jamais conclure. Que le code HTTP n'entre nulle part.
+# Et que le rapport de scan remonte l'inventaire et la version sans recopier
+# l'arborescence de déploiement de l'exploitant.
+
+INFINITY_DB_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                    "infinity-db-databases-exposed.yaml")
+
+INFINITY_DB_LIST_ROUTE = "/databases"
+INFINITY_DB_CONFIGS_ROUTE = "/configs"
+
+# Ce que ListDatabaseHandler met réellement sur le fil : « databases » empilé
+# d'abord, « error_code » posé ensuite, puis un dump de nlohmann::json qui range
+# les deux clés alphabétiquement — l'ordre observé est donc celui-ci.
+INFINITY_DB_LIST_BODY = '{"databases":["default_db","my_db"],"error_code":0}'
+
+# Le même corps dans l'ordre qu'imprime la référence d'API du produit. Les deux
+# doivent conclure : le constat porte sur la conjonction des clés, pas sur leur
+# rang.
+INFINITY_DB_LIST_BODY_AS_DOCUMENTED = (
+    '{"error_code":0,"databases":["default_db","my_db"]}'
+)
+
+# ShowConfigsHandler : l'enveloppe, puis toute la configuration recopiée nom par
+# nom, chaque valeur passée par un value.ToString() — donc des chaînes, y compris
+# pour les ports et les tailles.
+INFINITY_DB_CONFIGS_BODY = json.dumps({
+    "buffer_manager_size": "4294967296",
+    "checkpoint_interval": "86400",
+    "client_port": "23817",
+    "cpu_limit": "16",
+    "data_dir": "/var/infinity/data",
+    "error_code": 0,
+    "http_port": "23820",
+    "log_dir": "/var/infinity/log",
+    "log_level": "Info",
+    "postgres_port": "5432",
+    "server_address": "0.0.0.0",
+    "time_zone": "UTC+8",
+    "version": "0.7.3",
+    "wal_dir": "/var/infinity/wal",
+}, separators=(",", ":"))
+
+INFINITY_DB_VERSION = "0.7.3"
+INFINITY_DB_NAMES = ["default_db", "my_db"]
+
+# La branche d'échec des mêmes gestionnaires : « error_code » y porte la valeur
+# de result.ErrorCode() — 3013 est kSyntaxError dans src/common/status.cppm — et
+# « error_msg » l'accompagne. C'est la même route, le même processus, et seul le
+# corps le sépare du constat.
+INFINITY_DB_ERROR_BODY = '{"error_code":3013,"error_msg":"Syntax error"}'
+
+# L'instance qui ne rend aucun nom. Le push_back est dans la boucle, donc la clé
+# n'existe pas quand il n'y a rien à empiler : il n'y a alors pas d'inventaire à
+# constater, seulement une enveloppe que toute réponse du produit porte.
+INFINITY_DB_EMPTY_BODY = '{"error_code":0}'
+
+# L'inventaire republié au fond du document d'une supervision qui agrège
+# plusieurs instances : les deux clés y sont, mais ce n'est pas Infinity qui a
+# répondu.
+INFINITY_DB_COMPOSITE_BODY = json.dumps({
+    "collected_at": "2026-09-13T06:00:00Z",
+    "engine": json.loads(INFINITY_DB_LIST_BODY),
+}, separators=(",", ":"))
+
+# Un autre service qui publie une liste de bases : « databases » appartient au
+# vocabulaire commun de tout ce qui sert des données, et seul il ne nomme
+# personne.
+INFINITY_DB_OTHER_LIST_BODY = (
+    '{"databases":["prod","staging"],"status":"ok"}'
+)
+
+# Et une API qui emploie « error_code » comme enveloppe sans être ce produit :
+# la convention n'est pas rare, c'est sa conjonction avec un inventaire de bases
+# qui l'est.
+INFINITY_DB_OTHER_ENVELOPE_BODY = (
+    '{"error_code":0,"data":{"items":[]},"message":"success"}'
+)
+
+# Ce qu'un autre service rend sur /configs : du JSON, une notion de port, mais ni
+# l'enveloppe du produit ni la signature d'écriture de ce gestionnaire-là.
+INFINITY_DB_OTHER_CONFIGS_BODY = (
+    '{"status":"ok","config":{"http_port":8080,"debug":false}}'
+)
+
+# Le même réglage rendu en entier plutôt qu'en chaîne. ShowConfigsHandler passe
+# chaque valeur par value.ToString() avant de la poser : un entier nu vient d'un
+# autre programme.
+INFINITY_DB_NUMERIC_CONFIGS_BODY = '{"error_code":0,"http_port":23820}'
+
+# oat++ quand la route n'est pas montée : ce que rend l'hôte qui n'est pas
+# Infinity, ou une version qui ne sert pas ce chemin.
+INFINITY_DB_NOT_FOUND_BODY = (
+    '{"errorCode":404,"description":"Not Found",'
+    '"message":"Requested resource = \'/databases\' not found"}'
+)
+
+
+def infinity_db_block():
+    doc = load(INFINITY_DB_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/databases" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne lit pas /databases — c'est pourtant l'énumération la "
+        "plus haute de la hiérarchie du produit, et la seule qui nomme ce que "
+        "l'API sans identifiant donne ensuite à lire"
+    )
+    return blocks[0]
+
+
+def infinity_db_scenario(databases=None, configs=None):
+    return {
+        INFINITY_DB_LIST_ROUTE: (databases if databases is not None
+                                 else (200, INFINITY_DB_LIST_BODY)),
+        INFINITY_DB_CONFIGS_ROUTE: (configs if configs is not None
+                                    else (200, INFINITY_DB_CONFIGS_BODY)),
+    }
+
+
+def infinity_db_fires(**kwargs):
+    """
+    Les réponses sont rangées dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    block = infinity_db_block()
+    scenario = infinity_db_scenario(**kwargs)
+
+    ordered = []
+    for path in block.get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{route}"
+        )
+        ordered.append(scenario[route])
+
+    verdicts = [dsl_matcher_hits(m, ordered)
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_infinity_db_probe_touches_neither_the_documents_nor_the_write_routes():
+    """
+    Le danger propre à ce template : le constat porte sur un routeur qui donne
+    tout sur les mêmes chemins, à la méthode près. POST et DELETE
+    /databases/{database_name} créent et suppriment une base, PUT
+    /databases/{database_name}/tables/{table_name} importe un fichier, POST, PUT
+    et DELETE sur .../docs écrivent dans le corpus, et POST /configs change la
+    configuration du serveur en cours d'exécution. GET .../docs, lui, est une
+    lecture — mais c'est l'export des documents : l'exfiltrer pour prouver qu'on
+    le peut serait faire le dommage qu'on signale.
+    """
+    doc = load(INFINITY_DB_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les deux lectures se font en GET : sur ce produit, toute autre "
+            "méthode sur les mêmes chemins écrit ou supprime"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : ici un corps n'a de sens que "
+            "pour créer, importer, insérer ou changer un réglage"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/docs", "le template touche les documents : GET .../docs est "
+                          "l'export du corpus vectorisé, c'est le dommage et "
+                          "non la preuve"),
+                ("/tables", "le template descend dans les tables : leur "
+                            "énumération, leurs colonnes et leurs index sont ce "
+                            "que le constat signale, pas ce qu'il a besoin de "
+                            "lire"),
+                ("/snapshots", "le template touche les instantanés : ils "
+                               "portent les données elles-mêmes"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_infinity_db_matcher_needs_the_envelope_and_the_inventory_together():
+    """
+    Le point qui fait ce template. « error_code » est une enveloppe que bien
+    d'autres API emploient, et « databases » un mot que tout ce qui sert des
+    données peut écrire : ni l'une ni l'autre ne nomme le produit. C'est leur
+    conjonction dans un même corps qui lui appartient, et c'est elle que le
+    constat exige.
+    """
+    assert infinity_db_fires(), (
+        "le template ne reconnaît pas une instance qui rend son inventaire de "
+        "bases à l'anonyme"
+    )
+
+    for body, name in (
+        (INFINITY_DB_ERROR_BODY,
+         "la branche d'échec du même gestionnaire, dont le code n'est pas nul — "
+         "rien n'a été rendu qu'on puisse constater"),
+        (INFINITY_DB_EMPTY_BODY,
+         "l'enveloppe seule, sans inventaire : le push_back est dans la boucle, "
+         "donc il n'y a aucune base à nommer"),
+        (INFINITY_DB_COMPOSITE_BODY,
+         "l'inventaire republié au fond du document d'une supervision"),
+        (INFINITY_DB_OTHER_LIST_BODY,
+         "un autre service qui publie une liste de bases sans l'enveloppe du "
+         "produit"),
+        (INFINITY_DB_OTHER_ENVELOPE_BODY,
+         "une API qui emploie « error_code » sans servir d'inventaire de bases"),
+        (INFINITY_DB_NOT_FOUND_BODY,
+         "le 404 d'un hôte qui ne sert pas ce chemin"),
+        ("", "une réponse vide"),
+        ('{"databases":["default_db"],"error_code":3013}',
+         "un inventaire rendu avec un code d'erreur non nul"),
+        ('{"databases":[],"error_code":0}',
+         "un tableau vide : il n'y a pas d'inventaire, seulement sa place"),
+    ):
+        assert not infinity_db_fires(databases=(200, body)), (
+            "le template conclut sur %s" % name
+        )
+
+
+def test_infinity_db_matcher_does_not_rest_on_the_order_of_the_keys():
+    """
+    Le piège de sérialisation. La référence d'API imprime « error_code » en
+    premier, le « nlohmann::json » du gestionnaire range ses clés
+    alphabétiquement et met « databases » devant. Un constat qui parierait sur
+    l'un des deux serait faux dans un cas sur deux — et le cas perdu serait le
+    bon, puisque c'est la bibliothèque qui décide de ce qui part sur le fil.
+    """
+    for body, why in (
+        (INFINITY_DB_LIST_BODY,
+         "l'ordre que nlohmann::json met réellement sur le fil"),
+        (INFINITY_DB_LIST_BODY_AS_DOCUMENTED,
+         "l'ordre qu'imprime la référence d'API du produit"),
+        ('{\n  "databases": [\n    "default_db"\n  ],\n  "error_code": 0\n}',
+         "un intermédiaire qui réindente le JSON qu'il relaie"),
+        ("\n" + INFINITY_DB_LIST_BODY + "\n",
+         "un intermédiaire qui encadre le corps de sauts de ligne"),
+        ('{"databases":["default_db"],"error_code":0}',
+         "l'instance neuve, qui ne porte que la base que toute instance porte"),
+    ):
+        assert infinity_db_fires(databases=(200, body)), (
+            "le template perd %s" % why
+        )
+
+
+def test_infinity_db_configs_read_confirms_without_carrying_the_verdict():
+    """
+    /configs sert deux choses et une seule compte : la même enveloppe sur une
+    seconde route du même routeur, et un réglage écrit comme ce gestionnaire-là
+    les écrit — value.ToString() avant de poser, donc une chaîne même pour un
+    port. Elle ne porte pas le constat : c'est l'inventaire qui l'établit, et une
+    instance dont on n'aurait que la configuration n'aurait rien rendu de ce que
+    le template signale.
+    """
+    for configs, why in (
+        ((200, INFINITY_DB_CONFIGS_BODY), "la configuration telle qu'elle sort"),
+        ((200, '{\n  "error_code": 0,\n  "http_port": "23820"\n}'),
+         "un intermédiaire qui réindente le JSON qu'il relaie"),
+        ((200, '{"error_code":0,"http_port":"9000","version":"0.2.0"}'),
+         "une instance ancienne, sur un autre port que le défaut"),
+    ):
+        assert infinity_db_fires(configs=configs), "le template perd %s" % why
+
+    for configs, why in (
+        ((200, INFINITY_DB_OTHER_CONFIGS_BODY),
+         "un autre service qui publie sa configuration sur le même chemin"),
+        ((200, INFINITY_DB_NUMERIC_CONFIGS_BODY),
+         "un réglage rendu en entier nu, alors que le gestionnaire passe chaque "
+         "valeur par value.ToString()"),
+        ((200, INFINITY_DB_ERROR_BODY),
+         "la branche d'échec du gestionnaire de configuration"),
+        ((404, INFINITY_DB_NOT_FOUND_BODY),
+         "l'hôte qui ne sert pas ce chemin"),
+        ((200, ""), "une réponse vide"),
+    ):
+        assert not infinity_db_fires(configs=configs), (
+            "le template conclut sur %s" % why
+        )
+
+
+def test_infinity_db_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Les deux gestionnaires rendent CODE_200 sur succès et CODE_500 sur échec,
+    avec la même enveloppe dans le corps. Un matcher de statut ne séparerait donc
+    rien ici, et l'exiger ferait perdre l'instance dont un intermédiaire réécrit
+    le code.
+    """
+    block = infinity_db_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas une expression : le constat se "
+        f"lit dans les corps, pas dans les codes — {sorted(kinds)}"
+    )
+
+    for expression in (block.get("matchers") or [])[0].get("dsl") or []:
+        for read in ("status_code_1", "status_code_2"):
+            assert read not in expression, (
+                f"l'expression « {expression} » lit {read} : le succès et "
+                "l'échec sortent du même gestionnaire, et seule l'enveloppe du "
+                "corps les sépare"
+            )
+
+    assert infinity_db_fires(databases=(203, INFINITY_DB_LIST_BODY),
+                             configs=(203, INFINITY_DB_CONFIGS_BODY)), (
+        "le template dépend des codes rendus, alors qu'un intermédiaire peut "
+        "servir les mêmes corps sous d'autres"
+    )
+
+
+def test_infinity_db_extracts_the_inventory_and_the_version_not_the_paths():
+    """
+    Le rapport de scan ne doit porter que ce qui sert à décider de la suite.
+    L'inventaire en est — il nomme ce que les routes de tables et de documents
+    donnent ensuite à lire — et la version aussi, qui date le routeur. Les
+    chemins rendus par /configs n'en sont pas : data_dir, wal_dir et log_dir sont
+    l'arborescence de déploiement de l'exploitant, et les recopier dans un
+    rapport qui circule l'y écrirait sans rien ajouter au constat.
+    """
+    extractors = infinity_db_block().get("extractors") or []
+    assert len(extractors) == 2, (
+        "le bloc porte %d extracteurs : l'inventaire et la version, et rien "
+        "d'autre" % len(extractors)
+    )
+
+    by_name = {e.get("name"): e for e in extractors}
+    assert set(by_name) == {"database", "version"}, sorted(by_name)
+
+    assert by_name["database"].get("part") == "body_1", (
+        "l'extracteur d'inventaire n'est pas borné à /databases : sous "
+        "req-condition le moteur l'évalue contre chaque réponse — "
+        f"part={by_name['database'].get('part')!r}"
+    )
+    assert by_name["version"].get("part") == "body_2", (
+        "l'extracteur de version n'est pas borné à /configs, la seule des deux "
+        f"réponses qui en porte une — part={by_name['version'].get('part')!r}"
+    )
+
+    serialised = json.dumps(extractors)
+    for leaked in ("data_dir", "wal_dir", "log_dir", "temp_dir",
+                   "resource_dir"):
+        assert leaked not in serialised, (
+            f"l'extracteur remonte {leaked} : le rapport de scan écrirait "
+            "l'arborescence de déploiement de l'exploitant"
+        )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_infinity_db_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher, et
+    `dsl_matcher_hits` les réévalue avec Python plutôt qu'avec le moteur de Go :
+    seul un scan contre un vrai serveur ferme la boucle. L'enjeu propre est ici
+    la paire d'extracteurs bornés chacun à sa réponse sous req-condition — un
+    `json` sur body_1, un `regex` sur body_2 — et le fait que les deux ordres de
+    clés concluent également.
+    """
+    def scan(scenario):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in scenario:
+                    self.reply(*scenario[self.path])
+                else:
+                    self.reply(404, INFINITY_DB_NOT_FOUND_BODY)
+
+            def do_POST(self):
+                seen.append("POST " + self.path)
+                self.reply(404, INFINITY_DB_NOT_FOUND_BODY)
+
+            def reply(self, code, payload, content_type="application/json"):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", INFINITY_DB_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "infinity-db-databases-exposed"}, r.stdout + r.stderr
+        extracted = [value for item in results
+                     for value in (item.get("extracted-results") or [])]
+        return seen, results, extracted
+
+    seen, hits, extracted = scan({
+        INFINITY_DB_LIST_ROUTE: (200, INFINITY_DB_LIST_BODY),
+        INFINITY_DB_CONFIGS_ROUTE: (200, INFINITY_DB_CONFIGS_BODY),
+    })
+    assert sorted(set(seen)) == [INFINITY_DB_CONFIGS_ROUTE,
+                                 INFINITY_DB_LIST_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits, (
+        "le scan perd l'instance qui rend son inventaire de bases à l'anonyme"
+    )
+    assert sorted(extracted) == sorted(INFINITY_DB_NAMES
+                                       + [INFINITY_DB_VERSION]), (
+        "le scan ne remonte pas l'inventaire et la version, ou en remonte "
+        f"autre chose : {extracted}"
+    )
+
+    _, documented, documented_extracted = scan({
+        INFINITY_DB_LIST_ROUTE: (200, INFINITY_DB_LIST_BODY_AS_DOCUMENTED),
+        INFINITY_DB_CONFIGS_ROUTE: (200, INFINITY_DB_CONFIGS_BODY),
+    })
+    assert documented, (
+        "le scan perd le corps écrit dans l'ordre de la référence d'API — or "
+        "l'ordre des clés appartient à la bibliothèque de sérialisation, pas "
+        "au produit"
+    )
+    assert sorted(documented_extracted) == sorted(
+        INFINITY_DB_NAMES + [INFINITY_DB_VERSION]), documented_extracted
+
+    for databases, why in (
+        ((500, INFINITY_DB_ERROR_BODY),
+         "la branche d'échec du même gestionnaire"),
+        ((200, INFINITY_DB_EMPTY_BODY),
+         "l'enveloppe seule, sans base à nommer"),
+        ((200, INFINITY_DB_COMPOSITE_BODY),
+         "l'inventaire republié au fond du document d'une supervision"),
+        ((200, INFINITY_DB_OTHER_LIST_BODY),
+         "un autre service qui publie une liste de bases"),
+    ):
+        _, quiet, _ = scan({
+            INFINITY_DB_LIST_ROUTE: databases,
+            INFINITY_DB_CONFIGS_ROUTE: (200, INFINITY_DB_CONFIGS_BODY),
+        })
+        assert quiet == [], "le scan conclut sur %s" % why
+
+    _, foreign, _ = scan({
+        INFINITY_DB_LIST_ROUTE: (200, INFINITY_DB_LIST_BODY),
+        INFINITY_DB_CONFIGS_ROUTE: (200, INFINITY_DB_OTHER_CONFIGS_BODY),
+    })
+    assert foreign == [], (
+        "le scan conclut alors que /configs n'a pas rendu l'enveloppe du "
+        "produit : la confirmation ne tient plus"
+    )
+
+    _, alone, _ = scan({
+        INFINITY_DB_LIST_ROUTE: (200, INFINITY_DB_LIST_BODY),
+    })
+    assert alone == [], (
+        "le scan conclut sur un hôte qui ne sert pas /configs — les deux "
+        "routes sont pourtant dans la table de routage depuis la 0.2.0"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

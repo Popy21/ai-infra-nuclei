@@ -1,0 +1,235 @@
+id: infinity-db-databases-exposed
+
+info:
+  name: Infinity Database - Unauthenticated Database Inventory Exposure
+  author: popy21
+  severity: high
+  description: |
+    Infinity (infiniflow/infinity) est la base de données « AI-native » publiée
+    par l'équipe de RAGFlow — vectoriel dense, plein texte, creux et hybride dans
+    un même moteur —, et c'est le moteur de documents que RAGFlow emploie. À ne
+    pas confondre avec michaelfeil/infinity, le serveur d'embeddings que le pack
+    couvre par ailleurs : même nom, produits distincts, ports et API sans rapport.
+    Son API HTTP n'a pas de garde, et ce n'est pas un réglage laissé à zéro :
+    c'est qu'il n'y en a aucune à régler. src/network/http_server_impl.cpp monte
+    ses routes par une suite plate de « router->route("GET", "/databases",
+    std::make_shared<ListDatabaseHandler>()) » — une centaine de lignes de la
+    même forme — sans interposer le moindre intercepteur, et pas un de ses
+    gestionnaires ne lit d'en-tête d'identité : le fichier ne contient ni
+    « Authorization », ni « token », ni « api_key ». La référence d'API du
+    produit dit la même chose par son silence : les exemples s'adressent à
+    « http://localhost:23820 » et ne portent que « accept: application/json » et
+    « content-type: application/json » ; aucune clé, aucun jeton, aucun en-tête
+    d'autorisation n'y est documenté, nulle part.
+    Le défaut de liaison va dans le mauvais sens. conf/infinity_conf.toml pose
+    « server_address = "0.0.0.0" » et « http_port = 23820 » : l'instance sort de
+    la machine dès le premier lancement, sans qu'aucun réglage soit touché.
+    GET /databases est la lecture. ListDatabaseHandler parcourt le résultat de
+    ListDatabases(), empile chaque nom par « json_response["databases"].push_back
+    (db_name) », puis pose « json_response["error_code"] = 0 » avant de rendre
+    « json_response.dump() ». Deux clés, et leur conjonction nomme le produit :
+    « error_code » est l'enveloppe que tous les gestionnaires de ce fichier
+    posent — c'est la convention du produit, pas celle de HTTP —, et elle
+    accompagne ici un inventaire de bases de données. C'est cette conjonction que
+    le constat lit.
+    L'ordre des clés, lui, n'entre pas dans le constat, et c'est délibéré. Le
+    gestionnaire construit un « nlohmann::json », dont le type par défaut range
+    ses clés par ordre alphabétique à la sérialisation : le fil porte donc
+    « databases » avant « error_code », là où l'exemple publié par la
+    documentation imprime l'inverse. Les deux écritures sont admises plutôt que
+    l'une choisie contre l'autre.
+    La seconde lecture confirme et date. GET /configs, servi par
+    ShowConfigsHandler, pose la même enveloppe puis recopie toute la
+    configuration du serveur, nom par nom — « json_response[config_name] =
+    config_value », où config_value est un value.ToString(), donc une chaîne pour
+    chaque réglage, entiers compris. La liste des réglages rendus est écrite à la
+    main dans physical_show_configs_impl.cpp, et « http_port » comme « version »
+    en font partie depuis les premières versions.
+    Le code HTTP ne tranche rien et n'entre nulle part dans le constat. Les deux
+    gestionnaires rendent CODE_200 sur succès et CODE_500 sur échec, avec le même
+    « error_code » dans le corps — seul le corps les sépare.
+  impact: |
+    L'inventaire d'abord : la réponse nomme chaque base de données servie par
+    l'instance. Mais l'essentiel est que la même API sans identifiant descende
+    jusqu'aux documents, et le fichier de routage l'établit ligne à ligne.
+    En lecture : GET /databases/{database_name}/tables énumère les tables,
+    GET .../tables/{table_name}/columns rend leurs colonnes — donc les types
+    vectoriels, leur dimension et leur schéma —, GET .../indexes les index
+    construits dessus, et GET /databases/{database_name}/tables/{table_name}/docs
+    est servi par SelectHandler : c'est l'export des documents. Ce qui est en jeu
+    n'est donc pas la preuve qu'un port répond, c'est la lecture du corpus
+    vectorisé de l'organisation — les textes indexés, leurs métadonnées et les
+    plongements construits dessus.
+    En écriture, et sur les mêmes chemins sans plus de garde : POST
+    /databases/{database_name} crée une base, DELETE la supprime, DELETE
+    /databases/{database_name}/tables/{table_name} supprime une table, PUT sur ce
+    même chemin importe un fichier (ImportHandler), et POST, PUT et DELETE sur
+    .../docs insèrent, modifient et suppriment des documents. POST /configs
+    modifie enfin la configuration du serveur en cours d'exécution. Un appelant
+    anonyme peut donc empoisonner un corpus de RAG — y écrire les documents que
+    le modèle citera ensuite — aussi bien que le détruire.
+    GET /configs ajoute la topologie de l'hôte : data_dir, wal_dir, log_dir,
+    temp_dir et resource_dir, donc l'arborescence de déploiement ; client_port,
+    postgres_port et les peer_server_ip/peer_server_port, donc les autres portes
+    du même processus — le port Thrift et le port au protocole PostgreSQL, qui
+    n'ont pas davantage d'authentification ; cpu_limit et buffer_manager_size,
+    donc la taille de la machine. Les identifiants de stockage objet, eux, n'y
+    sont pas : physical_show_configs_impl.cpp énumère ses réglages à la main et
+    n'y met ni access_key ni secret_key.
+    GET /instance/queries, enfin, liste les requêtes en cours d'exécution avec
+    leur query_kind, leur session_id et leur temps de consommation : de quoi lire
+    en continu ce que l'exploitant fait tourner.
+  remediation: |
+    Il n'y a pas de clé à poser : le serveur HTTP n'implémente aucun mécanisme
+    d'authentification, et la référence d'API n'en documente aucun. La fermeture
+    est donc entièrement celle du réseau.
+    Passer « server_address » à 127.0.0.1 dans infinity_conf.toml, puisque le
+    défaut « 0.0.0.0 » est précisément l'exposition, et ne pas publier le port
+    23820 du conteneur sur une interface publique. Fermer les autres portes du
+    même processus dans le même mouvement — client_port 23817 (Thrift) et
+    postgres_port 5432 —, qui ne sont pas plus gardées que l'API HTTP et donnent
+    le même accès aux données. Quand l'instance doit être atteinte depuis un
+    autre hôte, la placer derrière un intermédiaire qui authentifie tout le
+    préfixe, et non seulement les chemins que l'on a en tête : l'API expose la
+    lecture et l'écriture sur les mêmes chemins, à la méthode près.
+    Après une exposition, tenir pour lus le nom des bases et des tables, leur
+    schéma, leurs index et les documents qu'elles portent — donc le corpus
+    vectorisé lui-même, et ce que les plongements en laissent reconstruire.
+    Vérifier ensuite l'intégrité plutôt que la seule confidentialité, puisque les
+    mêmes chemins acceptaient l'écriture : confronter le nombre de documents et
+    la liste des tables à ce qui a été déployé, et chercher dans les journaux les
+    imports et les suppressions qu'on ne s'explique pas. Relire enfin les
+    réglages rendus par /configs — ils ont été lus, et POST /configs a pu les
+    changer.
+  reference:
+    - https://github.com/infiniflow/infinity
+    - https://github.com/infiniflow/infinity/blob/main/src/network/http_server_impl.cpp
+    - https://github.com/infiniflow/infinity/blob/main/src/executor/operator/physical_show/physical_show_configs_impl.cpp
+    - https://github.com/infiniflow/infinity/blob/main/conf/infinity_conf.toml
+    - https://infiniflow.org/docs/dev/http_api_reference
+  metadata:
+    max-request: 2
+    vendor: infiniflow
+    product: infinity-db
+  tags: ai,llm,rag,vectordb,infinity,infiniflow,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et la première porte tout le constat.
+  #
+  # GET /databases est l'énumération la plus haute de la hiérarchie du produit :
+  # ListDatabaseHandler ouvre une session, appelle ListDatabases() et recopie des
+  # noms. Rien n'est construit, rien n'est écrit, aucun document n'est lu.
+  #
+  # GET /configs confirme le produit et le date. Elle est servie depuis la 0.2.0,
+  # comme /databases — les deux routes sont déjà dans la table de routage de
+  # cette version —, donc l'exiger ne tait aucune génération.
+  #
+  # GET /instance/queries dirait la même chose du même processus, mais elle est
+  # entrée dans la table de routage après la 0.2.0, qui ne la porte pas : en
+  # faire une exigence tairait précisément les instances les plus anciennes,
+  # celles qui traînent exposées. Elle est signalée dans le constat, elle n'y
+  # participe pas.
+  #
+  # En lecture seule, et strictement. Le même routeur, sans plus de garde, porte
+  # POST et DELETE /databases/{database_name}, PUT
+  # /databases/{database_name}/tables/{table_name} (import de fichier), POST, PUT
+  # et DELETE sur .../docs, et POST /configs, qui change la configuration du
+  # serveur en cours d'exécution. C'est l'abus que ce constat signale ; ce n'est
+  # pas la façon de l'établir. GET .../docs est une lecture, mais c'est l'export
+  # du corpus : l'exfiltrer pour prouver qu'on le peut serait faire le dommage
+  # qu'on signale.
+  - method: GET
+    path:
+      - "{{BaseURL}}/databases"
+      - "{{BaseURL}}/configs"
+
+    # req-condition accumule body_N pour que les deux réponses soient jugées
+    # ensemble : la confirmation du produit n'a pas à conclure de son côté.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture du document, et c'est elle qui dit que l'instance a
+          # répondu d'elle-même : l'inventaire republié au fond du document
+          # composite d'une supervision porterait les mêmes clés sous une clé à
+          # elle.
+          #
+          # Les deux noms en alternative plutôt qu'un seul, parce que l'ordre des
+          # clés est une propriété de la bibliothèque de sérialisation et non du
+          # produit : « nlohmann::json » range ses clés alphabétiquement, donc le
+          # fil porte « databases » d'abord, là où l'exemple de la documentation
+          # imprime « error_code ». Le constat n'a pas à parier sur l'un des deux.
+          #
+          # Les \s* laissent passer l'intermédiaire qui réindente ce qu'il
+          # relaie, et trim_space le saut de ligne qu'il ajoute.
+          - 'regex("^\\{\\s*\"(databases|error_code)\"\\s*:", trim_space(body_1))'
+
+          # L'inventaire lui-même : un tableau, et au moins un nom dedans.
+          # ListDatabaseHandler ne crée la clé qu'en empilant un nom — le
+          # push_back est dans la boucle —, donc une clé présente est une base
+          # nommée. Le guillemet exigé après le crochet tient le type : ce sont
+          # des chaînes, value.GetVarchar() ne rend rien d'autre.
+          #
+          # La valeur n'est pas contrainte au-delà : « default_db » est la base
+          # que toute instance porte, mais les autres sont nommées par
+          # l'exploitant.
+          - 'regex("\"databases\"\\s*:\\s*\\[\\s*\"", body_1)'
+
+          # L'enveloppe du produit, exigée à zéro. C'est la convention de ce
+          # fichier — chaque gestionnaire pose « error_code », succès comme
+          # échec — et c'est ce qui sépare l'inventaire rendu de l'erreur rendue
+          # par la même route sur la même instance, qui porte un code non nul et
+          # un « error_msg ».
+          #
+          # Le délimiteur qui suit le zéro est ce qui empêche de lire le début
+          # d'un code d'erreur comme un succès : « "error_code":3021 » commence
+          # par un chiffre, il ne s'arrête pas là.
+          #
+          # Seule, cette clé ne nomme personne ; c'est sa conjonction avec un
+          # inventaire de bases de données qui est propre au produit.
+          - 'regex("\"error_code\"\\s*:\\s*0\\s*[,}]", body_1)'
+
+          # La confirmation, et elle tient à deux choses. La même enveloppe sur
+          # une seconde route du même routeur, d'abord : un serveur qui n'est pas
+          # Infinity ne rend pas « error_code » sur /configs, il rend son propre
+          # 404.
+          - 'regex("\"error_code\"\\s*:\\s*0\\s*[,}]", body_2)'
+
+          # Et un réglage que ce gestionnaire-là est seul à publier de cette
+          # façon. « http_port » est énuméré à la main dans
+          # physical_show_configs_impl.cpp, et sa valeur passe par un
+          # value.ToString() avant d'être posée dans le JSON : un entier rendu
+          # comme une chaîne, ce qui est la signature d'écriture de cette route.
+          #
+          # C'est aussi le réglage le plus parlant du lot — le port sur lequel le
+          # scan vient de parler, republié par l'instance elle-même.
+          - 'regex("\"http_port\"\\s*:\\s*\"[0-9]+\"", body_2)'
+
+    extractors:
+      # Les bases que l'appelant anonyme apprend, et par elles ce que les routes
+      # de tables et de documents du même processus le laissent atteindre. Le
+      # parcours du tableau plutôt que sa première entrée : « default_db » ouvre
+      # toute instance, et n'en nommer qu'une tairait celles que l'exploitant a
+      # créées — c'est-à-dire tout le renseignement.
+      #
+      # Borné à body_1 : sous req-condition le moteur évalue chaque extracteur
+      # contre chaque réponse, et la réponse de /configs ne porte pas cette clé.
+      - type: json
+        part: body_1
+        name: database
+        json:
+          - '.databases[]'
+
+      # La version exacte de l'instance, donc la génération du routeur qu'elle
+      # sert et les avis du dépôt auxquels elle répond. Le reste de /configs est
+      # délibérément laissé de côté : les chemins de data_dir et de wal_dir sont
+      # l'arborescence de déploiement de l'exploitant, et les recopier dans un
+      # rapport de scan qui circule l'y écrirait sans rien ajouter au constat.
+      - type: regex
+        part: body_2
+        name: version
+        group: 1
+        regex:
+          - '"version"\s*:\s*"([^"]+)"'
