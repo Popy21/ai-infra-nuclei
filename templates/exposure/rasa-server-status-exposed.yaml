@@ -1,0 +1,228 @@
+id: rasa-server-status-exposed
+
+info:
+  name: Rasa Server - Unauthenticated Model Status Endpoint Exposure
+  author: popy21
+  severity: high
+  description: |
+    Rasa (RasaHQ/rasa) est le framework d'assistants conversationnels le plus
+    déployé en auto-hébergement. Son serveur HTTP est lancé par « rasa run
+    --enable-api » — le drapeau est un « action="store_true" » de
+    rasa/cli/arguments/run.py, et la documentation le dit dans les mêmes termes :
+    « By default, running a Rasa server does not enable the API endpoints ».
+    Le processus écoute par défaut sur le port 5005 et sur toutes les interfaces,
+    rasa/core/constants.py posant « DEFAULT_SERVER_PORT = 5005 » et
+    « DEFAULT_SERVER_INTERFACE = "0.0.0.0" », qui sont les défauts de « -p » et de
+    « -i » dans le même fichier d'arguments.
+    GET /status est la lecture, et c'est une route explicitement placée derrière
+    le contrôle d'authentification : dans rasa/server.py son handler porte les
+    trois décorateurs « @app.get("/status") », « @requires_auth(app, auth_token) »
+    et « @ensure_loaded_agent(app) », puis rend littéralement model_file, model_id
+    et num_active_training_jobs. Le corps ne dit donc pas seulement qu'un Rasa
+    répond : il dit qu'il a rendu la charge utile d'une route gardée à un appelant
+    qui n'a présenté ni jeton ni JWT — c'est-à-dire qu'aucun des deux n'est
+    configuré sur l'instance.
+    La clé du milieu est la seule à avoir bougé entre les générations : elle vaut
+    « fingerprint » sur la 2.8.34 — « model.fingerprint_from_path(...) » — et
+    « model_id » depuis la 3.0.0. model_file et num_active_training_jobs, eux,
+    ouvrent et ferment le littéral des deux côtés ; ce sont donc eux, et eux
+    seuls, que le constat lit.
+    L'absence d'authentification est le défaut de configuration, pas un oubli
+    d'exploitant. La signature est « def create_app(agent=None, cors_origins="*",
+    auth_token: Optional[Text] = None, response_timeout=DEFAULT_RESPONSE_TIMEOUT,
+    jwt_secret: Optional[Text] = None, jwt_private_key: Optional[Text] = None,
+    jwt_method="HS256", endpoints=None) » : les deux mécanismes sont nuls par
+    défaut, « --auth-token » vaut « os.getenv(AUTH_TOKEN_ENV) » donc None sans
+    variable d'environnement, et « app.config["USE_JWT"] = True » n'est posé que
+    sous « if jwt_secret and jwt_method ». Le corps de requires_auth en tire la
+    conséquence dans une branche écrite pour cela — « elif token is None and
+    app.config.get("USE_JWT") is None:  # authentication is disabled » — qui
+    exécute le handler sans la moindre vérification. Toutes les routes portant ce
+    décorateur répondent donc au même anonyme.
+    La documentation du dépôt (docs/docs/http-api.mdx) le confirme côté produit :
+    « Make sure to secure your server, either by restricting access to the server
+    (e.g. using firewalls), or by enabling an authentication method » et « We
+    recommend that you don't expose the Rasa Server to the outside world
+    directly, but rather connect to it via e.g. Nginx ». Le durcissement est à la
+    charge de l'exploitant.
+    La seconde lecture confirme le produit sans rien dire de l'authentification.
+    GET / est ajoutée par add_root_route(app), dont le handler tient en une ligne
+    — « async def hello(request): return response.text("Hello from Rasa: " +
+    rasa.__version__) » — et elle est servie même sans « --enable-api », puisque
+    rasa/core/run.py appelle « server.add_root_route(app) » dans les deux
+    branches de configure_app, y compris _create_app_without_api. Elle ne porte
+    pas @requires_auth : elle nomme le produit et le date, elle ne prouve rien.
+    Le code HTTP ne tranche rien et n'entre nulle part dans le constat. /status
+    rend 200 quand l'instance est ouverte, 401 quand un jeton est posé
+    (ErrorResponse « NotAuthenticated ») et 409 quand aucun modèle n'est chargé
+    (« No agent loaded. […] »). Les trois sont du JSON servi par le même
+    processus : seul le corps les sépare.
+  impact: |
+    Le corps de /status est déjà un renseignement : model_file est un chemin du
+    système de fichiers du serveur, donc l'arborescence de déploiement et le nom
+    de l'archive de modèle en service, et num_active_training_jobs dit si un
+    entraînement tourne à cet instant.
+    Mais l'essentiel est ce que la même absence d'identifiant ouvre par ailleurs.
+    L'inventaire est relevé dans rasa/server.py, et il est clos : dix-sept routes
+    portent « @requires_auth(app, auth_token) », c'est-à-dire /status et seize
+    autres, toutes atteignables par l'appelant qui vient d'obtenir ce corps.
+    En lecture : GET /domain rend le domaine complet de l'assistant — intents,
+    entités, slots, formulaires et le texte de toutes ses réponses — en JSON ou
+    en YAML selon l'en-tête Accept ; GET /conversations/<conversation_id>/tracker
+    rend le tracker d'une conversation, événements compris, et GET
+    /conversations/<conversation_id>/story la même conversation en histoire de
+    test. Les deux dernières prennent l'identifiant dans le chemin et server.py
+    ne sert aucune route qui les énumère : lire une conversation suppose d'en
+    connaître l'identifiant, qui est le sender_id du connecteur — et la
+    documentation illustre elle-même la route avec « default ».
+    En écriture sur les conversations : POST et PUT
+    /conversations/<conversation_id>/tracker/events ajoutent ou remplacent
+    l'historique d'événements, POST .../messages y insère un message, POST
+    .../trigger_intent y déclenche un intent, et POST .../execute exécute
+    l'action nommée dans le corps de la requête. Récrire un tracker, c'est
+    décider de ce que l'assistant croit savoir de son interlocuteur avant sa
+    prochaine réponse.
+    Sur le modèle enfin : PUT /model lit model_file, model_server et
+    remote_storage dans le corps, monte model_server en EndpointConfig et
+    remplace l'agent en service par celui qu'il charge — le serveur va donc
+    chercher l'archive là où l'appelant le lui indique. DELETE /model remplace
+    l'agent par un « Agent(lock_store=...) » vide, et l'assistant cesse de
+    répondre. POST /model/train fait tourner un entraînement complet sur les
+    données fournies, aux frais de l'exploitant, et POST /model/predict,
+    /model/parse, /model/test/stories et /model/test/intents font travailler le
+    modèle en service.
+    GET /version, qui ne porte pas le décorateur, publie par ailleurs la version
+    exacte et sa MINIMUM_COMPATIBLE_VERSION, donc les avis auxquels l'instance
+    répond.
+  remediation: |
+    Poser un des deux mécanismes, puisque requires_auth ne tombe dans sa branche
+    « authentication is disabled » que lorsque les deux manquent : « rasa run
+    --enable-api --auth-token <jeton> » (ou la variable d'environnement
+    AUTH_TOKEN), ou « --jwt-secret <secret> » (JWT_SECRET), que la documentation
+    recommande de passer par l'environnement plutôt que par la ligne de commande.
+    Connaître ce que chacun garde : le jeton se présente en paramètre de requête
+    — « curl -XGET localhost:5005/conversations/default/tracker?token=… » est
+    l'exemple de la documentation —, donc il traverse les journaux d'accès de
+    tout ce qui relaie. Le JWT distingue les porteurs : sufficient_scope() rend
+    True sans condition pour le rôle « admin », et pour le rôle « user »
+    seulement quand le conversation_id de la route égale le username de la charge
+    utile — les routes qui n'en portent pas, /domain et /model compris, ne sont
+    donc ouvertes qu'au rôle admin.
+    Ne pas publier le port : le défaut de « -i » est 0.0.0.0, donc « rasa run »
+    écoute sur toutes les interfaces sans qu'aucun drapeau ne soit passé. Lier
+    l'instance à 127.0.0.1 et placer devant elle un intermédiaire qui
+    authentifie — c'est la recommandation du dépôt lui-même, « connect to it via
+    e.g. Nginx ». Et ne pas passer « --enable-api » quand seul le webhook du
+    canal est nécessaire : sans ce drapeau, create_app n'est pas appelé et aucune
+    des dix-sept routes n'est montée.
+    Après une exposition, tenir pour lus le domaine de l'assistant et les
+    trackers des conversations dont l'identifiant était devinable — donc les
+    données personnelles qu'ils portent. Vérifier que le modèle en service est
+    toujours celui du déploiement, en confrontant model_file à ce qui a été
+    publié, puisque PUT /model a pu le remplacer par une archive tierce, et
+    chercher dans les journaux les entraînements et les exécutions d'actions
+    qu'on ne s'explique pas.
+  reference:
+    - https://github.com/RasaHQ/rasa
+    - https://github.com/RasaHQ/rasa/blob/main/rasa/server.py
+    - https://github.com/RasaHQ/rasa/blob/main/rasa/core/run.py
+    - https://github.com/RasaHQ/rasa/blob/main/rasa/core/constants.py
+    - https://github.com/RasaHQ/rasa/blob/main/rasa/cli/arguments/run.py
+    - https://github.com/RasaHQ/rasa/blob/main/docs/docs/http-api.mdx
+  metadata:
+    max-request: 2
+    vendor: rasahq
+    product: rasa
+  tags: ai,nlp,chatbot,rasa,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et la première porte tout le constat.
+  #
+  # GET /status est la seule route gardée que l'on puisse lire sans rien faire
+  # faire à l'instance : son handler ne consulte que trois attributs déjà en
+  # mémoire — model_filename, model_id et la valeur d'un compteur partagé. Elle
+  # porte pourtant « @requires_auth(app, auth_token) », exactement comme les
+  # seize autres ; obtenir son corps, c'est donc avoir traversé le même contrôle
+  # que celui de GET /domain ou de PUT /model, sans en toucher aucune.
+  #
+  # GET / confirme le produit et le date. add_root_route la monte dans les deux
+  # branches de configure_app, donc elle répond aussi sur une instance lancée
+  # sans « --enable-api » — c'est pour cela qu'elle ne peut pas porter le
+  # constat : elle ne dit rien de l'authentification, qu'elle ne traverse pas.
+  #
+  # En lecture, et strictement. Le même processus sert PUT /model, qui remplace
+  # le modèle en service par celui d'une URL fournie dans le corps, DELETE
+  # /model, qui arrête l'assistant, POST /model/train, qui lance un
+  # entraînement, et les routes /conversations/…, qui lisent et récrivent
+  # l'historique des conversations. C'est l'abus que ce constat signale, pas la
+  # façon de l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/status"
+      - "{{BaseURL}}/"
+
+    # req-condition accumule body_N pour que les deux réponses soient jugées
+    # ensemble. Sans lui, la salutation de la racine conclurait de son côté — or
+    # elle est servie par toute instance vivante, API activée ou non.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture de la charge utile gardée, et c'est elle qui dit que
+          # l'instance a répondu d'elle-même : model_file est la première clé
+          # insérée dans le littéral du handler, et response.json() rend le dict
+          # dans l'ordre d'insertion. L'ancrage écarte la même charge utile
+          # retrouvée au fond du document composite d'une supervision.
+          #
+          # Les \s* laissent passer l'intermédiaire qui réindente ce qu'il
+          # relaie, et trim_space le saut de ligne qu'il ajoute.
+          #
+          # La valeur n'est pas contrainte : c'est un chemin du serveur, qui
+          # n'a pas de forme commune entre un déploiement conteneurisé et une
+          # archive nommée à la main.
+          - 'regex("^\\{\\s*\"model_file\"\\s*:", trim_space(body_1))'
+
+          # La clé qui ferme le littéral, exigée avec un chiffre pour valeur.
+          # C'est elle qui nomme le produit : aucun autre service ne publie un
+          # compteur d'entraînements sur sa route d'état, là où « model_file »
+          # seul appartient au vocabulaire commun de tout ce qui sert un modèle.
+          #
+          # Elle est aussi ce qui rend inutile d'exiger la clé du milieu, la
+          # seule à avoir bougé : « fingerprint » sur la 2.8.34, « model_id »
+          # depuis la 3.0.0. Ces deux-là encadrent le littéral des deux côtés,
+          # donc le constat vaut sur les deux générations sans alternative.
+          #
+          # Le document n'est pas exigé plat : l'ancrage ci-dessus et cette clé
+          # font déjà le travail, et le tenir pour plat serait parier que la
+          # charge utile ne gagnera jamais un champ.
+          - 'regex("\"num_active_training_jobs\"\\s*:\\s*[0-9]", body_1)'
+
+          # La confirmation du produit, prise depuis le début du corps.
+          # response.text() rend le littéral seul, en text/plain : l'ancrage est
+          # ce qui distingue la réponse du serveur d'un runbook ou d'un miroir
+          # de documentation qui citerait la phrase au milieu du sien.
+          #
+          # Le chiffre qui suit est là pour que la phrase soit suivie de ce que
+          # le handler y concatène — rasa.__version__ — et pas d'autre chose.
+          - 'regex("^Hello from Rasa: [0-9]", trim_space(body_2))'
+
+    extractors:
+      # La version exacte de l'instance, donc les avis du dépôt auxquels elle
+      # répond et la génération du handler /status qu'elle sert.
+      #
+      # Bornée à body_2 : sous req-condition le moteur évalue chaque extracteur
+      # contre chaque réponse, et la charge utile de /status ne porte aucun
+      # numéro de version.
+      #
+      # Un seul extracteur, et c'est délibéré : model_file est un chemin du
+      # système de fichiers de l'exploitant, et le recopier dans le rapport de
+      # scan y écrirait son arborescence de déploiement. Le constat n'en a pas
+      # besoin — la clé suffit à l'établir, sa valeur ne l'améliore pas.
+      - type: regex
+        part: body_2
+        name: version
+        group: 1
+        regex:
+          - 'Hello from Rasa: ([0-9][^\s]*)'

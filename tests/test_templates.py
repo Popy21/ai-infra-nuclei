@@ -25996,6 +25996,492 @@ def test_portkey_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Rasa — RasaHQ/rasa, le framework d'assistants conversationnels le plus déployé
+# en auto-hébergement. Le serveur HTTP se lance par « rasa run --enable-api » et
+# écoute par défaut sur 0.0.0.0:5005.
+#
+# Ce que ce template a de particulier tient à la nature de sa lecture. Ailleurs
+# dans le pack, le constat se lit sur une route ouverte et il faut établir ce
+# qu'elle implique du reste du produit — une clé absente, un compte non
+# configuré, un drapeau de lancement. Ici, GET /status porte elle-même
+# « @requires_auth(app, auth_token) » : son corps EST le constat, puisque
+# requires_auth n'exécute le handler sans identifiant que dans sa branche
+# « elif token is None and app.config.get("USE_JWT") is None:  # authentication
+# is disabled ». Toute la difficulté se déplace donc sur un seul point : ne
+# jamais confondre ce corps-là avec l'une des deux réponses d'erreur que la même
+# route rend sur la même instance, ni avec la salutation de la racine, qui elle
+# ne traverse aucun contrôle.
+#
+# Cette section vérifie six choses. Que la sonde ne touche aucune des seize
+# autres routes gardées, dont PUT /model et POST /model/train. Que la charge
+# utile gardée soit exigée depuis son ouverture. Que les deux générations du
+# handler soient reconnues — « fingerprint » sur la 2.8.34, « model_id » depuis
+# la 3.0.0 — sans que la clé du milieu entre dans le constat. Que la racine
+# confirme le produit sans jamais porter le verdict. Que le code HTTP n'entre
+# nulle part, les trois réponses de /status étant du JSON du même processus. Et
+# que le rapport de scan remonte la version sans recopier le chemin de
+# déploiement de l'exploitant.
+
+RASA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                             "rasa-server-status-exposed.yaml")
+
+RASA_STATUS_ROUTE = "/status"
+RASA_ROOT_ROUTE = "/"
+
+# Le littéral du handler depuis la 3.0.0 : model_file, model_id,
+# num_active_training_jobs, dans cet ordre, rendus par response.json().
+RASA_STATUS_BODY = json.dumps({
+    "model_file": "models/20260913-120000-clean-ratio.tar.gz",
+    "model_id": "9a1f0c2d5e7b4f18",
+    "num_active_training_jobs": 0,
+}, separators=(",", ":"))
+
+# Le même handler sur la 2.8.34, où la clé du milieu s'appelait « fingerprint »
+# et portait « model.fingerprint_from_path(...) ». C'est la seule des trois à
+# avoir bougé, et c'est pour cela que le constat ne la lit pas.
+RASA_STATUS_BODY_LEGACY = json.dumps({
+    "model_file": "/app/models/20210714-104606.tar.gz",
+    "fingerprint": "2b0d4c0a4b6f4a2e8c1d3f5a7b9c1e30",
+    "num_active_training_jobs": 0,
+}, separators=(",", ":"))
+
+# La même instance pendant qu'un POST /model/train tourne : le compteur est un
+# multiprocessing.Value("I"), donc un entier, et les deux états sont également
+# exposés.
+RASA_STATUS_BODY_TRAINING = json.dumps({
+    "model_file": "models/20260913-120000-clean-ratio.tar.gz",
+    "model_id": "9a1f0c2d5e7b4f18",
+    "num_active_training_jobs": 2,
+}, separators=(",", ":"))
+
+# add_root_route(app) : response.text("Hello from Rasa: " + rasa.__version__),
+# donc le littéral seul, en text/plain.
+RASA_ROOT_BODY = "Hello from Rasa: 3.6.21"
+
+# Ce que la même route rend quand un jeton est posé : requires_auth lève son
+# ErrorResponse avant d'entrer dans le handler, et handle_error_response en fait
+# du JSON. C'est la réponse de l'instance protégée — celle qu'il ne faut jamais
+# lire comme un constat.
+RASA_NOT_AUTHENTICATED_BODY = json.dumps({
+    "version": "3.6.21",
+    "status": "failure",
+    "message": "User is not authenticated.",
+    "reason": "NotAuthenticated",
+    "details": {},
+    "help": "https://rasa.com/docs/rasa/user-guide/configuring-http-api/"
+            "#security-considerations",
+    "code": 401,
+}, separators=(",", ":"))
+
+# L'autre réponse d'erreur, celle d'ensure_loaded_agent : l'instance est bien
+# ouverte, mais aucun modèle n'est chargé. Le corps ne porte alors pas la charge
+# utile, donc il n'y a rien à constater — l'exposition ne se lit pas sur ce
+# qu'on devine, seulement sur ce qui a été rendu.
+RASA_NO_AGENT_BODY = json.dumps({
+    "version": "3.6.21",
+    "status": "failure",
+    "message": "No agent loaded. To continue processing, a model of a trained "
+               "agent needs to be loaded.",
+    "reason": "Conflict",
+    "details": {},
+    "help": "https://rasa.com/docs/rasa/user-guide/configuring-http-api/",
+    "code": 409,
+}, separators=(",", ":"))
+
+# La charge utile republiée au fond du document d'une supervision qui agrège
+# plusieurs instances : les trois clés y sont, mais ce n'est pas Rasa qui a
+# répondu.
+RASA_COMPOSITE_BODY = json.dumps({
+    "collected_at": "2026-09-13T06:00:00Z",
+    "assistant": json.loads(RASA_STATUS_BODY),
+}, separators=(",", ":"))
+
+# Ce qu'un autre service rend sur une route d'état : « model_file » appartient au
+# vocabulaire commun de tout ce qui sert un modèle, et seul il ne nomme personne.
+RASA_OTHER_MODEL_SERVER_BODY = json.dumps({
+    "model_file": "/models/intent-classifier.onnx",
+    "loaded": True,
+}, separators=(",", ":"))
+
+# Une page qui cite la salutation, et la salutation republiée sous une clé :
+# c'est un littéral de texte brut, donc n'importe quel document peut le porter.
+RASA_QUOTING_PAGE_BODY = (
+    "<html><body><h1>Runbook</h1><p>Un serveur Rasa sain répond « Hello from "
+    "Rasa: 3.6.21 » sur sa racine.</p></body></html>"
+)
+RASA_WRAPPED_ROOT_BODY = json.dumps({"upstream": RASA_ROOT_BODY},
+                                    separators=(",", ":"))
+RASA_GENERIC_WELCOME_BODY = "<html><body><h1>Welcome to nginx!</h1></body></html>"
+
+# Sanic quand la route n'est pas montée : l'instance lancée sans
+# « --enable-api », qui sert la racine et rien d'autre.
+RASA_NOT_FOUND_BODY = json.dumps({
+    "description": "Not Found",
+    "status": 404,
+    "message": "Requested URL /status not found",
+}, separators=(",", ":"))
+
+
+def rasa_block():
+    doc = load(RASA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}/status" in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne lit pas /status — c'est pourtant la seule route gardée "
+        "du produit qu'on puisse lire sans rien lui faire faire, et la seule "
+        "dont le corps dise à lui seul qu'aucun identifiant n'est demandé"
+    )
+    return blocks[0]
+
+
+def rasa_scenario(status=None, root=None):
+    return {
+        RASA_STATUS_ROUTE: (status if status is not None
+                            else (200, RASA_STATUS_BODY)),
+        RASA_ROOT_ROUTE: (root if root is not None else (200, RASA_ROOT_BODY)),
+    }
+
+
+def rasa_fires(**kwargs):
+    """
+    Les réponses sont rangées dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    block = rasa_block()
+    scenario = rasa_scenario(**kwargs)
+
+    ordered = []
+    for path in block.get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{route}"
+        )
+        ordered.append(scenario[route])
+
+    verdicts = [dsl_matcher_hits(m, ordered)
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_rasa_probe_touches_neither_the_conversations_nor_the_model_routes():
+    """
+    Le danger propre à ce template : le constat porte sur seize routes que la
+    sonde ne doit pas toucher, et ce sont les plus lourdes du produit. PUT /model
+    remplace le modèle en service par celui d'une URL fournie dans le corps,
+    DELETE /model arrête l'assistant, POST /model/train lance un entraînement
+    complet, et les routes /conversations/… lisent et récrivent l'historique des
+    conversations, c'est-à-dire des données personnelles. GET /domain, enfin, est
+    une lecture — mais elle rend le texte entier de l'assistant, donc l'exfiltrer
+    pour prouver qu'on le peut serait faire le dommage qu'on signale.
+    """
+    doc = load(RASA_TEMPLATE)
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les deux lectures se font en GET : le template ne doit rien "
+            "envoyer à un assistant qu'il découvre"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : sur ce produit, un corps n'a "
+            "de sens que pour charger un modèle, entraîner, ou écrire dans une "
+            "conversation"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/model", "le template touche les routes de modèle : PUT "
+                           "/model charge une archive tierce à la place de "
+                           "celle en service, DELETE /model arrête "
+                           "l'assistant, et POST /model/train lance un "
+                           "entraînement aux frais de l'exploitant"),
+                ("/conversations", "le template touche les trackers : leur "
+                                   "lecture exfiltre des conversations, et "
+                                   "leur écriture décide de ce que "
+                                   "l'assistant croit savoir"),
+                ("/domain", "le template lit le domaine : intents, slots et le "
+                            "texte de toutes les réponses de l'assistant — "
+                            "c'est le dommage, pas la preuve"),
+                ("/webhooks", "le template parle au connecteur de canal : il "
+                              "enverrait un message à l'assistant audité"),
+            ):
+                assert forbidden not in path, why
+
+
+def test_rasa_matcher_reads_the_guarded_payload_from_its_opening():
+    """
+    Le point qui fait ce template. La même route rend trois corps sur la même
+    instance : la charge utile du handler quand rien ne garde, l'ErrorResponse
+    « NotAuthenticated » quand un jeton est posé, et celle d'ensure_loaded_agent
+    quand aucun modèle n'est chargé. Les trois sont du JSON du même processus, et
+    seul le corps les sépare — l'ancrage sur model_file est ce qui dit que c'est
+    le handler qui a répondu, et non le gestionnaire d'erreur.
+    """
+    assert rasa_fires(), (
+        "le template ne reconnaît pas un serveur Rasa qui rend la charge utile "
+        "d'une route gardée à l'anonyme"
+    )
+
+    for body, name in (
+        (RASA_NOT_AUTHENTICATED_BODY,
+         "l'instance protégée par un jeton, dont requires_auth lève son 401 "
+         "avant d'entrer dans le handler — c'est exactement l'inverse du "
+         "constat"),
+        (RASA_NO_AGENT_BODY,
+         "l'instance ouverte mais sans modèle chargé : ensure_loaded_agent "
+         "répond à sa place, et rien n'a été rendu qu'on puisse constater"),
+        (RASA_COMPOSITE_BODY,
+         "la charge utile republiée au fond du document d'une supervision"),
+        (RASA_OTHER_MODEL_SERVER_BODY,
+         "un autre service qui publie « model_file » sur sa route d'état"),
+        (RASA_ROOT_BODY,
+         "la salutation de la racine servie sur /status par un intermédiaire"),
+        ("", "une réponse vide"),
+        (json.dumps({"model_file": "m.tar.gz",
+                     "num_active_training_jobs": "unknown"},
+                    separators=(",", ":")),
+         "un document qui reprend les clés en recopiant le compteur en texte — "
+         "le handler, lui, rend la valeur d'un multiprocessing.Value(\"I\")"),
+    ):
+        assert not rasa_fires(status=(200, body)), (
+            "le template conclut sur %s" % name
+        )
+
+
+def test_rasa_matcher_holds_across_both_generations_of_the_status_handler():
+    """
+    La clé du milieu a changé de nom entre les générations, les deux autres non.
+    Exiger « model_id » ferait perdre les 2.x — celles qui traînent exposées —,
+    et exiger « fingerprint » ferait perdre tout ce qui tourne aujourd'hui.
+    """
+    for body, why in (
+        (RASA_STATUS_BODY, "la génération 3.x, dont la clé du milieu est "
+                           "« model_id »"),
+        (RASA_STATUS_BODY_LEGACY, "la génération 2.x, dont la clé du milieu "
+                                  "est « fingerprint »"),
+        (RASA_STATUS_BODY_TRAINING, "l'instance sur laquelle un entraînement "
+                                    "tourne au moment du scan"),
+        ('{\n  "model_file": "m.tar.gz",\n  "model_id": "9a1f",\n'
+         '  "num_active_training_jobs": 0\n}',
+         "un intermédiaire qui réindente le JSON qu'il relaie"),
+        ("\n" + RASA_STATUS_BODY + "\n",
+         "un intermédiaire qui encadre le corps de sauts de ligne"),
+    ):
+        assert rasa_fires(status=(200, body)), (
+            "le template perd %s" % why
+        )
+
+
+def test_rasa_root_read_names_the_product_and_never_carries_the_verdict():
+    """
+    La racine est montée par add_root_route dans les deux branches de
+    configure_app, donc elle répond aussi sur une instance lancée sans
+    « --enable-api ». Elle ne porte pas @requires_auth : elle nomme le produit,
+    elle ne prouve rien. D'où les deux exigences — qu'elle suive l'instance
+    quelle que soit sa version, et qu'elle ne se laisse pas confondre avec un
+    document qui la cite.
+    """
+    for root, why in (
+        ((200, RASA_ROOT_BODY + "\n"),
+         "un intermédiaire qui termine le text/plain par un saut de ligne"),
+        ((200, "  " + RASA_ROOT_BODY + "  "),
+         "un intermédiaire qui encadre le corps d'espaces"),
+        ((200, "Hello from Rasa: 2.8.34"), "une instance de la génération 2.x"),
+        ((200, "Hello from Rasa: 3.13.0.dev1"),
+         "une instance qui tourne sur une version de développement"),
+    ):
+        assert rasa_fires(root=root), "le template perd %s" % why
+
+    for root, why in (
+        ((200, RASA_QUOTING_PAGE_BODY),
+         "une page qui cite la salutation dans son texte"),
+        ((200, RASA_WRAPPED_ROOT_BODY),
+         "la salutation republiée sous une clé par un intermédiaire"),
+        ((200, RASA_GENERIC_WELCOME_BODY),
+         "une page d'accueil de serveur web"),
+        ((200, "Hello from Rasa: "),
+         "la phrase sans la version que le handler y concatène"),
+        ((200, "hello from rasa: 3.6.21"), "la phrase en minuscules"),
+        ((200, ""), "une racine vide"),
+    ):
+        assert not rasa_fires(root=root), "le template conclut sur %s" % why
+
+
+def test_rasa_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Les trois réponses de /status — 200, 401, 409 — sortent du même processus, et
+    la racine rend 200 sur toute instance vivante, API activée ou non. Un matcher
+    de statut ne séparerait donc rien ici, et l'exiger ferait perdre l'instance
+    dont un intermédiaire réécrit le code.
+    """
+    block = rasa_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas une expression : le constat se "
+        f"lit dans les corps, pas dans les codes — {sorted(kinds)}"
+    )
+
+    for expression in (block.get("matchers") or [])[0].get("dsl") or []:
+        for read in ("status_code_1", "status_code_2"):
+            assert read not in expression, (
+                f"l'expression « {expression} » lit {read} : les trois "
+                "réponses de /status viennent du même processus, et seul leur "
+                "corps les sépare"
+            )
+
+    assert rasa_fires(status=(203, RASA_STATUS_BODY), root=(203, RASA_ROOT_BODY)), (
+        "le template dépend des codes rendus, alors qu'un intermédiaire peut "
+        "servir les mêmes corps sous d'autres"
+    )
+
+
+def test_rasa_extracts_the_version_and_not_the_operator_filesystem_path():
+    """
+    Le rapport de scan ne doit porter que ce qui sert à décider de la suite. La
+    version en est : elle date l'instance et dit à quels avis du dépôt elle
+    répond. model_file n'en est pas : c'est un chemin du système de fichiers de
+    l'exploitant, donc son arborescence de déploiement recopiée dans un rapport
+    qui circule.
+    """
+    extractors = rasa_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le bloc porte %d extracteurs : un seul champ mérite d'être remonté, "
+        "et la charge utile gardée n'en fait pas partie" % len(extractors)
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("name") == "version"
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à la racine : sous req-condition le "
+        "moteur l'évalue contre chaque réponse, et c'est la seule des deux qui "
+        f"porte un numéro de version — part={extractor.get('part')!r}"
+    )
+    assert "model_file" not in json.dumps(extractor), (
+        "l'extracteur remonte model_file : le rapport de scan écrirait "
+        "l'arborescence de déploiement de l'exploitant"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_rasa_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher, et
+    `dsl_matcher_hits` les réévalue avec Python plutôt qu'avec le moteur de Go :
+    seul un scan contre un vrai serveur ferme la boucle. L'enjeu propre est ici
+    l'extracteur `regex` borné à body_2 sous req-condition — le pack ne l'écrit
+    ailleurs qu'en `json` — et le fait que les trois corps de /status se
+    départagent sans qu'aucun code HTTP ne soit lu.
+    """
+    def scan(scenario):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in scenario:
+                    self.reply(*scenario[self.path])
+                else:
+                    self.reply(404, RASA_NOT_FOUND_BODY, "application/json")
+
+            def do_POST(self):
+                seen.append("POST " + self.path)
+                self.reply(404, RASA_NOT_FOUND_BODY, "application/json")
+
+            def reply(self, code, payload, content_type="application/json"):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", RASA_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "rasa-server-status-exposed"}, r.stdout + r.stderr
+        extracted = [value for item in results
+                     for value in (item.get("extracted-results") or [])]
+        return seen, results, extracted
+
+    seen, hits, extracted = scan({
+        RASA_STATUS_ROUTE: (200, RASA_STATUS_BODY),
+        RASA_ROOT_ROUTE: (200, RASA_ROOT_BODY, "text/plain; charset=utf-8"),
+    })
+    assert sorted(set(seen)) == [RASA_ROOT_ROUTE, RASA_STATUS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits, (
+        "le scan perd l'instance qui rend la charge utile d'une route gardée à "
+        "l'anonyme"
+    )
+    assert extracted == ["3.6.21"], (
+        "le scan ne remonte pas la version de la racine, ou en remonte autre "
+        f"chose : {extracted}"
+    )
+
+    _, legacy, legacy_extracted = scan({
+        RASA_STATUS_ROUTE: (200, RASA_STATUS_BODY_LEGACY),
+        RASA_ROOT_ROUTE: (200, "Hello from Rasa: 2.8.34",
+                          "text/plain; charset=utf-8"),
+    })
+    assert legacy, (
+        "le scan perd la génération 2.x, dont la clé du milieu s'appelle "
+        "« fingerprint » — ce sont pourtant celles qui traînent exposées"
+    )
+    assert legacy_extracted == ["2.8.34"], legacy_extracted
+
+    for status, why in (
+        ((401, RASA_NOT_AUTHENTICATED_BODY),
+         "l'instance protégée par un jeton, dont requires_auth lève son 401"),
+        ((409, RASA_NO_AGENT_BODY),
+         "l'instance ouverte dont aucun modèle n'est chargé : rien n'a été "
+         "rendu qu'on puisse constater"),
+        ((200, RASA_COMPOSITE_BODY),
+         "la charge utile republiée au fond du document d'une supervision"),
+    ):
+        _, quiet, _ = scan({
+            RASA_STATUS_ROUTE: status,
+            RASA_ROOT_ROUTE: (200, RASA_ROOT_BODY, "text/plain; charset=utf-8"),
+        })
+        assert quiet == [], "le scan conclut sur %s" % why
+
+    _, without_api, _ = scan({
+        RASA_ROOT_ROUTE: (200, RASA_ROOT_BODY, "text/plain; charset=utf-8"),
+    })
+    assert without_api == [], (
+        "le scan conclut sur une instance lancée sans « --enable-api » : "
+        "create_app n'y est pas appelé, aucune des dix-sept routes gardées "
+        "n'est montée, et la racine seule ne constate rien"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
