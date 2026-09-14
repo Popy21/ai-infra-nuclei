@@ -27405,6 +27405,608 @@ def test_fiftyone_matcher_compiles_and_fires_against_a_live_server():
         assert refused == [], "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# Cog : le conteneur d'inférence de Replicate, et un serveur qui publie
+# lui-même la carte de ses routes. Ce que cette section amarre tient en quatre
+# points, et aucun n'est décoratif.
+#
+# Le couple d'abord. « cog_version » seul serait un numéro de publication de
+# plus — le mot « version » ouvre la moitié des routes de diagnostic du pack.
+# C'est sa conjonction avec « predictions_url »: « /predictions » qui dit que ce
+# document est la carte des routes d'un conteneur d'inférence, et que la route
+# qui consomme le GPU y figure. Le chemin est une constante du littéral de
+# create_app(), jamais un réglage.
+#
+# La forme du document ensuite, et c'est le piège propre à ce template. Les
+# valeurs sont toutes des chaînes — un numéro de publication et sept chemins,
+# onze avec l'entraînement — mais deux d'entre elles portent de vraies accolades
+# à l'intérieur : « /predictions/{prediction_id} » et
+# « /predictions/{prediction_id}/cancel ». Le contrôle de platitude que le pack
+# écrit ailleurs — aucune paire { } dans le corps — ne verrait donc aucune
+# instance, et il faut exiger la forme positive : chaque valeur est une chaîne.
+#
+# Les deux générations du serveur ensuite. La première est le FastAPI de
+# python/cog/server/http.py, dont create_app() construit « index_document » et
+# dont /health-check rend « jsonable_encoder({"status": health.name, "setup":
+# setup}) » — deux clés. La seconde est coglet, le serveur Rust des publications
+# actuelles, dont docs/http.md documente une charge utile de santé à trois clés,
+# « version » portant le trio coglet / cog / python. Exiger ce trio tairait
+# toute la première génération, qui est exactement aussi ouverte : c'est un
+# choix, et les cas ci-dessous le disent explicitement.
+#
+# La seconde lecture enfin. Elle ne cherche pas à franchir une garde — il n'y en
+# a aucune à franchir, create_app() ne monte pas d'intergiciel et ne déclare
+# aucune dépendance d'appelant. Elle dit que la route de santé annoncée par la
+# carte répond bien au même anonyme, avec sa charge utile à elle : c'est ce qui
+# sépare une instance vivante d'un document de découverte recopié par un tiers,
+# et d'un catch-all qui rend le même corps sur tous ses chemins.
+
+COG_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "cog-http-server-exposed.yaml")
+
+COG_INDEX_ROUTE = "/"
+COG_HEALTH_ROUTE = "/health-check"
+
+COG_VERSION = "0.17.0"
+
+
+def cog_index_body(version=COG_VERSION, trainings=False, drop=(), first=None,
+                   extra=None, indent=None, predictions_url="/predictions"):
+    """
+    Ce que rend GET / : le littéral « index_document » de create_app(), dans son
+    ordre de déclaration et sérialisé compact par la JSONResponse de FastAPI.
+
+    `trainings` ajoute les trois clés que le document porte dès qu'un train.py
+    est configuré, `drop` en retire une, `first` en remonte une autre en tête
+    pour défaire l'ancrage, `extra` ajoute ce qu'une passerelle logerait à côté,
+    `indent` réécrit le document comme le ferait un proxy qui réindente ce qu'il
+    relaie.
+    """
+    document = {
+        "cog_version": version,
+        "docs_url": "/docs",
+        "openapi_url": "/openapi.json",
+        "shutdown_url": "/shutdown",
+        "healthcheck_url": "/health-check",
+        "predictions_url": predictions_url,
+        # Les deux valeurs qui portent des accolades à l'intérieur d'une chaîne,
+        # et qui interdisent le contrôle de platitude écrit ailleurs dans le
+        # pack.
+        "predictions_idempotent_url": "/predictions/{prediction_id}",
+        "predictions_cancel_url": "/predictions/{prediction_id}/cancel",
+    }
+    if trainings:
+        document["trainings_url"] = "/trainings"
+        document["trainings_idempotent_url"] = "/trainings/{training_id}"
+        document["trainings_cancel_url"] = "/trainings/{training_id}/cancel"
+
+    for key in drop:
+        document.pop(key, None)
+    if extra is not None:
+        document.update(extra)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def cog_health_body(status="READY", setup=True, trio=True, extra=None,
+                    indent=None):
+    """
+    Ce que rend GET /health-check.
+
+    `trio` porte l'objet « version » de coglet — coglet / cog / python — que la
+    génération FastAPI n'écrit pas : elle rend « jsonable_encoder({"status":
+    health.name, "setup": setup}) », donc deux clés. `setup` retire le détail de
+    la phase d'installation, que docs/http.md donne pour « included once setup
+    has started ».
+    """
+    document = {"status": status}
+    if setup:
+        document["setup"] = {
+            "started_at": "2026-01-01T00:00:00.000000+00:00",
+            "completed_at": "2026-01-01T00:00:05.000000+00:00",
+            "status": "succeeded",
+            "logs": "",
+        }
+    if trio:
+        document["version"] = {"coglet": COG_VERSION, "cog": "0.14.0",
+                               "python": "3.13.0"}
+    if extra is not None:
+        document.update(extra)
+
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+COG_INDEX_BODY = cog_index_body()
+COG_HEALTH_BODY = cog_health_body()
+
+# La charge utile de santé de la génération FastAPI : deux clés, sans objet
+# « version ». Elle vient de « jsonable_encoder({"status": health.name,
+# "setup": setup}) », et l'instance qui la rend est aussi ouverte que l'autre.
+COG_HEALTH_FASTAPI_BODY = cog_health_body(trio=False)
+
+# Le document de découverte des publications antérieures à la 0.13.0 : la clé
+# cog_version n'y était pas encore, et le template ne peut pas la reconnaître.
+COG_PRE_0_13_INDEX_BODY = json.dumps(
+    {"docs_url": "/docs", "openapi_url": "/openapi.json"},
+    separators=(",", ":"))
+
+# L'index d'un service quelconque : « version » y ouvre le document de la même
+# façon, et c'est tout ce qu'il a en commun.
+COG_OTHER_INDEX_BODY = json.dumps(
+    {"version": "2.4.0", "docs_url": "/docs", "status": "ok"},
+    separators=(",", ":"))
+
+# Un tableau de supervision qui agrège la réponse de l'instance sous une clé à
+# lui : le document entier y est, mais ce n'est pas l'instance qui a répondu.
+COG_COMPOSITE_INDEX_BODY = '{"cog":%s,"scraped_at":0}' % COG_INDEX_BODY
+
+# La même supervision, mais qui recopie la charge utile en tête plutôt que de
+# l'imbriquer. L'ancrage ne l'écarte pas — le document commence bien par la
+# bonne clé — et c'est la forme des valeurs, et elle seule, qui dit que ce n'est
+# pas l'instance qui a répondu.
+COG_ANNOTATED_INDEX_BODY = cog_index_body(
+    extra={"probe": {"latency_ms": 12, "checked_at": 0}})
+
+# Une passerelle qui republie la carte du serveur qu'elle proxifie, logée à côté
+# d'un objet à elle.
+COG_GATEWAY_INDEX_BODY = cog_index_body(
+    extra={"upstream": {"host": "cog-0.internal", "port": 5000}})
+
+# L'entrée d'un registre de services : le document est plat, toutes ses valeurs
+# sont des chaînes et les deux clés y sont — seul l'ancrage sur l'ouverture dit
+# que ce n'est pas l'instance qui a répondu.
+COG_REGISTRY_INDEX_BODY = json.dumps(
+    {"service": "sdxl-inpaint", "cog_version": COG_VERSION,
+     "predictions_url": "/predictions"},
+    separators=(",", ":"))
+
+# Le schéma que décrirait un tiers documentant la route : les deux noms y sont
+# nommés, mais comme propriétés — donc suivis d'objets.
+COG_SCHEMA_INDEX_BODY = json.dumps(
+    {"IndexDocument": {"type": "object", "properties": {
+        "cog_version": {"type": "string"},
+        "predictions_url": {"type": "string"}}}},
+    separators=(",", ":"))
+
+# La page d'accueil d'un serveur web quelconque, qu'un catch-all rend en 200 sur
+# le chemin racine.
+COG_HTML_INDEX_BODY = (
+    '<!doctype html><html><head><title>Model</title></head>'
+    '<body><h1>It works</h1></body></html>'
+)
+
+# Refus d'un proxy placé devant l'instance : c'est la seule fermeture possible,
+# puisque le produit ne porte aucun mécanisme d'authentification.
+COG_PROXY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+# Le 404 de FastAPI quand la route n'est pas montée.
+COG_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# La santé d'un autre produit : le mot « status » y ouvre le document, mais sa
+# valeur n'est pas un nom de l'énumération Health.
+COG_OTHER_HEALTH_BODY = json.dumps({"status": "ok", "uptime": 1234},
+                                   separators=(",", ":"))
+
+
+def cog_block():
+    doc = load(COG_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % COG_INDEX_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET / — c'est pourtant la seule route qui "
+        "nomme le produit et publie la carte de ses routes"
+    )
+    return blocks[0]
+
+
+def cog_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = cog_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def cog_fires(index=(200, COG_INDEX_BODY), health=(200, COG_HEALTH_BODY)):
+    scenario = {
+        COG_INDEX_ROUTE: index,
+        COG_HEALTH_ROUTE: health,
+    }
+    block = cog_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in cog_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que Cog ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_cog_probe_reads_two_routes_and_never_runs_a_prediction():
+    """
+    Le danger propre à ce template : le serveur publie lui-même la carte de ses
+    routes, et toutes sont sur le même serveur nu. POST /predictions ferait
+    tourner le modèle sur le GPU de l'exploitant, et son corps peut désigner une
+    URL que le serveur ira chercher — paramètre « webhook », entrées fichiers
+    « passed as URLs ». /shutdown, que le document annonce, arrête le conteneur.
+    La lecture doit donc rester sur les deux routes qui ne font rien.
+    """
+    doc = load(COG_TEMPLATE)
+
+    assert cog_requests() == [("GET", COG_INDEX_ROUTE),
+                              ("GET", COG_HEALTH_ROUTE)], (
+        "le template n'interroge pas les deux routes dans l'ordre où les "
+        f"expressions les numérotent en body_N — {cog_requests()}"
+    )
+
+    assert cog_block().get("req-condition") is True, (
+        "sans req-condition, chaque réponse conclurait de son côté : « un Cog "
+        "publie sa carte de routes » et « la route de santé qu'elle annonce "
+        "répond à l'anonyme » sont deux faits, et c'est leur conjonction qui "
+        "fait le constat"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la lecture se fait en GET : sur ce serveur, les autres méthodes "
+            "appartiennent aux routes qui exécutent le modèle ou arrêtent le "
+            "conteneur"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : ici un corps n'a de sens que "
+            "pour lancer une prédiction"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/predictions", "le template appelle la route de prédiction : "
+                                 "elle fait tourner le modèle sur le matériel "
+                                 "de l'exploitant, et son corps peut désigner "
+                                 "une URL que le serveur ira chercher"),
+                ("/trainings", "la route d'entraînement fait le même travail, "
+                               "en plus long"),
+                ("/shutdown", "la route d'arrêt stoppe le conteneur — c'est le "
+                              "dommage qu'on signale, pas une lecture"),
+                ("/openapi.json", "le schéma OpenAPI rend la signature exacte "
+                                  "du modèle : le constat n'a pas besoin de la "
+                                  "collecter pour être établi"),
+                ("/docs", "la page de documentation sert la même chose en "
+                          "cliquable"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_cog_matcher_rests_on_the_version_predictions_pair():
+    """
+    Le point qui fait ce template. « cog_version » seul serait un numéro de
+    publication de plus ; c'est sa conjonction avec « predictions_url » — et la
+    forme du document — qui dit qu'on a devant soi la carte des routes d'un
+    conteneur d'inférence.
+    """
+    assert cog_fires(), (
+        "le template ne reconnaît pas une instance dont GET / répond à "
+        "l'anonyme"
+    )
+
+    for body, why in (
+        (COG_PRE_0_13_INDEX_BODY,
+         "le document des publications antérieures à la 0.13.0, où cog_version "
+         "n'était pas encore écrite — le template ne peut pas la reconnaître, "
+         "et le dire est plus honnête que de deviner"),
+        (COG_OTHER_INDEX_BODY,
+         "l'index d'un autre service, qui ouvre sur une version sans porter la "
+         "route de prédiction"),
+        (cog_index_body(drop=("predictions_url",)),
+         "un document amputé de predictions_url : cog_version seule ne dit pas "
+         "qu'un modèle est servi"),
+        (cog_index_body(predictions_url="/v1/predictions"),
+         "une route de prédiction déplacée, alors que le chemin est une "
+         "constante du littéral de create_app()"),
+        (cog_index_body(version=1.7),
+         "un numéro de publication rendu en nombre, alors que __version__ est "
+         "une chaîne"),
+        (cog_index_body(first="docs_url"),
+         "un document qui n'ouvre pas sur cog_version, alors que le littéral la "
+         "déclare en premier"),
+        (COG_COMPOSITE_INDEX_BODY,
+         "la charge utile retrouvée au fond du document d'une supervision"),
+        (COG_ANNOTATED_INDEX_BODY,
+         "une supervision qui recopie la carte en tête avant d'y ajouter un "
+         "objet à elle — l'ancrage la laisse passer, et seule la forme des "
+         "valeurs l'écarte"),
+        (COG_GATEWAY_INDEX_BODY,
+         "une passerelle qui republie la carte du serveur qu'elle proxifie, à "
+         "côté d'un objet à elle"),
+        (COG_REGISTRY_INDEX_BODY,
+         "l'entrée d'un registre de services, plate et porteuse des deux clés, "
+         "mais qui n'ouvre pas sur cog_version"),
+        (COG_SCHEMA_INDEX_BODY,
+         "le schéma d'un tiers qui documente la route : les deux noms y sont "
+         "propriétés, donc suivis d'objets"),
+        (COG_HTML_INDEX_BODY,
+         "la page d'accueil d'un serveur web, qu'un catch-all rend en 200 sur "
+         "le chemin racine"),
+        (COG_PROXY_DENIED_BODY,
+         "le refus d'un proxy placé devant l'instance — c'est la seule "
+         "fermeture possible, puisque le produit ne porte aucune "
+         "authentification"),
+        ("", "une réponse vide"),
+    ):
+        assert not cog_fires(index=(200, body)), "le template conclut sur %s" % why
+
+
+def test_cog_matcher_reads_the_braces_inside_the_url_templates():
+    """
+    Le piège propre à ce document. Deux de ses valeurs portent de vraies
+    accolades à l'intérieur d'une chaîne — « /predictions/{prediction_id} » et
+    « /predictions/{prediction_id}/cancel » — parce que ce sont des gabarits
+    d'URL. Le contrôle de platitude que le pack écrit ailleurs, « aucune paire
+    { } dans le corps », ne verrait donc aucune instance : c'est la forme
+    positive qu'il faut exiger, chaque valeur étant une chaîne.
+    """
+    assert "{prediction_id}" in COG_INDEX_BODY, (
+        "le cas de test ne dit pas ce qu'il croit dire"
+    )
+    assert cog_fires(), (
+        "le template écarte le document réel : ses gabarits d'URL portent des "
+        "accolades, et un contrôle de platitude écrit sur elles ne verrait "
+        "jamais une instance"
+    )
+
+    assert not cog_fires(index=(200, COG_ANNOTATED_INDEX_BODY)), (
+        "le template admet un objet imbriqué : la forme exigée doit refuser "
+        "l'accolade qui ouvre une valeur, pas celle qui vit dans une chaîne"
+    )
+
+
+def test_cog_matcher_survives_the_shapes_the_document_has_really_taken():
+    for body, why in (
+        (COG_INDEX_BODY,
+         "la sérialisation compacte de la JSONResponse de FastAPI, donc celle "
+         "qui part réellement sur le fil"),
+        (cog_index_body(indent=2),
+         "un intermédiaire qui réindente le JSON qu'il relaie"),
+        (cog_index_body(indent=4),
+         "la mise en forme de la page de documentation, reprise telle quelle "
+         "par un relais"),
+        ("\n" + COG_INDEX_BODY + "\n",
+         "un intermédiaire qui encadre le corps de sauts de ligne"),
+        (cog_index_body(trainings=True),
+         "l'instance dont un train.py est configuré, et dont le document porte "
+         "trois clés de plus — elle sert exactement les mêmes prédictions"),
+        (cog_index_body(version="dev"),
+         "le repli de __version__ sur « dev », qu'écrit une installation sans "
+         "fichier de version"),
+        (cog_index_body(version="0.13.0"),
+         "la première publication qui ait porté cog_version"),
+    ):
+        assert cog_fires(index=(200, body)), "le template perd %s" % why
+
+
+def test_cog_health_arm_admits_both_generations_of_the_server():
+    """
+    Le choix explicite de ce template. docs/http.md documente une charge utile
+    de santé à trois clés, « version » portant le trio coglet / cog / python.
+    Mais la génération FastAPI rend « jsonable_encoder({"status": health.name,
+    "setup": setup}) » — deux clés, sans trio — et ses instances sont
+    exactement aussi ouvertes. Exiger le trio les tairait toutes.
+    """
+    for body, why in (
+        (COG_HEALTH_BODY,
+         "la charge utile de coglet, trio de versions compris"),
+        (COG_HEALTH_FASTAPI_BODY,
+         "celle de la génération FastAPI, qui ne porte pas d'objet « version »"),
+        (cog_health_body(setup=False, trio=False),
+         "l'instance interrogée avant que setup() ait commencé, dont "
+         "docs/http.md donne le détail pour « included once setup has started »"),
+        (cog_health_body(status="BUSY"),
+         "l'instance dont tous les créneaux de prédiction sont pris — elle "
+         "répond au même anonyme"),
+        (cog_health_body(status="STARTING", trio=False),
+         "l'instance dont le setup tourne encore"),
+        (cog_health_body(status="SETUP_FAILED", trio=False),
+         "l'instance dont le setup a échoué, qui sert quand même sa route de "
+         "santé"),
+        (cog_health_body(status="UNHEALTHY"),
+         "l'instance dont un healthcheck() défini par le modèle rend False"),
+        (cog_health_body(extra={"user_healthcheck_error": "boom"}),
+         "la clé que docs/http.md ajoute quand ce healthcheck() a échoué"),
+        (cog_health_body(indent=2),
+         "un intermédiaire qui réindente ce qu'il relaie"),
+    ):
+        assert cog_fires(health=(200, body)), "le template perd %s" % why
+
+
+def test_cog_health_arm_proves_the_announced_route_answers():
+    """
+    Ce que la seconde lecture établit : la route que la carte annonce répond au
+    même anonyme, avec sa charge utile à elle. Il n'y a aucune garde à franchir
+    — create_app() ne monte pas d'intergiciel et ne déclare aucune dépendance
+    d'appelant — donc c'est la vivacité, et non une autorisation, qu'elle prouve.
+    """
+    for body, why in (
+        (COG_NOT_FOUND_BODY,
+         "une route de santé absente, donc un serveur qui n'est pas celui que "
+         "la carte décrit"),
+        (COG_PROXY_DENIED_BODY,
+         "le refus d'un proxy sur la route de santé"),
+        (COG_INDEX_BODY,
+         "l'écho du document de découverte : un catch-all qui rend le même "
+         "corps sur tous ses chemins n'est pas une instance vivante"),
+        (cog_health_body(status="ready"),
+         "un statut en minuscules, alors que le serveur rend « health.name » "
+         "et non la valeur de l'énumération"),
+        (COG_OTHER_HEALTH_BODY,
+         "la santé d'un autre produit, dont le statut n'est pas un nom de "
+         "l'énumération Health"),
+        ('{"data":%s}' % COG_HEALTH_BODY,
+         "la charge utile de santé enveloppée par une supervision"),
+        ("", "une réponse vide"),
+    ):
+        assert not cog_fires(health=(200, body)), "le template conclut sur %s" % why
+
+
+def test_cog_conclusion_rests_on_the_payloads_not_on_the_http_status():
+    """
+    Le statut est inutilisable des deux côtés, et pour deux raisons distinctes.
+    Sur /health-check, docs/http.md l'écrit : « This endpoint always responds
+    with 200 OK — check the status field in the response body to determine
+    readiness ». Sur /, le handler n'a pas de branche d'échec — il rend un
+    dictionnaire construit à la création de l'application — donc exiger un 200
+    n'écarterait rien que les corps n'écartent déjà.
+    """
+    block = cog_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro — et un "
+        "matcher de statut n'aurait rien à dire ici"
+    )
+
+    for expression in (block.get("matchers") or [])[0].get("dsl") or []:
+        assert "status_code" not in expression, (
+            "une expression s'appuie sur le statut HTTP : la route de santé "
+            "rend 200 quoi qu'il arrive, et le document de découverte ne sort "
+            f"que sous un 200 — {expression}"
+        )
+
+    assert cog_fires(index=(203, COG_INDEX_BODY), health=(203, COG_HEALTH_BODY)), (
+        "le template perd l'instance dont un intermédiaire réécrit le statut, "
+        "alors que les deux corps sont ceux du serveur"
+    )
+
+
+def test_cog_extractor_reports_the_release():
+    extractors = cog_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le moteur "
+        "les évalue contre chaque réponse, et la même instance serait signalée "
+        "plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — la clé n'existe pas dans la "
+        "charge utile de santé"
+    )
+    assert extractor.get("json") == [".cog_version"], (
+        "l'extracteur ne lit pas .cog_version — c'est pourtant lui qui dit "
+        "quels correctifs manquent au serveur"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_cog_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs avec le module `re`
+    de Python plutôt qu'avec RE2 : seul un scan contre un vrai serveur ferme la
+    boucle. L'enjeu propre est ici la troisième expression — un groupe non
+    capturant répété, qui doit accepter les accolades vivant dans les gabarits
+    d'URL et refuser celle qui ouvre une valeur.
+    """
+    def scan(index_body, health_body=COG_HEALTH_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == COG_INDEX_ROUTE:
+                    self.reply(200, index_body)
+                elif self.path == COG_HEALTH_ROUTE:
+                    self.reply(200, health_body)
+                else:
+                    self.reply(404, COG_NOT_FOUND_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", COG_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "cog-http-server-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(COG_INDEX_BODY)
+    assert sorted(set(seen)) == sorted([COG_INDEX_ROUTE, COG_HEALTH_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == [COG_VERSION], (
+        f"le scan ne remonte pas la publication du serveur — {extracted}"
+    )
+
+    _, fastapi = scan(cog_index_body(version="0.15.0"),
+                      health_body=COG_HEALTH_FASTAPI_BODY)
+    assert fastapi == ["0.15.0"], (
+        "le scan perd la génération FastAPI, dont la charge utile de santé ne "
+        f"porte pas d'objet « version » — {fastapi}"
+    )
+
+    for index_body, health_body, why in (
+        (COG_ANNOTATED_INDEX_BODY, COG_HEALTH_BODY,
+         "une supervision qui recopie la carte en tête avant d'y ajouter un "
+         "objet à elle"),
+        (COG_COMPOSITE_INDEX_BODY, COG_HEALTH_BODY,
+         "le document d'une supervision qui republie la carte sous une clé à "
+         "elle"),
+        (COG_INDEX_BODY, COG_INDEX_BODY,
+         "un catch-all qui rend le même document sur tous ses chemins"),
+        (COG_INDEX_BODY, COG_PROXY_DENIED_BODY,
+         "une instance dont un proxy refuse déjà la route de santé"),
+    ):
+        _, refused = scan(index_body, health_body=health_body)
+        assert refused == [], "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

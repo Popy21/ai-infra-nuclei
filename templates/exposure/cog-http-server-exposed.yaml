@@ -1,0 +1,253 @@
+id: cog-http-server-exposed
+
+info:
+  name: Cog HTTP Server - Unauthenticated Model Container Exposure
+  author: popy21
+  severity: high
+  description: |
+    Cog (replicate/cog) empaquette un modèle d'apprentissage automatique dans un
+    conteneur — « an open-source tool that lets you package machine learning
+    models in a standard, production-ready container ». C'est le format de
+    conteneur d'inférence de Replicate, donc l'emballage sous lequel circulent
+    des milliers de modèles que l'on retrouve tout autant auto-hébergés.
+    Le conteneur ne sert pas un fichier : il fait tourner un serveur HTTP, et ce
+    serveur est l'interface d'exécution du modèle. docs/deploy.md l'écrit ainsi
+    — « It serves an HTTP server on port 5000 when run » — et donne la commande
+    qui le publie, « docker run -d -p 5001:5000 my-model », c'est-à-dire sur
+    toutes les interfaces de l'hôte. Seul « cog serve », réservé au
+    développement local, publie le port sur 127.0.0.1 ; le processus, lui, se
+    lie à 0.0.0.0 dans le conteneur par conception.
+    GET / est la lecture qui nomme le produit, et elle le nomme entièrement.
+    docs/http.md la décrit comme rendant « a discovery document listing
+    available API endpoints, the OpenAPI schema URL, and version information »,
+    et en donne le corps : « {"cog_version": "0.17.0", "docs_url": "/docs",
+    "openapi_url": "/openapi.json", "shutdown_url": "/shutdown",
+    "healthcheck_url": "/health-check", "predictions_url": "/predictions",
+    "predictions_idempotent_url": "/predictions/{prediction_id}",
+    "predictions_cancel_url": "/predictions/{prediction_id}/cancel"} ». Le
+    serveur publie donc de lui-même la carte de ses routes.
+    Deux générations rendent ce document, et elles le rendent pareil. La
+    première est le serveur FastAPI de python/cog/server/http.py, où create_app()
+    construit un littéral « index_document » ouvert par « "cog_version":
+    __version__ » puis suivi des sept clés d'URL dans cet ordre, et où
+    « @app.get("/") » ne fait que le rendre ; la clé cog_version y est entrée en
+    0.13.0, les publications antérieures rendant le même document sans elle. La
+    seconde est coglet, le serveur Rust qui porte les publications actuelles :
+    python/cog/server/http.py n'est plus qu'une amorce appelant
+    « coglet.server.serve(...) », et docs/deploy.md l'annonce — « The server
+    inside Cog containers is coglet, a Rust-based inference server ». Quand un
+    entraînement est configuré, trois clés s'ajoutent au document — trainings_url,
+    trainings_idempotent_url, trainings_cancel_url — et ce sont des chaînes,
+    comme les huit autres.
+    GET /health-check est la seconde lecture, et son statut HTTP n'y sert à
+    rien : la page le dit, « This endpoint always responds with 200 OK — check
+    the status field in the response body to determine readiness ». Le corps
+    ouvre sur « status », dont les valeurs sont écrites en capitales — STARTING,
+    READY, BUSY, SETUP_FAILED, DEFUNCT, UNHEALTHY — et l'énumération Health du
+    serveur FastAPI déclare les mêmes, UNKNOWN compris. Cette génération-là rend
+    « jsonable_encoder({"status": health.name, "setup": setup}) » ; coglet y
+    ajoute un objet « version » qui porte le trio coglet / cog / python.
+    L'absence d'authentification est un défaut du produit, pas un réglage
+    manqué. docs/http.md ne mentionne ni jeton, ni en-tête d'autorisation, ni
+    schéma de sécurité — les seuls en-têtes qu'elle documente sont « Prefer:
+    respond-async », « Accept: text/event-stream » et « Content-Type ». Côté
+    code, create_app() ne monte aucun intergiciel, ne déclare aucune dépendance
+    d'appelant et n'a aucune notion d'identité. docs/deploy.md, de son côté, ne
+    décrit aucune restriction d'accès.
+  impact: |
+    Le renseignement d'abord. « cog_version » date le serveur, donc les
+    correctifs qui lui manquent, et le document de découverte donne la carte des
+    routes. L'une d'elles la complète aussitôt : GET /openapi.json rend « the
+    OpenAPI specification of the API, which is derived from the input and output
+    types specified in your model's Predictor », c'est-à-dire la signature exacte
+    du modèle — noms des entrées, types, valeurs par défaut, contraintes. /docs
+    sert la même chose en page cliquable.
+    Le coût ensuite, et c'est lui qui fait la sévérité. POST /predictions est
+    servi par le même serveur nu : chaque appel fait tourner le modèle sur le
+    matériel de l'exploitant — un GPU le plus souvent, puisque « docker run -d
+    -p 5001:5000 --gpus all my-model » est la commande de la page — pour qui a
+    trouvé le port, et sans compte à débiter. PUT /predictions/<prediction_id>
+    fait la même chose de façon idempotente, et « Prefer: respond-async » la met
+    en file sans même attendre le résultat.
+    Le corps d'une prédiction porte en outre deux primitives de requête
+    sortante, l'une et l'autre documentées. « webhook » d'abord : « You can
+    provide a webhook parameter in the client request body when creating a
+    prediction », et « the server makes requests to the provided URL with the
+    current state of the prediction object in the request body ». L'appelant
+    anonyme désigne donc une URL que le serveur va chercher depuis sa position
+    réseau — service de métadonnées de l'hébergeur, services internes joignables
+    du seul intérieur — et l'objet de prédiction part avec. Les entrées fichiers
+    ensuite : « Any File or Path inputs are passed as URLs », donc c'est le
+    serveur qui les télécharge.
+    Le document de découverte annonce enfin un « shutdown_url » (/shutdown).
+    Dans la génération FastAPI, la route est montée sans condition — le
+    commentaire du code l'écrit, « shutdown is needed no matter what happens » —
+    sous « @app.post("/shutdown") », et son handler pose l'événement d'arrêt
+    avant de rendre 200 : un déni de service par une requête sans corps. La
+    méthode que coglet lui donne, elle, n'est pas documentée dans docs/http.md ;
+    elle est à contrôler sur l'instance avant d'en faire une preuve, pas à
+    deviner.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé
+    d'identité, donc aucune trace n'en portera.
+  remediation: |
+    Il n'y a pas de réglage à poser : le produit ne porte aucun mécanisme
+    d'authentification — docs/http.md ne documente aucun jeton et create_app()
+    ne déclare aucune dépendance d'appelant. La fermeture est donc entièrement
+    en amont de l'application.
+    La publication du port d'abord, parce que c'est elle qui expose et non la
+    liaison du processus : celui-ci se lie à 0.0.0.0 dans le conteneur par
+    conception, et c'est la cartographie Docker qui décide qui l'atteint.
+    Publier sur la boucle locale — « docker run -d -p 127.0.0.1:5001:5000
+    my-model » — plutôt que « -p 5001:5000 », qui publie sur toutes les
+    interfaces de l'hôte. « cog serve » le fait déjà pour le développement
+    local.
+    Quand l'instance doit être atteinte à distance, la placer derrière un proxy
+    qui exige une authentification sur tout le serveur, et non sur la seule route
+    de prédiction : GET / publie la carte des routes, /openapi.json la signature
+    du modèle, et /shutdown arrête le conteneur. Un tunnel SSH avec redirection
+    de port fait la même chose sans proxy à tenir. Filtrer aussi les sorties du
+    conteneur : le paramètre « webhook » et les entrées fichiers font du serveur
+    un client HTTP que l'appelant dirige.
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<hote>:5001/ » ne doit plus rendre le document de découverte.
+    Après une exposition, tenir la signature du modèle pour lue — /openapi.json
+    la donne en une requête. Chercher ensuite dans les journaux les POST
+    /predictions dont le corps porte un « webhook » vers un hôte que
+    l'exploitant ne connaît pas, ou des entrées fichiers dont l'URL pointe vers
+    une adresse interne — 169.254.169.254, une adresse de bouclage, un préfixe
+    RFC 1918 : c'est la requête sortante dirigée en cours d'usage. Vérifier enfin
+    si /shutdown a été appelée. Aucune de ces lignes ne portera d'identité
+    d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/replicate/cog/blob/main/docs/http.md
+    - https://github.com/replicate/cog/blob/main/docs/deploy.md
+    - https://github.com/replicate/cog/blob/main/python/cog/server/http.py
+    - https://github.com/replicate/cog/blob/v0.15.0/python/cog/server/http.py
+    - https://github.com/replicate/cog/blob/v0.15.0/python/cog/server/runner.py
+    - https://github.com/replicate/cog
+  metadata:
+    max-request: 2
+    vendor: replicate
+    product: cog
+  tags: ai,ml,cog,replicate,inference,model-serving,gpu,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit et rend la carte de ses routes,
+  # la seconde dit que la route de santé que cette carte annonce répond bien au
+  # même anonyme — donc que le document de découverte n'est pas une copie servie
+  # par un tiers.
+  #
+  # GET /, c'est-à-dire le handler le moins cher du serveur : « @app.get("/") »
+  # ne fait que rendre « index_document », un dictionnaire construit une fois à
+  # la création de l'application. Il ne touche ni le modèle chargé, ni le
+  # registre de prédictions, ni le disque.
+  #
+  # GET /health-check ensuite, dont le corps est lu par « app.state.health » et
+  # le résultat de setup() — pas davantage. Son statut HTTP n'apprend rien par
+  # conception : docs/http.md écrit « This endpoint always responds with 200 OK
+  # — check the status field in the response body to determine readiness ».
+  #
+  # GET, et rien d'autre. Le même serveur nu porte POST /predictions et PUT
+  # /predictions/<prediction_id>, qui feraient tourner le modèle sur le GPU de
+  # l'exploitant et dont le corps peut désigner une URL que le serveur ira
+  # chercher — paramètre « webhook », entrées fichiers « passed as URLs ». Il
+  # porte aussi /shutdown, que le document de découverte annonce lui-même et qui
+  # arrête le conteneur. Signaler l'exposition ne demande d'en toucher aucun.
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+      - "{{BaseURL}}/health-check"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, chacune conclurait de son côté — or « un Cog
+    # publie sa carte de routes » et « la route de santé qu'elle annonce répond
+    # à l'anonyme » sont deux faits distincts, et c'est leur conjonction qui fait
+    # le constat.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture du document, et « cog_version » y est une clé. L'ordre
+          # est celui du littéral de create_app() — FastAPI rend le dictionnaire
+          # tel quel et jsonable_encoder préserve l'ordre d'insertion — donc
+          # cette clé ouvre le corps.
+          #
+          # L'ancrage sur l'ouverture écarte l'entrée d'un registre de services
+          # ou la réponse d'un relais qui préfixerait la charge utile d'une clé
+          # de routage à lui : c'est lui qui dit que l'instance a répondu
+          # d'elle-même.
+          #
+          # La valeur est laissée libre : elle change à chaque publication, et
+          # c'est l'extracteur qui la rapporte. Elle est tenue pour une chaîne
+          # parce que __version__ en est une — y compris son repli « dev »,
+          # qu'écrit une installation sans fichier de version.
+          #
+          # Les \s* sont là parce que FastAPI sérialise compact, mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          - 'regex("^\\{\\s*\"cog_version\"\\s*:\\s*\"[^\"]+\"", trim_space(body_1))'
+
+          # La route de prédiction, nommée par le serveur lui-même, et c'est
+          # elle qui fait le constat : « cog_version » seul serait un numéro de
+          # publication de plus. Le couple dit que ce document est la carte des
+          # routes d'un conteneur d'inférence, et que la route qui consomme le
+          # GPU y figure.
+          #
+          # Le chemin est exigé littéralement — « /predictions » — parce que
+          # c'est une constante du littéral, jamais un réglage : rien dans
+          # create_app() ne le rend configurable.
+          #
+          # Non ancrée : ni en tête, où « cog_version » est déjà exigée, ni en
+          # fin, puisque trois clés d'entraînement s'ajoutent après elle dès
+          # qu'un train.py est configuré.
+          - 'regex("\"predictions_url\"\\s*:\\s*\"/predictions\"", trim_space(body_1))'
+
+          # Le document n'a que des valeurs de chaîne, et il en est ainsi par
+          # construction : les huit clés du littéral portent un numéro de
+          # publication et sept chemins, les trois clés d'entraînement trois
+          # chemins de plus. Aucune n'ouvre d'objet ni de tableau.
+          #
+          # Exiger cette forme plutôt que l'absence d'accolade intérieure n'est
+          # pas un détour : « predictions_idempotent_url » vaut
+          # « /predictions/{prediction_id} », donc le corps porte de vraies
+          # accolades à l'intérieur de ses chaînes. Un contrôle de platitude
+          # écrit sur elles ne verrait aucune instance.
+          #
+          # C'est ce qui sépare la réponse du serveur du document d'une
+          # supervision qui recopierait la charge utile en tête avant d'y
+          # ajouter un objet à elle — un tel document commence bien par la bonne
+          # clé, et l'ancrage de la première expression ne le ferait pas seul.
+          - 'regex("^\\{(?:\\s*\"[^\"]+\"\\s*:\\s*\"[^\"]*\"\\s*,?)+\\s*\\}$", trim_space(body_1))'
+
+          # La route de santé que la carte annonce, et elle a répondu à l'anonyme
+          # avec sa charge utile à elle. C'est la seconde moitié du constat : un
+          # catch-all qui rendrait le même document sur tous ses chemins échoue
+          # ici, puisque les deux corps n'ouvrent pas sur la même clé.
+          #
+          # Les valeurs sont les noms de l'énumération Health, écrits en
+          # capitales parce que le serveur rend « health.name » et non sa valeur.
+          # UNKNOWN y est joint aux six que docs/http.md énumère : l'énumération
+          # du serveur FastAPI la déclare, et une génération qui l'émettrait
+          # serait tout aussi ouverte.
+          #
+          # Rien n'est exigé de « setup » ni de « version » : docs/http.md donne
+          # le premier pour « included once setup has started », et le second
+          # n'existe que depuis coglet — la génération FastAPI rend
+          # « jsonable_encoder({"status": health.name, "setup": setup}) », deux
+          # clés et pas trois. Les exiger tairait les instances les plus
+          # anciennes, qui sont exactement aussi ouvertes.
+          - 'regex("^\\{\\s*\"status\"\\s*:\\s*\"(?:UNKNOWN|STARTING|READY|BUSY|SETUP_FAILED|DEFUNCT|UNHEALTHY)\"", trim_space(body_2))'
+
+    extractors:
+      # La publication du serveur, donc les correctifs qui lui manquent.
+      #
+      # Un seul extracteur, et borné à body_1 — sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, et la charge utile de santé n'a de
+      # toute façon pas cette clé.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.cog_version'
