@@ -26978,6 +26978,433 @@ def test_infinity_db_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Chez FiftyOne, il n'y a aucune garde à contourner et c'est le constat
+# lui-même : fiftyone/server/app.py réduit sa pile à « _middleware =
+# [Middleware(HeadersMiddleware)] » — un intergiciel qui ne fait qu'ajouter des
+# en-têtes — plus un CORSMiddleware conditionnel, et l'application monte les
+# routes de la table, « Route("/graphql", GraphQL(schema)) » et deux arbres
+# statiques sans déclarer la moindre dépendance d'appelant. Le handler lu n'a
+# même pas de paramètre utile : « return {"version": foc.VERSION, "dev":
+# foc.DEV_INSTALL or foc.RC_INSTALL} », et il est écrit ainsi depuis la 0.21.
+#
+# La difficulté du template est donc entièrement de reconnaissance, et elle est
+# vive dans les deux sens.
+#
+# Trop lâche d'un côté : « version » est le mot de toutes les routes de
+# diagnostic du pack, et deux clés ne font pas une signature à elles seules.
+# Trop serrée de l'autre : la charge utile n'a que deux champs, donc il n'y a
+# aucun troisième nom sur quoi s'appuyer, et compter les champs ferait taire la
+# première publication qui en ajouterait un.
+#
+# Ce qui sépare est la conjonction de trois faits du code, et cette section les
+# amarre un par un. Le chemin, qui est le nom du produit. La FORME de « dev »,
+# un booléen JSON nu parce que « DEV_INSTALL or RC_INSTALL » joint un
+# os.path.isdir() à un « "rc" in VERSION ». Et la platitude du document, que
+# deux scalaires garantissent.
+#
+# Un quatrième point s'y ajoute, et il est de sérialisation : create_response()
+# appelle « json_util.dumps(response, cls=Encoder) » sans separators, donc
+# json.dumps écrit ses défauts — « ": " » et « ", " ». Le corps réel porte des
+# espaces, et un constat écrit sur la sérialisation compacte ne verrait aucune
+# instance.
+
+FIFTYONE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "fiftyone-app-server-exposed.yaml")
+
+FIFTYONE_ROUTE = "/fiftyone"
+
+
+def fiftyone_body(version="1.9.1", dev=False, extra=None, compact=False):
+    """
+    Réponse de GET /fiftyone telle que create_response() la met sur le fil :
+    « json_util.dumps(response, cls=Encoder) », donc json.dumps sans
+    separators — les défauts « ", " » et « ": " » — sur le littéral à deux clés
+    du handler, dans l'ordre où fiftyone/server/routes/fiftyone.py les déclare.
+    """
+    document = {"version": version, "dev": dev}
+    document.update(extra or {})
+    if compact:
+        return json.dumps(document, separators=(",", ":"))
+    return json.dumps(document)
+
+
+# Le cas nominal : une installation par paquet, donc ni dépôt git sous le
+# répertoire d'installation ni « rc » dans le numéro de publication.
+FIFTYONE_BODY = fiftyone_body()
+
+# L'instance lancée depuis une copie de travail, ou depuis une préversion :
+# DEV_INSTALL ou RC_INSTALL est vrai, et le booléen sort en true. Elle est tout
+# aussi ouverte, et la taire serait taire les déploiements les moins suivis.
+FIFTYONE_DEV_BODY = fiftyone_body(version="1.10.0rc1", dev=True)
+
+# La route de version d'un service quelconque : « version » y ouvre le document
+# de la même façon, et c'est tout ce qu'il a en commun.
+FIFTYONE_OTHER_VERSION_BODY = '{"version": "2.4.0", "commit": "9f3c1ab"}'
+
+# Le même document, mais « dev » y est une chaîne plutôt qu'un booléen. Le
+# handler ne peut pas l'écrire ainsi : DEV_INSTALL est un os.path.isdir() et
+# RC_INSTALL un « "rc" in VERSION », donc leur disjonction est un booléen.
+FIFTYONE_STRING_DEV_BODY = '{"version": "1.9.1", "dev": "false"}'
+
+# Et la même en 0/1, comme l'écrirait un service qui sérialise ses drapeaux en
+# entiers.
+FIFTYONE_NUMERIC_DEV_BODY = '{"version": "1.9.1", "dev": 0}'
+
+# Un numéro de publication rendu en nombre plutôt qu'en chaîne : VERSION est
+# « metadata("fiftyone")["version"] », donc toujours une chaîne.
+FIFTYONE_NUMERIC_VERSION_BODY = '{"version": 1.9, "dev": false}'
+
+# Un tableau de supervision qui agrège la réponse de l'instance sous une clé à
+# lui : les deux champs y sont, avec leurs valeurs exactes, mais ce n'est pas
+# l'instance qui a répondu d'elle-même.
+FIFTYONE_COMPOSITE_BODY = ('{"fiftyone": %s, "scraped_at": 0}'
+                           % FIFTYONE_BODY)
+
+# La même supervision, mais qui recopie la charge utile en tête plutôt que de
+# l'imbriquer. L'ancrage sur l'ouverture ne l'écarte pas — le document commence
+# bien par la bonne clé — et c'est la platitude, et elle seule, qui dit que ce
+# n'est pas l'instance qui a répondu : le handler ne rend que deux scalaires.
+FIFTYONE_ANNOTATED_BODY = fiftyone_body(
+    extra={"probe": {"latency_ms": 12, "checked_at": 0}})
+
+# L'entrée d'un registre de services, ou la réponse d'un relais qui préfixe la
+# charge utile d'une clé de routage à lui. Le document est plat et porte les
+# deux champs : seul l'ancrage sur l'ouverture dit que ce n'est pas l'instance
+# qui a répondu, puisque le littéral du handler déclare « version » en premier.
+FIFTYONE_REGISTRY_BODY = (
+    '{"service": "cv-datasets", "version": "1.9.1", "dev": false}'
+)
+
+# Le schéma que décrirait un tiers documentant la route : les deux noms y sont
+# nommés, mais comme propriétés — donc suivis d'objets.
+FIFTYONE_SCHEMA_BODY = (
+    '{"FiftyOne": {"properties": {"version": {"type": "string"}, '
+    '"dev": {"type": "boolean"}}, "type": "object"}}'
+)
+
+# L'index de l'App, que le Mount("/") de app.py sert en html=True et qu'un
+# catch-all rend en 200 sur un chemin qu'il ne connaît pas.
+FIFTYONE_SPA_BODY = (
+    '<!doctype html><html lang="en"><head><title>FiftyOne</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# La branche d'échec du décorateur : route() attrape ce que le handler lève et
+# rend « {"kind": "Server Error", "stack": ...} » en 500. Le handler lu ne peut
+# pas y tomber — il lit deux constantes — mais un voisin de la même table, oui,
+# et le corps n'est alors pas celui qu'on constate.
+FIFTYONE_SERVER_ERROR_BODY = (
+    '{"kind": "Server Error", "stack": "Traceback (most recent call last):\\n"}'
+)
+
+# Refus d'un proxy placé devant l'instance : c'est la seule fermeture possible,
+# puisque l'édition open source ne porte aucun mécanisme d'authentification.
+FIFTYONE_PROXY_DENIED_BODY = '{"message": "Unauthorized"}'
+
+
+def fiftyone_block():
+    doc = load(FIFTYONE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % FIFTYONE_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET /fiftyone — c'est pourtant la seule route "
+        "du serveur dont la réponse nomme le produit sans rien rendre du jeu "
+        "de données"
+    )
+    return blocks[0]
+
+
+def fiftyone_fires(status=200, body=FIFTYONE_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même
+    si le bloc n'a pas à en dépendre.
+    """
+    block = fiftyone_block()
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_fiftyone_probe_reads_neither_the_annotations_nor_the_media():
+    """
+    Le danger propre à ce template : la table de routes de
+    fiftyone/server/routes/__init__.py monte tout sur le même serveur nu. La
+    lecture doit donc rester sur la seule route qui ne rend rien du corpus.
+    /graphql donnerait les jeux de données et leurs annotations ; /media, dont
+    le handler prend « request.query_params.get("filepath") » et ne vérifie
+    qu'un stat.S_ISREG(), servirait le fichier que l'appelant nomme —
+    l'exfiltrer pour prouver qu'on le peut serait faire le dommage qu'on
+    signale. /tag, lui, réécrit les étiquettes.
+    """
+    doc = load(FIFTYONE_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", FIFTYONE_ROUTE)}, (
+        "le template n'interroge pas exactement la route qui nomme le "
+        f"produit — {sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la lecture se fait en GET : la classe FiftyOne ne déclare que "
+            "« get », et sur ce serveur les autres méthodes appartiennent aux "
+            "routes qui écrivent"
+        )
+        assert not block.get("body"), (
+            "le bloc porte un corps de requête : ici un corps n'a de sens que "
+            "pour interroger le graphe ou réécrire des étiquettes"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/graphql", "le template interroge le graphe : il rend les "
+                             "jeux de données, leurs vues, leurs annotations "
+                             "et les chemins de chaque média"),
+                ("/media", "le template appelle la route de service des "
+                           "fichiers : son seul contrôle est un os.stat() "
+                           "suivi d'un stat.S_ISREG(), donc elle sert tout "
+                           "fichier régulier que l'appelant nomme"),
+                ("/aggregate", "la route d'agrégation fait calculer le serveur "
+                               "sur le jeu de données de l'exploitant"),
+                ("/values", "la route de valeurs tire les valeurs distinctes "
+                            "d'un champ du jeu de données"),
+                ("/tag", "la route d'étiquetage réécrit les annotations de "
+                         "l'exploitant"),
+                ("/plugins", "l'énumération des greffons rend l'inventaire des "
+                             "extensions installées, et le Mount du même "
+                             "préfixe sert leurs fichiers"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_fiftyone_matcher_rests_on_the_version_dev_pair_not_on_a_version_route():
+    """
+    Le point qui fait ce template. « version » est le mot de toutes les routes
+    de diagnostic, et la charge utile n'a que deux champs : il n'y a aucun
+    troisième nom sur quoi s'appuyer. Ce qui sépare est la conjonction du couple
+    et de la platitude du document — et, pour « dev », sa forme de booléen nu.
+    """
+    assert fiftyone_fires(), (
+        "le template ne reconnaît pas une instance dont /fiftyone répond à "
+        "l'anonyme"
+    )
+
+    for body, why in (
+        (FIFTYONE_OTHER_VERSION_BODY,
+         "la route de version d'un autre produit, qui ouvre sur « version » "
+         "sans porter « dev »"),
+        (FIFTYONE_STRING_DEV_BODY,
+         "un « dev » rendu en chaîne, alors que « DEV_INSTALL or RC_INSTALL » "
+         "joint un os.path.isdir() à un « \"rc\" in VERSION »"),
+        (FIFTYONE_NUMERIC_DEV_BODY,
+         "un « dev » rendu en entier, comme l'écrirait un service qui "
+         "sérialise ses drapeaux en 0/1"),
+        (FIFTYONE_NUMERIC_VERSION_BODY,
+         "un numéro de publication rendu en nombre, alors que VERSION est "
+         "« metadata(\"fiftyone\")[\"version\"] », donc une chaîne"),
+        (FIFTYONE_COMPOSITE_BODY,
+         "la charge utile retrouvée au fond du document d'une supervision : "
+         "le handler ne rend que deux scalaires, donc aucune accolade "
+         "intérieure"),
+        (FIFTYONE_ANNOTATED_BODY,
+         "une supervision qui recopie la charge utile en tête avant d'y "
+         "ajouter un objet à elle — l'ancrage sur l'ouverture la laisse "
+         "passer, et seule la platitude l'écarte"),
+        (FIFTYONE_REGISTRY_BODY,
+         "l'entrée d'un registre de services, plate et porteuse des deux "
+         "champs, mais qui n'ouvre pas sur « version »"),
+        (FIFTYONE_SCHEMA_BODY,
+         "le schéma d'un tiers qui documente la route : les deux noms y sont "
+         "propriétés, donc suivis d'objets"),
+        (FIFTYONE_SPA_BODY,
+         "l'index de l'App, que le Mount(\"/\") sert en html=True et qu'un "
+         "catch-all rend en 200 sur un chemin qu'il ne connaît pas"),
+        (FIFTYONE_SERVER_ERROR_BODY,
+         "la branche d'échec du décorateur route(), qui rend « kind » et "
+         "« stack » en 500"),
+        ("", "une réponse vide"),
+    ):
+        assert not fiftyone_fires(body=body), "le template conclut sur %s" % why
+
+
+def test_fiftyone_matcher_holds_across_the_shapes_the_server_emits():
+    """
+    Le piège de sérialisation. create_response() appelle « json_util.dumps(
+    response, cls=Encoder) » sans separators, donc json.dumps écrit ses défauts
+    — « ": " » et « ", " ». Le corps réel porte des espaces, et un constat
+    écrit sur la sérialisation compacte ne verrait aucune instance. L'inverse
+    doit tenir aussi : un intermédiaire qui recompacte ou réindente ce qu'il
+    relaie ne suit pas le sérialiseur d'origine.
+    """
+    for body, why in (
+        (FIFTYONE_BODY,
+         "la sérialisation que json.dumps écrit par défaut, donc celle qui "
+         "part réellement sur le fil"),
+        (fiftyone_body(compact=True),
+         "la même charge utile recompactée par un intermédiaire"),
+        ('{\n  "version": "1.9.1",\n  "dev": false\n}',
+         "un intermédiaire qui réindente le JSON qu'il relaie"),
+        ("\n" + FIFTYONE_BODY + "\n",
+         "un intermédiaire qui encadre le corps de sauts de ligne"),
+    ):
+        assert fiftyone_fires(body=body), "le template perd %s" % why
+
+    assert fiftyone_fires(body=FIFTYONE_DEV_BODY), (
+        "le template exige « dev » à false : il tait alors les instances "
+        "lancées depuis une copie de travail ou une préversion, qui sont tout "
+        "aussi ouvertes et suivent le moins les publications"
+    )
+
+    assert fiftyone_fires(body=fiftyone_body(extra={"edition": "oss"})), (
+        "le template compte les champs : une publication ultérieure qui "
+        "ajouterait un scalaire au littéral du handler le rendrait muet, alors "
+        "que la route resterait exactement aussi ouverte"
+    )
+
+
+def test_fiftyone_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le handler n'a pas de branche d'échec : il lit deux constantes que
+    fiftyone/constants.py a résolues à l'import, donc route() n'a rien à
+    attraper et la charge utile ne peut sortir que sous un 200. Exiger ce 200
+    n'écarterait rien que le corps n'écarte déjà, et ferait manquer l'instance
+    dont un intermédiaire réécrit le statut.
+    """
+    block = fiftyone_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : le handler ne rend cette charge "
+        "utile que sur un 200, donc ce matcher n'écarte rien et n'ajoute qu'un "
+        "risque de silence"
+    )
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : c'est le couple "
+        "version / dev conjoint à la platitude du document qui nomme le "
+        "produit, aucun des deux seul"
+    )
+
+    assert not fiftyone_fires(status=401, body=FIFTYONE_PROXY_DENIED_BODY), (
+        "le template signale une instance dont un proxy refuse déjà la route à "
+        "l'anonyme — c'est la seule fermeture possible, puisque l'édition open "
+        "source ne porte aucun mécanisme d'authentification"
+    )
+
+
+def test_fiftyone_extractor_reports_the_release_and_not_the_boolean():
+    block = fiftyone_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "la réponse ne porte qu'un renseignement exploitable — la publication "
+        f"de l'instance — et {len(extractors)} extracteurs feraient remonter "
+        "autant de fois la même instance"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant lui qui dit quels "
+        "correctifs manquent à l'instance ; « dev » est un booléen et ne prend "
+        "que deux valeurs, dont aucune ne se recoupe"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_fiftyone_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    module `re` de Python plutôt qu'avec RE2 : seul un scan contre un vrai
+    serveur ferme la boucle. Le groupe non capturant de « dev » en est l'enjeu
+    propre — il se lit différemment dans les deux moteurs si l'un ne le
+    supportait pas — et le refus du document composite en est l'autre.
+    """
+    def scan(body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                payload = (body if self.path == FIFTYONE_ROUTE
+                           else '{"detail": "Not Found"}')
+                status = 200 if self.path == FIFTYONE_ROUTE else 404
+                encoded = payload.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", FIFTYONE_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "fiftyone-app-server-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(FIFTYONE_BODY)
+    assert set(seen) == {FIFTYONE_ROUTE}, (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == ["1.9.1"], (
+        f"le scan ne remonte pas la publication de l'instance — {extracted}"
+    )
+
+    _, dev = scan(FIFTYONE_DEV_BODY)
+    assert dev == ["1.10.0rc1"], (
+        "le scan perd l'instance lancée depuis une copie de travail ou une "
+        f"préversion, dont « dev » vaut true — {dev}"
+    )
+
+    for body, why in (
+        (FIFTYONE_COMPOSITE_BODY,
+         "le document d'une supervision qui republie la charge utile sous une "
+         "clé à elle, donc sur une instance qui n'a pas répondu d'elle-même"),
+        (FIFTYONE_STRING_DEV_BODY,
+         "un « dev » rendu en chaîne, que le handler ne peut pas écrire"),
+        (FIFTYONE_OTHER_VERSION_BODY,
+         "la route de version d'un autre produit"),
+    ):
+        _, refused = scan(body)
+        assert refused == [], "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

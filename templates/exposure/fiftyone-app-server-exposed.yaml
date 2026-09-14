@@ -1,0 +1,193 @@
+id: fiftyone-app-server-exposed
+
+info:
+  name: FiftyOne App Server - Unauthenticated Instance Exposure
+  author: popy21
+  severity: high
+  description: |
+    FiftyOne (voxel51/fiftyone) est l'outil de curation, d'annotation et de
+    visualisation de jeux de données de vision par ordinateur le plus déployé.
+    L'App n'est pas un fichier statique : elle est servie par un serveur
+    Starlette embarqué, et c'est ce processus-là qui porte le graphe GraphQL des
+    jeux de données, les routes d'agrégation et d'étiquetage, et le service des
+    fichiers média.
+    GET /fiftyone en est la lecture qui nomme le produit. La route est montée
+    par fiftyone/server/routes/__init__.py, dont la table porte
+    « ("/fiftyone", FiftyOne) » aux côtés de « ("/aggregate", Aggregate) »,
+    « ("/media", Media) », « ("/plugins", Plugins) », « ("/values", Values) » et
+    « ("/tag", Tag) ». Son handler tient en une expression dans
+    fiftyone/server/routes/fiftyone.py — « return {"version": foc.VERSION,
+    "dev": foc.DEV_INSTALL or foc.RC_INSTALL} » — et il est écrit ainsi, mot
+    pour mot, depuis la 0.21 au moins : deux clés, jamais plus.
+    Les deux valeurs viennent de fiftyone/constants.py. « version » est
+    VERSION, c'est-à-dire « metadata("fiftyone")["version"] », donc toujours une
+    chaîne. « dev » est « DEV_INSTALL or RC_INSTALL », et les deux sont des
+    booléens — le premier est un « os.path.isdir(...) » sur le .git du
+    répertoire d'installation, le second un « "rc" in VERSION ». La valeur sort
+    donc en true ou false, jamais en chaîne ni en nombre.
+    L'absence d'authentification n'est pas un réglage manqué : c'est une
+    fonctionnalité absente de l'édition open source. fiftyone/server/app.py
+    réduit sa pile à « _middleware = [Middleware(HeadersMiddleware)] » — un
+    intergiciel qui ne fait qu'ajouter des en-têtes de cache et d'isolation
+    d'origine — auquel s'ajoute un CORSMiddleware seulement si
+    FIFTYONE_ALLOWED_ORIGINS est posé. L'application monte ensuite les routes de
+    la table, « Route("/graphql", GraphQL(schema)) » et deux arbres statiques.
+    Aucun garde, aucune dépendance d'authentification, aucune notion d'appelant
+    n'y est déclarée ; la gestion des rôles et des permissions n'est documentée
+    que pour FiftyOne Enterprise — « Learn how to configure roles, groups and
+    access permissions for users of your deployment ».
+    Les défauts de liaison sont dans fiftyone/core/config.py :
+    « default_app_address » vaut "localhost" (variable
+    FIFTYONE_DEFAULT_APP_ADDRESS) et « default_app_port » vaut 5151 (variable
+    FIFTYONE_DEFAULT_APP_PORT). L'exposition survient donc dès que l'exploitant
+    change l'adresse d'écoute pour servir une autre machine, ou publie le port
+    du conteneur sur toutes les interfaces de l'hôte.
+  impact: |
+    Le renseignement d'abord, et il est mince mais daté : « version » est la
+    publication exacte de l'instance, donc les correctifs qui lui manquent, et
+    « dev » dit si le serveur tourne depuis une copie de travail git ou une
+    préversion — c'est-à-dire hors du cycle de publication que suivent les avis
+    de sécurité.
+    Le risque est sur ce que le même processus sert au même anonyme, et il est
+    d'un autre ordre. /graphql porte le schéma complet : énumération des jeux de
+    données, de leurs vues, de leurs champs et de leurs échantillons, donc les
+    annotations elles-mêmes — boîtes, masques, classes, métadonnées — et les
+    chemins de fichiers de chaque média. C'est le corpus d'entraînement et son
+    étiquetage, pas seulement leur résumé. Les routes de la même table
+    l'accompagnent : /aggregate calcule sur le jeu de données, /values en tire
+    les valeurs distinctes d'un champ, /tag en réécrit les étiquettes.
+    GET /media?filepath=... ferme la liste, et c'est la lecture la plus large :
+    le handler de fiftyone/server/routes/media.py prend « path =
+    request.query_params.get("filepath") » puis le passe à _file_response(),
+    dont le seul contrôle est un « os.stat() » suivi d'un
+    « stat.S_ISREG(stat_result.st_mode) ». Aucune restriction de répertoire, ni
+    racine imposée, ni vérification que le chemin appartienne à un jeu de
+    données : tout fichier régulier lisible par le compte qui fait tourner le
+    serveur est servi à qui le nomme. Le chemin est désigné par l'appelant, donc
+    la lecture ne se limite pas aux médias — clés privées, fichiers
+    d'environnement, jetons montés dans le conteneur.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé
+    d'identité, donc aucune trace n'en portera.
+  remediation: |
+    Il n'y a pas de réglage à poser : l'édition open source ne porte aucun
+    mécanisme d'authentification, et fiftyone/server/app.py ne déclare ni garde
+    ni dépendance d'appelant. La fermeture est donc entièrement en amont de
+    l'application.
+    Ramener la liaison à son défaut d'abord : FIFTYONE_DEFAULT_APP_ADDRESS vaut
+    "localhost" quand on ne lui dit rien, et c'est la bonne valeur tant que
+    l'App n'a pas à être atteinte depuis une autre machine. Côté conteneur,
+    publier le port sur la boucle locale — « -p 127.0.0.1:5151:5151 » — plutôt
+    que sur toutes les interfaces de l'hôte, ce que fait « -p 5151:5151 ».
+    Quand l'instance doit être atteinte à distance, la placer derrière un proxy
+    qui exige une authentification sur tout le serveur, et non sur les seules
+    routes qui paraissent sensibles : /graphql rend les annotations et
+    /media?filepath=... rend n'importe quel fichier régulier que le compte du
+    serveur peut lire. Un tunnel SSH avec redirection de port fait la même chose
+    sans proxy à tenir.
+    Resserrer FIFTYONE_ALLOWED_ORIGINS si la variable est posée : app.py monte
+    le CORSMiddleware sur sa valeur, et le serveur journalise lui-même un
+    avertissement quand elle contient "*".
+    Vérifier depuis l'extérieur du périmètre, sans en-tête :
+    « curl -s http://<hote>:5151/fiftyone » ne doit plus rendre le couple
+    version / dev.
+    Après une exposition, tenir les jeux de données pour lus : le schéma GraphQL
+    donne les annotations et les chemins de chaque média, et /media les sert
+    ensuite un par un. Chercher dans les journaux du serveur les appels à
+    /media dont le paramètre filepath sort de l'arborescence des jeux de données
+    — un chemin vers /proc, /root, un répertoire personnel ou un fichier
+    d'environnement est la lecture arbitraire en cours d'usage. Aucune de ces
+    lignes ne portera d'identité d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/voxel51/fiftyone/blob/develop/fiftyone/server/routes/fiftyone.py
+    - https://github.com/voxel51/fiftyone/blob/develop/fiftyone/server/routes/__init__.py
+    - https://github.com/voxel51/fiftyone/blob/develop/fiftyone/server/app.py
+    - https://github.com/voxel51/fiftyone/blob/develop/fiftyone/server/routes/media.py
+    - https://github.com/voxel51/fiftyone/blob/develop/fiftyone/server/decorators.py
+    - https://github.com/voxel51/fiftyone/blob/develop/fiftyone/core/config.py
+    - https://github.com/voxel51/fiftyone/blob/develop/fiftyone/constants.py
+    - https://docs.voxel51.com/enterprise/index.html
+  metadata:
+    max-request: 1
+    vendor: voxel51
+    product: fiftyone
+  tags: ai,ml,cv,computer-vision,dataset,annotation,fiftyone,voxel51,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la moins coûteuse du serveur. Le handler ne
+  # touche ni la base, ni le disque, ni le jeu de données chargé : il lit deux
+  # constantes que fiftyone/constants.py a résolues à l'import.
+  #
+  # En lecture seule, et strictement. Le même routeur nu porte /graphql, qui
+  # rendrait les annotations et les chemins de médias ; /media?filepath=..., qui
+  # sert tout fichier régulier que le compte du serveur peut lire ; /aggregate
+  # et /values, qui calculent sur le jeu de données de l'exploitant ; et /tag,
+  # qui en réécrit les étiquettes. C'est précisément ce que le constat signale ;
+  # ce n'est pas ce qu'un scanner a le droit de faire pour l'établir.
+  #
+  # GET, et rien d'autre. La classe FiftyOne ne déclare que « get » : toute
+  # autre méthode sortirait en 405 sans rien apprendre, et le même chemin ne
+  # sert rien d'autre.
+  - method: GET
+    path:
+      - "{{BaseURL}}/fiftyone"
+
+    matchers-condition: and
+    matchers:
+      # Le chemin nomme déjà le produit ; les expressions disent que c'est bien
+      # son handler qui a répondu, et pas un catch-all qui rend 200 sur ce qu'il
+      # ne connaît pas.
+      #
+      # « version » ouvre le document, et l'ancrage n'est pas décoratif : le
+      # littéral du handler pose cette clé en premier, et json.dumps — que
+      # bson.json_util appelle sous create_response() — conserve l'ordre
+      # d'insertion. L'exiger en ouverture écarte la même charge utile retrouvée
+      # au fond du document d'une supervision qui l'agrégerait sous une clé à
+      # elle. La valeur est une chaîne parce que VERSION est
+      # « metadata("fiftyone")["version"] », et elle est laissée libre : elle
+      # change à chaque publication, et c'est l'extracteur qui la rapporte.
+      #
+      # Les \s* sont là parce que json.dumps écrit « ": " » et « ", " » par
+      # défaut — create_response() ne passe pas de separators — mais qu'un
+      # intermédiaire qui recompacte ou réindente ce qu'il relaie ne s'y tient
+      # pas.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"version"\s*:\s*"[^"]+"'
+
+          # « dev » est ce qui sépare cette charge utile de la route de version
+          # de n'importe quel autre produit. Le mot seul ne dirait rien ; c'est
+          # sa forme qui compte — un booléen JSON nu, parce que le handler écrit
+          # « DEV_INSTALL or RC_INSTALL » et que les deux sont des booléens
+          # Python : un « os.path.isdir(...) » et un « "rc" in VERSION ». Une
+          # chaîne « "true" », un 0/1 ou un objet viendraient d'ailleurs.
+          #
+          # Volontairement non ancrée en fin de document alors qu'elle y est
+          # écrite en dernier : une publication ultérieure qui ajouterait un
+          # champ après elle ne cesserait pas pour autant d'être un serveur
+          # FiftyOne ouvert.
+          - '"dev"\s*:\s*(?:true|false)'
+
+          # Le document est tenu pour plat, et il l'est par construction : le
+          # handler rend deux scalaires, une chaîne et un booléen, dont aucun
+          # n'ouvre d'accolade. Aucune paire { } ne doit donc apparaître à
+          # l'intérieur du corps.
+          #
+          # C'est ce qui sépare la réponse du serveur du document composite
+          # d'une passerelle qui recopierait la charge utile en tête avant d'y
+          # ajouter un objet à elle — ce que l'ancrage de la première expression
+          # ne ferait pas seul, puisqu'un tel document commence bien par la
+          # bonne clé — et du schéma OpenAPI ou GraphQL d'un tiers, où les deux
+          # noms seraient des propriétés, donc suivies d'objets.
+          - '^\s*\{[^{}]*\}\s*$'
+        condition: and
+
+    extractors:
+      # La publication de l'instance, donc les correctifs qui lui manquent.
+      # « dev » n'est pas remonté : c'est un booléen, il ne prend que deux
+      # valeurs, et le rapport de scan n'en tire rien qu'il puisse recouper.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
