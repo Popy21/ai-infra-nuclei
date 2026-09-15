@@ -1,0 +1,246 @@
+id: dcgm-exporter-metrics-exposed
+
+info:
+  name: NVIDIA DCGM Exporter - Unauthenticated GPU Telemetry Exposure
+  author: popy21
+  severity: medium
+  description: |
+    DCGM-Exporter (NVIDIA/dcgm-exporter) est l'exportateur de télémétrie GPU de
+    NVIDIA — son README l'ouvre ainsi : « It exposes GPU metrics exporter for
+    Prometheus leveraging NVIDIA DCGM ». Ce n'est pas un composant qu'on choisit
+    d'installer : la même page écrit que « dcgm-exporter is deployed as part of
+    the GPU Operator », donc il tourne partout où le GPU Operator tourne, c'est-à-dire
+    sur l'essentiel des parcs d'entraînement et d'inférence en Kubernetes.
+    GET /metrics est sa seule lecture utile, et elle est montée sans garde :
+    server.go la câble en « router.HandleFunc("/metrics", serverv1.Metrics) »,
+    sur un routeur gorilla/mux qui ne reçoit aucun intergiciel — pas de
+    vérification d'appelant, pas de notion d'identité. Le README donne la
+    commande qui l'atteint, « curl localhost:9400/metrics », et le drapeau
+    d'écoute a pour défaut « :9400 », c'est-à-dire toutes les interfaces
+    (app.go, « Value: ":9400" » sous le drapeau « address »). La commande de
+    démarrage que le README publie la complète : « docker run -d --gpus all
+    --cap-add SYS_ADMIN --rm -p 9400:9400 nvcr.io/nvidia/k8s/dcgm-exporter:... »,
+    donc le port est publié sur toutes les interfaces de l'hôte.
+    L'absence d'authentification est le défaut du produit, et le README le
+    documente en propre : « Exporter supports TLS and basic auth using
+    exporter-toolkit. To use TLS and/or basic auth, users need to use
+    `--web-config-file` CLI flag ». Ce drapeau a pour défaut la chaîne vide
+    (app.go), et c'est lui seul qui monte la garde — sans fichier de
+    configuration web, exporter-toolkit sert /metrics en clair à tout appelant.
+    Ce que la réponse porte est propre au produit, et c'est là-dessus que le
+    constat repose. Chaque série s'appelle « DCGM_FI_DEV_… » et ouvre son jeu
+    d'étiquettes sur le couple gpu / UUID : le README en donne deux exemplaires
+    verbatim — « DCGM_FI_DEV_SM_CLOCK{gpu="0", UUID="GPU-604ac76c-d9cf-fef3-62e9-d92044ab6e52"} 139 »
+    et « DCGM_FI_DEV_MEM_CLOCK{gpu="0", UUID="GPU-604ac76c-d9cf-fef3-62e9-d92044ab6e52"} 405 ».
+    Ce couple n'est pas cosmétique : le rendu le pose dans cet ordre, gpu
+    d'abord puis l'étiquette d'UUID, et les deux générations du moteur de rendu
+    s'y tiennent — le gabarit text/template des publications 3.x et 4.1
+    (« {gpu="{{ $metric.GPU }}",{{ $metric.UUID }}="{{ $metric.GPUUUID }}",… »)
+    comme la construction expfmt des publications actuelles, où metricLabels()
+    ajoute « gpu » avant l'étiquette d'UUID, puis pci_bus_id, device et
+    modelName.
+  impact: |
+    Ce que la lecture livre n'est pas un numéro de version, et c'est ce qui la
+    distingue des autres constats du pack : c'est l'inventaire nominatif du
+    parc d'accélérateurs, plus son taux d'occupation, rafraîchis à chaque
+    scrutation.
+    L'inventaire d'abord. Sur chaque série, metricLabels() écrit « modelName »
+    (le modèle exact de la carte), « device » (« nvidia0 » et suivants),
+    « pci_bus_id », l'UUID de chaque GPU et le nom de la machine — la
+    documentation officielle en donne le rendu, « device="nvidia0" » et
+    « Hostname="ub20-a100-k8s" ». Le fichier de compteurs par défaut y joint
+    « DCGM_FI_DRIVER_VERSION, label, Driver Version », donc la version du pilote
+    NVIDIA de l'hôte se lit sur chaque ligne : le niveau de correctif du parc,
+    en une requête et sans compte.
+    Le découpage ensuite. Quand le MIG est actif, la même fonction ajoute
+    « GPU_I_PROFILE » et « GPU_I_ID » — la documentation donne
+    « GPU_I_PROFILE="1g.5gb" » —, donc la façon dont chaque carte est
+    tranchée entre locataires.
+    La carte des charges enfin, et c'est elle qui fait la sévérité. En
+    déploiement Kubernetes, la transformation pose sur chaque série les
+    étiquettes « pod », « namespace » et « container » — le README les montre
+    en place, « DCGM_FI_DEV_SM_CLOCK{gpu="0", UUID="GPU-604ac…",container="",namespace="",pod=""} 139 ».
+    L'appelant anonyme lit donc quel pod occupe quel GPU, dans quel namespace,
+    sous quel conteneur : les noms des travaux d'entraînement et des services
+    d'inférence du cluster, leur répartition, et — par DCGM_FI_DEV_GPU_UTIL,
+    DCGM_FI_DEV_FB_USED et leurs voisines — ce que chacun consomme réellement.
+    C'est une cartographie interne : nommage des équipes et des projets,
+    rythme des campagnes d'entraînement, cartes inoccupées, machines en
+    maintenance. Rien de tout cela n'est attribuable : la route n'a jamais
+    réclamé d'identité, donc aucun journal n'en portera.
+  remediation: |
+    Le produit porte le mécanisme, il est seulement éteint par défaut. Poser
+    « --web-config-file=web-config.yaml » (ou DCGM_EXPORTER_WEB_CONFIG_FILE) :
+    c'est le drapeau que le README désigne pour « TLS and/or basic auth » via
+    exporter-toolkit, et son défaut est la chaîne vide, donc aucune garde
+    n'est montée tant qu'il n'est pas écrit. Le fichier de référence est celui
+    d'exporter-toolkit ; il porte « basic_auth_users » et « tls_server_config ».
+    Sans lui, /metrics répond à tout appelant.
+    Fermer aussi le réseau, parce que c'est lui qui a exposé. Le défaut du
+    drapeau d'écoute est « :9400 », donc toutes les interfaces : passer
+    « -a 127.0.0.1:9400 » quand la scrutation est locale. En conteneur, ne pas
+    reprendre le « -p 9400:9400 » du README, qui publie sur toutes les
+    interfaces de l'hôte — préférer « -p 127.0.0.1:9400:9400 ». En Kubernetes,
+    laisser le service en ClusterIP et le scruter depuis le cluster : c'est un
+    hostPort, un NodePort ou un ingress qui met la télémétrie sur Internet, pas
+    le pod. Une NetworkPolicy qui n'admet que le collecteur Prometheus ferme le
+    reste.
+    Le profilage suit la même clé et n'a donc pas à être fermé séparément :
+    « --enable-pprof » monte /debug/pprof/, et le README écrit que « When pprof
+    is enabled, startup requires `--web-config-file` » — le démarrage échoue
+    sans lui.
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<hote>:9400/metrics » ne doit plus rendre de série
+    « DCGM_FI_DEV_… ».
+    Après une exposition, tenir l'inventaire pour lu, et il ne se reprend pas :
+    modèles de cartes, UUID, bus PCI, noms de machines, version du pilote,
+    découpage MIG, et — en Kubernetes — les noms de pods, de namespaces et de
+    conteneurs qui occupaient les GPU pendant toute la fenêtre. La seule
+    question qui reste ouverte est la durée de cette fenêtre : la chercher dans
+    les journaux du proxy ou du pare-feu, puisque l'exportateur, lui, n'a rien
+    journalisé d'attribuable.
+  reference:
+    - https://github.com/NVIDIA/dcgm-exporter/blob/main/README.md
+    - https://docs.nvidia.com/datacenter/cloud-native/gpu-telemetry/latest/dcgm-exporter.html
+    - https://github.com/NVIDIA/dcgm-exporter/blob/main/internal/pkg/server/server.go
+    - https://github.com/NVIDIA/dcgm-exporter/blob/main/internal/pkg/rendermetrics/render_metrics.go
+    - https://github.com/NVIDIA/dcgm-exporter/blob/4.2.3-4.1.1/internal/pkg/rendermetrics/render_metrics.go
+    - https://github.com/NVIDIA/dcgm-exporter/blob/main/pkg/cmd/app.go
+    - https://github.com/NVIDIA/dcgm-exporter/blob/main/etc/default-counters.csv
+    - https://github.com/NVIDIA/dcgm-exporter
+  metadata:
+    max-request: 1
+    vendor: nvidia
+    product: dcgm-exporter
+    shodan-query: http.title:"GPU Exporter"
+  tags: ai,ml,gpu,nvidia,dcgm,dcgm-exporter,telemetry,prometheus,exposure,unauth,misconfig
+
+http:
+  # Une lecture, et c'est la seule que le produit expose : server.go monte trois
+  # routes — « / » (une page HTML de quatre lignes), « /health » (« OK » ou
+  # « KO » en texte nu) et « /metrics ». Les deux premières ne diraient rien
+  # qu'un autre serveur ne puisse dire ; la troisième porte la signature et la
+  # preuve dans le même corps.
+  #
+  # /debug/pprof/ n'est pas interrogée, et n'a pas à l'être : elle n'existe que
+  # sous « --enable-pprof », et le README écrit que ce mode « requires
+  # `--web-config-file` » au démarrage — donc elle n'est jamais atteignable sans
+  # la garde que ce constat signale comme absente.
+  #
+  # GET, et rien d'autre : la route est câblée par HandleFunc sans restriction
+  # de méthode, mais rien ici n'écrit ni ne déclenche de travail — Metrics()
+  # rassemble les valeurs déjà collectées et les rend.
+  - method: GET
+    path:
+      - "{{BaseURL}}/metrics"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat entier tient dans cette expression, et chacun de ses
+          # morceaux porte.
+          #
+          # « DCGM_FI_DEV_ » d'abord : c'est le préfixe des champs DCGM, écrit
+          # par le fichier de compteurs (DCGM_FI_DEV_SM_CLOCK, DCGM_FI_DEV_MEM_CLOCK,
+          # DCGM_FI_DEV_GPU_TEMP…). Aucun autre exportateur ne le publie.
+          #
+          # L'ancrage en début de ligne ensuite — (?m) et ^ — parce que dans le
+          # format d'exposition Prometheus, une ligne d'échantillon commence par
+          # le nom de la famille. Les lignes de métadonnées commencent par « # »,
+          # et une mention du nom au milieu d'une phrase, d'une requête PromQL
+          # ou d'un tableau de bord ne commence rien du tout.
+          #
+          # « {gpu=" » comme PREMIÈRE étiquette enfin, immédiatement suivie de
+          # l'étiquette d'UUID. C'est ce qui sépare une instance de sa copie
+          # relayée : metricLabels() ajoute « gpu » puis l'UUID dans cet ordre —
+          # le gabarit text/template des publications 3.x et 4.1 écrivait déjà
+          # « {gpu="…",{{ $metric.UUID }}="…" » — alors que toute republication
+          # passée par Prometheus, par une fédération ou par un collecteur
+          # OpenTelemetry réordonne les étiquettes par octet croissant, ce qui
+          # place UUID, Hostname et DCGM_FI_DRIVER_VERSION avant « gpu ». La
+          # série republiée porte les mêmes noms ; elle n'ouvre pas de la même
+          # façon.
+          #
+          # (?:UUID|uuid) : le nom de cette étiquette n'est pas une constante —
+          # metricLabels() l'ajoute sous « metric.UUID », que le collecteur pose
+          # à « UUID » par défaut et à « uuid » sous « --use-old-namespace ».
+          # Cette bascule ne touche pas le nom des séries ; une instance en
+          # ancien espace de noms est exactement aussi ouverte.
+          #
+          # « GPU- » suivi des deux premiers groupes d'un UUID : c'est la forme
+          # d'un identifiant de carte NVIDIA, et l'exiger écarte ce qui cite le
+          # nom des étiquettes sans porter de valeur de périphérique — un
+          # sélecteur PromQL, une règle d'alerte, un tableau de bord Grafana.
+          #
+          # \s* après la virgule : le rendu réel n'insère pas d'espace — ni le
+          # gabarit text/template, ni expfmt — mais le README et la
+          # documentation officielle impriment leurs exemples avec une espace,
+          # et un relais qui reformaterait ce qu'il sert ne coûte rien à
+          # admettre.
+          - 'regex("(?m)^DCGM_FI_DEV_[A-Z0-9_]+\\{gpu=\"[0-9]+\",\\s*(?:UUID|uuid)=\"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-", body)'
+
+          # La seconde moitié : les métadonnées de famille que le format
+          # d'exposition impose, et que le moteur écrit avant chaque groupe
+          # d'échantillons — « # HELP <nom> <aide> » puis « # TYPE <nom> <type> ».
+          #
+          # Elle dit que le corps est une exposition rendue par un exportateur,
+          # et non un extrait qui contiendrait une ligne d'échantillon : un
+          # journal, une page de documentation, un fragment recopié portent la
+          # ligne sans porter la déclaration de sa famille.
+          #
+          # Les trois types sont ceux que le rendu sait émettre —
+          # metricTypeForCounter() ne rend que COUNTER, GAUGE et UNTYPED, et le
+          # fichier de compteurs par défaut n'écrit que « gauge » et
+          # « counter ». La fin de ligne n'est pas ancrée : un relais qui
+          # servirait le corps en CRLF laisserait un \r derrière le type.
+          - 'regex("(?m)^# TYPE DCGM_FI_DEV_[A-Z0-9_]+ (?:gauge|counter|untyped)", body)'
+
+    extractors:
+      # L'inventaire, pas la version. Ce que cette exposition livre n'est pas un
+      # numéro de publication — l'exportateur n'en publie aucun sur cette route —
+      # mais le parc lui-même, et c'est cela qu'il faut rapporter pour que le
+      # constat se lise sans rescruter la cible.
+      #
+      # Un seul extracteur, et c'est délibéré : nuclei émet une ligne de
+      # résultat par extracteur nommé qui rend quelque chose, donc trois
+      # extracteurs signaleraient trois fois la même instance. Les quatre
+      # étiquettes sont donc lues par une seule expression, et le groupe 0 garde
+      # la paire entière — « modelName="NVIDIA A100-SXM4-40GB" » plutôt que la
+      # seule valeur — pour que le rapport se relise sans table de
+      # correspondance.
+      #
+      # Les quatre sont posées par metricLabels() sur chaque série, donc une
+      # seule réponse les rend toutes ; nuclei déduplique les correspondances,
+      # de sorte qu'un parc de huit cartes identiques remonte un modèle et un
+      # parc hétérogène autant qu'il en porte :
+      #
+      #   modelName              le modèle exact des accélérateurs. Le groupe
+      #                          NVLink écrit « model_name », que ce motif ne
+      #                          ramasse pas.
+      #   GPU_I_PROFILE          le découpage MIG, ajouté seulement quand le
+      #                          profil est non vide.
+      #   DCGM_FI_DRIVER_VERSION la version du pilote NVIDIA de l'hôte, donc son
+      #                          niveau de correctif. Elle vient du compteur
+      #                          d'étiquette « DCGM_FI_DRIVER_VERSION, label,
+      #                          Driver Version », actif dans le fichier de
+      #                          compteurs par défaut.
+      #   hostname / Hostname    la machine exposée — le gabarit text/template
+      #                          l'écrivait en capitale, expfmt l'écrit en
+      #                          minuscules. C'est elle qui dit à l'exploitant
+      #                          quel nœud fermer.
+      #
+      # Aucune ne conditionne le constat : le MIG n'est pas toujours actif, le
+      # nom de machine n'est pas toujours résolu et le fichier de compteurs peut
+      # être réécrit sans DCGM_FI_DRIVER_VERSION — une instance qui n'en porte
+      # aucune est exactement aussi ouverte.
+      #
+      # Les étiquettes de charge — pod, namespace, container — ne sont pas
+      # extraites, alors que ce sont elles qui font la sévérité. Les rapporter
+      # reviendrait à recopier la carte des travaux du cluster dans le rapport
+      # de scrutation : le constat n'en a pas besoin, et la section « impact »
+      # dit déjà ce qu'un appelant anonyme y lit.
+      - type: regex
+        name: inventory
+        regex:
+          - '(?:modelName|GPU_I_PROFILE|DCGM_FI_DRIVER_VERSION|[Hh]ostname)="[^"]+"'

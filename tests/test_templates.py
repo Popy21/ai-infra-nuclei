@@ -2346,6 +2346,11 @@ def dsl_matcher_hits(matcher, responses):
     reçues peuplent body_N et status_code_N, chaque expression est évaluée
     contre cet espace de noms, et la condition vaut `or` par défaut.
 
+    `body` et `status_code`, sans numéro, nomment la réponse courante — celle
+    que le moteur vient de recevoir. Un bloc qui n'émet qu'une requête n'a pas
+    de req-condition et n'a donc que cette écriture-là à sa disposition : les
+    formes numérotées n'existent pas sans elle.
+
     Le sous-ensemble du langage employé ici — contains, starts_with, trim_space,
     regex, `&&` et `||` — se traduit terme à terme en Python. L'espace de noms est
     clos : aucune autre fonction n'y est atteignable.
@@ -2365,6 +2370,8 @@ def dsl_matcher_hits(matcher, responses):
     for i, (status, body) in enumerate(responses, start=1):
         env[f"status_code_{i}"] = status
         env[f"body_{i}"] = body
+    if responses:
+        env["status_code"], env["body"] = responses[-1]
 
     def hit(expr):
         python_expr = expr.replace("&&", " and ").replace("||", " or ")
@@ -28005,6 +28012,588 @@ def test_cog_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, refused = scan(index_body, health_body=health_body)
         assert refused == [], "le scan conclut sur %s" % why
+
+
+# --------------------------------------------------------------------------
+# DCGM-Exporter : l'exportateur de télémétrie GPU de NVIDIA, celui que le GPU
+# Operator embarque. Ce que cette section amarre tient en quatre points, et
+# c'est le troisième qui fait le template.
+#
+# Le préfixe d'abord. « DCGM_FI_DEV_ » nomme les champs DCGM et personne
+# d'autre ne le publie — c'est la moitié du constat que la feuille de route
+# impose, l'autre étant l'étiquette d'UUID. Ni le statut HTTP ni le seul chemin
+# /metrics ne peuvent y suppléer : le premier vaut 200 sur tout serveur vivant,
+# le second est le chemin d'exposition de la moitié de l'écosystème Prometheus.
+#
+# L'ordre des étiquettes ensuite, et c'est le point non évident. Une série
+# « DCGM_FI_DEV_… » se retrouve telle quelle dans n'importe quel Prometheus qui
+# scrute le parc, dans une fédération, dans la sortie d'un collecteur
+# OpenTelemetry. Ce qui sépare l'instance de sa copie, c'est que l'exportateur
+# écrit « gpu » en PREMIÈRE étiquette, immédiatement suivie de l'UUID —
+# metricLabels() les ajoute dans cet ordre, et le gabarit text/template des
+# publications 3.x et 4.1 écrivait déjà « {gpu="…",{{ $metric.UUID }}="…" » —
+# alors que toute republication réordonne les étiquettes par octet croissant,
+# ce qui place UUID, Hostname et DCGM_FI_DRIVER_VERSION devant « gpu ». Les cas
+# ci-dessous exigent que cette différence-là soit lue.
+#
+# Le nom de l'étiquette d'UUID ensuite. Il n'est pas constant : metricLabels()
+# l'ajoute sous « metric.UUID », que le collecteur pose à « UUID » par défaut et
+# à « uuid » sous « --use-old-namespace ». Cette bascule ne touche pas le nom
+# des séries, donc l'instance en ancien espace de noms est exactement aussi
+# ouverte — l'oublier tairait tout un parc.
+#
+# Les deux écritures de l'espacement enfin. Le rendu réel n'insère pas d'espace
+# après la virgule — ni le gabarit text/template, ni expfmt — mais le README et
+# la documentation officielle impriment leurs exemples avec une espace. Les
+# deux doivent être lues, sans quoi le template se juge sur sa documentation
+# plutôt que sur ce qui sort du serveur.
+
+DCGM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                             "dcgm-exporter-metrics-exposed.yaml")
+
+DCGM_ROUTE = "/metrics"
+
+DCGM_UUID = "GPU-604ac76c-d9cf-fef3-62e9-d92044ab6e52"
+DCGM_MODEL = "NVIDIA A100-SXM4-40GB"
+DCGM_DRIVER = "535.104.05"
+DCGM_HOST = "ub20-a100-k8s"
+
+
+def dcgm_sample(name="DCGM_FI_DEV_SM_CLOCK", value="139", gpu="0",
+                uuid_label="UUID", uuid=DCGM_UUID, mig=None,
+                hostname_label="hostname", k8s=False, driver=DCGM_DRIVER,
+                extra_first=()):
+    """
+    Une ligne d'échantillon telle que le serveur la rend.
+
+    L'ordre est celui de metricLabels() : gpu, l'étiquette d'UUID, pci_bus_id,
+    device, modelName, puis GPU_I_PROFILE et GPU_I_ID quand le MIG est actif,
+    puis le nom de machine, puis les étiquettes de compteur (que le fichier par
+    défaut remplit avec DCGM_FI_DRIVER_VERSION) et enfin les attributs que la
+    transformation Kubernetes ajoute — pod, namespace, container.
+
+    `hostname_label` porte la bascule des publications : le gabarit
+    text/template écrivait « Hostname », la construction expfmt écrit
+    « hostname ». `extra_first` loge des étiquettes AVANT « gpu », ce que fait
+    toute republication triée — les corps que le README imprime, eux, sont
+    écrits en toutes lettres plus bas.
+    """
+    labels = list(extra_first)
+    labels.append(('gpu', gpu))
+    labels.append((uuid_label, uuid))
+    labels.append(("pci_bus_id", "00000000:07:00.0"))
+    labels.append(("device", "nvidia%s" % gpu))
+    labels.append(("modelName", DCGM_MODEL))
+    if mig is not None:
+        labels.append(("GPU_I_PROFILE", mig))
+        labels.append(("GPU_I_ID", "0"))
+    if hostname_label:
+        labels.append((hostname_label, DCGM_HOST))
+    if driver:
+        labels.append(("DCGM_FI_DRIVER_VERSION", driver))
+    if k8s:
+        labels.append(("container", "trainer"))
+        labels.append(("namespace", "research"))
+        labels.append(("pod", "llama-sft-0"))
+
+    rendered = ",".join('%s="%s"' % pair for pair in labels)
+    return "%s{%s} %s" % (name, rendered, value)
+
+
+def dcgm_body(samples=None, family="DCGM_FI_DEV_SM_CLOCK",
+              help_line="SM clock frequency (in MHz).", prom_type="gauge",
+              metadata=True, **kwargs):
+    """
+    Le corps entier de GET /metrics : les métadonnées de famille que le format
+    d'exposition impose, puis les échantillons.
+    """
+    if samples is None:
+        samples = [dcgm_sample(name=family, **kwargs)]
+    lines = []
+    if metadata:
+        lines.append("# HELP %s %s" % (family, help_line))
+        lines.append("# TYPE %s %s" % (family, prom_type))
+    lines.extend(samples)
+    return "\n".join(lines) + "\n"
+
+
+# Ce qui sort réellement du serveur : expfmt, sans espace après les virgules,
+# étiquette de machine en minuscules.
+DCGM_BODY = dcgm_body()
+
+# La même réponse telle que le README et la documentation officielle
+# l'impriment — une espace après la première virgule, et les seules deux
+# étiquettes que l'exemple retient.
+DCGM_README_BODY = dcgm_body(
+    samples=[
+        'DCGM_FI_DEV_SM_CLOCK{gpu="0", UUID="%s"} 139' % DCGM_UUID,
+        'DCGM_FI_DEV_MEM_CLOCK{gpu="0", UUID="%s"} 405' % DCGM_UUID,
+    ])
+
+# L'exemple Kubernetes du README : les trois étiquettes de charge, vides parce
+# qu'aucun pod ne tient encore le GPU. L'instance est tout aussi ouverte.
+DCGM_README_K8S_BODY = dcgm_body(
+    samples=['DCGM_FI_DEV_SM_CLOCK{gpu="0", UUID="%s",container="",'
+             'namespace="",pod=""} 139' % DCGM_UUID])
+
+# La série republiée par un Prometheus, une fédération ou un collecteur
+# OpenTelemetry : mêmes noms, mêmes valeurs, mais les étiquettes triées par
+# octet croissant — donc UUID, Hostname et DCGM_FI_DRIVER_VERSION passent
+# devant « gpu ». Ce n'est plus l'exportateur qui répond.
+DCGM_FEDERATED_BODY = dcgm_body(samples=[
+    'DCGM_FI_DEV_SM_CLOCK{DCGM_FI_DRIVER_VERSION="%s",Hostname="%s",'
+    'UUID="%s",device="nvidia0",gpu="0",instance="10.0.0.4:9400",'
+    'job="dcgm-exporter",modelName="%s"} 139'
+    % (DCGM_DRIVER, DCGM_HOST, DCGM_UUID, DCGM_MODEL)])
+
+# Un exportateur Prometheus quelconque sur le même chemin : c'est exactement ce
+# que « matcher sur /metrics » ferait remonter.
+DCGM_NODE_EXPORTER_BODY = (
+    "# HELP node_cpu_seconds_total Seconds the cpus spent in each mode.\n"
+    "# TYPE node_cpu_seconds_total counter\n"
+    'node_cpu_seconds_total{cpu="0",mode="idle"} 12345.6\n'
+    "# HELP go_goroutines Number of goroutines that currently exist.\n"
+    "# TYPE go_goroutines gauge\n"
+    "go_goroutines 42\n"
+)
+
+# Un serveur d'inférence qui publie lui aussi des compteurs de GPU sur
+# /metrics — le voisin le plus proche, et il ne porte pas le préfixe DCGM.
+DCGM_VLLM_BODY = (
+    "# HELP vllm:num_requests_running Number of requests in model execution "
+    "batches.\n"
+    "# TYPE vllm:num_requests_running gauge\n"
+    'vllm:num_requests_running{model_name="meta-llama/Llama-3.1-8B"} 3.0\n'
+)
+
+# Une règle d'alerte ou un tableau de bord qui cite les séries sans porter de
+# valeur de périphérique : les deux noms y sont, aucune carte n'est derrière.
+DCGM_PROMQL_BODY = (
+    "groups:\n"
+    "  - name: gpu\n"
+    "    rules:\n"
+    "      - alert: GPUHot\n"
+    '        expr: DCGM_FI_DEV_GPU_TEMP{gpu="0"} > 85\n'
+    '        annotations: {summary: "UUID=GPU- overheating"}\n'
+)
+
+# La page de documentation du produit servie telle quelle : elle porte la ligne
+# d'échantillon, mais dans une phrase — donc jamais en début de ligne.
+DCGM_DOC_PAGE_BODY = (
+    "<html><body><pre>Then check the metrics endpoint: "
+    'DCGM_FI_DEV_SM_CLOCK{gpu="0", UUID="%s"} 139</pre></body></html>'
+    % DCGM_UUID
+)
+
+# Le refus d'un proxy placé devant l'instance, ou d'exporter-toolkit une fois
+# --web-config-file posé : c'est l'instance fermée.
+DCGM_UNAUTHORIZED_BODY = "Unauthorized\n"
+
+# Le 404 du routeur gorilla/mux sur un chemin qu'il ne monte pas.
+DCGM_NOT_FOUND_BODY = "404 page not found\n"
+
+
+def dcgm_block():
+    doc = load(DCGM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % DCGM_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /metrics — c'est pourtant la seule "
+        "route que server.go monte qui porte la signature du produit"
+    )
+    return blocks[0]
+
+
+def dcgm_fires(body=None, status=200):
+    if body is None:
+        body = DCGM_BODY
+    block = dcgm_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    verdicts = [dsl_matcher_hits(m, [(status, body)]) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def dcgm_extracted(body):
+    """
+    Ce que les extracteurs rendraient de ce corps, avec la sémantique de
+    nuclei : chaque motif appliqué au corps entier, le groupe demandé retenu,
+    doublons écartés.
+
+    Le tri est celui de la lecture, pas celui du moteur : nuclei accumule les
+    correspondances dans une table de hachage, donc leur ordre de sortie n'est
+    pas garanti.
+    """
+    found = set()
+    for extractor in dcgm_block().get("extractors") or []:
+        assert extractor.get("type") == "regex", (
+            "un extracteur n'est pas une expression régulière, alors que le "
+            "corps est du texte d'exposition Prometheus et non du JSON"
+        )
+        group = extractor.get("group", 0)
+        for pattern in extractor.get("regex") or []:
+            for m in re.finditer(pattern, body):
+                found.add(m.group(group))
+    return sorted(found)
+
+
+def test_dcgm_probe_reads_the_single_open_route_and_writes_nothing():
+    """
+    Le produit ne monte que trois routes — « / », « /health » et « /metrics » —
+    et une quatrième famille sous --enable-pprof. Celle-là n'a pas à être
+    interrogée : le README écrit que « When pprof is enabled, startup requires
+    `--web-config-file` », donc elle n'existe jamais sans la garde dont ce
+    constat signale l'absence.
+    """
+    doc = load(DCGM_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", DCGM_ROUTE)}, (
+        "le template interroge autre chose que /metrics — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la lecture se fait en GET : rien ici n'a de raison d'écrire"
+        )
+        assert not block.get("body"), "le bloc porte un corps de requête"
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            assert "/debug/pprof" not in path, (
+                "le template appelle les routes de profilage : elles rendent "
+                "la ligne de commande et les tas du processus, et elles "
+                "n'existent de toute façon que derrière --web-config-file"
+            )
+
+
+def test_dcgm_matcher_rests_on_the_dcgm_prefix_joined_to_the_uuid_label():
+    """
+    Le point qui fait ce template. Le chemin /metrics est celui de la moitié de
+    l'écosystème Prometheus et le statut vaut 200 sur tout serveur vivant :
+    seule la conjonction du préfixe « DCGM_FI_DEV_ » et de l'étiquette d'UUID
+    de carte dit qu'on a devant soi la télémétrie d'un parc de GPU.
+    """
+    assert dcgm_fires(), (
+        "le template ne reconnaît pas ce que rend réellement le serveur"
+    )
+
+    for body, why in (
+        (DCGM_NODE_EXPORTER_BODY,
+         "un exportateur Prometheus quelconque sur le même chemin — c'est "
+         "exactement ce qu'un matcher écrit sur /metrics ferait remonter"),
+        (DCGM_VLLM_BODY,
+         "un serveur d'inférence qui publie ses propres compteurs de GPU"),
+        (DCGM_PROMQL_BODY,
+         "une règle d'alerte qui cite les séries sans qu'aucune carte soit "
+         "derrière"),
+        (DCGM_DOC_PAGE_BODY,
+         "la page de documentation du produit, qui porte la ligne "
+         "d'échantillon au milieu d'une phrase"),
+        (dcgm_body(metadata=False),
+         "des échantillons sans métadonnées de famille : le format "
+         "d'exposition les impose, donc ce corps n'est pas une scrutation"),
+        ('DCGM_FI_DEV_SM_CLOCK{gpu="0",UUID="%s"} 139\n' % DCGM_UUID,
+         "la seule ligne d'échantillon, sans les # HELP et # TYPE que le "
+         "moteur écrit avant chaque famille"),
+        (dcgm_body(uuid="GPU-"),
+         "une étiquette d'UUID vidée de sa valeur : le préfixe seul ne dit "
+         "pas qu'une carte est derrière"),
+        (dcgm_body(uuid_label="gpu_uuid"),
+         "l'étiquette du groupe NVLink, que metricLabels() écrit "
+         "« gpu_uuid » — ce n'est pas la série par carte"),
+        (DCGM_UNAUTHORIZED_BODY,
+         "le refus d'exporter-toolkit une fois --web-config-file posé, ou "
+         "celui d'un proxy — c'est l'instance fermée"),
+        (DCGM_NOT_FOUND_BODY,
+         "le 404 du routeur sur un chemin qu'il ne monte pas"),
+        ("", "une réponse vide"),
+    ):
+        assert not dcgm_fires(body), "le template conclut sur %s" % why
+
+
+def test_dcgm_matcher_separates_the_instance_from_its_republished_copy():
+    """
+    Le piège propre à ce template, et la raison de l'ancrage en début de ligne
+    sur « {gpu=" ». Une série « DCGM_FI_DEV_… » se retrouve à l'identique dans
+    tout Prometheus qui scrute le parc, dans une fédération, dans la sortie d'un
+    collecteur OpenTelemetry — et ces copies-là ne sont pas l'exportateur.
+
+    Ce qui les sépare est vérifiable : metricLabels() ajoute « gpu » en premier
+    puis l'UUID, alors qu'une republication trie les étiquettes par octet
+    croissant, ce qui place UUID, Hostname et DCGM_FI_DRIVER_VERSION devant.
+    """
+    assert 'gpu="0"' in DCGM_FEDERATED_BODY and "DCGM_FI_DEV_" in DCGM_FEDERATED_BODY, (
+        "le cas de test ne dit pas ce qu'il croit dire : la copie doit porter "
+        "les mêmes noms que l'original"
+    )
+    assert not dcgm_fires(DCGM_FEDERATED_BODY), (
+        "le template conclut sur une série republiée par un Prometheus, une "
+        "fédération ou un collecteur OpenTelemetry : l'exposition signalée "
+        "serait alors celle du collecteur, pas celle de l'exportateur"
+    )
+
+    assert not dcgm_fires(dcgm_body(extra_first=(("job", "dcgm-exporter"),))), (
+        "le template admet une étiquette logée avant « gpu », alors que c'est "
+        "précisément l'empreinte d'un relais qui a réécrit le jeu"
+    )
+
+
+def test_dcgm_matcher_holds_across_the_shapes_the_exporter_really_emits():
+    for body, why in (
+        (DCGM_BODY,
+         "ce que rend la construction expfmt des publications actuelles, donc "
+         "ce qui part réellement sur le fil"),
+        (dcgm_body(hostname_label="Hostname"),
+         "le gabarit text/template des publications 3.x et 4.1, qui écrivait "
+         "le nom de machine en capitale"),
+        (DCGM_README_BODY,
+         "la forme que le README et la documentation officielle impriment, "
+         "avec une espace après la virgule"),
+        (dcgm_body(uuid_label="uuid"),
+         "l'instance lancée avec --use-old-namespace, où le collecteur pose "
+         "l'étiquette en minuscules — elle est exactement aussi ouverte"),
+        (dcgm_body(mig="1g.5gb"),
+         "une carte découpée en instances MIG, dont metricLabels() ajoute "
+         "GPU_I_PROFILE et GPU_I_ID"),
+        (dcgm_body(k8s=True),
+         "un déploiement Kubernetes, dont la transformation ajoute container, "
+         "namespace et pod"),
+        (DCGM_README_K8S_BODY,
+         "l'exemple Kubernetes du README, dont les trois étiquettes de charge "
+         "sont vides parce qu'aucun pod ne tient encore le GPU"),
+        (dcgm_body(driver=None, hostname_label=None),
+         "un fichier de compteurs réécrit sans DCGM_FI_DRIVER_VERSION, sur un "
+         "hôte dont le nom n'est pas résolu"),
+        (dcgm_body(family="DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION",
+                   prom_type="counter", value="319159391",
+                   help_line="Total energy consumption since boot (in mJ)."),
+         "une famille déclarée « counter », le second des deux types que le "
+         "fichier de compteurs par défaut emploie"),
+        (dcgm_body(gpu="7"),
+         "la huitième carte d'un nœud, dont l'index n'est pas zéro"),
+        (dcgm_body().replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF — la fin de ligne n'est pas "
+         "ancrée derrière le type, précisément pour cela"),
+        (dcgm_body(uuid=DCGM_UUID.upper()),
+         "un identifiant de carte rendu en capitales"),
+    ):
+        assert dcgm_fires(body), "le template perd %s" % why
+
+
+def test_dcgm_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le statut n'apprend rien : Metrics() rend 200 dès que la scrutation
+    aboutit, et 500 sinon — donc exiger un 200 n'écarterait rien que le corps
+    n'écarte déjà, et le perdrait dès qu'un intermédiaire réécrit le statut.
+    """
+    block = dcgm_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL — un matcher de statut "
+        "n'aurait rien à dire sur une route que tout serveur vivant sert"
+    )
+
+    for expression in (block.get("matchers") or [])[0].get("dsl") or []:
+        assert "status_code" not in expression, (
+            "une expression s'appuie sur le statut HTTP, alors que la "
+            f"signature du produit est entièrement dans le corps — {expression}"
+        )
+
+    assert dcgm_fires(status=203), (
+        "le template perd l'instance dont un intermédiaire réécrit le statut, "
+        "alors que le corps est bien celui du serveur"
+    )
+    assert not dcgm_fires(DCGM_NODE_EXPORTER_BODY, status=200), (
+        "le template conclut sur un 200 dont le corps n'est pas le sien"
+    )
+
+
+def test_dcgm_extraction_reports_the_inventory_in_a_single_result_line():
+    """
+    Ce que cette exposition livre n'est pas une version — l'exportateur n'en
+    publie aucune sur cette route — mais le parc lui-même.
+
+    D'où les deux contraintes que ce cas amarre. Un seul extracteur nommé,
+    parce que nuclei émet une ligne de résultat par extracteur qui rend quelque
+    chose : trois extracteurs signaleraient trois fois la même instance. Et le
+    groupe 0, donc la paire entière, pour que le rapport se relise sans table
+    de correspondance.
+    """
+    extractors = dcgm_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs : nuclei émet une ligne de "
+        "résultat par extracteur nommé qui rend quelque chose, et la même "
+        f"instance serait signalée plusieurs fois — {len(extractors)}"
+    )
+    assert not extractors[0].get("group"), (
+        "l'extracteur retient un groupe de capture : sans le nom de "
+        "l'étiquette, « 1g.5gb » et « 535.104.05 » arrivent dans le rapport "
+        "sans dire de quoi ils sont la valeur"
+    )
+
+    assert dcgm_extracted(DCGM_BODY) == sorted([
+        'modelName="%s"' % DCGM_MODEL,
+        'hostname="%s"' % DCGM_HOST,
+        'DCGM_FI_DRIVER_VERSION="%s"' % DCGM_DRIVER,
+    ]), (
+        "le template ne remonte pas l'inventaire du parc — "
+        f"{dcgm_extracted(DCGM_BODY)}"
+    )
+
+    assert 'GPU_I_PROFILE="1g.5gb"' in dcgm_extracted(dcgm_body(mig="1g.5gb")), (
+        "le template ne remonte pas le découpage MIG"
+    )
+    assert 'Hostname="%s"' % DCGM_HOST in dcgm_extracted(
+        dcgm_body(hostname_label="Hostname")), (
+        "le template perd le nom de machine du gabarit text/template, qui "
+        "l'écrivait en capitale"
+    )
+
+    # Le groupe NVLink écrit « model_name » là où le groupe GPU écrit
+    # « modelName » : le motif ne doit pas confondre les deux.
+    assert dcgm_extracted(
+        'DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL{nvlink="0",gpu="0",'
+        'model_name="%s"} 0\n' % DCGM_MODEL) == [], (
+        "l'extracteur ramasse l'étiquette du groupe NVLink"
+    )
+
+    # Les étiquettes de charge sont délibérément hors de portée : les extraire
+    # recopierait la carte des travaux du cluster dans le rapport.
+    charge = dcgm_extracted(dcgm_body(k8s=True))
+    for label in ("pod=", "namespace=", "container="):
+        assert not any(value.startswith(label) for value in charge), (
+            f"l'extracteur recopie l'étiquette {label} dans le rapport — "
+            f"{charge}"
+        )
+
+    # Huit cartes identiques : nuclei déduplique les correspondances d'une même
+    # expression, donc le rapport porte un modèle et non huit lignes.
+    parc = dcgm_extracted(dcgm_body(samples=[
+        dcgm_sample(gpu=str(i), uuid="GPU-604ac76c-d9cf-fef3-62e9-d92044ab6e5%d" % i)
+        for i in range(8)]))
+    assert parc.count('modelName="%s"' % DCGM_MODEL) == 1, (
+        f"le parc homogène remonte plusieurs fois le même modèle — {parc}"
+    )
+
+    assert dcgm_fires(dcgm_body(driver=None, hostname_label=None)), (
+        "le template perd l'instance dont le fichier de compteurs a été "
+        "réécrit sans DCGM_FI_DRIVER_VERSION : un extracteur ne conditionne "
+        "pas le constat"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_dcgm_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et `dsl_matcher_hits`
+    réévalue les motifs avec le module `re` de Python plutôt qu'avec RE2 : seul
+    un scan contre un vrai serveur ferme la boucle. L'enjeu propre est ici le
+    drapeau multiligne — c'est lui qui porte l'ancrage en début de ligne, et
+    donc toute la séparation entre l'instance et sa copie republiée.
+    """
+    def scan(body, content_type="text/plain; version=0.0.4; charset=utf-8"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == DCGM_ROUTE:
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                else:
+                    payload = DCGM_NOT_FOUND_BODY.encode()
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", DCGM_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "dcgm-exporter-metrics-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(DCGM_BODY)
+    assert seen == [DCGM_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, (
+        f"le scan ne reconnaît pas ce que rend réellement le serveur — {hits}"
+    )
+    assert extracted == sorted(['modelName="%s"' % DCGM_MODEL,
+                                'hostname="%s"' % DCGM_HOST,
+                                'DCGM_FI_DRIVER_VERSION="%s"' % DCGM_DRIVER]), (
+        f"le scan ne remonte pas l'inventaire du parc — {extracted}"
+    )
+
+    _, mig_hits, mig = scan(dcgm_body(mig="1g.5gb", hostname_label="Hostname"))
+    assert mig_hits == 1, (
+        "le scan signale plusieurs fois la même instance : un extracteur nommé "
+        f"de plus, c'est une ligne de résultat de plus — {mig_hits}"
+    )
+    assert mig == sorted(['modelName="%s"' % DCGM_MODEL,
+                          'Hostname="%s"' % DCGM_HOST,
+                          'DCGM_FI_DRIVER_VERSION="%s"' % DCGM_DRIVER,
+                          'GPU_I_PROFILE="1g.5gb"']), (
+        "le scan perd le découpage MIG, ou la génération dont le gabarit "
+        f"écrivait le nom de machine en capitale — {mig}"
+    )
+
+    _, readme_hits, readme = scan(DCGM_README_BODY)
+    assert readme_hits == 1, (
+        "le scan perd la forme que le README et la documentation officielle "
+        "impriment, avec une espace après la virgule"
+    )
+    assert readme == [], (
+        "l'exemple du README ne porte ni modelName ni version de pilote : le "
+        f"constat tient, mais il n'y a rien à en extraire — {readme}"
+    )
+
+    for body, why in (
+        (DCGM_FEDERATED_BODY,
+         "une série republiée par un Prometheus, une fédération ou un "
+         "collecteur OpenTelemetry — l'ancrage multiligne doit l'écarter"),
+        (DCGM_NODE_EXPORTER_BODY,
+         "un exportateur Prometheus quelconque servi sur le même chemin"),
+        (DCGM_DOC_PAGE_BODY,
+         "la page de documentation du produit, qui porte la ligne au milieu "
+         "d'une phrase"),
+        (DCGM_UNAUTHORIZED_BODY,
+         "le refus d'exporter-toolkit une fois --web-config-file posé"),
+    ):
+        _, refused, _ = scan(body)
+        assert refused == 0, "le scan conclut sur %s" % why
 
 
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
