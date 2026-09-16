@@ -28596,6 +28596,527 @@ def test_dcgm_matcher_compiles_and_fires_against_a_live_server():
         assert refused == 0, "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# Whisper ASR Webservice — ahmetoner/whisper-asr-webservice, distribué par
+# l'image onerahmet/openai-whisper-asr-webservice. Ce que cette section amarre
+# tient en trois points.
+#
+# La lecture d'abord. app/webservice.py construit l'application en une seule
+# expression dont tous les paramètres sont ceux de la documentation : aucun
+# « openapi_url=None » n'y figure, donc FastAPI monte le schéma sur son chemin
+# par défaut. C'est la seule route du produit qui ne le fasse pas travailler —
+# les deux autres font traverser un fichier audio à un sous-processus ffmpeg
+# puis au modèle chargé à l'import.
+#
+# Le constat ensuite, et il tient d'un seul tenant : la phrase littérale que
+# pyproject.toml écrit sous « description » et que
+# « description=projectMetadata["Summary"] » pose telle quelle dans
+# info.description, conjointe au chemin « /detect-language ». Ni l'une ni
+# l'autre seule — la phrase est celle du README et du registre d'images, et une
+# route de détection de langue n'appartient à personne.
+#
+# Le titre enfin, et c'est le point non évident. Il n'est écrit nulle part dans
+# le dépôt : « projectMetadata["Name"].title().replace("-", " ") » le fabrique à
+# l'exécution depuis le nom du paquet installé, donc sa casse suit la
+# normalisation qu'en a faite l'outil d'installation. Les cas ci-dessous
+# exigent qu'il soit extrait et non exigé, et que le constat tienne quelle que
+# soit la forme que ce nom a prise.
+
+WHISPER_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "whisper-asr-webservice-exposed.yaml")
+
+WHISPER_ROUTE = "/openapi.json"
+
+# La phrase de pyproject.toml, reprise sans retouche : c'est le Summary du
+# paquet installé que le constructeur reçoit.
+WHISPER_SUMMARY = ("Whisper ASR Webservice is a general-purpose speech "
+                   "recognition webservice.")
+
+# Ce que « "whisper-asr-webservice".title().replace("-", " ") » rend pour le nom
+# de paquet tel que le dépôt l'écrit. Le template ne l'exige pas.
+WHISPER_TITLE = "Whisper Asr Webservice"
+
+WHISPER_VERSION = "1.9.1"
+
+WHISPER_CONTACT = {"url": "https://github.com/ahmetoner/whisper-asr-webservice/"}
+WHISPER_LICENSE = {
+    "name": "MIT License",
+    "url": "https://github.com/ahmetoner/whisper-asr-webservice"
+           "/blob/main/LICENCE",
+}
+
+WHISPER_RESPONSES = {
+    "200": {"description": "Successful Response",
+            "content": {"application/json": {"schema": {}}}},
+    "422": {"description": "Validation Error",
+            "content": {"application/json": {"schema": {
+                "$ref": "#/components/schemas/HTTPValidationError"}}}},
+}
+
+
+def whisper_query(name):
+    return {"name": name, "in": "query", "required": False,
+            "schema": {"title": name.replace("_", " ").title()}}
+
+
+def whisper_asr_parameters(engine="openai_whisper", hf_token=False):
+    """
+    Les paramètres de /asr que le schéma retient, dans l'ordre de la signature
+    du handler.
+
+    Leur visibilité est conditionnée à CONFIG au moment de l'import :
+    « vad_filter » et « word_timestamps » portent « include_in_schema=(True if
+    CONFIG.ASR_ENGINE == "faster_whisper" else False) », « min_speakers » et
+    « max_speakers » la même condition sur "whisperx", et « diarize » exige en
+    plus « CONFIG.HF_TOKEN != "" ». La liste dépend donc de la configuration de
+    l'instance, et le template n'a pas à s'y raccrocher.
+    """
+    names = ["encode", "task", "language", "initial_prompt"]
+    if engine == "faster_whisper":
+        names += ["vad_filter", "word_timestamps"]
+    if engine == "whisperx":
+        if hf_token:
+            names.append("diarize")
+        names += ["min_speakers", "max_speakers"]
+    names.append("output")
+    return [whisper_query(name) for name in names]
+
+
+def whisper_paths(prefix="", engine="openai_whisper", hf_token=False):
+    """
+    Les deux chemins que le document décrit. Le troisième déclaré,
+    « @app.get("/", response_class=RedirectResponse, include_in_schema=False) »,
+    s'exclut lui-même de la description.
+    """
+    return {
+        prefix + "/asr": {"post": {
+            "tags": ["Endpoints"], "summary": "Asr",
+            "operationId": "asr_asr_post",
+            "parameters": whisper_asr_parameters(engine, hf_token),
+            "responses": WHISPER_RESPONSES}},
+        prefix + "/detect-language": {"post": {
+            "tags": ["Endpoints"], "summary": "Detect Language",
+            "operationId": "detect_language_detect_language_post",
+            "parameters": [whisper_query("encode")],
+            "responses": WHISPER_RESPONSES}},
+    }
+
+
+def whisper_schema(openapi="3.1.0", title=WHISPER_TITLE,
+                   description=WHISPER_SUMMARY, version=WHISPER_VERSION,
+                   contact=None, paths=None, indent=None, **kwargs):
+    """
+    Le document que get_openapi() rend pour cette application : l'ordre des clés
+    est celui des modèles pydantic de FastAPI — « openapi » ouvre, puis info,
+    paths et components — et JSONResponse le sérialise compact.
+    """
+    info = {"title": title, "description": description,
+            "contact": WHISPER_CONTACT if contact is None else contact,
+            "license": WHISPER_LICENSE, "version": version}
+    document = {
+        "openapi": openapi,
+        "info": info,
+        "paths": whisper_paths(**kwargs) if paths is None else paths,
+        "components": {"schemas": {"Body_asr_asr_post": {
+            "properties": {"audio_file": {"type": "string",
+                                          "format": "binary",
+                                          "title": "Audio File"}},
+            "type": "object", "required": ["audio_file"],
+            "title": "Body_asr_asr_post"}}},
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+WHISPER_BODY = whisper_schema()
+
+# Une passerelle qui monte le produit sous un préfixe et republie son schéma :
+# la phrase de description est recopiée, mais les chemins ne sont plus ceux que
+# webservice.py déclare — ce n'est plus l'instance qui répond.
+WHISPER_PREFIXED_BODY = whisper_schema(paths=whisper_paths(prefix="/whisper"))
+
+# La supervision qui republie le document entier sous une clé à elle : la charge
+# utile y est intacte, mais l'instance n'a pas répondu d'elle-même.
+WHISPER_COMPOSITE_BODY = '{"whisper":%s,"checked_at":0}' % WHISPER_BODY
+
+# Un autre produit qui déclare une route de détection de langue : le chemin ne
+# nomme personne à lui seul.
+WHISPER_OTHER_PRODUCT_BODY = whisper_schema(
+    title="Speech Gateway", description="Internal speech routing API.",
+    paths={"/detect-language": {"post": {
+        "summary": "Detect Language", "responses": WHISPER_RESPONSES}}})
+
+# La page de documentation du projet servie telle quelle : elle porte la phrase
+# et le nom de la route, mais ce n'est pas le document d'une application.
+WHISPER_DOC_PAGE_BODY = (
+    "<html><body><h1>Whisper ASR Webservice</h1><p>Whisper ASR Webservice is a "
+    "general-purpose speech recognition webservice.</p><pre>POST "
+    "/detect-language</pre></body></html>")
+
+# La coquille de Swagger UI servie sur /docs : elle porte le titre de
+# l'application et rien d'autre.
+WHISPER_DOCS_HTML_BODY = (
+    '<!DOCTYPE html><html><head><title>Whisper Asr Webservice - Swagger UI'
+    '</title><link rel="stylesheet" href="/assets/swagger-ui.css"></head>'
+    '<body><div id="swagger-ui"></div></body></html>')
+
+# Ce que rend une instance construite avec « openapi_url=None » : la
+# documentation est fermée, POST /asr ne l'est pas. Le template n'a rien à dire
+# de cette réponse — et c'est la limite assumée du constat.
+WHISPER_NO_SCHEMA_BODY = '{"detail":"Not Found"}'
+
+# Un intermédiaire qui refuse à l'anonyme : la fermeture attendue, puisque le
+# produit ne porte aucun contrôle d'accès à lui.
+WHISPER_PROXY_DENIED_BODY = '{"detail":"Unauthorized"}'
+
+# Le même document dont un relais a resérialisé l'objet info dans un autre
+# ordre. Seule l'ouverture est ancrée : la phrase de description et le chemin se
+# lisent où qu'ils soient.
+WHISPER_REORDERED_INFO_BODY = json.dumps(
+    {"openapi": "3.1.0",
+     "info": {"version": WHISPER_VERSION, "license": WHISPER_LICENSE,
+              "description": WHISPER_SUMMARY, "contact": WHISPER_CONTACT,
+              "title": WHISPER_TITLE},
+     "paths": whisper_paths()}, separators=(",", ":"))
+
+
+def whisper_block():
+    doc = load(WHISPER_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % WHISPER_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /openapi.json — c'est pourtant la "
+        "seule route du produit qui le nomme sans le faire travailler"
+    )
+    return blocks[0]
+
+
+def whisper_fires(status=200, body=None):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare, et matchers-condition les joint. Le paramètre
+    de statut est tenu ici pour que les cas d'un intermédiaire se disent, même
+    si le bloc n'a pas à en dépendre.
+    """
+    block = whisper_block()
+    if body is None:
+        body = WHISPER_BODY
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_whisper_asr_probe_reads_the_schema_and_never_makes_the_model_run():
+    """
+    L'application ne déclare que trois routes, et deux d'entre elles sont du
+    calcul : POST /asr et POST /detect-language passent les octets reçus à un
+    sous-processus ffmpeg — « ffmpeg.input("pipe:", threads=0)... .run(...,
+    input=file.read()) » — puis au modèle que load_model() a chargé à l'import.
+    C'est l'abus que le constat signale ; ce n'est pas ce qu'un scanner a le
+    droit de faire pour l'établir.
+    """
+    doc = load(WHISPER_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", WHISPER_ROUTE)}, (
+        "le template interroge autre chose que le schéma — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la lecture se fait en GET : les deux autres routes du produit sont "
+            "des POST qui font tourner le modèle aux frais de l'exploitant"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande de déposer un fichier sur l'instance auditée"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/asr", "le template dépose un fichier audio et fait tourner "
+                         "le modèle sur le matériel de l'exploitant"),
+                ("/detect-language", "même route de calcul, pour un coût "
+                                     "moindre — c'est toujours le modèle qui "
+                                     "tourne"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_whisper_asr_matcher_needs_the_summary_joined_to_the_route():
+    """
+    Le point qui fait ce template. La phrase de description est publiée par le
+    README, la documentation et le registre d'images ; un chemin de détection de
+    langue n'appartient à personne. C'est leur conjonction, dans le document
+    d'une application, qui nomme l'instance.
+    """
+    assert whisper_fires(), (
+        "le template ne reconnaît pas le schéma que rend réellement l'instance"
+    )
+
+    for body, why in (
+        (WHISPER_OTHER_PRODUCT_BODY,
+         "le schéma d'un autre produit qui déclare la même route : le chemin "
+         "seul ne nomme personne"),
+        (whisper_schema(description="A speech recognition webservice."),
+         "un document dont la description n'est pas la phrase de "
+         "pyproject.toml, alors que le constructeur pose le Summary du paquet "
+         "sans le retoucher"),
+        (whisper_schema(paths={"/asr": whisper_paths()["/asr"]}),
+         "un document qui ne décrit pas /detect-language : les deux moitiés du "
+         "constat sont exigées ensemble"),
+        (WHISPER_PREFIXED_BODY,
+         "le schéma republié par une passerelle qui monte le produit sous un "
+         "préfixe — « /whisper/detect-language » n'est plus le chemin que "
+         "webservice.py déclare"),
+        (WHISPER_COMPOSITE_BODY,
+         "le document republié au fond de celui d'une supervision : c'est "
+         "l'ancrage sur l'ouverture qui dit que l'instance a répondu "
+         "d'elle-même"),
+        (WHISPER_DOC_PAGE_BODY,
+         "la page de documentation du projet, qui porte la phrase et le nom de "
+         "la route sans être le document d'une application"),
+        (WHISPER_DOCS_HTML_BODY,
+         "la coquille de Swagger UI servie sur /docs, identique pour toute "
+         "application FastAPI de la Terre"),
+        (WHISPER_NO_SCHEMA_BODY,
+         "l'instance construite avec « openapi_url=None » : la documentation "
+         "est fermée, et le template n'a rien à dire de cette réponse"),
+        (WHISPER_PROXY_DENIED_BODY,
+         "un intermédiaire qui refuse le document à l'anonyme — c'est la "
+         "fermeture attendue"),
+        ("", "une réponse vide"),
+    ):
+        assert not whisper_fires(body=body), "le template conclut sur %s" % why
+
+
+def test_whisper_asr_matcher_does_not_rest_on_the_runtime_built_title():
+    """
+    La nuance propre à ce produit. Le titre n'est pas une constante du dépôt :
+    « projectMetadata["Name"].title().replace("-", " ") » le fabrique depuis le
+    nom du paquet installé, donc sa casse suit la normalisation qu'en a faite
+    l'outil d'installation. S'y accrocher ferait manquer des instances par
+    ailleurs identiques ; le template l'extrait pour que sa valeur réelle soit
+    relevée avant d'en faire une condition.
+    """
+    for matcher in whisper_block().get("matchers") or []:
+        for expression in (matcher.get("regex") or []) + (matcher.get("words") or []):
+            assert "Whisper Asr" not in expression, (
+                "une expression épingle le titre, qui est fabriqué à "
+                f"l'exécution — {expression}"
+            )
+            assert '"title"' not in expression, (
+                f"une expression s'appuie sur le titre du document — {expression}"
+            )
+
+    for title, why in (
+        ("Whisper_Asr_Webservice",
+         "le nom de paquet normalisé avec des tirets bas : replace(\"-\", \" \") "
+         "ne les touche pas, et l'instance est exposée au même titre"),
+        ("Whisper-Asr-Webservice", "une normalisation qui garde les tirets"),
+        ("whisper-asr-webservice",
+         "un titre que title() n'a pas capitalisé"),
+    ):
+        assert whisper_fires(body=whisper_schema(title=title)), (
+            "le template perd l'instance dont le titre a pris une autre "
+            "forme : %s" % why
+        )
+
+
+def test_whisper_asr_matcher_holds_across_the_shapes_the_instance_emits():
+    for body, why in (
+        (WHISPER_BODY,
+         "le document d'une instance par défaut, dont ASR_ENGINE vaut "
+         "\"openai_whisper\""),
+        (whisper_schema(engine="faster_whisper"),
+         "une instance sous faster_whisper, dont le schéma retient en plus "
+         "vad_filter et word_timestamps"),
+        (whisper_schema(engine="whisperx"),
+         "une instance sous whisperx sans jeton Hugging Face, dont le schéma "
+         "retient min_speakers et max_speakers mais pas diarize"),
+        (whisper_schema(engine="whisperx", hf_token=True),
+         "une instance sous whisperx avec un jeton posé, dont le schéma retient "
+         "diarize — c'est la plus exposée des trois, et la liste des paramètres "
+         "ne conditionne pas le constat"),
+        (whisper_schema(openapi="3.0.2"),
+         "une instance dont FastAPI est antérieure à la 0.99, qui écrivait "
+         "« 3.0.2 » — elle est exposée au même titre"),
+        (whisper_schema(version="1.11.0-dev"),
+         "une publication de développement, dont le numéro porte un suffixe"),
+        (whisper_schema(contact={}),
+         "l'instance dont les métadonnées ne portent pas de Home-page : "
+         "contact={\"url\": None} est vidé par exclude_none, et le document "
+         "reste celui du produit"),
+        (whisper_schema(indent=2),
+         "un intermédiaire qui réindente ce qu'il relaie, là où JSONResponse "
+         "sérialise compact"),
+        (WHISPER_BODY + "\n",
+         "une fin de ligne ajoutée par un intermédiaire"),
+        (WHISPER_REORDERED_INFO_BODY,
+         "un relais qui réordonne les clés de l'objet info en le "
+         "resérialisant : ni la phrase ni le chemin n'y dépendent de l'ordre, "
+         "et seule l'ouverture du document est ancrée"),
+    ):
+        assert whisper_fires(body=body), "le template perd %s" % why
+
+
+def test_whisper_asr_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le statut n'apprend rien : la route de schéma rend 200 sur toute instance
+    vivante, donc l'exiger n'écarterait rien que le corps n'écarte déjà, et le
+    perdrait dès qu'un intermédiaire réécrit le statut.
+    """
+    block = whisper_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : il conclurait sur un code que "
+        "toute application FastAPI vivante rend sur son schéma"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : l'ancrage dit que "
+            "l'instance a répondu d'elle-même, et ni la phrase de description "
+            "ni le chemin ne nomment le produit à eux seuls"
+        )
+
+    assert whisper_fires(status=203), (
+        "le template dépend du code rendu, alors que le corps est bien celui de "
+        "l'instance"
+    )
+    assert not whisper_fires(status=200, body=WHISPER_DOC_PAGE_BODY), (
+        "le template conclut sur un 200 dont le corps n'est pas le sien"
+    )
+
+
+def test_whisper_asr_extractor_reports_the_release_and_the_title_to_be_checked():
+    """
+    Un seul extracteur, deux expressions : nuclei émet une ligne de résultat par
+    extracteur nommé qui rend quelque chose, et la même instance serait signalée
+    deux fois. La version dit les correctifs qui manquent ; le titre est la
+    valeur qu'il faut relever sur de vraies instances avant d'en faire un second
+    matcher, puisqu'il est fabriqué à l'exécution.
+    """
+    extractors = whisper_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs : nuclei émet une ligne de "
+        "résultat par extracteur nommé qui rend quelque chose, et la même "
+        f"instance serait signalée plusieurs fois — {len(extractors)}"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression régulière n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("json") == ['.info.version', '.info.title'], (
+        "l'extracteur ne remonte pas la publication de l'instance et le titre "
+        f"fabriqué à l'exécution — {extractor.get('json')}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_whisper_asr_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni les requêtes
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    moteur d'expressions de Python plutôt qu'avec celui de Go : seul un scan
+    contre un vrai serveur ferme la boucle. L'enjeu propre est ici l'ancrage `^`
+    sur l'ouverture du document, et le fait qu'un extracteur à deux expressions
+    ne signale bien qu'une fois l'instance.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == WHISPER_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, WHISPER_NO_SCHEMA_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", WHISPER_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "whisper-asr-webservice-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, whisper_schema(engine="whisperx",
+                                                     hf_token=True))
+    assert seen == [WHISPER_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, (
+        "le scan ne reconnaît pas le schéma de l'instance, ou il la signale "
+        f"plusieurs fois — {hits}"
+    )
+    assert extracted == sorted([WHISPER_VERSION, WHISPER_TITLE]), (
+        "le scan ne remonte pas la publication et le titre de l'instance — "
+        f"{extracted}"
+    )
+
+    for status, body, why in (
+        (200, WHISPER_COMPOSITE_BODY,
+         "le document republié au fond de celui d'une supervision — c'est "
+         "l'ancrage sur l'ouverture qui doit l'écarter"),
+        (200, WHISPER_PREFIXED_BODY,
+         "le schéma republié par une passerelle qui monte le produit sous un "
+         "préfixe"),
+        (200, WHISPER_OTHER_PRODUCT_BODY,
+         "le schéma d'un autre produit qui déclare la même route"),
+        (404, WHISPER_NO_SCHEMA_BODY,
+         "l'instance construite avec « openapi_url=None »"),
+        (401, WHISPER_PROXY_DENIED_BODY,
+         "une instance placée derrière un intermédiaire qui authentifie"),
+    ):
+        _, refused, _ = scan(status, body)
+        assert refused == 0, "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

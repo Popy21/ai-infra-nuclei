@@ -1,0 +1,206 @@
+id: whisper-asr-webservice-exposed
+
+info:
+  name: Whisper ASR Webservice - Unauthenticated Transcription API Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Whisper ASR Webservice (ahmetoner/whisper-asr-webservice, distribué par
+    l'image onerahmet/openai-whisper-asr-webservice) est la façade HTTP que l'on
+    pose le plus couramment devant Whisper. Le conteneur ne sert pas un fichier :
+    app/webservice.py charge un modèle dès l'import — « asr_model =
+    ASRModelFactory.create_asr_model() » puis « asr_model.load_model() », avant
+    même que l'application ne soit construite — et publie deux routes de calcul.
+    GET /openapi.json est la lecture qui nomme le produit, et c'est une lecture
+    qu'il ne peut pas ne pas servir. L'application est construite en une seule
+    expression, « app = FastAPI(title=projectMetadata["Name"].title().replace("-",
+    " "), description=projectMetadata["Summary"], version=projectMetadata["Version"],
+    contact={"url": projectMetadata["Home-page"]},
+    swagger_ui_parameters={"defaultModelsExpandDepth": -1}, license_info={...}) » :
+    aucun « openapi_url=None » n'y figure, donc FastAPI monte le schéma sur son
+    chemin par défaut.
+    Ce que le document porte se lit dans les deux fichiers sources.
+    « projectMetadata = importlib.metadata.metadata("whisper-asr-webservice") »
+    va chercher les métadonnées du paquet installé, et pyproject.toml donne
+    « name = "whisper-asr-webservice" » et « description = "Whisper ASR
+    Webservice is a general-purpose speech recognition webservice." ». Cette
+    phrase-là arrive telle quelle dans info.description, sans recomposition : le
+    Summary du paquet est passé au constructeur sans être touché.
+    Les chemins ensuite, et ils sont trois à être déclarés pour deux dans le
+    schéma. « @app.post("/asr", tags=["Endpoints"]) » et
+    « @app.post("/detect-language", tags=["Endpoints"]) » sont les deux routes de
+    calcul ; « @app.get("/", response_class=RedirectResponse,
+    include_in_schema=False) » ne fait que rendre "/docs" et s'exclut elle-même de
+    la description. Le document n'énumère donc que /asr et /detect-language, tous
+    deux en POST, et c'est le second qui sert de signature : /asr est trop court
+    pour n'appartenir qu'à ce produit.
+    Le titre, lui, n'est pas une constante du dépôt : « projectMetadata["Name"]
+    .title().replace("-", " ") » le fabrique à l'exécution, donc sa casse suit la
+    normalisation du nom de paquet telle que l'outil d'installation l'a écrite —
+    « whisper-asr-webservice » donne « Whisper Asr Webservice », un nom normalisé
+    autrement en donnerait un autre. Il est ici extrait, pas exigé : le constat
+    repose sur la description et sur les chemins, que le code reprend tels quels.
+    L'absence d'authentification n'est pas un réglage manqué mais une
+    fonctionnalité absente du produit. app/webservice.py ne déclare ni dépendance
+    « Security(...) », ni vérification de clé ou de jeton, ni intergiciel : les
+    seuls paramètres passés à FastAPI sont ceux de la documentation, et les deux
+    handlers ne prennent en signature que « audio_file: UploadFile » et des
+    paramètres de requête. Il n'y a donc rien à activer, et rien à mal configurer.
+    La liaison va dans le même sens : start() est un point d'entrée click dont les
+    options portent « default="0.0.0.0" » pour l'hôte et « default=9000 » pour le
+    port, et le Dockerfile pose « EXPOSE 9000 » puis
+    « ENTRYPOINT ["whisper-asr-webservice"] ». Ce qui sépare l'instance du réseau
+    n'est que la publication du port.
+  impact: |
+    POST /asr reçoit un fichier audio arbitraire et le fait traverser le modèle
+    chargé par le conteneur. Sa signature dit tout ce que l'appelant anonyme
+    commande : « task » entre "transcribe" et "translate", « language » parmi les
+    codes de whisper.tokenizer, « initial_prompt », « vad_filter »,
+    « word_timestamps », « diarize », « min_speakers », « max_speakers », et
+    « output » entre "txt", "vtt", "srt", "tsv" et "json". C'est de la
+    transcription — et de la diarisation quand whisperx est l'engin — gratuite sur
+    le matériel de l'exploitant, sans compte à débiter et sans limite de débit.
+    Le matériel en question est le sien au sens le plus littéral : app/config.py
+    pose « DEVICE = os.getenv("ASR_DEVICE", "cuda" if torch.cuda.is_available()
+    else "cpu") », donc le GPU dès qu'il y en a un, et « MODEL_IDLE_TIMEOUT =
+    int(os.getenv("MODEL_IDLE_TIMEOUT", 0)) », dont le commentaire dit lui-même
+    qu'une valeur nulle signifie « the model will never be unloaded ». POST
+    /detect-language fait tourner le même modèle pour un coût moindre.
+    Chaque appel fait plus que du calcul : load_audio() lance un sous-processus
+    ffmpeg par requête et lui donne à manger les octets reçus —
+    « ffmpeg.input("pipe:", threads=0).output("-", format="s16le", ...)
+    .run(cmd="ffmpeg", ..., input=file.read()) ». Toute la surface de décodage de
+    ffmpeg est donc atteignable par un anonyme, et « encode=false » la
+    court-circuite pour interpréter les octets déposés directement comme du PCM
+    16 bits.
+    Le schéma trahit en prime la configuration de l'instance, parce que la
+    visibilité des paramètres y est conditionnée à l'exécution : « vad_filter » et
+    « word_timestamps » portent « include_in_schema=(True if CONFIG.ASR_ENGINE ==
+    "faster_whisper" else False) », « min_speakers » et « max_speakers » la même
+    condition sur "whisperx", et « diarize » porte « (True if CONFIG.ASR_ENGINE ==
+    "whisperx" and CONFIG.HF_TOKEN != "" else False) ». Lire la liste des
+    paramètres, c'est donc lire quel engin l'exploitant a choisi et, pour la
+    dernière, savoir qu'un jeton Hugging Face est configuré sur la machine.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera. Les fichiers audio déposés par des tiers, eux,
+    auront bien traversé la machine.
+  remediation: |
+    Il n'y a rien à activer dans le produit : app/webservice.py ne porte aucune
+    dépendance de sécurité, aucune vérification de clé et aucun intergiciel, donc
+    aucune variable d'environnement ne ferme ces routes. Le contrôle d'accès se
+    pose à l'extérieur — un intermédiaire qui authentifie devant le port
+    (authentification HTTP, mTLS, oauth2-proxy), ou l'isolement réseau pur et
+    simple.
+    Restreindre l'écoute d'abord, parce que le défaut ne la restreint pas :
+    « whisper-asr-webservice --host 127.0.0.1 » quand l'instance n'a pas à être
+    atteinte depuis l'extérieur de la machine — l'option vaut "0.0.0.0" par défaut
+    — et « -p 127.0.0.1:9000:9000 » côté conteneur, là où « -p 9000:9000 » publie
+    le port sur toutes les interfaces de l'hôte.
+    Ne pas confondre le symptôme et la brèche. Masquer la documentation — en
+    construisant l'application avec « openapi_url=None, docs_url=None » — retire
+    la lecture sur laquelle ce constat repose, mais ne retire rien à POST /asr ni
+    à POST /detect-language, qui restent servies au même anonyme. Une instance
+    dont /openapi.json rend 404 n'est pas une instance fermée.
+    Vérifier la prise en compte sur la route de calcul elle-même, depuis
+    l'extérieur du périmètre : « curl -s -o /dev/null -w '%{http_code}' -F
+    audio_file=@court.wav http://<hote>:9000/asr » ne doit plus rendre 200.
+    Après une exposition, relire le journal d'accès à la recherche des POST /asr
+    et POST /detect-language qu'on ne s'explique pas : chacun est un fichier audio
+    qu'un tiers a fait traverser ffmpeg puis le modèle sur la machine, et un
+    calcul payé par l'exploitant. Aucune de ces lignes ne portera d'identité
+    d'appelant : il n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/ahmetoner/whisper-asr-webservice/blob/main/app/webservice.py
+    - https://github.com/ahmetoner/whisper-asr-webservice/blob/main/app/utils.py
+    - https://github.com/ahmetoner/whisper-asr-webservice/blob/main/app/config.py
+    - https://github.com/ahmetoner/whisper-asr-webservice/blob/main/pyproject.toml
+    - https://github.com/ahmetoner/whisper-asr-webservice/blob/main/Dockerfile
+    - https://github.com/ahmetoner/whisper-asr-webservice
+    - https://hub.docker.com/r/onerahmet/openai-whisper-asr-webservice
+  metadata:
+    max-request: 1
+    vendor: ahmetoner
+    product: whisper-asr-webservice
+  tags: ai,ml,whisper,whisper-asr-webservice,asr,stt,speech,transcription,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la seule du produit qui ne fasse pas travailler
+  # l'instance. Le schéma est construit par FastAPI à partir des routes déjà
+  # déclarées : ni le modèle chargé en mémoire, ni le disque, ni ffmpeg ne sont
+  # touchés.
+  #
+  # En lecture, et rien d'autre. Les deux seules autres routes décrites sont POST
+  # /asr et POST /detect-language, qui font traverser un fichier audio à ffmpeg
+  # puis au modèle sur le matériel de l'exploitant — c'est l'abus que le constat
+  # signale, ce n'est pas ce qu'un scanner a le droit de faire pour l'établir. La
+  # troisième route déclarée, « @app.get("/", ...) », ne rend qu'une redirection
+  # vers /docs et ne nomme rien.
+  - method: GET
+    path:
+      - "{{BaseURL}}/openapi.json"
+
+    matchers:
+      # Trois expressions, et ce sont les deux dernières qui font le constat : la
+      # phrase littérale de description conjointe au chemin /detect-language.
+      #
+      # L'ancrage sur l'ouverture vient d'abord. get_openapi() rend un document
+      # dont « openapi » est la première clé, et la valeur est laissée au seul
+      # chiffre majeur : FastAPI écrit "3.1.0" depuis la 0.99 et "3.0.2" avant
+      # elle, et les instances anciennes du produit sont exposées au même titre.
+      # Exiger cette ouverture écarte la même charge utile retrouvée au fond du
+      # document d'une supervision qui l'agrégerait sous une clé à elle — c'est
+      # cet ancrage qui dit que l'instance a répondu d'elle-même — et il écarte
+      # du même coup la page de documentation du projet, qui porte la phrase de
+      # description sans être du JSON.
+      #
+      # La phrase ensuite, et elle vient de pyproject.toml. « description =
+      # "Whisper ASR Webservice is a general-purpose speech recognition
+      # webservice." » y est écrite en toutes lettres, et le constructeur la pose
+      # dans info.description sans la retoucher, puisque c'est le Summary du
+      # paquet installé.
+      #
+      # Le chemin enfin, joint à l'opération qui le sert. « /detect-language » est
+      # la route que webservice.py déclare en second ; la retenir plutôt que /asr
+      # tient à ce que celle-ci est trop courte pour n'appartenir qu'à ce produit.
+      # Le guillemet ouvrant est exigé : une passerelle qui republierait le schéma
+      # sous un préfixe écrirait « /whisper/detect-language », et ce n'est plus
+      # l'instance qui répond. « post » derrière la clé dit que le chemin est
+      # décrit comme une route, et non cité dans une valeur.
+      #
+      # Le titre n'entre dans aucune des trois, et c'est délibéré : il est
+      # fabriqué à l'exécution par « projectMetadata["Name"].title().replace("-",
+      # " ") », donc sa casse dépend de la normalisation du nom de paquet. Il est
+      # remonté par l'extracteur, pour que sa valeur réelle soit relevée sur des
+      # instances avant d'en faire une condition.
+      #
+      # Le code HTTP n'entre dans aucune non plus : la route de schéma rend 200
+      # sur toute instance vivante, donc l'exiger n'écarterait rien que le corps
+      # n'écarte déjà, et ferait manquer l'instance dont un intermédiaire réécrit
+      # le statut.
+      #
+      # Les \s* sont là parce que JSONResponse sérialise compact mais qu'un
+      # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"openapi"\s*:\s*"3'
+          - '"description"\s*:\s*"Whisper ASR Webservice is a general-purpose speech recognition webservice\."'
+          - '"/detect-language"\s*:\s*\{\s*"post"'
+        condition: and
+
+    extractors:
+      # Un seul extracteur, et deux expressions plutôt que deux extracteurs :
+      # nuclei émet une ligne de résultat par extracteur nommé qui rend quelque
+      # chose, et la même instance serait signalée deux fois.
+      #
+      # La version est celle du paquet installé — « version=projectMetadata
+      # ["Version"] » — donc les correctifs qui manquent à l'instance. Le titre
+      # est l'inconnue du document : sa casse est fabriquée à l'exécution, et
+      # c'est sa valeur relevée sur de vraies instances qui dira un jour si elle
+      # peut servir de second matcher.
+      - type: json
+        part: body
+        name: instance
+        json:
+          - '.info.version'
+          - '.info.title'
