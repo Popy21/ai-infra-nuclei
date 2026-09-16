@@ -1,0 +1,209 @@
+id: nextchat-open-instance
+
+info:
+  name: NextChat - Open Instance Without Access Code
+  author: popy21
+  severity: high
+  description: |
+    NextChat (ChatGPTNextWeb/NextChat, anciennement ChatGPT-Next-Web) est
+    l'interface de chat LLM auto-hébergée la plus déployée. Elle n'a pas de
+    comptes : ce qui sépare un visiteur du fournisseur branché derrière est un
+    mot de passe partagé — le code d'accès — et une seule lecture dit s'il
+    existe.
+    GET /api/config est cette lecture, et c'est une lecture que le produit ne
+    peut pas ne pas servir. app/api/config/route.ts construit un objet de huit
+    clés — « needCode: serverConfig.needCode, hideUserApiKey: ...,
+    disableGPT4: ..., hideBalanceQuery: ..., disableFastLink: ...,
+    customModels: ..., defaultModel: ..., visionModels: ... » — et le handler le
+    rend tel quel : « async function handle() { return
+    NextResponse.json(DANGER_CONFIG); } », puis « export const GET = handle;
+    export const POST = handle; export const runtime = "edge"; ». Les deux
+    méthodes pointent sur le même handler, qui ne prend même pas la requête en
+    argument : il n'y a rien à présenter. Le fichier ne porte aucune
+    vérification de session, de jeton ni de clé, et son propre commentaire dit
+    pourquoi il ne doit rien porter de sensible : « Danger! Do not hard code any
+    secret value here! ».
+    Un 200 sur cette route ne prouve donc rien : elle répond pareil sur une
+    instance correctement fermée. C'est la valeur d'une seule des huit clés qui
+    fait le constat, needCode. app/config/server.ts pose
+    « needCode: ACCESS_CODES.size > 0 », et ACCESS_CODES est construit depuis la
+    seule variable d'environnement CODE : « const codes = (code?.split(",") ??
+    []).filter((v) => !!v).map((v) => md5.hash(v.trim())); return new
+    Set(codes); ». Une variable absente comme une variable vide traversent le
+    filter() sans laisser de code — « "".split(",") » rend [""], que
+    « !!v » écarte — donc l'ensemble est vide, donc needCode vaut faux, donc il
+    n'y a aucun code d'accès à présenter.
+    C'est la configuration livrée par défaut, et non un réglage manqué : le
+    Dockerfile du dépôt pose « ENV CODE="" » dans l'étape de construction comme
+    dans celle d'exécution, aux côtés de « ENV OPENAI_API_KEY="" », puis
+    « EXPOSE 3000 ». Un déploiement conteneur qui ne définit pas CODE est ouvert,
+    et la réponse le dit d'elle-même.
+    Le couple hideBalanceQuery + disableFastLink est ce qui nomme le produit
+    dans cette réponse. Il est propre à NextChat — « hideBalanceQuery:
+    !process.env.ENABLE_BALANCE_QUERY » interroge le solde du fournisseur,
+    « disableFastLink: !!process.env.DISABLE_FAST_LINK » la lecture des réglages
+    depuis l'URL — et c'est lui qui sépare ce document des autres /api/config
+    que le pack couvre déjà, LibreChat et Gradio.
+  impact: |
+    Le visiteur parle au fournisseur configuré, avec la clé de l'exploitant.
+    app/api/auth.ts est le seul contrôle que traverse le mandataire de chat,
+    « /api/[provider]/[...path] », et sa condition de refus est
+    « if (serverConfig.needCode && !serverConfig.codes.has(hashedCode) &&
+    !apiKey) » : needCode à faux la court-circuite, sans que rien d'autre ne
+    soit regardé. La suite de la même fonction achève le tableau — « if (!apiKey)
+    { ... if (systemApiKey) { console.log("[Auth] use system api key");
+    req.headers.set("Authorization", `Bearer ${systemApiKey}`); } } » — et le
+    switch qui précède choisit la clé selon le fournisseur visé : OPENAI_API_KEY,
+    ANTHROPIC_API_KEY, GOOGLE_API_KEY, AZURE_API_KEY, DEEPSEEK_API_KEY,
+    XAI_API_KEY et le reste. L'inférence est gratuite pour n'importe quel
+    visiteur, aux frais de l'exploitant, et sans limite de débit dans le produit.
+    La même réponse dit ce qui est câblé derrière. customModels est CUSTOM_MODELS
+    tel que l'exploitant l'a écrit — la liste des modèles ajoutés ou retirés, qui
+    nomme souvent des déploiements internes —, defaultModel est DEFAULT_MODEL,
+    le modèle de toute nouvelle conversation, et visionModels est VISION_MODELS.
+    Trois champs qui décrivent le parc de modèles et, à travers leurs
+    identifiants, les fournisseurs branchés. disableGPT4 renseigne en prime :
+    quand il vaut vrai, getServerSideConfig() recopie dans customModels la liste
+    des modèles GPT-4 préfixés d'un « - », donc la réponse énumère ce que
+    l'exploitant a voulu interdire.
+    Rien de tout cela ne sera attribué. Le code d'accès n'est pas une identité
+    mais un mot de passe partagé — le client l'envoie sous « Bearer nk-<code> »,
+    le serveur le compare en md5 — et sur une instance ouverte il n'y a même pas
+    ce mot de passe : aucune trace ne portera d'appelant.
+    Une frontière que le template tient plutôt qu'il ne la masque : la réponse
+    dit qu'il n'y a pas de code d'accès, elle ne dit pas qu'une clé de
+    fournisseur est configurée. Sur une instance dont aucune clé n'est posée,
+    auth() journalise « [Auth] admin did not provide an api key » et relaie sans
+    Authorization, et c'est le fournisseur en amont qui refuse. Le champ le plus
+    proche de ce renseignement est hideUserApiKey, « !!process.env
+    .HIDE_USER_API_KEY » : l'exploitant qui interdit à ses visiteurs de saisir
+    leur propre clé en a presque toujours posé une côté serveur. Le template le
+    remonte, il n'en conclut rien.
+  remediation: |
+    Poser CODE et redémarrer : « CODE=<code1,code2> » dans l'environnement du
+    conteneur, ou « -e CODE=... » à côté de « -e OPENAI_API_KEY=... ». La
+    variable est lue à l'import de app/config/server.ts et nulle part ailleurs —
+    rien n'est recopié en base —, donc le redémarrage suffit et le contrôle se
+    refait de l'extérieur : sur une instance fermée, GET /api/config rend
+    « "needCode":true ».
+    Ne pas confondre le code d'accès avec une authentification. C'est un secret
+    partagé, sans compte, sans expiration et sans révocation individuelle : il
+    ferme la porte, il ne dit pas qui entre. Une instance qui doit rendre des
+    comptes se place derrière un intermédiaire qui authentifie (authentification
+    HTTP, mTLS, oauth2-proxy), et c'est le même intermédiaire qui refermerait
+    /api/config.
+    Car poser CODE ne referme pas la route : /api/config reste servie à
+    l'anonyme quelle que soit la configuration, donc customModels, defaultModel
+    et visionModels — le parc de modèles et les fournisseurs qu'ils nomment —
+    restent lisibles sur une instance par ailleurs fermée.
+    Restreindre l'écoute ensuite, parce que le défaut ne la restreint pas :
+    « -p 127.0.0.1:3000:3000 » côté conteneur là où « -p 3000:3000 » publie le
+    port sur toutes les interfaces de l'hôte.
+    Après une exposition, vérifier la consommation chez les fournisseurs de
+    modèles sur la période — c'est le seul endroit où l'usage se lit, puisque
+    l'instance n'a jamais réclamé d'identité — et changer les clés qui y
+    figurent : elles ont servi à des tiers, même si elles n'ont jamais quitté le
+    serveur.
+  reference:
+    - https://github.com/ChatGPTNextWeb/NextChat/blob/main/app/api/config/route.ts
+    - https://github.com/ChatGPTNextWeb/NextChat/blob/main/app/config/server.ts
+    - https://github.com/ChatGPTNextWeb/NextChat/blob/main/app/api/auth.ts
+    - https://github.com/ChatGPTNextWeb/NextChat/blob/main/app/api/%5Bprovider%5D/%5B...path%5D/route.ts
+    - https://github.com/ChatGPTNextWeb/NextChat/blob/main/app/constant.ts
+    - https://github.com/ChatGPTNextWeb/NextChat/blob/main/Dockerfile
+    - https://github.com/ChatGPTNextWeb/NextChat
+  metadata:
+    max-request: 1
+    vendor: chatgptnextweb
+    product: nextchat
+    shodan-query: http.title:"NextChat"
+  tags: ai,llm,nextchat,chatgpt-next-web,exposure,unauth,misconfig
+
+http:
+  # /api/config, et rien d'autre. Les deux voisins qui viennent à l'esprit sont
+  # écartés, chacun pour une raison propre :
+  #
+  # - Le mandataire de chat, « /api/[provider]/[...path] », serait la preuve
+  #   définitive — on obtient une complétion ou on ne l'obtient pas — mais le
+  #   template ferait tourner le modèle et débiterait la clé de l'exploitant
+  #   pour établir que n'importe qui peut le faire. C'est l'abus que le constat
+  #   signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+  # - La page d'accueil ne dit rien. NextChat est une application cliente : le
+  #   formulaire de code d'accès est rendu dans le navigateur à partir de cette
+  #   même réponse, et la coquille HTML est identique que l'instance soit
+  #   ouverte ou fermée.
+  #
+  # GET plutôt que POST bien que « export const POST = handle » vise le même
+  # handler : les deux rendent la même chose, et le GET est la lecture.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/config"
+
+    matchers:
+      # Trois expressions, et elles se partagent le travail : la première fait le
+      # constat, les deux autres nomment le produit.
+      #
+      # La première porte les deux moitiés de l'ancrage. « needCode » ouvre
+      # DANGER_CONFIG — c'est la première clé de l'objet littéral, et
+      # NextResponse.json sérialise dans l'ordre d'insertion —, donc exiger
+      # qu'elle ouvre le corps dit que l'instance a répondu d'elle-même, et
+      # écarte la même charge utile retrouvée au fond du document d'une
+      # supervision qui l'agrégerait sous une clé à elle. Sa valeur, ensuite,
+      # est le constat entier : « needCode: ACCESS_CODES.size > 0 », donc false
+      # signifie qu'aucun code d'accès n'est posé.
+      #
+      # Les deux suivantes sont la signature produit, et c'est leur réunion qui
+      # désigne NextChat : une application qui publie à l'anonyme à la fois
+      # l'état de sa requête de solde chez le fournisseur et celui de la lecture
+      # de ses réglages depuis l'URL n'est pas une application quelconque. Le
+      # « : true|false » est exigé parce que les deux valent « !process.env.X »
+      # ou « !!process.env.X » : ce sont des booléens, et un document qui ne
+      # ferait que citer ces noms ailleurs ne serait pas cette réponse.
+      #
+      # Les cinq autres clés sont écartées, et chacune pour une raison. needCode,
+      # hideUserApiKey et disableGPT4 sont trop banales pour nommer quoi que ce
+      # soit. customModels, defaultModel et visionModels n'ont rejoint l'objet
+      # qu'en 2023-11, 2024-04 et 2024-12 : les exiger raterait précisément les
+      # instances anciennes, celles qui traînent exposées. La limite assumée est
+      # à l'autre bout — disableFastLink n'existe que depuis 2023-11, donc une
+      # instance antérieure à cette date n'est pas reconnue. Elle est le prix de
+      # la signature : sans elle il ne resterait que hideBalanceQuery, seul.
+      #
+      # Le code HTTP n'entre dans aucune des trois, à dessein. Le handler n'a pas
+      # de branche d'échec — il rend NextResponse.json(), donc un 200 sur toute
+      # instance vivante, fermée comprise — donc l'exiger n'écarterait rien que
+      # le corps n'écarte déjà, et ferait manquer l'instance dont un
+      # intermédiaire réécrit le statut.
+      #
+      # Les \s* sont là parce que NextResponse.json sérialise compact mais qu'un
+      # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"needCode"\s*:\s*false'
+          - '"hideBalanceQuery"\s*:\s*(?:true|false)'
+          - '"disableFastLink"\s*:\s*(?:true|false)'
+        condition: and
+
+    extractors:
+      # Un seul extracteur, et quatre expressions plutôt que quatre extracteurs :
+      # nuclei émet une ligne de résultat par extracteur nommé qui rend quelque
+      # chose, et la même instance serait signalée plusieurs fois.
+      #
+      # Les trois premières décrivent ce qui est branché derrière — DEFAULT_MODEL,
+      # CUSTOM_MODELS, VISION_MODELS tels que l'exploitant les a écrits — et le
+      # « select(. != "") » est ce qui les tait quand elles ne sont pas posées :
+      # les trois valent « ?? "" », et une instance par défaut les rend vides.
+      # La quatrième est hideUserApiKey, le champ le plus proche du
+      # renseignement que la réponse ne donne pas : l'exploitant qui interdit à
+      # ses visiteurs de saisir leur propre clé en a presque toujours posé une
+      # côté serveur. Booléen, donc toujours remonté — c'est un renseignement,
+      # pas une condition.
+      - type: json
+        part: body
+        name: instance
+        json:
+          - '.defaultModel | select(. != "")'
+          - '.customModels | select(. != "")'
+          - '.visionModels | select(. != "")'
+          - '.hideUserApiKey'

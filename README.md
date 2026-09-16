@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-90 templates, 87 produits.
+91 templates, 88 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -89,6 +89,7 @@ amont.
 | mlrun | [`mlrun-client-spec-exposed`](templates/exposure/mlrun-client-spec-exposed.yaml) | high |
 | mlserver | [`mlserver-metadata-exposed`](templates/exposure/mlserver-metadata-exposed.yaml) | high |
 | nemo-guardrails | [`nemo-guardrails-server-exposed`](templates/exposure/nemo-guardrails-server-exposed.yaml) | high |
+| nextchat | [`nextchat-open-instance`](templates/exposure/nextchat-open-instance.yaml) | high |
 | ollama | [`ollama-model-pull-abuse`](templates/exposure/ollama-model-pull-abuse.yaml) | high |
 | ollama | [`ollama-unauthenticated-api`](templates/exposure/ollama-unauthenticated-api.yaml) | high |
 | open-webui | [`open-webui-signup-enabled`](templates/exposure/open-webui-signup-enabled.yaml) | medium |

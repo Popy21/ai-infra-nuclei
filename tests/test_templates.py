@@ -29117,6 +29117,487 @@ def test_whisper_asr_matcher_compiles_and_fires_against_a_live_server():
         assert refused == 0, "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# NextChat — ChatGPTNextWeb/NextChat, anciennement ChatGPT-Next-Web. Troisième
+# /api/config du pack après LibreChat et Gradio, et c'est ce voisinage qui fait
+# le travail de cette section : la route est banale, la charge utile ne l'est
+# pas.
+#
+# Trois choses à tenir.
+#
+# La route est publique par dessein, et le fichier le dit lui-même :
+# app/api/config/route.ts ne porte aucune vérification de session, de jeton ni
+# de clé, son commentaire prévient « Danger! Do not hard code any secret value
+# here! », et « export const GET = handle; export const POST = handle » rend le
+# même objet à tout appelant. Reconnaître NextChat, c'est donc reconnaître une
+# instance correctement fermée aussi bien qu'une instance ouverte : le constat
+# tient à la valeur de needCode seule, « ACCESS_CODES.size > 0 » sur un
+# ensemble construit depuis la variable d'environnement CODE — que le
+# Dockerfile du dépôt pose à « "" ».
+#
+# La signature produit doit traverser les versions. L'objet a gagné
+# disableFastLink le 2023-11-07, customModels le lendemain, defaultModel le
+# 2024-04-19 et visionModels le 2024-12-30, chacun ajouté en queue : un template
+# qui exigerait les huit clés raterait tout le parc ancien, celui qui traîne
+# exposé.
+#
+# Et elle doit survivre au voisinage. LibreChat et Gradio servent eux aussi une
+# configuration anonyme sur une route de configuration, et le constat de
+# LibreChat porte lui aussi sur un seul booléen d'ouverture : aucun des deux
+# templates ne doit voir l'instance de l'autre.
+
+NEXTCHAT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "nextchat-open-instance.yaml")
+
+NEXTCHAT_ROUTE = "/api/config"
+
+# Les huit clés de DANGER_CONFIG, dans l'ordre de l'objet littéral de
+# app/api/config/route.ts — celui que JSON.stringify respecte. Chacune des
+# quatre dernières a été ajoutée en queue, à une date connue, donc les tranches
+# de ce tuple sont les formes historiques de la charge utile.
+NEXTCHAT_KEYS = ("needCode", "hideUserApiKey", "disableGPT4", "hideBalanceQuery",
+                 "disableFastLink", "customModels", "defaultModel", "visionModels")
+
+
+def nextchat_config(need_code=False, hide_user_api_key=False, disable_gpt4=False,
+                    hide_balance_query=True, disable_fast_link=False,
+                    custom_models="", default_model="", vision_models="",
+                    keys=NEXTCHAT_KEYS, indent=None):
+    """
+    Ce que NextResponse.json(DANGER_CONFIG) rend.
+
+    Les valeurs par défaut sont celles d'un conteneur lancé sans variables :
+    « needCode: ACCESS_CODES.size > 0 » est faux puisque CODE vaut "",
+    « hideBalanceQuery: !process.env.ENABLE_BALANCE_QUERY » est vrai puisque la
+    variable est absente, les trois listes de modèles valent « ?? "" ».
+    """
+    payload = {
+        "needCode": need_code,
+        "hideUserApiKey": hide_user_api_key,
+        "disableGPT4": disable_gpt4,
+        "hideBalanceQuery": hide_balance_query,
+        "disableFastLink": disable_fast_link,
+        "customModels": custom_models,
+        "defaultModel": default_model,
+        "visionModels": vision_models,
+    }
+    payload = {key: payload[key] for key in keys}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+NEXTCHAT_OPEN_BODY = nextchat_config()
+
+# La même instance, un code d'accès posé. Le template ne doit pas déclencher :
+# sinon il remonte toute instance NextChat vivante.
+NEXTCHAT_CLOSED_BODY = nextchat_config(need_code=True)
+
+# La charge utile entière retrouvée au fond du document d'une supervision qui
+# l'agrégerait sous une clé à elle : ce n'est pas l'instance qui a répondu.
+NEXTCHAT_COMPOSITE_BODY = '{"nextchat":%s,"checked_at":0}' % NEXTCHAT_OPEN_BODY
+
+# La coquille de l'application : NextChat est une application cliente, et le
+# formulaire de code d'accès est rendu dans le navigateur depuis /api/config.
+# Le HTML est identique que l'instance soit ouverte ou fermée.
+NEXTCHAT_SPA_BODY = (
+    '<!DOCTYPE html><html lang="en"><head><title>NextChat</title>'
+    '<meta name="description" content="NextChat"/>'
+    '<link rel="stylesheet" href="/_next/static/css/app.css"/></head>'
+    '<body><div id="__next"></div></body></html>'
+)
+
+# Un intermédiaire qui refuse la route à l'anonyme : la fermeture attendue,
+# puisque le produit n'a rien à opposer lui-même.
+NEXTCHAT_PROXY_DENIED_BODY = '{"error":"unauthorized"}'
+
+# Une autre application qui publie son état d'ouverture sous /api/config :
+# « needCode » ne désigne aucun produit.
+NEXTCHAT_OTHER_APP_BODY = (
+    '{"needCode":false,"version":"3.4.1","title":"portail interne",'
+    '"loginEnabled":true}'
+)
+
+
+def nextchat_block():
+    doc = load(NEXTCHAT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % NEXTCHAT_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /api/config — c'est pourtant la seule "
+        "lecture du produit qui dise s'il y a un code d'accès"
+    )
+    return blocks[0]
+
+
+def nextchat_fires(status=200, body=None):
+    """
+    Sémantique nuclei d'un bloc à une seule requête. Le paramètre de statut est
+    tenu ici pour que les cas d'un intermédiaire se disent, même si le bloc n'a
+    pas à en dépendre.
+    """
+    block = nextchat_block()
+    if body is None:
+        body = NEXTCHAT_OPEN_BODY
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_nextchat_probe_never_makes_the_instance_talk_to_a_provider():
+    """
+    Le mandataire de chat, « /api/[provider]/[...path] », serait la preuve
+    définitive : auth() y injecte la clé de l'exploitant quand needCode est
+    faux — « req.headers.set("Authorization", `Bearer ${systemApiKey}`) » — et
+    la complétion revient. C'est l'abus que le constat signale, et le template
+    le débiterait pour établir que n'importe qui peut le débiter.
+    """
+    doc = load(NEXTCHAT_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", NEXTCHAT_ROUTE)}, (
+        "le template interroge autre chose que la route de configuration — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la configuration se lit en GET : « export const POST = handle » "
+            "vise le même handler et rend la même chose, donc rien ne justifie "
+            "d'écrire vers une instance qu'on découvre"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande de faire tourner un modèle sur l'instance auditée"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/api/openai", "le mandataire OpenAI fait relayer une "
+                                "complétion avec la clé de l'exploitant"),
+                ("/api/anthropic", "même mandataire, autre fournisseur, même "
+                                   "clé débitée"),
+                ("/api/google", "même mandataire, autre fournisseur"),
+                ("/api/azure", "même mandataire, autre fournisseur"),
+                ("/api/proxy", "le mandataire générique fait ouvrir à "
+                               "l'instance une connexion vers une adresse "
+                               "choisie par l'appelant"),
+                ("/api/webdav", "la route de synchronisation fait écrire "
+                                "l'instance vers un serveur WebDAV tiers"),
+                ("/api/upstash", "la route de synchronisation fait parler "
+                                 "l'instance à un magasin distant"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_nextchat_matcher_proves_there_is_no_access_code_not_merely_that_it_is_nextchat():
+    """
+    Le point qui fait ce template. La route répond à l'anonyme par dessein — le
+    handler ne prend même pas la requête en argument — donc reconnaître le
+    produit ne prouve rien. C'est « "needCode":false » qui fait le constat, et
+    le couple hideBalanceQuery + disableFastLink qui dit de quel produit on
+    parle.
+    """
+    assert nextchat_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance sans code "
+        "d'accès"
+    )
+
+    assert not nextchat_fires(body=NEXTCHAT_CLOSED_BODY), (
+        "le template déclenche sur une instance dont CODE est posé : "
+        "/api/config est servie à l'anonyme quelle que soit la configuration, "
+        "et reconnaître NextChat n'est pas le constat"
+    )
+
+    for body, why in (
+        (NEXTCHAT_OTHER_APP_BODY,
+         "une application quelconque qui publie son état d'ouverture sous "
+         "/api/config — « needCode » ne nomme personne"),
+        (nextchat_config(keys=[k for k in NEXTCHAT_KEYS
+                               if k != "hideBalanceQuery"]),
+         "un document dont hideBalanceQuery est absent : la moitié de la "
+         "signature produit ne serait plus exigée"),
+        (nextchat_config(keys=[k for k in NEXTCHAT_KEYS
+                               if k != "disableFastLink"]),
+         "un document dont disableFastLink est absent : l'autre moitié de la "
+         "signature ne serait plus exigée"),
+        ('{"needCode":false,"hideBalanceQuery":"true",'
+         '"disableFastLink":"false"}',
+         "un document dont les deux clés portent des chaînes : les deux valent "
+         "« !process.env.X » ou « !!process.env.X », donc des booléens, et un "
+         "document qui ne fait que citer ces noms n'est pas cette réponse"),
+        (NEXTCHAT_COMPOSITE_BODY,
+         "la charge utile republiée au fond du document d'une supervision : "
+         "c'est l'ancrage sur l'ouverture qui dit que l'instance a répondu "
+         "d'elle-même"),
+        (NEXTCHAT_SPA_BODY,
+         "la coquille de l'application, identique que l'instance soit ouverte "
+         "ou fermée"),
+        (NEXTCHAT_PROXY_DENIED_BODY,
+         "un intermédiaire qui refuse la route à l'anonyme — c'est la "
+         "fermeture attendue"),
+        ("", "une réponse vide"),
+    ):
+        assert not nextchat_fires(body=body), "le template conclut sur %s" % why
+
+
+def test_nextchat_matcher_holds_across_the_shapes_the_payload_has_taken():
+    """
+    Les quatre dernières clés ont été ajoutées en queue à quatre dates connues.
+    Les exiger raterait les instances antérieures, et ce sont exactement celles
+    qui traînent exposées.
+    """
+    for body, why in (
+        (nextchat_config(keys=NEXTCHAT_KEYS[:5]),
+         "la charge utile du 2023-11-07, celle des cinq clés — customModels, "
+         "defaultModel et visionModels n'existaient pas encore"),
+        (nextchat_config(keys=NEXTCHAT_KEYS[:6], custom_models="-all,+llama3"),
+         "la charge utile du 2023-11-08, qui a gagné customModels"),
+        (nextchat_config(keys=NEXTCHAT_KEYS[:7], default_model="gpt-4o"),
+         "la charge utile du 2024-04-19, qui a gagné defaultModel"),
+        (nextchat_config(hide_balance_query=False),
+         "une instance dont ENABLE_BALANCE_QUERY est posé : la valeur du "
+         "booléen ne conditionne pas la signature"),
+        (nextchat_config(disable_fast_link=True),
+         "une instance dont DISABLE_FAST_LINK est posé"),
+        (nextchat_config(hide_user_api_key=True, disable_gpt4=True,
+                         custom_models="-gpt-4,-gpt-4-turbo",
+                         default_model="gpt-3.5-turbo"),
+         "une instance dont DISABLE_GPT4 est posé, où getServerSideConfig() "
+         "recopie dans customModels les modèles GPT-4 préfixés d'un « - »"),
+        (nextchat_config(indent=2),
+         "un intermédiaire qui réindente ce qu'il relaie, là où "
+         "NextResponse.json sérialise compact"),
+        (NEXTCHAT_OPEN_BODY + "\n",
+         "une fin de ligne ajoutée par un intermédiaire"),
+    ):
+        assert nextchat_fires(body=body), "le template perd %s" % why
+
+
+def test_nextchat_does_not_claim_the_payload_that_predates_disable_fast_link():
+    """
+    La limite assumée, et elle est le prix de la signature. disableFastLink n'a
+    rejoint l'objet que le 2023-11-07 : avant cette date la charge utile n'a que
+    quatre clés, et il ne resterait que hideBalanceQuery pour nommer le produit.
+    Le template se tait plutôt que de conclure sur ce seul booléen — et ce test
+    est là pour que le jour où la frontière bouge, elle bouge sciemment.
+    """
+    assert not nextchat_fires(body=nextchat_config(keys=NEXTCHAT_KEYS[:4])), (
+        "le template reconnaît la charge utile des quatre clés : il ne lui "
+        "reste alors que hideBalanceQuery, et une clé seule ne désigne pas un "
+        "produit"
+    )
+
+
+def test_nextchat_and_its_neighbours_on_api_config_do_not_see_each_other():
+    """
+    Trois templates du pack lisent une route de configuration servie à
+    l'anonyme, et deux d'entre eux concluent sur un booléen d'ouverture. Le
+    couple hideBalanceQuery + disableFastLink est ce qui sépare celui-ci des
+    autres : la relation doit tenir dans les deux sens.
+    """
+    for other_body, other_name in (
+        (LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY, "librechat"),
+        (LIBRECHAT_OLD_CONFIG_REGISTRATION_OPEN_BODY,
+         "librechat, dans sa forme ancienne"),
+        (GRADIO_CONFIG_BODY, "gradio"),
+        (OPENWEBUI_CONFIG_SIGNUP_OPEN_BODY, "open-webui"),
+        (DIFY_SETUP_NOT_STARTED_BODY, "dify"),
+        (CHAINLIT_SETTINGS_BODY, "chainlit"),
+    ):
+        assert not nextchat_fires(body=other_body), (
+            f"le template déclenche sur {other_name}, qui sert lui aussi une "
+            "configuration d'interface de chat sans être NextChat"
+        )
+
+    librechat_body_matchers = [m for m in (librechat_config_block().get("matchers") or [])
+                               if m.get("part") == "body"]
+    assert librechat_body_matchers, "le voisin n'a plus de matcher sur le corps"
+    assert not all(body_matcher_hits(m, NEXTCHAT_OPEN_BODY)
+                   for m in librechat_body_matchers), (
+        "le template de LibreChat voit une instance NextChat ouverte : le même "
+        "hôte serait signalé deux fois, pour un seul fait et sous le mauvais "
+        "nom de produit"
+    )
+
+
+def test_nextchat_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le handler n'a pas de branche d'échec — « return
+    NextResponse.json(DANGER_CONFIG) », donc un 200 sur toute instance vivante,
+    fermée comprise. Exiger le statut n'écarterait rien que le corps n'écarte
+    déjà, et ferait manquer l'instance dont un intermédiaire le réécrit.
+    """
+    block = nextchat_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : il conclurait sur un code que "
+        "toute instance NextChat vivante rend sur cette route"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : le constat est "
+            "« needCode » à faux, la signature est le couple qui l'accompagne, "
+            "et aucun des deux ne conclut seul"
+        )
+
+    assert nextchat_fires(status=503), (
+        "le template dépend du code rendu, alors que le corps est bien celui "
+        "d'une instance sans code d'accès"
+    )
+    assert not nextchat_fires(status=200, body=NEXTCHAT_CLOSED_BODY), (
+        "un 200 portant la réponse d'une instance fermée fait conclure le "
+        "template : c'est le corps qui porte la preuve"
+    )
+
+
+def test_nextchat_extractor_names_the_wired_models_and_stays_silent_when_unset():
+    """
+    Un seul extracteur, quatre expressions : nuclei émet une ligne de résultat
+    par extracteur nommé qui rend quelque chose, et la même instance serait
+    signalée plusieurs fois. Le « select(. != "") » est ce qui tait les trois
+    listes de modèles quand elles ne sont pas posées — elles valent « ?? "" »,
+    donc une instance par défaut les rend vides — là où hideUserApiKey est un
+    booléen toujours présent.
+    """
+    extractors = nextchat_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs : la même instance serait "
+        f"signalée plusieurs fois — {len(extractors)}"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : une expression régulière n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [
+        '.defaultModel | select(. != "")',
+        '.customModels | select(. != "")',
+        '.visionModels | select(. != "")',
+        '.hideUserApiKey',
+    ], (
+        "l'extracteur ne remonte pas les trois listes de modèles filtrées du "
+        "vide, ni hideUserApiKey — le champ le plus proche du renseignement "
+        f"que la réponse ne donne pas — {extractor.get('json')}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_nextchat_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni les requêtes
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    moteur d'expressions de Python plutôt qu'avec celui de Go : seul un scan
+    contre un vrai serveur ferme la boucle. L'enjeu propre est ici le
+    « select(. != "") », qui n'est pas un chemin JSON mais un filtre, et
+    l'ancrage `^` sur l'ouverture de la charge utile.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == NEXTCHAT_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, NEXTCHAT_SPA_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", NEXTCHAT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "nextchat-open-instance"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, nextchat_config(
+        hide_user_api_key=True, custom_models="-all,+gpt-4o",
+        default_model="gpt-4o-mini", vision_models="gpt-4o"))
+    assert seen == [NEXTCHAT_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, (
+        "le scan ne reconnaît pas la réponse d'une instance ouverte, ou il la "
+        f"signale plusieurs fois — {hits}"
+    )
+    assert extracted == ["-all,+gpt-4o", "gpt-4o", "gpt-4o-mini", "true"], (
+        "le scan ne remonte pas le parc de modèles câblé ni hideUserApiKey — "
+        f"{extracted}"
+    )
+
+    _, hits, extracted = scan(200, NEXTCHAT_OPEN_BODY)
+    assert hits == 1, (
+        "le scan ne reconnaît pas l'instance par défaut, dont les trois listes "
+        f"de modèles sont vides — {hits}"
+    )
+    assert extracted == ["false"], (
+        "le « select(. != \"\") » ne tait pas les listes de modèles non "
+        f"posées, que « ?? \"\" » rend vides — {extracted}"
+    )
+
+    for status, body, why in (
+        (200, NEXTCHAT_CLOSED_BODY,
+         "une instance dont CODE est posé — c'est l'instance fermée"),
+        (200, NEXTCHAT_COMPOSITE_BODY,
+         "la charge utile republiée au fond du document d'une supervision — "
+         "c'est l'ancrage sur l'ouverture qui doit l'écarter"),
+        (200, NEXTCHAT_OTHER_APP_BODY,
+         "une application quelconque qui publie « needCode » sous la même "
+         "route"),
+        (200, LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY,
+         "une instance LibreChat, qui sert sa configuration à l'anonyme sur "
+         "exactement la même route"),
+        (200, NEXTCHAT_SPA_BODY,
+         "la coquille de l'application, identique ouverte ou fermée"),
+        (401, NEXTCHAT_PROXY_DENIED_BODY,
+         "une instance placée derrière un intermédiaire qui authentifie"),
+    ):
+        _, refused, _ = scan(status, body)
+        assert refused == 0, "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
