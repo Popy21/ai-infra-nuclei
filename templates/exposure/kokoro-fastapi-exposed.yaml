@@ -1,0 +1,235 @@
+id: kokoro-fastapi-exposed
+
+info:
+  name: Kokoro-FastAPI (FastKoko) - Unauthenticated Text-to-Speech API Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Kokoro-FastAPI (remsky/Kokoro-FastAPI, publié sous le nom FastKoko) se décrit
+    dans son propre README comme « Dockerized FastAPI wrapper for Kokoro-82M
+    text-to-speech model », et c'est le serveur de synthèse vocale que l'on pose
+    le plus couramment derrière une interface de chat auto-hébergée — le badge du
+    README annonce « downloads 2.6M+ » pour ses images ghcr.io.
+    GET /v1/models est la lecture qui nomme le produit, et c'est la moins
+    coûteuse de l'API. api/src/main.py monte le routeur par
+    « app.include_router(openai_router, prefix="/v1") », donc la route
+    « @router.get("/models") » déclarée dans
+    api/src/routers/openai_compatible.py est servie sous /v1/models. Son handler
+    ne lit ni le disque ni le modèle : il rend un littéral écrit dans le fichier,
+    « return {"object": "list", "data": models} », où models est une liste de
+    dictionnaires de la forme « {"id": "tts-1", "object": "model", "created":
+    1686935002, "owned_by": "kokoro"} », répétée pour "tts-1", "tts-1-hd",
+    "kokoro" et "gpt-4o-mini-tts" — les quatre portant « "owned_by": "kokoro" ».
+    C'est cette valeur, conjointe à l'identifiant tts-1-hd, qui nomme le produit.
+    /v1/models est partagé par tous les serveurs compatibles OpenAI, et le pack en
+    couvre déjà plusieurs : l'enveloppe {"object":"list","data":[...]} ne désigne
+    donc personne. Un serveur qui annonce le modèle de synthèse d'OpenAI et
+    revendique dans le même objet un propriétaire nommé kokoro, lui, ne peut être
+    que celui-ci — la table de correspondance api/src/core/openai_mappings.json
+    dit pourquoi : elle mappe "tts-1", "tts-1-hd", "kokoro" et "gpt-4o-mini-tts"
+    sur le même poids local "kokoro-v1_0", c'est-à-dire qu'elle accepte les noms
+    de modèles d'OpenAI pour les servir avec Kokoro-82M.
+    L'ordre des clés sépare en prime cette réponse de celle de Speaches, l'autre
+    serveur TTS/STT du pack : le littéral de Kokoro-FastAPI ouvre sur "object" et
+    porte "data" en second, là où le handler de Speaches rend
+    « {"data": [...], "object": "list"} ». FastAPI sérialise le dictionnaire tel
+    quel, donc l'ordre est celui du code source.
+    La liste est un littéral, donc elle date l'instance et rien d'autre. La route
+    n'existe pas avant la v0.2.1 (2025-02-10), qui l'introduit avec trois
+    entrées ; "gpt-4o-mini-tts" n'a rejoint la liste qu'en v0.3.0 (2026-05-15).
+    Exiger la quatrième entrée ferait manquer quinze mois d'instances, et ce sont
+    exactement celles qui traînent exposées : c'est tts-1-hd, présent depuis le
+    premier jour de la route, qui porte le constat.
+    L'absence d'authentification n'est pas un réglage manqué mais une
+    fonctionnalité absente du produit. api/src/main.py construit l'application en
+    une seule expression — « app = FastAPI(title=settings.api_title,
+    description=settings.api_description, version=settings.api_version,
+    lifespan=lifespan, openapi_url="/openapi.json") » — puis ajoute un
+    CORSMiddleware sous « if settings.cors_enabled », et rien d'autre : aucune
+    dépendance de sécurité, aucun contrôle de clé, aucun intergiciel
+    d'authentification, ni sur l'application ni sur les
+    « app.include_router(...) » qui suivent. api/src/core/config.py va dans le
+    même sens : la classe Settings ne déclare aucun champ de clé d'API, et pose
+    « host: str = "0.0.0.0" » et « port: int = 8880 » — le serveur écoute sur
+    toutes les interfaces sans qu'aucun drapeau ne soit passé. Il n'y a donc rien
+    à activer, et rien à mal configurer.
+    Le produit l'assume côté client : le README branche le client OpenAI officiel
+    par « OpenAI(base_url="http://localhost:8880/v1", api_key="not-needed") », et
+    publie l'installation par « docker run -p 8880:8880
+    ghcr.io/remsky/kokoro-fastapi-cpu:latest » — le compose du dépôt écrit de même
+    « ports: - "8880:8880" », c'est-à-dire sur toutes les interfaces de l'hôte. Ce
+    qui sépare l'instance du réseau n'est que la publication du port.
+    Deux lectures corroborent le constat à la main, sans qu'aucune n'ait à entrer
+    dans le matcher. GET /openapi.json — le chemin est écrit en dur dans l'appel à
+    FastAPI, donc toute instance le sert — rend « "title":"Kokoro TTS API" » et
+    « "description":"API for text-to-speech generation using Kokoro" », qui sont
+    les valeurs par défaut de api_title et api_description ; mais Settings hérite
+    de BaseSettings avec « env_file = ".env" », donc ces deux chaînes sont
+    remplaçables par une variable d'environnement, et une signature qu'un
+    exploitant peut renommer n'en est pas une. GET /v1/audio/voices rend depuis la
+    v0.9.0 (2026-09-10) « {"voices":[{"id":"<voix>","name":"<voix>",...}],
+    "default_voice":"<voix>"} », et la clé default_voice — absente du
+    /v1/audio/voices de Speaches — signe le produit ; mais elle est trop récente
+    pour le parc exposé, « ?legacy=true » retombe sur la forme historique
+    {"voices":[...]}, et le handler appelle get_tts_service(), donc réveille le
+    service de synthèse là où /v1/models ne touche à rien.
+    GET /health, enfin, rend « {"status":"healthy"} » : deux mots que publie la
+    moitié du web, et le voisin /v1/test rend « {"status":"ok"} ». Ni l'un ni
+    l'autre ne nomme quoi que ce soit.
+  impact: |
+    POST /v1/audio/speech est servie par le même serveur nu, et c'est là qu'est le
+    risque : de la synthèse vocale gratuite sur le matériel de l'exploitant, sans
+    compte à débiter et sans limite de débit. Le schéma OpenAISpeechRequest dit
+    tout ce que l'appelant anonyme commande — « model » parmi les quatre noms de
+    la table de correspondance, « input », « voice » (voix simple ou combinaison
+    « af_sky+af_bella »), « response_format » entre mp3, opus, aac, flac, wav et
+    pcm, « speed », « stream », « volume_multiplier », « lang_code ».
+    Le matériel en question est bien le sien : api/src/core/config.py pose
+    « use_gpu: bool = True », et get_device() rend "mps" puis "cuda" avant de se
+    rabattre sur "cpu". Le coût d'une seule requête est plafonné très haut —
+    « max_input_length: int = 1_000_000 » caractères de texte par requête,
+    « max_total_pause_s: float = 300.0 » de silence demandable — et le modèle est
+    chargé et préchauffé dès le démarrage par le lifespan, donc prêt à servir le
+    premier venu.
+    Les routes voisines du même routeur prolongent l'abus. POST
+    /v1/audio/voices/combine fabrique une voix par pondération de voix
+    existantes ; GET /v1/audio/voices énumère les paquets de voix présents sur la
+    machine ; GET /v1/models/{model} confirme un nom de modèle. Et
+    /openapi.json trahit la configuration de l'instance, puisque plusieurs
+    routeurs ne sont montés que sous condition : y lire /web/, /dev/tune ou
+    /debug/*, c'est savoir que le lecteur web, le tuner de voix ou les routes
+    d'introspection du processus ont été activés sur cette machine.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera. Les textes soumis par des tiers, eux, auront
+    bien traversé la machine — et l'audio produit, écrit dans le répertoire de
+    fichiers temporaires quand « return_download_link » est demandé.
+  remediation: |
+    Il n'y a rien à activer dans le produit : api/src/core/config.py ne déclare
+    aucun champ de clé d'API et api/src/main.py aucune dépendance
+    d'authentification, donc aucune variable d'environnement ne ferme ces routes.
+    Le contrôle d'accès se pose à l'extérieur — un intermédiaire qui authentifie
+    devant le port (authentification HTTP, mTLS, oauth2-proxy), ou l'isolement
+    réseau pur et simple.
+    Restreindre l'écoute d'abord, parce que le défaut ne la restreint pas :
+    « HOST=127.0.0.1 » quand l'instance n'a pas à être atteinte depuis l'extérieur
+    de la machine — le réglage vaut "0.0.0.0" par défaut — et
+    « -p 127.0.0.1:8880:8880 » côté conteneur, là où le « -p 8880:8880 » du README
+    publie le port sur toutes les interfaces de l'hôte.
+    Ne pas confondre le symptôme et la brèche. « CORS_ENABLED=false » ne concerne
+    que les navigateurs et ne change rien à un appel direct ; couper le lecteur web
+    par « ENABLE_WEB_PLAYER=false » retire une page, pas une route de synthèse ;
+    et /openapi.json n'est même pas masquable, puisque son chemin est écrit en dur
+    dans la construction de l'application. Une instance dont le lecteur web est
+    coupé n'est pas une instance fermée.
+    Vérifier la prise en compte sur la route de calcul elle-même, depuis
+    l'extérieur du périmètre : « curl -s -o /dev/null -w '%{http_code}' -X POST
+    http://<hote>:8880/v1/audio/speech -H 'Content-Type: application/json' -d
+    '{"model":"kokoro","input":"test","voice":"af_heart"}' » ne doit plus rendre
+    200.
+    Après une exposition, relire le journal d'accès à la recherche des POST
+    /v1/audio/speech qu'on ne s'explique pas : chacun est un texte qu'un tiers a
+    fait synthétiser sur le matériel de l'exploitant. Aucune de ces lignes ne
+    portera d'identité d'appelant : il n'y en a jamais eu à porter. Vider aussi le
+    répertoire de fichiers temporaires, où l'audio rendu par « download_link »
+    reste jusqu'à expiration.
+  reference:
+    - https://github.com/remsky/Kokoro-FastAPI/blob/master/api/src/routers/openai_compatible.py
+    - https://github.com/remsky/Kokoro-FastAPI/blob/master/api/src/main.py
+    - https://github.com/remsky/Kokoro-FastAPI/blob/master/api/src/core/config.py
+    - https://github.com/remsky/Kokoro-FastAPI/blob/master/api/src/core/openai_mappings.json
+    - https://github.com/remsky/Kokoro-FastAPI/blob/master/docker/cpu/docker-compose.yml
+    - https://github.com/remsky/Kokoro-FastAPI
+  metadata:
+    max-request: 1
+    vendor: remsky
+    product: kokoro-fastapi
+  tags: ai,ml,kokoro,kokoro-fastapi,fastkoko,tts,speech,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la seule route du produit qui ne lui fasse rien
+  # faire du tout. list_models() rend un littéral écrit dans le fichier source :
+  # ni le modèle chargé en mémoire, ni le cache de voix sur le disque, ni le GPU
+  # ne sont touchés.
+  #
+  # En lecture, et rien d'autre. Le même serveur nu sert POST /v1/audio/speech,
+  # qui synthétise du texte arbitraire sur le matériel de l'exploitant, et POST
+  # /v1/audio/voices/combine, qui fabrique une voix — c'est l'abus que le constat
+  # signale, ce n'est pas ce qu'un scanner a le droit de faire pour l'établir.
+  #
+  # Les deux autres lectures propres au produit ne sont pas jointes non plus, et
+  # chacune pour sa raison. /openapi.json rend le titre et la description par
+  # défaut, « Kokoro TTS API » et « API for text-to-speech generation using
+  # Kokoro » — mais Settings hérite de BaseSettings avec « env_file = ".env" »,
+  # donc ce sont deux chaînes qu'une variable d'environnement remplace, et une
+  # signature renommable n'en est pas une. /v1/audio/voices porte depuis la v0.9.0
+  # la clé « default_voice », qui sépare le produit de Speaches — mais la v0.9.0
+  # date du 2026-09-10, « ?legacy=true » retombe sur la forme historique, et son
+  # handler appelle get_tts_service(), donc réveille le service de synthèse.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers:
+      # Trois expressions, et c'est celle du milieu qui nomme le produit.
+      #
+      # L'ancrage sur l'ouverture vient d'abord. Le handler rend le littéral
+      # « {"object": "list", "data": models} » et FastAPI sérialise un dict tel
+      # quel, donc "object" ouvre le corps et "data" suit. Cet ordre est déjà un
+      # discriminant : le handler de Speaches, l'autre serveur TTS/STT du pack,
+      # rend l'enveloppe dans l'autre sens. Et exiger l'ouverture écarte la même
+      # charge utile retrouvée au fond du document d'une passerelle qui
+      # l'agrégerait sous une clé à elle — c'est cet ancrage qui dit que
+      # l'instance a répondu d'elle-même.
+      #
+      # L'entrée tts-1-hd ensuite, exigée d'un seul tenant. Prises séparément, les
+      # deux moitiés ne prouvent rien : "tts-1-hd" est le nom d'un modèle
+      # d'OpenAI, que cite n'importe quelle passerelle qui le relaie, et "kokoro"
+      # est le nom d'un modèle ouvert, que sert aussi bien Speaches. Ce qui
+      # n'appartient qu'à Kokoro-FastAPI, c'est de les voir dans le même objet :
+      # un serveur qui annonce le modèle de synthèse d'OpenAI et le déclare
+      # possédé par kokoro. Les clés sont adjacentes parce que le dictionnaire
+      # source les écrit dans cet ordre, et "created" est laissé libre — le
+      # littéral porte 1686935002 dans toutes les versions, mais sa valeur ne
+      # nomme rien, c'est l'horodatage d'exemple de la documentation d'OpenAI.
+      #
+      # L'entrée "gpt-4o-mini-tts" n'entre dans aucune expression : elle n'a
+      # rejoint la liste qu'en v0.3.0, le 2026-05-15, et l'exiger ferait manquer
+      # les instances des quinze mois précédents. tts-1-hd, lui, est là depuis la
+      # v0.2.1, celle qui a introduit la route.
+      #
+      # La fermeture sur l'enveloppe enfin, ancrée en fin de corps : "data" est la
+      # seconde et dernière clé du littéral, donc la liste ferme le document. Cet
+      # ancrage écarte le document composite d'une supervision qui recopierait la
+      # réponse en tête avant d'y ajouter une clé à elle — ce que l'ancrage de la
+      # première expression ne ferait pas seul.
+      #
+      # Le code HTTP n'entre dans aucune des trois : la charge utile ne sort du
+      # handler que sous un 200, donc l'exiger n'écarterait rien que les corps
+      # n'écartent déjà, et ferait manquer l'instance dont un intermédiaire
+      # réécrit le statut.
+      #
+      # Les \s* sont là parce que FastAPI sérialise compact mais qu'un
+      # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"data"\s*:\s*\['
+          - '"id"\s*:\s*"tts-1-hd"\s*,\s*"object"\s*:\s*"model"\s*,\s*"created"\s*:\s*\d+\s*,\s*"owned_by"\s*:\s*"kokoro"'
+          - '\]\s*\}\s*$'
+        condition: and
+
+    extractors:
+      # Le seul renseignement que cette réponse porte, et il ne dit pas ce que
+      # l'instance sert — la liste est un littéral, identique sur toutes les
+      # machines d'une même version. Ce qu'il dit, c'est laquelle : trois
+      # identifiants, et l'instance est antérieure à la v0.3.0 du 2026-05-15 ;
+      # quatre, et "gpt-4o-mini-tts" est là. Ce sont aussi les seuls noms que
+      # create_speech() accepte — « if request.model not in
+      # _openai_mappings["models"] » rejette tout le reste en 400 — donc ce que
+      # l'extrait relève est très exactement ce qu'un tiers passerait à POST
+      # /v1/audio/speech.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'

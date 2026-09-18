@@ -29598,6 +29598,471 @@ def test_nextchat_matcher_compiles_and_fires_against_a_live_server():
         assert refused == 0, "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# Kokoro-FastAPI — remsky/Kokoro-FastAPI, publié sous le nom FastKoko, le
+# serveur de synthèse vocale que l'on pose derrière une interface de chat
+# auto-hébergée. Il parle le protocole OpenAI, donc GET /v1/models ne le
+# distingue de rien à lui seul : vLLM, LM Studio et Speaches, tous couverts ici,
+# servent la même enveloppe sur le même chemin.
+#
+# Ce que cette section amarre tient en trois points. Le premier : la signature
+# est le couple « tts-1-hd » + « "owned_by":"kokoro" » pris dans le même objet —
+# un serveur qui annonce le modèle de synthèse d'OpenAI et le déclare possédé
+# par kokoro — et aucune des deux moitiés ne conclut seule, « tts-1-hd » étant
+# un nom d'OpenAI et « kokoro » le nom d'un modèle ouvert que sert aussi
+# Speaches. Le deuxième : la liste est un littéral du code source, et elle a
+# gagné « gpt-4o-mini-tts » en v0.3.0, le 2026-05-15 — l'exiger raterait les
+# quinze mois d'instances antérieures, celles qui traînent exposées. Le
+# troisième : le voisinage. Speaches sert lui aussi des voix Kokoro et rend son
+# enveloppe dans l'autre sens, {"data":...,"object":"list"} contre
+# {"object":"list","data":...} ; aucun des deux templates ne doit voir
+# l'instance de l'autre.
+
+KOKORO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "kokoro-fastapi-exposed.yaml")
+
+KOKORO_MODELS_ROUTE = "/v1/models"
+
+# Les identifiants du littéral de list_models(), dans l'ordre du fichier.
+# « gpt-4o-mini-tts » ferme la liste parce qu'il y a été ajouté en queue en
+# v0.3.0 : les tranches de ce tuple sont donc les deux formes historiques de la
+# charge utile, celle de la v0.2.1 et celle d'aujourd'hui.
+KOKORO_MODEL_IDS = ("tts-1", "tts-1-hd", "kokoro", "gpt-4o-mini-tts")
+
+# L'horodatage que le littéral porte dans toutes les versions. Ce n'est pas une
+# date d'instance : c'est celui de l'exemple de la documentation d'OpenAI,
+# recopié tel quel.
+KOKORO_CREATED = 1686935002
+
+
+def kokoro_model_entry(model_id, created=KOKORO_CREATED, owned_by="kokoro"):
+    """Une entrée de `data`, dans l'ordre où le dictionnaire source écrit ses clés."""
+    return {"id": model_id, "object": "model", "created": created,
+            "owned_by": owned_by}
+
+
+def kokoro_models_body(entries=None, indent=None):
+    """
+    Ce que rend « return {"object": "list", "data": models} » : l'ordre
+    d'insertion du littéral, donc « object » d'abord et « data » ensuite, et la
+    sérialisation compacte de FastAPI.
+    """
+    if entries is None:
+        entries = [kokoro_model_entry(model_id) for model_id in KOKORO_MODEL_IDS]
+    content = {"object": "list", "data": list(entries)}
+    if indent is not None:
+        return json.dumps(content, indent=indent)
+    return json.dumps(content, separators=(",", ":"))
+
+
+KOKORO_MODELS_BODY = kokoro_models_body()
+
+# La charge utile de la v0.2.1, celle des trois entrées : « gpt-4o-mini-tts »
+# n'existait pas encore. Le template doit toujours la reconnaître.
+KOKORO_PRE_V030_BODY = kokoro_models_body(
+    [kokoro_model_entry(model_id) for model_id in KOKORO_MODEL_IDS[:3]])
+
+# La charge utile entière retrouvée au fond du document d'une supervision qui
+# l'agrégerait sous une clé à elle : ce n'est pas l'instance qui a répondu.
+KOKORO_COMPOSITE_BODY = '{"kokoro":%s,"checked_at":0}' % KOKORO_MODELS_BODY
+
+# La même, recopiée en tête par une passerelle qui ajoute une clé derrière la
+# liste. L'ancrage sur l'ouverture ne l'écarterait pas seul.
+KOKORO_APPENDED_BODY = KOKORO_MODELS_BODY[:-1] + ',"checked_at":0}'
+
+# Une passerelle compatible OpenAI qui relaie les noms de modèles d'OpenAI sans
+# être Kokoro-FastAPI : « tts-1-hd » ne nomme personne.
+KOKORO_OPENAI_PROXY_BODY = kokoro_models_body(
+    [kokoro_model_entry("tts-1-hd", created=1753900000, owned_by="openai"),
+     kokoro_model_entry("gpt-4o-mini-tts", created=1753900000,
+                        owned_by="openai")])
+
+# La même passerelle, qui sert en prime un modèle nommé « kokoro » — les deux
+# moitiés de la signature sont dans le corps, mais dans deux objets différents.
+KOKORO_SPLIT_PAIR_BODY = kokoro_models_body(
+    [kokoro_model_entry("tts-1-hd", created=1753900000, owned_by="openai"),
+     kokoro_model_entry("kokoro", created=1753900000)])
+
+# Les deux routes que le produit sert sans rien nommer : santé et test de
+# routage, déclarées toutes deux dans main.py.
+KOKORO_HEALTH_BODY = '{"status":"healthy"}'
+
+# Un intermédiaire qui refuse la route à l'anonyme : la fermeture attendue,
+# puisque le produit n'a rien à opposer lui-même.
+KOKORO_PROXY_DENIED_BODY = '{"detail":"Not authenticated"}'
+
+
+def kokoro_block():
+    doc = load(KOKORO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % KOKORO_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /v1/models — c'est pourtant la seule "
+        "lecture du produit qui ne lui fasse rien faire du tout"
+    )
+    return blocks[0]
+
+
+def kokoro_fires(status=200, body=None):
+    """
+    Sémantique nuclei d'un bloc à une seule requête. Le paramètre de statut est
+    tenu ici pour que les cas d'un intermédiaire se disent, même si le bloc n'a
+    pas à en dépendre.
+    """
+    block = kokoro_block()
+    if body is None:
+        body = KOKORO_MODELS_BODY
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_kokoro_probe_reads_the_literal_list_and_never_makes_the_instance_speak():
+    """
+    POST /v1/audio/speech serait la preuve définitive : elle rend l'audio, donc
+    elle établirait à elle seule que n'importe qui fait chanter le GPU de
+    l'exploitant. C'est l'abus que le constat signale, et le template le
+    commettrait pour établir qu'il est commettable. list_models(), lui, rend un
+    littéral écrit dans le fichier source : aucun modèle chargé, aucun disque
+    lu, aucun GPU touché.
+    """
+    doc = load(KOKORO_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", KOKORO_MODELS_ROUTE)}, (
+        "le template interroge autre chose que la liste de modèles — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste se lit en GET : la route n'est déclarée que sous ce verbe"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande de faire synthétiser du texte sur l'instance auditée"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/audio/speech", "la route de synthèse fait tourner Kokoro-82M "
+                                  "sur le matériel de l'exploitant — jusqu'à un "
+                                  "million de caractères par requête"),
+                ("/audio/voices/combine", "la combinaison fabrique une voix, et "
+                                          "l'écrit sur le disque quand "
+                                          "ALLOW_LOCAL_VOICE_SAVING est posé"),
+                ("/dev/", "les routes de développement font tourner le tuner de "
+                          "voix et la phonémisation"),
+                ("/debug/", "les routes de débogage rendent l'introspection de "
+                            "l'hôte et du processus"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_kokoro_matcher_separates_it_from_the_openai_compatible_runtimes():
+    """
+    Le point qui fait ce template. /v1/models est le chemin le plus partagé de
+    l'écosystème, et l'enveloppe {"object":"list","data":[...]} ne désigne
+    personne. C'est « tts-1-hd » déclaré « "owned_by":"kokoro" » qui nomme le
+    produit — un serveur qui annonce le modèle de synthèse d'OpenAI et le
+    revendique pour un modèle ouvert.
+    """
+    assert kokoro_fires(), (
+        "le template ne reconnaît pas la liste de modèles de Kokoro-FastAPI"
+    )
+
+    for other, why in (
+        (VLLM_MODELS_BODY, "vLLM, déjà couvert par son propre template"),
+        (OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (LMSTUDIO_MODELS_BODY, "LM Studio, déjà couvert"),
+        (SPEACHES_MODELS_BODY, "Speaches, déjà couvert"),
+        (SPEACHES_TWO_MODELS_BODY,
+         "une instance Speaches qui sert justement un paquet de voix Kokoro : "
+         "« kokoro » est le nom d'un modèle ouvert, pas celui d'un serveur"),
+        (KOKORO_OPENAI_PROXY_BODY,
+         "une passerelle qui relaie les noms de modèles d'OpenAI — "
+         "« tts-1-hd » ne nomme personne"),
+        (KOKORO_HEALTH_BODY,
+         "la route de santé du produit lui-même, qui ne nomme rien"),
+        (KOKORO_PROXY_DENIED_BODY,
+         "un intermédiaire qui refuse la route à l'anonyme — c'est la fermeture "
+         "attendue"),
+        ("", "une réponse vide"),
+    ):
+        assert not kokoro_fires(body=other), "le template conclut sur %s" % why
+
+    # La relation doit tenir dans les deux sens : Speaches lit la même route.
+    speaches_body_matchers = [m for m in (speaches_block().get("matchers") or [])
+                              if m.get("part") == "body"]
+    assert speaches_body_matchers, "le voisin n'a plus de matcher sur le corps"
+    assert not all(body_matcher_hits(m, KOKORO_MODELS_BODY)
+                   for m in speaches_body_matchers), (
+        "le template de Speaches voit une instance Kokoro-FastAPI : le même "
+        "hôte serait signalé deux fois, pour un seul fait et sous le mauvais "
+        "nom de produit"
+    )
+
+    vllm_body_matchers = [m for m in (load(VLLM_TEMPLATE)["http"][0]["matchers"])
+                          if m.get("part") == "body"]
+    assert vllm_body_matchers, "le voisin n'a plus de matcher sur le corps"
+    assert not all(body_matcher_hits(m, KOKORO_MODELS_BODY)
+                   for m in vllm_body_matchers), (
+        "le template de vLLM voit une instance Kokoro-FastAPI, alors que les "
+        "deux lisent la même route"
+    )
+
+
+def test_kokoro_matcher_needs_the_pair_inside_one_object():
+    """
+    Les deux moitiés de la signature circulent séparément : « tts-1-hd » est un
+    nom d'OpenAI que relaie n'importe quelle passerelle, « kokoro » est le nom
+    d'un modèle ouvert. Ce qui n'appartient qu'au produit, c'est de les voir
+    dans le même objet, et les clés y sont adjacentes parce que le dictionnaire
+    source les écrit dans cet ordre.
+    """
+    assert not kokoro_fires(body=KOKORO_SPLIT_PAIR_BODY), (
+        "le template conclut sur une passerelle qui sert « tts-1-hd » dans un "
+        "objet et « kokoro » dans un autre : les deux mots sont dans le corps, "
+        "la signature n'y est pas"
+    )
+
+    assert not kokoro_fires(body=kokoro_models_body(
+        [kokoro_model_entry("tts-1", owned_by="kokoro")])), (
+        "le template conclut sur la seule entrée « tts-1 » : c'est « tts-1-hd » "
+        "qui porte le constat, et « tts-1 » en est un préfixe"
+    )
+
+    assert not kokoro_fires(body=kokoro_models_body(
+        [kokoro_model_entry("tts-1-hd", owned_by="kokoro-team")])), (
+        "le template admet un propriétaire qui n'est pas exactement « kokoro »"
+    )
+
+
+def test_kokoro_matcher_holds_across_the_shapes_the_list_has_taken():
+    """
+    La liste est un littéral, et elle a bougé une fois : « gpt-4o-mini-tts » l'a
+    rejointe en v0.3.0, le 2026-05-15. L'exiger raterait toutes les instances
+    des quinze mois précédents — or ce sont elles qui traînent exposées.
+    """
+    for body, why in (
+        (KOKORO_PRE_V030_BODY,
+         "la charge utile de la v0.2.1, celle des trois entrées — "
+         "« gpt-4o-mini-tts » n'existait pas encore"),
+        (kokoro_models_body([kokoro_model_entry("tts-1-hd")]),
+         "une liste réduite à la seule entrée qui porte le constat"),
+        (kokoro_models_body(indent=2),
+         "un intermédiaire qui réindente ce qu'il relaie, là où FastAPI "
+         "sérialise compact"),
+        (KOKORO_MODELS_BODY + "\n",
+         "une fin de ligne ajoutée par un intermédiaire"),
+        (kokoro_models_body([kokoro_model_entry(model_id, created=1740000000)
+                             for model_id in KOKORO_MODEL_IDS]),
+         "un horodatage autre que celui de l'exemple d'OpenAI : « created » ne "
+         "nomme rien et n'a pas à être exigé"),
+    ):
+        assert kokoro_fires(body=body), "le template perd %s" % why
+
+
+def test_kokoro_matcher_refuses_the_payload_republished_by_a_third_party():
+    """
+    Les deux ancrages d'enveloppe, et chacun a sa cible. Celui d'ouverture
+    écarte la charge utile agrégée sous une clé étrangère ; celui de fermeture
+    écarte le document qui la recopie en tête avant d'y ajouter la sienne — que
+    le premier laisserait passer.
+    """
+    assert not kokoro_fires(body=KOKORO_COMPOSITE_BODY), (
+        "le template conclut sur la charge utile republiée au fond du document "
+        "d'une supervision : c'est l'ancrage sur l'ouverture qui dit que "
+        "l'instance a répondu d'elle-même"
+    )
+    assert not kokoro_fires(body=KOKORO_APPENDED_BODY), (
+        "le template conclut sur un document composite qui ouvre bien sur la "
+        "réponse mais ajoute une clé derrière la liste : sans ancrage de "
+        "fermeture, l'ouverture ne suffit pas"
+    )
+
+
+def test_kokoro_does_not_claim_the_envelope_written_in_the_other_order():
+    """
+    La limite assumée, et elle est le prix du voisinage. Le littéral du produit
+    ouvre sur « object » ; celui de Speaches ouvre sur « data ». Une passerelle
+    qui réécrirait l'ordre des clés de Kokoro-FastAPI ne serait plus reconnue —
+    et c'est ce qu'on veut, puisque cette forme-là est celle du voisin. Ce test
+    est là pour que le jour où la frontière bouge, elle bouge sciemment.
+    """
+    reordered = json.dumps(
+        {"data": [kokoro_model_entry(model_id) for model_id in KOKORO_MODEL_IDS],
+         "object": "list"}, separators=(",", ":"))
+
+    assert not kokoro_fires(body=reordered), (
+        "le template reconnaît l'enveloppe écrite dans l'ordre de Speaches : "
+        "l'ordre des clés est ce qui sépare les deux produits sur cette route"
+    )
+
+
+def test_kokoro_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le littéral ne sort du handler que sous un 200 : exiger le statut
+    n'écarterait rien que le corps n'écarte déjà, et ferait manquer l'instance
+    dont un intermédiaire le réécrit.
+    """
+    block = kokoro_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : il conclurait sur un code que "
+        "tout serveur vivant rend sur cette route"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : la signature est le "
+            "couple pris dans un objet, tenu entre deux ancrages d'enveloppe, "
+            "et aucune des trois ne conclut seule"
+        )
+
+    assert kokoro_fires(status=304), (
+        "le template dépend du code rendu, alors que le corps est bien celui "
+        "d'une instance Kokoro-FastAPI"
+    )
+
+
+def test_kokoro_extractor_reports_the_model_names_the_speech_route_accepts():
+    """
+    La liste est un littéral, donc l'extrait ne dit pas ce que l'instance sert :
+    il dit de quelle version elle date — trois identifiants avant la v0.3.0,
+    quatre après — et quels noms create_speech() accepte, puisqu'elle rejette en
+    400 tout ce qui n'est pas dans la table de correspondance.
+    """
+    extractors = kokoro_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs : la même instance serait "
+        f"signalée plusieurs fois — {len(extractors)}"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la route rend un objet JSON : une expression régulière n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == ['.data[].id'], (
+        "l'extracteur ne remonte pas les identifiants de la liste — "
+        f"{extractor.get('json')}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_kokoro_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions du matcher ni la requête
+    gojq de l'extracteur, et `body_matcher_hits` réévalue les motifs avec le
+    moteur d'expressions de Python plutôt qu'avec celui de Go : seul un scan
+    contre un vrai serveur ferme la boucle. L'enjeu propre est ici les deux
+    ancrages, `^` et `$`, dont la sémantique diffère entre les deux moteurs.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == KOKORO_MODELS_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}')
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", KOKORO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "kokoro-fastapi-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, KOKORO_MODELS_BODY)
+    assert seen == [KOKORO_MODELS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, (
+        "le scan ne reconnaît pas la liste de modèles de Kokoro-FastAPI, ou il "
+        f"la signale plusieurs fois — {hits}"
+    )
+    assert extracted == sorted(KOKORO_MODEL_IDS), (
+        f"le scan ne remonte pas les identifiants de la liste — {extracted}"
+    )
+
+    _, hits, extracted = scan(200, KOKORO_PRE_V030_BODY)
+    assert hits == 1, (
+        "le scan ne reconnaît pas la charge utile des trois entrées, celle des "
+        f"instances antérieures à la v0.3.0 — {hits}"
+    )
+    assert extracted == sorted(KOKORO_MODEL_IDS[:3]), (
+        f"le scan ne date pas l'instance par sa liste — {extracted}"
+    )
+
+    for status, body, why in (
+        (200, SPEACHES_TWO_MODELS_BODY,
+         "une instance Speaches qui sert un paquet de voix Kokoro, sur "
+         "exactement la même route"),
+        (200, VLLM_MODELS_BODY, "une instance vLLM, déjà couverte"),
+        (200, KOKORO_OPENAI_PROXY_BODY,
+         "une passerelle qui relaie les noms de modèles d'OpenAI"),
+        (200, KOKORO_SPLIT_PAIR_BODY,
+         "la même passerelle servant en prime un modèle nommé « kokoro » : les "
+         "deux mots sont là, la signature n'y est pas"),
+        (200, KOKORO_COMPOSITE_BODY,
+         "la charge utile republiée au fond du document d'une supervision — "
+         "c'est l'ancrage sur l'ouverture qui doit l'écarter"),
+        (200, KOKORO_APPENDED_BODY,
+         "un document composite qui ouvre sur la réponse et ajoute une clé "
+         "derrière la liste — c'est l'ancrage de fermeture qui doit l'écarter"),
+        (200, KOKORO_HEALTH_BODY,
+         "la route de santé du produit, qui ne nomme rien"),
+        (401, KOKORO_PROXY_DENIED_BODY,
+         "une instance placée derrière un intermédiaire qui authentifie"),
+    ):
+        _, refused, _ = scan(status, body)
+        assert refused == 0, "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
