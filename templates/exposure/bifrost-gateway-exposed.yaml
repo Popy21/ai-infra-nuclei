@@ -1,0 +1,240 @@
+id: bifrost-gateway-exposed
+
+info:
+  name: Bifrost AI Gateway - Management API Exposed (Dashboard Auth Disabled)
+  author: popy21
+  severity: high
+  description: |
+    Bifrost (maximhq/bifrost, édité par Maxim AI) est une passerelle LLM
+    auto-hébergée écrite en Go. C'est un produit distinct des deux proxys que le
+    pack couvre déjà — autre dépôt, autre runtime, autre modèle de configuration
+    — et ce qui l'en sépare est justement ce qui fait ce constat : là où LiteLLM
+    et Portkey n'exposent qu'un relais d'inférence, Bifrost sert sur le même port
+    une API de gestion complète, celle qui adosse son tableau de bord.
+    GET /api/session/is-auth-enabled est la lecture, et elle ne se contente pas
+    d'indiquer que le produit est là : elle dit dans son propre corps si
+    l'instance réclame un jeton. transports/bifrost-http/handlers/session.go
+    déclare « r.GET("/api/session/is-auth-enabled",
+    lib.ChainMiddlewares(h.isAuthEnabled, middlewares...)) », et isAuthEnabled
+    rend « "is_auth_enabled": authConfig.IsEnabled » à côté de
+    « "has_valid_token": hasValidToken ». La valeur false sur le premier champ
+    n'est donc pas un indice d'exposition, c'est l'aveu de configuration de
+    l'instance elle-même.
+    Le chemin a été relevé sur une instance réelle avant d'être figé, parce que
+    la documentation du produit se contredit : l'index d'API du site
+    (docs.getbifrost.ai/_llms/api.md) désigne l'endpoint sous
+    /api/session/auth-enabled, là où la page de référence, docs/openapi/openapi.yaml
+    et le code donnent /api/session/is-auth-enabled. Sur une v2.2.0 lancée par la
+    commande du guide de démarrage, /api/session/auth-enabled rend 200 avec le
+    HTML du tableau de bord — « <title>Bifrost</title> », text/html — parce que le
+    routeur ne connaît pas ce chemin et retombe sur l'application web. Le même
+    index écrit d'ailleurs /api/session/websocket-ticket là où le code enregistre
+    /api/session/ws-ticket : c'est l'index qui est périmé, pas le produit.
+    La forme du corps est fixée par la sérialisation, pas par une convention
+    d'écriture. SendJSON (transports/bifrost-http/handlers/utils.go) marshale par
+    « sonic.ConfigStd », dont la configuration porte « SortMapKeys: true », et le
+    handler rend un map[string]any : les clés sortent donc triées. Sur une v2.2.0,
+    le corps est exactement « {"auth_type":"none","has_valid_token":false,
+    "is_auth_enabled":false} » suivi du saut de ligne que SendJSON ajoute. Le
+    champ auth_type n'a rejoint la charge utile qu'en mai 2026 ; avant lui, les
+    instances rendaient les deux seules clés « {"has_valid_token":false,
+    "is_auth_enabled":false} ». Dans les deux formes, has_valid_token ouvre ou
+    suit immédiatement l'ouverture et is_auth_enabled ferme le document — c'est
+    sur ces deux positions que le matcher se pose, et non sur la présence
+    d'auth_type, dont l'exigence ferait manquer les six premiers mois
+    d'instances.
+    Le code HTTP ne dit rien ici, et c'est structurel : la route figure dans
+    systemWhitelistedRoutes de l'intergiciel d'authentification
+    (transports/bifrost-http/handlers/middlewares.go), aux côtés de
+    /api/session/login, /health et /api/version. Elle rend donc 200 à l'anonyme
+    dans les deux états du produit — l'instance fermée répond
+    « {"auth_type":"password","has_valid_token":false,"is_auth_enabled":true} »,
+    dashboardAuthType() rendant "password" quand authConfig.IsEnabled est vrai.
+    Seul le corps sépare les deux.
+    Ce que false sur ce champ entraîne se lit dans le même intergiciel : quand
+    authConfig est absent ou désactivé, le middleware ne se contente pas de
+    laisser passer, il pose « ctx.SetUserValue(schemas.IsLocalAdminContextKey,
+    true) » — le commentaire du code dit pourquoi, « so downstream RBAC bypasses
+    cleanly when auth is fully disabled » — et
+    « ctx.SetUserValue(schemas.BifrostContextKeyAuthBypassed, true) », marqueur
+    explicite de « no credential was checked at all ». L'appelant anonyme est donc
+    traité en administrateur local sur toute l'API de gestion, pas seulement sur
+    les routes ouvertes.
+    L'exposition est un défaut de configuration par défaut, jamais une
+    désactivation. Le guide de démarrage lance la passerelle par « docker run -p
+    8080:8080 maximhq/bifrost » et n'assortit ce lancement que d'un avertissement
+    — « These unversioned commands are for local evaluation. For a hosted or
+    production deployment, pin an image version, enable authentication and TLS,
+    and choose durable storage using the deployment support matrix. »
+    L'authentification est donc à activer, et l'image y pousse deux fois : le
+    transports/Dockerfile pose « ARG ARG_APP_HOST=0.0.0.0 » puis
+    « ENV APP_HOST=$ARG_APP_HOST », là où le binaire lancé à la main écoute sur
+    localhost, et « -p 8080:8080 » publie ce port sur toutes les interfaces de
+    l'hôte. La page d'activation de l'authentification le dit sans détour :
+    « until an admin account exists, Bifrost's dashboard/admin API is reachable
+    without a password from anyone who can route to it. »
+  impact: |
+    L'API de gestion montée sur ce port est la même que celle du tableau de bord,
+    et elle répond entière. Les lectures ci-dessous ont été relevées sur une
+    v2.2.0 lancée par la commande du guide, sans le moindre en-tête
+    d'authentification.
+    GET /api/providers rend « {"providers":[...],"total":N} », c'est-à-dire les
+    fournisseurs souscrits et la configuration réseau de chacun. GET /api/keys
+    rend la liste des clés de tous les fournisseurs à la fois, et
+    GET /api/providers/{provider}/keys celle d'un seul : les deux passent par
+    GetProviderKeysRedacted(), et la valeur rendue est bien masquée — une clé
+    posée en clair ressort sous la forme « sk-C************************mnop »,
+    quatre caractères de tête et quatre de queue. Ce n'est donc pas une fuite de
+    secret, et il ne faut pas la rapporter comme telle ; c'est l'inventaire des
+    fournisseurs souscrits, des modèles autorisés par clé et du préfixe de chaque
+    clé. GET /api/governance/virtual-keys énumère les clés virtuelles émises, et
+    GET /api/config rend la configuration du client en clair.
+    GET /api/logs est la lecture qui coûte le plus cher, parce que le journal
+    porte le contenu : la configuration par défaut relevée sur la même instance
+    est « "enable_logging":true » avec « "disable_content_logging":false », donc
+    les requêtes d'inférence conservées le sont avec leurs prompts et leurs
+    réponses. Une passerelle en service depuis des mois tient là tout ce que les
+    applications de l'exploitant ont fait dire à ses modèles.
+    L'accès n'est pas qu'en lecture, et c'est ce qui fait la sévérité. Sur la même
+    instance anonyme, POST /api/providers inscrit un fournisseur et POST
+    /api/providers/{provider}/keys y ajoute une clé, tous deux en 200 : un tiers
+    peut donc adosser la passerelle au fournisseur de son choix. L'intergiciel
+    permet aussi de poser des routes en liste blanche, avec joker de préfixe —
+    une liste blanche inscrite pendant l'exposition survit à l'activation
+    ultérieure de l'authentification.
+    Enfin, POST /v1/chat/completions et les autres routes d'inférence sont
+    servies par le même processus : l'anonyme dépense le budget des fournisseurs
+    souscrits, sous l'adresse IP de l'exploitant, sans compte à débiter ni notion
+    d'appelant. Aucune de ces traces ne portera d'identité : le produit n'en a
+    jamais réclamé.
+  remediation: |
+    Activer l'authentification du tableau de bord, qui ferme du même coup l'API
+    de gestion : Workspace → Config → Security, section « Password protect the
+    dashboard », puis nom d'utilisateur et mot de passe administrateur.
+    Poser le jeton d'installation AVANT d'ouvrir le port, et non après : depuis la
+    2.0.0-prerelease3, la création du premier compte administrateur exige un
+    setup_token, configuré à l'avance dans config.json ou par la variable
+    d'environnement BIFROST_SETUP_TOKEN, et la documentation précise que sans lui
+    « creating the first admin account is rejected until you set one ». Une
+    instance déjà publiée sur un réseau non maîtrisé se referme donc dans le
+    mauvais ordre — le premier à joindre le port est aussi le premier à pouvoir
+    réclamer le compte.
+    Ne pas publier le port en attendant. L'image pose APP_HOST=0.0.0.0 là où le
+    binaire écoute sur localhost, et « -p 8080:8080 » publie sur toutes les
+    interfaces de l'hôte : « -p 127.0.0.1:8080:8080 » restreint la publication, et
+    un intermédiaire qui authentifie devant le port reste la fermeture la plus
+    sûre.
+    Deux réglages rouvrent ce que l'activation vient de fermer, et il faut les
+    connaître. « Disable authentication on inference calls » laisse le tableau de
+    bord gardé mais rend /v1/* de nouveau anonyme — c'est le relais d'inférence
+    qu'on rouvre. Et les routes en liste blanche configurables traversent
+    l'intergiciel entièrement, joker de préfixe compris : une entrée « /api/* »
+    posée là annule l'authentification sur toute l'API de gestion.
+    Vérifier la prise en compte depuis l'extérieur du périmètre, sur la route même
+    qui porte le constat : « curl -s http://<hote>:8080/api/session/is-auth-enabled »
+    doit désormais rendre « "is_auth_enabled":true ». Le code HTTP, lui, restera
+    200 — la route est en liste blanche système, elle répond dans les deux états.
+    Après une exposition, tenir pour lus l'inventaire des fournisseurs, le
+    catalogue de modèles, les clés virtuelles et le journal des requêtes, prompts
+    compris. Les valeurs de clés de fournisseur ressortent masquées de l'API, mais
+    leurs quatre premiers et quatre derniers caractères, eux, sont en clair :
+    renouveler ces clés reste la conduite prudente, et contrôler la facturation de
+    chaque fournisseur souscrit sur la période l'est tout autant, l'inférence
+    anonyme n'ayant laissé aucune identité d'appelant. Passer aussi en revue ce
+    qui a pu être écrit pendant la fenêtre : la liste des fournisseurs et des clés,
+    les clés virtuelles, et les routes en liste blanche.
+  reference:
+    - https://github.com/maximhq/bifrost/blob/main/transports/bifrost-http/handlers/session.go
+    - https://github.com/maximhq/bifrost/blob/main/transports/bifrost-http/handlers/middlewares.go
+    - https://github.com/maximhq/bifrost/blob/main/transports/bifrost-http/handlers/providers.go
+    - https://github.com/maximhq/bifrost/blob/main/transports/bifrost-http/handlers/utils.go
+    - https://github.com/maximhq/bifrost/blob/main/transports/Dockerfile
+    - https://docs.getbifrost.ai/api-reference/session/check-if-authentication-is-enabled
+    - https://docs.getbifrost.ai/quickstart/gateway/setting-up
+    - https://docs.getbifrost.ai/quickstart/gateway/setting-up-auth
+  metadata:
+    max-request: 1
+    vendor: maximhq
+    product: bifrost
+  tags: ai,llm,bifrost,gateway,proxy,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier. isAuthEnabled() lit la
+  # configuration d'authentification et un éventuel jeton d'en-tête, puis rend
+  # trois constantes : aucun fournisseur n'est joint, aucun modèle n'est appelé,
+  # rien n'est écrit.
+  #
+  # En lecture seule, et c'est délibéré. POST /api/session/login serait une
+  # tentative de connexion sur l'instance auditée ; POST /api/providers et POST
+  # /api/providers/{provider}/keys y inscriraient un fournisseur et une clé, donc
+  # modifieraient la configuration de l'exploitant ; POST /v1/chat/completions
+  # dépenserait le budget du fournisseur que le constat est censé protéger. Ce
+  # sont les abus que le template signale, pas ce qu'un scanner a le droit de
+  # faire pour les établir.
+  #
+  # GET /api/version n'est pas jointe non plus, et la raison a été relevée sur une
+  # instance plutôt que supposée. getVersion() rend « SendJSON(ctx, version) » où
+  # version est un simple « var version string » : le corps servi est une chaîne
+  # JSON nue — « "v2.2.0" » sur l'image courante —, pas un objet. Le schéma
+  # « Version » de la référence d'API est le nom du schéma, pas celui d'un champ.
+  # Une chaîne nue ne porte aucun vocabulaire de produit : un matcher posé là
+  # admettrait n'importe quel service publiant son numéro de version, et la
+  # valeur est en prime « vunknown » sur une image construite sans la variable de
+  # build. La corroboration qu'elle apporterait est nulle, la requête qu'elle
+  # coûte ne l'est pas.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/session/is-auth-enabled"
+
+    matchers:
+      # Deux expressions, une par extrémité du document, et c'est leur
+      # conjonction qui nomme le produit autant qu'elle établit le constat.
+      #
+      # La première ancre l'ouverture. sonic.ConfigStd trie les clés du
+      # map[string]any, donc auth_type — quand il existe — précède
+      # has_valid_token, qui précède is_auth_enabled. Le groupe optionnel
+      # transcrit exactement cette place : les instances d'avant mai 2026 rendent
+      # deux clés, celles d'après en rendent trois, et l'expression reconnaît les
+      # deux formes sans exiger la plus récente. Exiger auth_type ferait manquer
+      # les six premiers mois de la route — c'est-à-dire les instances les plus
+      # anciennes, donc celles qui traînent exposées.
+      #
+      # La seconde porte le constat et ferme le document. « is_auth_enabled » est
+      # la dernière clé du corps dans les deux formes, donc l'ancrage de fin est
+      # celui du produit et non une contrainte ajoutée. Il écarte le document
+      # composite d'une supervision qui recopierait la charge utile avant d'y
+      # ajouter une clé à elle, là où l'ancrage d'ouverture, seul, écarte celle
+      # qui la republie au fond du sien.
+      #
+      # has_valid_token est laissé libre entre true et false. Le scan n'envoie ni
+      # en-tête Authorization ni cookie token, donc le handler rend false ; mais
+      # un intermédiaire qui injecterait un jeton de service ferait basculer ce
+      # champ sans rien changer au constat, qui tient au seul is_auth_enabled.
+      #
+      # Le code HTTP n'entre dans aucune des deux, et pas par prudence : la route
+      # figure dans systemWhitelistedRoutes, donc elle rend 200 à l'anonyme aussi
+      # bien sur une instance fermée que sur une instance ouverte. Un matcher de
+      # statut ne séparerait donc rien du tout — seul le corps le fait.
+      #
+      # Les \s* absorbent l'intermédiaire qui réindente ce qu'il relaie, là où
+      # sonic sérialise compact, et le saut de ligne que SendJSON ajoute au corps.
+      #
+      # Angle mort assumé : une version future qui insérerait une clé avant
+      # has_valid_token ou après is_auth_enabled déplacerait l'une des deux
+      # ancres, et l'instance ne serait plus signalée. C'est le prix de ne pas
+      # conclure sur une charge utile republiée par un tiers, et il est payé
+      # sciemment — une clé insérée entre les deux, elle, ne casse rien.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*(?:"auth_type"\s*:\s*"[^"]*"\s*,\s*)?"has_valid_token"\s*:\s*(?:true|false)\s*,'
+          - '"is_auth_enabled"\s*:\s*false\s*\}\s*$'
+        condition: and
+
+    # Pas d'extracteur, et c'est délibéré. Le corps ne porte que trois constantes,
+    # toutes déjà fixées par les matchers : auth_type vaut "none" dès lors que
+    # is_auth_enabled vaut false, et has_valid_token vaut false pour un appelant
+    # qui ne présente rien. Recopier l'une d'elles dans le rapport n'y ajouterait
+    # aucun renseignement. Ce qui daterait l'instance se lit sur GET /api/version,
+    # que ce template n'interroge pas : établir l'exposition ne demande pas de
+    # relever la version, et l'inventaire des fournisseurs encore moins.

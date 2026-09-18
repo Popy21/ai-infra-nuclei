@@ -30063,6 +30063,427 @@ def test_kokoro_matcher_compiles_and_fires_against_a_live_server():
         assert refused == 0, "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# Bifrost — maximhq/bifrost, la passerelle LLM en Go éditée par Maxim AI. Elle
+# sert sur un seul port l'inférence et l'API de gestion qui adosse son tableau
+# de bord, et c'est cette seconde moitié qui fait le constat : LiteLLM et
+# Portkey, déjà couverts, n'exposent qu'un relais.
+#
+# Ce que cette section amarre tient en trois points. Le premier : le chemin.
+# L'index d'API du site (docs.getbifrost.ai/_llms/api.md) écrit
+# /api/session/auth-enabled là où la page de référence, docs/openapi/openapi.yaml
+# et « r.GET("/api/session/is-auth-enabled", ...) » de
+# transports/bifrost-http/handlers/session.go donnent /api/session/is-auth-enabled.
+# Sur une v2.2.0 lancée par « docker run -p 8080:8080 maximhq/bifrost », le
+# chemin de l'index rend 200 avec le HTML du tableau de bord — le routeur ne le
+# connaît pas et retombe sur l'application web. Un template posé sur ce chemin-là
+# n'aurait donc jamais rien constaté, tout en répondant 200.
+#
+# Le deuxième : le constat est dans le corps, jamais dans le statut. La route
+# figure dans systemWhitelistedRoutes de l'intergiciel d'authentification, donc
+# elle rend 200 à l'anonyme sur une instance fermée comme sur une instance
+# ouverte. C'est « "is_auth_enabled":false » qui sépare les deux.
+#
+# Le troisième : la charge utile a deux formes. SendJSON marshale par
+# sonic.ConfigStd, dont la configuration porte « SortMapKeys: true », donc les
+# clés du map[string]any sortent triées ; et « auth_type » n'a rejoint la charge
+# utile qu'en mai 2026. Les instances antérieures rendent deux clés, et ce sont
+# elles qui traînent exposées.
+
+BIFROST_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "bifrost-gateway-exposed.yaml")
+
+# Le chemin réellement servi, relevé sur l'instance et non sur l'index d'API.
+BIFROST_AUTH_ROUTE = "/api/session/is-auth-enabled"
+
+# Celui que l'index du même site donne, et qui ne désigne aucune route.
+BIFROST_DOC_INDEX_ROUTE = "/api/session/auth-enabled"
+
+
+def bifrost_auth_body(is_auth_enabled=False, has_valid_token=False,
+                      auth_type=True, indent=None):
+    """
+    Ce que rend isAuthEnabled().
+
+    Les clés sortent triées parce que SendJSON marshale par sonic.ConfigStd —
+    « SortMapKeys: true » — et le handler lui passe un map[string]any. Le saut de
+    ligne final est celui que SendJSON ajoute, « ctx.SetBody(append(body, '\\n')) ».
+
+    `auth_type=True` demande la valeur que dashboardAuthType() rendrait ;
+    `auth_type=None` rend la charge utile d'avant mai 2026, celle des deux clés.
+    """
+    payload = {"has_valid_token": has_valid_token,
+               "is_auth_enabled": is_auth_enabled}
+    if auth_type is True:
+        auth_type = "password" if is_auth_enabled else "none"
+    if auth_type is not None:
+        payload["auth_type"] = auth_type
+
+    if indent is not None:
+        return json.dumps(payload, indent=indent, sort_keys=True) + "\n"
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+
+
+# Le corps relevé mot pour mot sur une v2.2.0 lancée par la commande du guide de
+# démarrage : le constat, dans sa forme courante.
+BIFROST_OPEN_BODY = bifrost_auth_body()
+
+# La même instance une fois l'authentification activée. Le statut ne bouge pas —
+# la route est en liste blanche système — et dashboardAuthType() rend "password".
+BIFROST_CLOSED_BODY = bifrost_auth_body(is_auth_enabled=True)
+
+# La charge utile d'avant mai 2026, celle des deux seules clés : « auth_type »
+# n'existait pas encore. Le template doit toujours la reconnaître.
+BIFROST_PRE_AUTH_TYPE_BODY = bifrost_auth_body(auth_type=None)
+
+# La même, fermée : une instance ancienne qui réclame bien un jeton.
+BIFROST_PRE_AUTH_TYPE_CLOSED_BODY = bifrost_auth_body(is_auth_enabled=True,
+                                                      auth_type=None)
+
+# La charge utile entière retrouvée au fond du document d'une supervision qui
+# l'agrégerait sous une clé à elle : ce n'est pas l'instance qui a répondu.
+BIFROST_COMPOSITE_BODY = '{"bifrost":%s,"checked_at":0}' % BIFROST_OPEN_BODY.strip()
+
+# La même, recopiée en tête par une passerelle qui ajoute une clé derrière le
+# dernier champ. L'ancrage d'ouverture ne l'écarterait pas seul.
+BIFROST_APPENDED_BODY = BIFROST_OPEN_BODY.strip()[:-1] + ',"checked_at":0}'
+
+# Ce que rend le chemin de l'index d'API sur une instance réelle : le routeur ne
+# connaît pas la route et sert l'application web, en 200 et en text/html.
+BIFROST_SPA_BODY = (
+    '<!doctype html>\n<html lang="en" suppressHydrationWarning>\n\t<head>\n'
+    '\t\t<meta charset="UTF-8" />\n\t\t<title>Bifrost</title>\n\t</head>\n'
+    '</html>\n'
+)
+
+# Un intermédiaire qui refuse la route à l'anonyme : la fermeture par le réseau.
+BIFROST_PROXY_DENIED_BODY = '{"error":"unauthorized"}'
+
+# Un service quelconque qui publie un drapeau d'authentification sous un autre
+# vocabulaire : la moitié des tableaux de bord auto-hébergés en ont un.
+BIFROST_OTHER_FLAG_BODY = '{"auth_enabled":false,"authenticated":false}'
+
+
+def bifrost_block():
+    doc = load(BIFROST_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % BIFROST_AUTH_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant la seule route du "
+        "produit dont le corps dise si l'instance réclame un jeton"
+        % BIFROST_AUTH_ROUTE
+    )
+    return blocks[0]
+
+
+def bifrost_fires(status=200, body=None):
+    """
+    Sémantique nuclei d'un bloc à une seule requête. Le paramètre de statut est
+    tenu pour que les cas d'un intermédiaire se disent, même si le bloc n'a pas à
+    en dépendre.
+    """
+    block = bifrost_block()
+    if body is None:
+        body = BIFROST_OPEN_BODY
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_bifrost_probe_reads_the_session_flag_and_never_logs_in_nor_writes():
+    """
+    La même surface non authentifiée sert l'API de gestion entière. POST
+    /api/session/login serait une tentative de connexion sur l'instance auditée ;
+    POST /api/providers et POST /api/providers/{provider}/keys y inscriraient un
+    fournisseur et une clé, donc modifieraient la configuration de l'exploitant ;
+    POST /v1/chat/completions dépenserait le budget du fournisseur souscrit ; et
+    GET /api/logs rendrait les prompts d'un tiers, que rien n'autorise à lire.
+    isAuthEnabled(), lui, rend trois constantes.
+    """
+    doc = load(BIFROST_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", BIFROST_AUTH_ROUTE)}, (
+        "le template interroge autre chose que le drapeau de session — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "le drapeau se lit en GET : la route n'est déclarée que sous ce verbe"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande d'écrire sur l'instance auditée"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/session/login", "ce serait une tentative de connexion sur "
+                                   "l'instance auditée"),
+                ("/providers", "l'API des fournisseurs se lit mais s'écrit "
+                               "aussi, et le template ne doit toucher ni l'un "
+                               "ni l'autre"),
+                ("/keys", "l'inventaire des clés est le renseignement que le "
+                          "constat signale, pas ce qu'un scanner relève"),
+                ("/logs", "le journal porte les prompts d'un tiers"),
+                ("/v1/", "les routes d'inférence dépensent le budget du "
+                         "fournisseur souscrit"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_bifrost_matcher_proves_auth_is_off_not_merely_that_it_is_bifrost():
+    """
+    Le point qui fait ce template. La route est en liste blanche système, donc
+    elle répond 200 à l'anonyme dans les deux états du produit : la reconnaître
+    ne prouverait que la présence de Bifrost. C'est « "is_auth_enabled":false »
+    qui dit que l'instance ne réclame rien — et c'est l'instance qui le dit.
+    """
+    assert bifrost_fires(), (
+        "le template ne reconnaît pas le drapeau d'une instance ouverte"
+    )
+
+    for other, why in (
+        (BIFROST_CLOSED_BODY,
+         "une instance Bifrost dont l'authentification est activée — la route "
+         "répond pourtant 200, elle est en liste blanche système"),
+        (BIFROST_PRE_AUTH_TYPE_CLOSED_BODY,
+         "une instance ancienne, fermée elle aussi"),
+        (BIFROST_OTHER_FLAG_BODY,
+         "un service quelconque qui publie un drapeau d'authentification sous "
+         "un autre vocabulaire"),
+        (BIFROST_SPA_BODY,
+         "l'application web du tableau de bord, que le routeur sert sur tout "
+         "chemin qu'il ne connaît pas"),
+        (BIFROST_PROXY_DENIED_BODY,
+         "un intermédiaire qui refuse la route à l'anonyme — c'est la fermeture "
+         "attendue"),
+        ("", "une réponse vide"),
+    ):
+        assert not bifrost_fires(body=other), "le template conclut sur %s" % why
+
+
+def test_bifrost_matcher_holds_across_the_two_shapes_the_payload_has_taken():
+    """
+    « auth_type » n'a rejoint la charge utile qu'en mai 2026, et sonic.ConfigStd
+    trie les clés, donc il s'insère en tête. L'exiger ferait manquer les six
+    premiers mois de la route — c'est-à-dire les instances les plus anciennes,
+    celles qui traînent exposées.
+    """
+    for body, why in (
+        (BIFROST_PRE_AUTH_TYPE_BODY,
+         "la charge utile d'avant mai 2026, celle des deux seules clés"),
+        (bifrost_auth_body(has_valid_token=True),
+         "un intermédiaire qui injecte un jeton de service : has_valid_token "
+         "bascule sans que le constat change, il tient au seul is_auth_enabled"),
+        (bifrost_auth_body(auth_type="none", indent=2),
+         "un intermédiaire qui réindente ce qu'il relaie, là où sonic "
+         "sérialise compact"),
+        (bifrost_auth_body(auth_type="sso"),
+         "une valeur d'auth_type que dashboardAuthType() ne rend pas "
+         "aujourd'hui : le champ n'a pas à être contraint, seule sa place l'est"),
+        (BIFROST_OPEN_BODY.strip(),
+         "le corps sans le saut de ligne que SendJSON ajoute, tel qu'un "
+         "intermédiaire peut le relayer"),
+    ):
+        assert bifrost_fires(body=body), "le template perd %s" % why
+
+
+def test_bifrost_matcher_refuses_the_payload_republished_by_a_third_party():
+    """
+    Les deux ancrages d'enveloppe, et chacun a sa cible. Celui d'ouverture écarte
+    la charge utile agrégée sous une clé étrangère ; celui de fermeture écarte le
+    document qui la recopie en tête avant d'ajouter la sienne — que le premier
+    laisserait passer.
+    """
+    assert not bifrost_fires(body=BIFROST_COMPOSITE_BODY), (
+        "le template conclut sur la charge utile republiée au fond du document "
+        "d'une supervision : c'est l'ancrage d'ouverture qui dit que l'instance "
+        "a répondu d'elle-même"
+    )
+    assert not bifrost_fires(body=BIFROST_APPENDED_BODY), (
+        "le template conclut sur un document composite qui ouvre bien sur la "
+        "réponse mais ajoute une clé derrière le dernier champ : sans ancrage "
+        "de fermeture, l'ouverture ne suffit pas"
+    )
+
+
+def test_bifrost_rests_on_the_path_the_router_serves_not_on_the_one_the_doc_index_gives():
+    """
+    La documentation du produit se contredit sur ce chemin, et le mauvais des
+    deux répond 200. L'index d'API du site donne /api/session/auth-enabled ; la
+    page de référence, docs/openapi/openapi.yaml et l'enregistrement de route en
+    Go donnent /api/session/is-auth-enabled. Sur une instance réelle, le premier
+    tombe sur l'application web — 200, text/html, « <title>Bifrost</title> ».
+    Un template posé là n'aurait jamais rien constaté.
+    """
+    doc = load(BIFROST_TEMPLATE)
+    targets = {path for block in (doc.get("http") or [])
+               for path in (block.get("path") or [])}
+
+    assert targets == {"{{BaseURL}}%s" % BIFROST_AUTH_ROUTE}, (
+        f"le template ne vise pas le chemin que le routeur sert — {sorted(targets)}"
+    )
+    for target in targets:
+        assert not target.endswith(BIFROST_DOC_INDEX_ROUTE), (
+            "le template suit le chemin de l'index d'API, que le routeur ne "
+            "connaît pas : la requête tomberait sur l'application web"
+        )
+
+    assert not bifrost_fires(body=BIFROST_SPA_BODY), (
+        "le template conclut sur le HTML du tableau de bord, c'est-à-dire sur "
+        "ce que rend justement le chemin de l'index d'API"
+    )
+
+
+def test_bifrost_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    La route est en liste blanche système : elle rend 200 à l'anonyme aussi bien
+    sur une instance fermée que sur une instance ouverte. Un matcher de statut ne
+    séparerait donc rien du tout, et ferait manquer l'instance dont un
+    intermédiaire réécrit le code.
+    """
+    block = bifrost_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : la route répond 200 dans les deux "
+        "états du produit, il ne distinguerait rien"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : le constat est le "
+            "drapeau à false tenu entre les deux ancrages d'enveloppe, et "
+            "aucune des deux ne conclut seule"
+        )
+
+    assert bifrost_fires(status=304), (
+        "le template dépend du code rendu, alors que le corps est bien celui "
+        "d'une instance Bifrost ouverte"
+    )
+
+
+def test_bifrost_carries_no_extractor_because_the_payload_is_three_constants():
+    """
+    Le corps ne porte que trois constantes, toutes déjà fixées par les matchers :
+    auth_type vaut "none" dès lors que is_auth_enabled vaut false, et
+    has_valid_token vaut false pour un appelant qui ne présente rien. Un
+    extracteur n'ajouterait au rapport qu'une recopie du matcher — et relever ce
+    que l'instance sert demanderait d'interroger l'API de gestion, ce que le
+    template s'interdit.
+    """
+    assert not bifrost_block().get("extractors"), (
+        "le template porte un extracteur : il ne peut relever ici que ce que "
+        "les matchers exigent déjà"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_bifrost_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher, et
+    `body_matcher_hits` les réévalue avec le moteur d'expressions de Python
+    plutôt qu'avec celui de Go : seul un scan contre un vrai serveur ferme la
+    boucle. L'enjeu propre est ici le `$`, dont la sémantique diffère entre les
+    deux moteurs — Python le fait aussi correspondre juste avant un saut de ligne
+    final, Go non —, alors que le corps servi en porte précisément un,
+    « ctx.SetBody(append(body, '\\n')) ».
+    """
+    def scan(status, body, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == BIFROST_AUTH_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"error":"not found"}')
+
+            def reply(self, code, payload, kind="application/json"):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", BIFROST_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "bifrost-gateway-exposed"}, r.stdout + r.stderr
+        return seen, len(results)
+
+    seen, hits = scan(200, BIFROST_OPEN_BODY)
+    assert seen == [BIFROST_AUTH_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, (
+        "le scan ne reconnaît pas le drapeau d'une instance ouverte, ou il la "
+        f"signale plusieurs fois — {hits}"
+    )
+
+    _, hits = scan(200, BIFROST_PRE_AUTH_TYPE_BODY)
+    assert hits == 1, (
+        "le scan ne reconnaît pas la charge utile d'avant mai 2026, celle des "
+        f"deux seules clés — {hits}"
+    )
+
+    for status, body, kind, why in (
+        (200, BIFROST_CLOSED_BODY, "application/json",
+         "une instance Bifrost dont l'authentification est activée — elle rend "
+         "200 comme l'autre, la route est en liste blanche système"),
+        (200, BIFROST_PRE_AUTH_TYPE_CLOSED_BODY, "application/json",
+         "une instance ancienne, fermée elle aussi"),
+        (200, BIFROST_SPA_BODY, "text/html; charset=utf-8",
+         "l'application web du tableau de bord, c'est-à-dire ce que rend le "
+         "chemin donné par l'index d'API"),
+        (200, BIFROST_COMPOSITE_BODY, "application/json",
+         "la charge utile republiée au fond du document d'une supervision"),
+        (200, BIFROST_APPENDED_BODY, "application/json",
+         "un document composite qui ouvre sur la réponse et ajoute une clé "
+         "derrière le dernier champ"),
+        (200, BIFROST_OTHER_FLAG_BODY, "application/json",
+         "un service quelconque qui publie un drapeau d'authentification"),
+        (401, BIFROST_PROXY_DENIED_BODY, "application/json",
+         "une instance placée derrière un intermédiaire qui authentifie"),
+    ):
+        _, refused = scan(status, body, kind)
+        assert refused == 0, "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
