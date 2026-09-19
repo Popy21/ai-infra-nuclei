@@ -30972,6 +30972,579 @@ def test_openhands_matcher_compiles_and_fires_against_a_live_server():
         assert refused == [], "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# Agent Zero — le framework d'agents auto-hébergé agent0ai/agent-zero, dont
+# l'agent exécute du code et des commandes shell dans son conteneur. Tout passe
+# par un dispatcher unique, « /api/<path:path> », qui résout « api/{path}.py »
+# et n'enveloppe l'appel que de ce que les classmethods du handler réclament.
+#
+# Ce que cette section amarre tient en trois points, tous relevés dans la source
+# du produit au commit b1cbd1f plutôt que déduits d'une documentation.
+#
+# Le premier, et c'est l'enjeu du template : la route qui nomme le produit ne
+# prouve rien de l'autorisation. api/health.py surcharge « requires_auth(cls) ->
+# bool: return False » et « requires_csrf(cls) -> bool: return False », donc le
+# dispatcher ne l'enveloppe d'aucun décorateur et elle rend le même
+# « {"gitinfo": ..., "error": ...} » à l'anonyme sur une instance munie
+# d'identifiants comme sur une instance ouverte. Un template posé sur la seule
+# bannière signalerait donc toutes les instances, gardées comprises.
+#
+# Le deuxième : la route qui prouve n'est pas celle qu'on attendrait. Le
+# listing du répertoire de travail, GET /api/get_work_dir_files, est bien
+# derrière requires_auth par héritage — mais requires_csrf() vaut alors True par
+# « requires_csrf() -> cls.requires_auth() », et csrf_protect n'exempte aucune
+# méthode : « token = session.get("csrf_token") ... if not token or not sent or
+# token != sent: return Response("CSRF token missing or invalid", 403) ». Un
+# appelant anonyme n'a pas de session, donc cette route rend 403 même sur une
+# instance ouverte, et la suite de tests du produit le fixe elle-même —
+# tests/test_http_auth_csrf.py, « test_http_csrf_required_even_when_auth_not_
+# configured », pose get_credentials_hash à None, émet un GET et attend 403.
+# La seule route du produit derrière requires_auth et devant lui seul est
+# GET /api/csrf_token : GetCsrfToken surcharge requires_csrf() à False et
+# get_methods() à ["GET"] sans toucher à requires_auth().
+#
+# Le troisième : ce que cette route rend à un appelant sans en-tête Origin ni
+# Referer. get_origin_from_request() rend alors None, is_allowed_origin() rend
+# « {"ok": False, ...} », et process rend une phrase qui énonce le constat —
+# « not allowed when login is disabled ». Le produit dit lui-même que la
+# connexion est désactivée, sur une route que le dispatcher a bel et bien
+# enveloppée de requires_auth.
+
+AGENT_ZERO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "agent-zero-unauthenticated.yaml")
+
+# La bannière, montée sans décorateur.
+AGENT_ZERO_HEALTH_ROUTE = "/api/health"
+
+# La route gardée par le seul requires_auth — celle dont le corps servi à
+# l'anonyme est le constat.
+AGENT_ZERO_CSRF_ROUTE = "/api/csrf_token"
+
+# Le listing du répertoire de travail. Derrière requires_auth lui aussi, mais
+# aussi derrière csrf_protect, qui le refuse à tout appelant sans session.
+AGENT_ZERO_FILES_ROUTE = "/api/get_work_dir_files"
+
+
+def agent_zero_health_body(gitinfo=None, error=None, indent=None):
+    """
+    Ce que rend GET /api/health : « {"gitinfo": gitinfo, "error": error} ».
+
+    L'ordre des clés est celui du dict que rend process, et la sérialisation est
+    celle de handle_request — « json.dumps(output) », sans séparateurs
+    personnalisés, donc une espace après chaque deux-points et chaque virgule.
+    """
+    if gitinfo is None and error is None:
+        gitinfo = {
+            "branch": "main",
+            "commit_hash": "b1cbd1f960a1a5c4482b324dcff4742aa67b7a51",
+            "commit_time": "2026-09-09 12:07:58",
+            "tag": "v0.9.8-3-gb1cbd1f",
+            "short_tag": "v0.9.8",
+            "version": "M v0.9.8",
+        }
+    payload = {"gitinfo": gitinfo, "error": error}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload)
+
+
+AGENT_ZERO_HEALTH_BODY = agent_zero_health_body()
+
+# La même bannière sur une instance munie d'AUTH_LOGIN : identique, parce que
+# HealthCheck surcharge requires_auth() à False.
+AGENT_ZERO_HEALTH_BODY_KEYED = AGENT_ZERO_HEALTH_BODY
+
+# Un déploiement qui copie l'arbre au lieu de le cloner : git.get_git_info()
+# lève, errors.error_text(e) rend « str(e) », et gitinfo vaut null. Le constat
+# est le même, donc le template doit tenir sur cette forme-là aussi.
+AGENT_ZERO_HEALTH_BODY_NO_GIT = agent_zero_health_body(
+    error="Repository at /a0 is not usable.")
+
+# La même, avec un guillemet dans le message d'erreur : c'est ce que la classe
+# « (\\.|[^"\\])* » de l'ancrage de fermeture doit absorber.
+AGENT_ZERO_HEALTH_BODY_QUOTED_ERROR = agent_zero_health_body(
+    error='Cmd(\'git\') failed: "describe" is not a git command.')
+
+# Ce que rend GET /api/csrf_token sur une instance ouverte interrogée sans
+# en-tête Origin ni Referer — la branche de refus de check_allowed_origin(),
+# dont le message est le constat.
+AGENT_ZERO_OPEN_CSRF_BODY = json.dumps({
+    "ok": False,
+    "error": "Origin None not allowed when login is disabled. Set login and "
+             "password or add your URL to ALLOWED_ORIGINS env variable. "
+             "Currently allowed origins: ",
+})
+
+# Ce que la même route rend quand l'origine est admise : le jeton et le
+# runtime_id. Le template ne provoque jamais cette réponse — il n'envoie pas
+# d'Origin, précisément pour ne pas déclencher initialize_allowed_origins(),
+# qui écrirait l'origine reçue dans la configuration de la cible.
+AGENT_ZERO_TOKEN_BODY = json.dumps({
+    "ok": True,
+    "token": "n2Qw8rF1vKzXo0pLmY7bTc4hJdS6aRuE9gN3iVwZqKs",
+    "runtime_id": "a1b2c3d4",
+})
+
+# Ce que le scanner observe sur une instance munie d'identifiants. requires_auth
+# rend « redirect(url_for("login_handler", next=...)) », nuclei suit la
+# redirection par défaut, et body_2 porte donc le HTML de webui/login.html.
+AGENT_ZERO_LOGIN_PAGE_BODY = (
+    '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+    '    <meta charset="UTF-8">\n'
+    '    <title>Login - Agent Zero</title>\n'
+    '    <link rel="stylesheet" href="/login.css">\n</head>\n<body>\n'
+    '    <div class="login-container">\n'
+    '        <form class="login-form" method="POST" '
+    'action="/login?next=%2Fapi%2Fcsrf_token">\n'
+    '            <input type="hidden" name="next" value="/api/csrf_token">\n'
+    '            <label for="username">Username</label>\n'
+    '            <label for="password">Password</label>\n'
+    '            <button type="submit">Login</button>\n'
+    '        </form>\n    </div>\n</body>\n</html>'
+)
+
+# Ce que rend csrf_protect au même appelant anonyme sur les routes qui, elles,
+# héritent requires_csrf() — texte brut, pas JSON.
+AGENT_ZERO_CSRF_DENIED_BODY = "CSRF token missing or invalid"
+
+# Ce que rend le dispatcher quand aucun fichier ne porte le chemin demandé.
+AGENT_ZERO_NOT_FOUND_BODY = "API endpoint not found: csrf_token"
+
+# Une API quelconque qui rend elle aussi un refus « ok » à false : sans la
+# phrase du produit, elle ne doit rien déclencher.
+AGENT_ZERO_GENERIC_REFUSAL_BODY = json.dumps({
+    "ok": False, "error": "Rate limit exceeded, retry in 30s",
+})
+
+# La phrase du produit republiée au fond du document d'une supervision : c'est
+# l'ancrage sur l'ouverture qui doit l'écarter.
+AGENT_ZERO_COMPOSITE_CSRF_BODY = ('{"agent": "a0-01", "probe": %s}'
+                                  % AGENT_ZERO_OPEN_CSRF_BODY)
+
+# La bannière republiée de la même façon : même ancrage, autre réponse.
+AGENT_ZERO_COMPOSITE_HEALTH_BODY = ('{"source": "fleet", "health": %s}'
+                                    % AGENT_ZERO_HEALTH_BODY)
+
+# Un document qui ouvre bien sur gitinfo mais ajoute une clé derrière error :
+# c'est l'ancrage de fermeture qui l'écarte.
+AGENT_ZERO_APPENDED_HEALTH_BODY = (
+    '{"gitinfo": null, "error": null, "collected_at": "2026-09-19T00:00:00Z"}')
+
+# Un service de supervision qui expose lui aussi un /api/health en rendant un
+# bloc git : la clé « gitinfo » n'y est pas, et c'est elle qui nomme le produit.
+AGENT_ZERO_OTHER_HEALTH_BODY = json.dumps({
+    "status": "ok",
+    "git": {"branch": "main", "commit": "b1cbd1f"},
+    "error": None,
+})
+
+
+def agent_zero_block():
+    doc = load(AGENT_ZERO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % AGENT_ZERO_CSRF_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET %s — or c'est la seule route du produit "
+        "qui soit derrière requires_auth et devant lui seul, donc la seule "
+        "dont le corps servi à l'anonyme prouve quoi que ce soit"
+        % AGENT_ZERO_CSRF_ROUTE
+    )
+    return blocks[0]
+
+
+def agent_zero_responses(health_status=200, health_body=AGENT_ZERO_HEALTH_BODY,
+                         csrf_status=200, csrf_body=AGENT_ZERO_OPEN_CSRF_BODY):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    ordered = []
+    for path in agent_zero_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == AGENT_ZERO_HEALTH_ROUTE:
+            ordered.append((health_status, health_body))
+        elif route == AGENT_ZERO_CSRF_ROUTE:
+            ordered.append((csrf_status, csrf_body))
+        else:
+            raise AssertionError(
+                "le template interroge un chemin inattendu : %s" % route)
+    return ordered
+
+
+def agent_zero_fires(**kwargs):
+    block = agent_zero_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = agent_zero_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_agent_zero_probe_reads_two_routes_and_sends_no_origin():
+    doc = load(AGENT_ZERO_TEMPLATE)
+    declared = set()
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les deux lectures se font en GET : le template ne doit rien "
+            "envoyer à une instance qu'il découvre, le même dispatcher servant "
+            "api/message.py, qui exécuterait une commande dans le conteneur"
+        )
+
+        # Aucun en-tête, et ce n'est pas un oubli. Sur une instance ouverte dont
+        # ALLOWED_ORIGINS est vide, présenter un Origin ou un Referer déclenche
+        # initialize_allowed_origins(), qui écrit l'origine reçue dans la
+        # configuration de la cible par dotenv.save_dotenv_value(). Une lecture
+        # ne modifie pas ce qu'elle lit.
+        headers = {k.lower() for k in (block.get("headers") or {})}
+        assert not (headers & {"origin", "referer"}), (
+            "le template présente un en-tête d'origine : sur une instance "
+            "ouverte, api/csrf_token.py l'enrôlerait dans ALLOWED_ORIGINS et "
+            "le scan aurait modifié la cible — %s" % sorted(headers)
+        )
+
+        for path in (block.get("path") or []):
+            declared.add(path.replace("{{BaseURL}}", ""))
+            for forbidden, why in (
+                ("/api/message", "api/message.py ferait tourner l'agent, donc "
+                                 "exécuterait du code dans son conteneur"),
+                ("/api/chat_create", "api/chat_create.py ouvrirait une "
+                                     "conversation sur l'instance"),
+                ("/api/edit_work_dir_file", "api/edit_work_dir_file.py "
+                                            "écrirait dans le répertoire de "
+                                            "travail de l'agent"),
+                ("/api/delete_work_dir_file", "api/delete_work_dir_file.py y "
+                                              "supprimerait un fichier"),
+                ("/api/extract_work_dir_archive", "api/extract_work_dir_"
+                                                  "archive.py y déploierait "
+                                                  "une archive"),
+                ("/api/backup_restore", "api/backup_restore.py réinjecterait "
+                                        "un état dans l'instance"),
+                ("/api/mcp_servers_apply", "api/mcp_servers_apply.py "
+                                           "réécrirait la liste des serveurs "
+                                           "MCP que l'agent contacte"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+
+    assert declared == {AGENT_ZERO_HEALTH_ROUTE, AGENT_ZERO_CSRF_ROUTE}, (
+        "le template doit interroger exactement la bannière et la route "
+        "gardée — %s" % sorted(declared)
+    )
+    assert AGENT_ZERO_FILES_ROUTE not in declared, (
+        "le template se pose sur %s : cette route hérite requires_csrf() de "
+        "requires_auth(), donc csrf_protect la refuse en 403 à tout appelant "
+        "sans session, y compris sur une instance ouverte — la suite de tests "
+        "du produit le fixe dans test_http_csrf_required_even_when_auth_not_"
+        "configured" % AGENT_ZERO_FILES_ROUTE
+    )
+
+    assert agent_zero_block().get("req-condition") is True, (
+        "sans req-condition, /api/health conclurait seule — or HealthCheck "
+        "surcharge requires_auth() à False, donc elle rend 200 à l'anonyme y "
+        "compris sur une instance munie d'AUTH_LOGIN"
+    )
+
+
+def test_agent_zero_matcher_needs_the_guarded_route_not_the_open_banner():
+    """
+    Le cœur du constat. /api/health répond à l'identique dans les deux états du
+    produit : c'est le basculement de /api/csrf_token qui sépare une instance
+    ouverte d'une instance munie d'identifiants.
+    """
+    assert agent_zero_fires(), (
+        "le template ne reconnaît pas une instance ouverte : bannière du "
+        "produit, puis refus d'origine servi à l'anonyme sur la route que "
+        "requires_auth était censée fermer"
+    )
+
+    assert not agent_zero_fires(health_body=AGENT_ZERO_HEALTH_BODY_KEYED,
+                                csrf_body=AGENT_ZERO_LOGIN_PAGE_BODY), (
+        "le template conclut sur la seule bannière : une instance munie "
+        "d'AUTH_LOGIN rend le même /api/health et redirige la route gardée "
+        "vers /login, dont nuclei suit la redirection — elle serait signalée "
+        "à tort"
+    )
+
+    assert not agent_zero_fires(csrf_status=302, csrf_body=""), (
+        "le template conclut sur la redirection elle-même, corps vide compris"
+    )
+
+    assert not agent_zero_fires(csrf_status=403,
+                                csrf_body=AGENT_ZERO_CSRF_DENIED_BODY), (
+        "le template conclut sur le refus de csrf_protect : c'est ce que "
+        "rendrait %s, qui hérite requires_csrf(), et ce corps n'est même pas "
+        "du JSON" % AGENT_ZERO_FILES_ROUTE
+    )
+
+    assert not agent_zero_fires(csrf_status=404,
+                                csrf_body=AGENT_ZERO_NOT_FOUND_BODY), (
+        "le template conclut sur un 404 : c'est ce que rend le dispatcher "
+        "quand aucun fichier ne porte le chemin demandé, donc sur une version "
+        "antérieure à l'apparition de la route"
+    )
+
+    assert not agent_zero_fires(health_status=401, health_body=""), (
+        "le template conclut alors qu'un intermédiaire authentifie devant le "
+        "port : rien n'a été servi, donc rien n'est prouvé"
+    )
+
+
+def test_agent_zero_matcher_holds_on_a_git_checkout_and_on_a_copied_tree():
+    """
+    Le constat est l'atteignabilité de la route gardée, pas la présence d'un
+    dépôt git : un déploiement qui copie l'arbre rend « "gitinfo": null » et
+    doit être signalé comme les autres.
+    """
+    for body, why in (
+        (AGENT_ZERO_HEALTH_BODY, "la bannière d'un clone git"),
+        (AGENT_ZERO_HEALTH_BODY_NO_GIT,
+         "la bannière d'un arbre copié, dont gitinfo vaut null"),
+        (AGENT_ZERO_HEALTH_BODY_QUOTED_ERROR,
+         "une bannière dont le message d'erreur porte un guillemet échappé"),
+        (agent_zero_health_body(indent=2),
+         "la même bannière réindentée par un intermédiaire qui la relaie"),
+    ):
+        assert agent_zero_fires(health_body=body), (
+            "le template perd %s" % why
+        )
+
+    assert agent_zero_fires(csrf_body=json.dumps(json.loads(
+        AGENT_ZERO_OPEN_CSRF_BODY), indent=2)), (
+        "le template exige la sérialisation d'origine du refus : un "
+        "intermédiaire qui réindente ce qu'il relaie ferait manquer l'instance"
+    )
+
+
+def test_agent_zero_matcher_refuses_what_resembles_it_without_being_it():
+    """
+    Les deux moitiés du constat doivent rester exigées ensemble : une bannière
+    qui n'est pas celle du produit, ou un refus qui n'est pas le sien, ne
+    doivent rien déclencher.
+    """
+    assert not agent_zero_fires(health_body=AGENT_ZERO_OTHER_HEALTH_BODY), (
+        "le template déclenche sur un service de supervision qui sert lui "
+        "aussi /api/health : il y nomme son bloc git « git », là où "
+        "api/health.py rend la clé « gitinfo »"
+    )
+
+    assert not agent_zero_fires(csrf_body=AGENT_ZERO_GENERIC_REFUSAL_BODY), (
+        "le template déclenche sur un refus « ok » à false quelconque : c'est "
+        "la phrase « not allowed when login is disabled » qui porte le "
+        "constat, pas la forme du document"
+    )
+
+    assert not agent_zero_fires(csrf_body=AGENT_ZERO_TOKEN_BODY), (
+        "le template déclenche sur la branche qui délivre le jeton : le "
+        "template n'envoie pas d'Origin, donc il ne provoque jamais cette "
+        "réponse, et l'admettre reviendrait à couvrir un cas que rien ne "
+        "vérifie"
+    )
+
+    for body, why in (
+        (AGENT_ZERO_COMPOSITE_HEALTH_BODY,
+         "la bannière republiée au fond du document d'une supervision — c'est "
+         "l'ancrage sur l'ouverture qui doit l'écarter"),
+        (AGENT_ZERO_APPENDED_HEALTH_BODY,
+         "un document qui ouvre sur gitinfo et ajoute une clé derrière error — "
+         "c'est l'ancrage de fermeture qui l'écarte"),
+    ):
+        assert not agent_zero_fires(health_body=body), (
+            "le template conclut sur %s" % why
+        )
+
+    assert not agent_zero_fires(csrf_body=AGENT_ZERO_COMPOSITE_CSRF_BODY), (
+        "le template conclut sur le refus republié au fond du document d'une "
+        "supervision : l'ancrage sur l'ouverture doit l'écarter"
+    )
+
+
+def test_agent_zero_extractor_stays_on_the_health_response():
+    block = agent_zero_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "un second extracteur ferait remonter deux fois la même instance sous "
+        "req-condition, qui évalue chaque extracteur contre les deux réponses"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur doit être borné à la réponse de %s — la première requête "
+        "déclarée — puisque c'est la seule à porter la version"
+        % AGENT_ZERO_HEALTH_ROUTE
+    )
+    assert extractor.get("type") == "json", (
+        "/api/health rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".gitinfo.version"], (
+        "la version que compose _format_release_version dans helpers/git.py "
+        "est ce qui date l'instance, donc ce qui dit si les handlers énumérés "
+        "dans l'impact existaient déjà sur la version en face — %s"
+        % extractor.get("json")
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_agent_zero_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs avec le moteur
+    d'expressions de Python plutôt qu'avec le lexer de nuclei : seul un scan
+    contre un vrai serveur ferme la boucle. L'enjeu propre est ici l'instance
+    munie d'identifiants — elle sert la même bannière, mot pour mot, et nuclei
+    suit la redirection que requires_auth rend sur la route gardée, si bien que
+    le refus se lit sur la page de connexion et non sur la 302.
+    """
+    def scan(health_body=AGENT_ZERO_HEALTH_BODY, csrf_status=200,
+             csrf_body=AGENT_ZERO_OPEN_CSRF_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == AGENT_ZERO_HEALTH_ROUTE:
+                    self.reply(200, health_body, "application/json")
+                elif self.path == AGENT_ZERO_CSRF_ROUTE:
+                    if csrf_status == 302:
+                        self.redirect()
+                    else:
+                        self.reply(csrf_status, csrf_body, "application/json")
+                elif self.path.startswith("/login"):
+                    self.reply(200, AGENT_ZERO_LOGIN_PAGE_BODY,
+                               "text/html; charset=utf-8")
+                else:
+                    self.reply(404, AGENT_ZERO_NOT_FOUND_BODY, "text/plain")
+
+            def redirect(self):
+                self.send_response(302)
+                self.send_header("Location",
+                                 "/login?next=%2Fapi%2Fcsrf_token")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def reply(self, status, body, content_type):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", AGENT_ZERO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "agent-zero-unauthenticated"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert sorted(set(seen)) == sorted([AGENT_ZERO_HEALTH_ROUTE,
+                                        AGENT_ZERO_CSRF_ROUTE]), (
+        "le scan a touché une route que le template ne déclare pas — %s" % seen
+    )
+    assert len(results) == 1, (
+        "le scan ne conclut pas sur une instance ouverte — %s" % results
+    )
+    assert [value for item in results
+            for value in (item.get("extracted-results") or [])] == [
+        "M v0.9.8"], (
+        "le scan ne remonte pas la version, qui date l'instance — %s" % results
+    )
+
+    # L'instance ouverte d'un arbre copié : gitinfo vaut null, l'extracteur ne
+    # rend donc rien d'utile, mais la correspondance tient aux matchers et le
+    # constat reste entier.
+    _, results = scan(health_body=AGENT_ZERO_HEALTH_BODY_NO_GIT)
+    assert len(results) == 1, (
+        "le scan perd une instance ouverte déployée sans dépôt git — %s"
+        % results
+    )
+
+    # Et aucune requête ne doit porter d'en-tête d'origine, sans quoi le scan
+    # ferait écrire la cible dans sa propre configuration.
+    origins = []
+
+    class OriginHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            origins.append((self.headers.get("Origin"),
+                            self.headers.get("Referer")))
+            body = (AGENT_ZERO_HEALTH_BODY
+                    if self.path == AGENT_ZERO_HEALTH_ROUTE
+                    else AGENT_ZERO_OPEN_CSRF_BODY)
+            payload = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), OriginHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        subprocess.run(
+            ["nuclei", "-t", AGENT_ZERO_TEMPLATE,
+             "-u", "http://127.0.0.1:%d" % server.server_port,
+             "-duc", "-auth=false", "-jsonl", "-silent"],
+            capture_output=True, text=True, timeout=90,
+        )
+    finally:
+        server.shutdown()
+    assert origins and all(o == (None, None) for o in origins), (
+        "une requête du scan porte un en-tête d'origine : api/csrf_token.py "
+        "l'enrôlerait dans ALLOWED_ORIGINS sur une instance ouverte — %s"
+        % origins
+    )
+
+    for kwargs, why in (
+        (dict(csrf_status=302, csrf_body=""),
+         "une instance munie d'AUTH_LOGIN : elle sert la même bannière et "
+         "redirige la route gardée vers la page de connexion"),
+        (dict(csrf_status=403, csrf_body=AGENT_ZERO_CSRF_DENIED_BODY),
+         "le refus de csrf_protect, que rendrait le listing du répertoire de "
+         "travail"),
+        (dict(csrf_status=404, csrf_body=AGENT_ZERO_NOT_FOUND_BODY),
+         "une instance qui ne sert pas ce chemin"),
+        (dict(csrf_body=AGENT_ZERO_TOKEN_BODY),
+         "la branche qui délivre le jeton, que le template ne provoque jamais"),
+        (dict(csrf_body=AGENT_ZERO_GENERIC_REFUSAL_BODY),
+         "un refus « ok » à false quelconque"),
+        (dict(csrf_body=AGENT_ZERO_COMPOSITE_CSRF_BODY),
+         "le refus republié au fond du document d'une supervision"),
+        (dict(health_body=AGENT_ZERO_OTHER_HEALTH_BODY),
+         "un service de supervision qui sert lui aussi /api/health"),
+        (dict(health_body=AGENT_ZERO_APPENDED_HEALTH_BODY),
+         "un document qui ouvre sur gitinfo et ajoute une clé derrière error"),
+    ):
+        _, refused = scan(**kwargs)
+        assert refused == [], "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

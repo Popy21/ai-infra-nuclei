@@ -1,0 +1,247 @@
+id: agent-zero-unauthenticated
+
+info:
+  name: Agent Zero - API Exposed Without Login Credentials
+  author: popy21
+  severity: high
+  description: |
+    Agent Zero (agent0ai/agent-zero, 19 204 étoiles, dépôt actif, non archivé —
+    l'organisation a été renommée et l'ancien chemin frdel/agent-zero ne résout
+    plus) est un framework d'agents auto-hébergé dont l'agent exécute du code et
+    des commandes shell dans son propre conteneur. Tout passe par un dispatcher
+    unique : helpers/api.py enregistre « /api/<path:path> » avec les méthodes
+    GET, POST, PUT, PATCH et DELETE, résout « api/{path}.py », lit les
+    classmethods du handler et n'enveloppe l'appel que de ce que le handler
+    réclame — « if handler_cls.requires_csrf(): handler_fn =
+    csrf_protect(handler_fn) », puis requires_api_key, puis requires_auth, puis
+    requires_loopback. C'est un ordre d'enveloppement, donc l'ordre d'exécution
+    est l'inverse : loopback, auth, clé d'API, CSRF.
+    GET /api/health nomme le produit. api/health.py déclare
+    « class HealthCheck(ApiHandler) » et son process rend littéralement
+    « {"gitinfo": gitinfo, "error": error} », gitinfo venant de
+    git.get_git_info() qui rend branch, commit_hash, commit_time, tag, short_tag
+    et version, error portant errors.error_text(e) quand le répertoire n'est pas
+    un dépôt git. Ce couple de clés, dans cet ordre, à la racine du document, est
+    ce qui identifie le produit — jamais le statut HTTP.
+    Mais /api/health ne prouve rien de l'autorisation, et c'est le point que ce
+    template tient : la classe surcharge « requires_auth(cls) -> bool: return
+    False » et « requires_csrf(cls) -> bool: return False », donc elle répond 200
+    à l'anonyme sur une instance munie d'identifiants exactement comme sur une
+    instance ouverte. Elle identifie le produit, elle ne dit pas s'il est gardé.
+    La preuve vient de GET /api/csrf_token. api/csrf_token.py déclare
+    « class GetCsrfToken(ApiHandler) », surcharge « get_methods(cls) ->
+    list[str]: return ["GET"] » et « requires_csrf(cls) -> bool: return False »,
+    mais ne surcharge pas requires_auth : la base ApiHandler de helpers/api.py
+    déclare « requires_auth() -> True », « requires_csrf() -> cls.requires_auth()
+    », « requires_api_key() -> False », « requires_loopback() -> False » et
+    « get_methods() -> ["POST"] ». Cette route est donc la seule du produit à
+    être placée derrière le contrôle d'authentification et devant lui seul :
+    atteindre son corps en anonyme prouve que le contrôle est inerte.
+    Or ce corps le dit lui-même. Sans identifiants, le décorateur requires_auth
+    laisse passer — « user_pass_hash = login.get_credentials_hash() ; if not
+    user_pass_hash: return await f(*args, **kwargs) » — et le handler atteint
+    check_allowed_origin(), qui ne court-circuite que « if
+    login.is_login_required() ». Une requête sans en-tête Origin ni Referer fait
+    rendre None à get_origin_from_request(), donc is_allowed_origin() rend
+    « {"ok": False, ...} » et process rend
+    « {"ok": false, "error": "Origin None not allowed when login is disabled.
+    Set login and password or add your URL to ALLOWED_ORIGINS env variable.
+    Currently allowed origins: "} ». C'est le produit qui énonce que la connexion
+    est désactivée, sur une route que l'authentification était censée fermer.
+    Une instance munie d'identifiants ne rend jamais ce corps : requires_auth y
+    exécute « if session.get("authentication") != user_pass_hash: return
+    redirect(url_for("login_handler", next=...)) », soit une 302 vers /login
+    (helpers/ui_server.py enregistre bien « /login » sous le nom login_handler).
+    Les identifiants sont deux variables lues par login.get_credentials_hash() :
+    AUTH_LOGIN et AUTH_PASSWORD, nommées KEY_AUTH_LOGIN et KEY_AUTH_PASSWORD
+    dans helpers/dotenv.py. Le hash n'existe que si AUTH_LOGIN est posée, donc
+    l'absence d'authentification est bien un défaut de configuration par défaut.
+    La route de preuve n'est pas celle qu'on attendrait, et le motif a été relevé
+    à la source plutôt que supposé. GET /api/get_work_dir_files listerait le
+    répertoire de travail — api/get_work_dir_files.py déclare
+    « get_methods(cls): return ["GET"] », ne surcharge ni requires_auth ni
+    requires_csrf, et rend « {"data": result, "limits": FileBrowser.limits()} »
+    sur « /a0 » par défaut — mais requires_csrf() y vaut True par héritage, et
+    csrf_protect n'exempte aucune méthode : il lit « token =
+    session.get("csrf_token") » et rend « Response("CSRF token missing or
+    invalid", 403) » dès que « not token ». Un appelant anonyme n'a pas de
+    session, donc cette route rend 403 sur une instance ouverte. La suite de
+    tests du produit le fixe elle-même, dans tests/test_http_auth_csrf.py :
+    « test_http_csrf_required_even_when_auth_not_configured » pose
+    get_credentials_hash à None, émet un GET et attend 403.
+  impact: |
+    Le corps de /api/csrf_token est le moins grave de ce que l'exposition ouvre :
+    sa valeur ici est d'être la preuve, pas le butin. Le butin est sur le même
+    dispatcher, derrière le même contrôle inerte. api/message.py et
+    api/message_async.py font tourner l'agent, donc exécutent du code et des
+    commandes shell dans le conteneur, aux frais du fournisseur de modèle
+    configuré ; api/chat_create.py ouvre une conversation ;
+    api/download_work_dir_file.py et api/edit_work_dir_file.py lisent et
+    écrivent dans le répertoire de travail ; api/delete_work_dir_file.py et
+    api/extract_work_dir_archive.py y suppriment et y déploient une archive ;
+    api/backup_create.py et api/backup_restore.py emportent et réinjectent
+    l'état de l'instance ; api/mcp_servers_apply.py réécrit la liste des
+    serveurs MCP que l'agent contacte.
+    Ces dix handlers ont été relevés un par un : aucun ne surcharge
+    requires_auth, et backup_create comme backup_restore la redéclarent
+    explicitement à True tout en laissant requires_loopback à False. Tous valent
+    donc requires_csrf() True par héritage, et c'est le seul obstacle qui leur
+    reste quand les identifiants manquent — pas l'authentification, qui est
+    traversée avant.
+    Cet obstacle-là se retire sur la route même qui porte le constat, et le
+    mécanisme est écrit dans api/csrf_token.py. Un appelant qui présente un
+    en-tête Origin déclenche initialize_allowed_origins(), dont la docstring
+    annonce « If A0 is hosted on a server, add the first visit origin to
+    ALLOWED_ORIGINS. This simplifies deployment process » : tant que la variable
+    ALLOWED_ORIGINS est vide, la première origine visitée y est écrite par
+    dotenv.save_dotenv_value(), après quoi is_allowed_origin() la reconnaît,
+    process pose « session["csrf_token"] = secrets.token_urlsafe(32) » et rend
+    le jeton avec le runtime_id. Le jeton et la session obtenus, csrf_protect
+    est satisfait — « sent = header or cookie ; if not token or not sent or
+    token != sent » — et tout /api/* s'ouvre, exécution de commandes comprise.
+    Ce chemin est décrit ici d'après la source ; il n'est pas exécuté par le
+    template, qui n'envoie aucun en-tête Origin ni Referer précisément pour ne
+    pas écrire dans la configuration de la cible. C'est à cette confirmation que
+    tient le passage du constat en critique.
+  remediation: |
+    Poser des identifiants, ce qui ferme d'un coup tout /api/* sauf les routes
+    qui déclarent requires_auth() False : AUTH_LOGIN et AUTH_PASSWORD dans
+    l'environnement du serveur. login.get_credentials_hash() ne rend un hash que
+    si AUTH_LOGIN est posée, et c'est ce hash seul qui arme requires_auth.
+    Poser aussi ALLOWED_ORIGINS sur la ou les origines légitimes. Tant que la
+    variable est vide et que la connexion est désactivée, api/csrf_token.py
+    enrôle de lui-même la première origine visitée et délivre un jeton CSRF à
+    qui la présente — le garde-fou destiné à simplifier le déploiement devient
+    alors le dernier verrou et il s'ouvre tout seul.
+    Ne pas publier le port en attendant. Le serveur écoute sur ce que rend
+    « runtime.get_arg("host") or dotenv.get_dotenv_value("WEB_UI_HOST") or
+    "localhost" » : la valeur par défaut est la boucle locale, donc une instance
+    joignable a reçu un hôte explicite ou une publication de port. Restreindre
+    la publication à la boucle locale, ou placer devant un intermédiaire qui
+    authentifie, reste la fermeture la plus sûre.
+    Vérifier depuis l'extérieur du périmètre, sur la route même qui porte le
+    constat : « curl -s -o /dev/null -w "%{http_code}"
+    http://<hote>:5000/api/csrf_token » doit rendre 302, la redirection vers
+    /login — curl ne la suit pas sans -L. Le port est celui que rend
+    runtime.get_web_ui_port(), « get_arg("port") or WEB_UI_PORT or 5000 » ;
+    l'image officielle, elle, publie 80. Le code de /api/health restera 200
+    dans les deux cas : sa classe surcharge requires_auth() à False et elle
+    répond quel que soit l'état de l'authentification.
+    Après une exposition, tenir pour compromis le conteneur de l'agent —
+    api/message.py y exécute des commandes — ainsi que le répertoire de travail
+    et les sauvegardes. Renouveler les clés des fournisseurs de modèle
+    configurées et contrôler leur facturation sur la période : l'inférence
+    anonyme n'a laissé aucune identité d'appelant.
+  reference:
+    - https://github.com/agent0ai/agent-zero/blob/main/api/health.py
+    - https://github.com/agent0ai/agent-zero/blob/main/api/csrf_token.py
+    - https://github.com/agent0ai/agent-zero/blob/main/api/get_work_dir_files.py
+    - https://github.com/agent0ai/agent-zero/blob/main/helpers/api.py
+    - https://github.com/agent0ai/agent-zero/blob/main/helpers/login.py
+    - https://github.com/agent0ai/agent-zero/blob/main/helpers/dotenv.py
+    - https://github.com/agent0ai/agent-zero/blob/main/helpers/ui_server.py
+    - https://github.com/agent0ai/agent-zero/blob/main/tests/test_http_auth_csrf.py
+  metadata:
+    max-request: 2
+    vendor: agent0ai
+    product: agent-zero
+  tags: ai,llm,agent,agent-zero,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /api/health nomme le produit : api/health.py rend littéralement
+  # « {"gitinfo": gitinfo, "error": error} ». Mais la même classe surcharge
+  # requires_auth() à False, donc le dispatcher ne l'enveloppe d'aucun
+  # décorateur et elle rend 200 à l'anonyme sur une instance munie
+  # d'identifiants comme sur une instance ouverte. Seule, elle ne conclurait que
+  # « c'est bien ce produit », jamais « il est ouvert ».
+  #
+  # GET /api/csrf_token est la seule route du produit derrière requires_auth et
+  # devant lui seul : GetCsrfToken surcharge requires_csrf() à False sans
+  # toucher à requires_auth(), que la base ApiHandler déclare True. Son corps
+  # servi à l'anonyme EST le constat.
+  #
+  # En lecture seule, et strictement. Le même dispatcher sert api/message.py,
+  # qui exécuterait des commandes dans le conteneur de l'agent,
+  # api/edit_work_dir_file.py, qui écrirait dans le répertoire de travail, et
+  # api/backup_restore.py, qui réinjecterait un état. Ce sont les abus que le
+  # template signale, pas ce qu'un scanner a le droit de faire pour les
+  # établir.
+  #
+  # Pas d'en-tête Origin ni Referer, et ce n'est pas une omission : sur une
+  # instance ouverte dont ALLOWED_ORIGINS est vide, en présenter un déclenche
+  # initialize_allowed_origins(), qui écrit l'origine reçue dans la
+  # configuration de la cible par dotenv.save_dotenv_value(). Une lecture ne
+  # modifie pas ce qu'elle lit.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/health"
+      - "{{BaseURL}}/api/csrf_token"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, /api/health conclurait seule —
+    # or elle répond à l'identique quel que soit l'état de l'authentification.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La bannière, prise par ses deux bornes. helpers/api.py sérialise la
+          # sortie du handler par json.dumps(output) sans séparateurs
+          # personnalisés, donc « {"gitinfo": » ouvre le document et la clé
+          # error le ferme, dans l'ordre de déclaration du dict que rend
+          # process. Ancrer les deux bouts écarte le document composite d'une
+          # supervision qui recopierait la réponse dans un champ à elle.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"gitinfo\"\\s*:", trim_space(body_1))'
+
+          # La valeur d'error est null quand git.get_git_info() a abouti, et la
+          # chaîne rendue par errors.error_text(e) — « str(e) » — quand le
+          # répertoire n'est pas un dépôt git, ce qui arrive sur les
+          # déploiements qui copient l'arbre au lieu de le cloner. Les deux
+          # formes doivent passer, d'où l'alternative ; la classe
+          # « (\\.|[^"\\])* » lit une chaîne JSON jusqu'à son guillemet
+          # fermant sans se laisser couper par un guillemet échappé du message
+          # d'erreur.
+          - 'regex("\"error\"\\s*:\\s*(null|\"(\\\\.|[^\"\\\\])*\")\\s*\\}$", trim_space(body_1))'
+
+          # La seconde réponse, et c'est elle qui conclut. La forme d'abord :
+          # la branche de refus de GetCsrfToken rend « {"ok": False, "error":
+          # ... } », donc le document ouvre sur ok à false.
+          #
+          # Une instance munie d'identifiants n'atteint jamais cette branche :
+          # requires_auth y rend une 302 vers /login. Ce que le scanner observe
+          # alors n'est pas la 302 mais la page de connexion, relevé plutôt que
+          # supposé — nuclei suit la redirection par défaut, donc body_2 porte
+          # le HTML de webui/login.html et status_code_2 vaut 200. C'est la
+          # forme du document, pas le statut, qui sépare les deux états.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"ok\"\\s*:\\s*false\\s*,", trim_space(body_2))'
+
+          # Puis la phrase, qui est le constat lui-même : le produit énonce que
+          # la connexion est désactivée, sur une route que le dispatcher a bel
+          # et bien enveloppée de requires_auth. Le fragment retenu s'arrête
+          # avant « Set login and password » et après « Origin None », deux
+          # bouts que le message compose : l'origine varie avec ce que
+          # l'appelant envoie, et la fin de la phrase énumère les origines
+          # admises, donc ni l'un ni l'autre n'est stable.
+          - 'contains(body_2, "not allowed when login is disabled")'
+
+    extractors:
+      # La version rendue par git.get_git_info(), c'est-à-dire le
+      # « {préfixe de branche} {tag} » que compose _format_release_version dans
+      # helpers/git.py. Une seule raison de la relever : elle date l'instance,
+      # et c'est ce qui permet de dire si les handlers énumérés dans l'impact
+      # existaient déjà sur la version en face.
+      #
+      # Un seul extracteur, et borné à body_1 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second ferait
+      # remonter deux fois la même instance. Il ne rend rien quand gitinfo vaut
+      # null, ce qui ne retire rien au constat — la correspondance tient aux
+      # matchers, pas à lui.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.gitinfo.version'
