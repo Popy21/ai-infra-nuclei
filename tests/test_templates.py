@@ -30484,6 +30484,494 @@ def test_bifrost_matcher_compiles_and_fires_against_a_live_server():
         assert refused == 0, "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# OpenHands Agent Server — le paquet openhands-agent-server de
+# OpenHands/software-agent-sdk, c'est-à-dire le serveur REST/WebSocket qui
+# exécute les agents OpenHands V1 : terminal, arbre de fichiers et dépôt git de
+# l'espace de travail de l'agent, sur un seul port.
+#
+# Ce que cette section amarre tient en trois points, tous relevés sur une 1.49.2
+# lancée par « python -m openhands.agent_server » plutôt que déduits de la
+# documentation.
+#
+# Le premier, et c'est l'enjeu du template : la route qui nomme le produit ne
+# prouve rien de l'autorisation. api.py monte
+# « app.include_router(server_details_router) » SANS dépendance, là où
+# « APIRouter(prefix="/api", dependencies=[Depends(check_session_api_key),
+# Depends(require_initialized)]) » porte tout le reste. Sur l'instance lancée
+# avec SESSION_API_KEY, /server_info rend le même 200 et le même corps qu'ouvert
+# — seul /api/conversations/search bascule, en 401
+# « {"detail":"Unauthorized"} ». Un template posé sur la seule bannière
+# signalerait donc toutes les instances, gardées comprises.
+#
+# Le deuxième : le chemin. Le README du serveur annonce
+# GET /conversations/search, mais api_router impose /api et ce chemin-là rend
+# 404 sur une instance réelle. Le README se trompe aussi d'en-tête — il écrit
+# « Authorization header as Bearer <key> » là où dependencies.py déclare
+# « APIKeyHeader(name="X-Session-API-Key") » —, et l'instance tranche : Bearer
+# rend 401, X-Session-API-Key rend 200.
+#
+# Le troisième : le title ne suffit pas à lui seul. « OpenHands Agent Server »
+# est aussi le title de l'application FastAPI, donc il se lit dans
+# /openapi.json — deux fois, dans le bloc info et dans le défaut du schéma
+# ServerInfo — et dans le HTML de /docs. Le littéral
+# conversation_runtime_routes_v1, lui, sort de la fabrique du champ
+# capabilities, que pydantic n'appelle pas pour produire le schéma : il est
+# absent du document OpenAPI, vérifié sur l'instance. C'est cette paire, et non
+# le title seul, qui dit que /server_info a répondu de lui-même.
+
+OPENHANDS_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "openhands-agent-server-exposed.yaml")
+
+# La bannière, montée sans dépendance.
+OPENHANDS_INFO_ROUTE = "/server_info"
+
+# La route gardée, sous api_router — celle dont le 200 anonyme est le constat.
+OPENHANDS_SEARCH_ROUTE = "/api/conversations/search"
+
+# Celui que le README du serveur donne, et qui ne désigne aucune route : le
+# préfixe /api vient de l'APIRouter, pas du routeur des conversations.
+OPENHANDS_README_SEARCH_ROUTE = "/conversations/search"
+
+# Les cinq littéraux que rend la fabrique du champ capabilities de ServerInfo.
+OPENHANDS_CAPABILITIES = [
+    "conversation_runtime_routes_v1",
+    "profile_secret_scope_v1",
+    "credential_binding_v1",
+    "credential_binding_readiness_probe_v1",
+    "credential_binding_activation_guard_v1",
+]
+
+
+def openhands_server_info_body(title="OpenHands Agent Server", version="1.49.2",
+                               capabilities=None, indent=None):
+    """
+    Ce que rend GET /server_info, transcrit du corps relevé sur une 1.49.2.
+
+    L'ordre des clés est celui de la déclaration de ServerInfo, que pydantic
+    conserve, et la sérialisation est compacte parce que c'est celle de
+    JSONResponse.
+    """
+    payload = {
+        "uptime": 26.0,
+        "idle_time": 26.0,
+        "title": title,
+        "version": version,
+        "sdk_version": version,
+        "tools_version": version,
+        "workspace_version": version,
+        "build_git_sha": "unknown",
+        "build_git_ref": "unknown",
+        "python_version": "3.13.3 (main, Apr  8 2025, 13:54:08) "
+                          "[Clang 17.0.0 (clang-1700.0.13.3)]",
+        "usable_tools": ["ask_oracle", "file_editor", "task_tool_set", "task",
+                         "task_tracker", "terminal", "workflow_tool_set",
+                         "workflow", "browser_tool_set", "edit",
+                         "list_directory", "read_file", "write_file", "glob",
+                         "grep", "planning_file_editor"],
+        "runtime_idle_timeout_seconds": None,
+        "conversation_runtime": "local",
+        "capabilities": (OPENHANDS_CAPABILITIES if capabilities is None
+                         else capabilities),
+        "max_foreground_terminal_timeout_seconds": None,
+        "docs": "/docs",
+        "redoc": "/redoc",
+    }
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+OPENHANDS_INFO_BODY = openhands_server_info_body()
+
+# Le même corps sur une instance dotée d'une clé de session : identique, parce
+# que server_details_router est monté sans dépendance.
+OPENHANDS_INFO_BODY_KEYED = OPENHANDS_INFO_BODY
+
+# Le document que la même instance sert sur /openapi.json, réduit à ce qui
+# compte ici : le title du produit y est, deux fois, et aucun littéral de
+# capabilities n'y figure — pydantic n'appelle pas la fabrique du champ pour
+# produire le schéma.
+OPENHANDS_OPENAPI_BODY = json.dumps({
+    "openapi": "3.1.0",
+    "info": {
+        "title": "OpenHands Agent Server",
+        "description": "OpenHands Agent Server - REST/WebSocket interface "
+                       "for OpenHands AI Agent",
+        "version": "1.49.2",
+    },
+    "components": {"schemas": {"ServerInfo": {"properties": {
+        "title": {"type": "string", "title": "Title",
+                  "default": "OpenHands Agent Server"},
+        "capabilities": {"items": {"type": "string"}, "type": "array",
+                         "title": "Capabilities"},
+    }}}},
+}, separators=(",", ":"))
+
+
+def openhands_page_body(items=(), next_page_id=None, indent=None):
+    """
+    Le modèle ConversationPage de models.py : « items: list[ConversationInfo] »
+    puis « next_page_id: str | None = None », dans cet ordre.
+    """
+    payload = {"items": list(items), "next_page_id": next_page_id}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# Instance neuve : le corps exact relevé sur /api/conversations/search.
+OPENHANDS_EMPTY_PAGE_BODY = openhands_page_body()
+
+# Une instance en service. Les champs sont ceux de ConversationInfo et de sa
+# base _ConversationInfoBase (models.py), réduits à un contexte réaliste.
+OPENHANDS_USED_PAGE_BODY = openhands_page_body(items=[{
+    "id": "0d1f6b2e-6a1f-4f52-9a0c-8b7d3e2f1a44",
+    "workspace": {"kind": "LocalWorkspace", "working_dir": "/workspace/project"},
+    "persistence_dir": "workspace/conversations",
+    "max_iterations": 500,
+    "stuck_detection": True,
+    "execution_status": "idle",
+    "agent": {"kind": "Agent", "llm": {"model": "gpt-5.6",
+                                       "api_key": "**********"}},
+    "client_tools": [],
+    "runtime_info": None,
+}], next_page_id="0d1f6b2e6a1f4f529a0c8b7d3e2f1a44")
+
+# Ce que rend la route gardée sur une instance lancée avec SESSION_API_KEY,
+# relevé tel quel.
+OPENHANDS_DENIED_BODY = '{"detail":"Unauthorized"}'
+
+# Une instance en deferred_init : require_initialized 503 avant que le handler
+# ne soit atteint, et le corps porte le message d'init_router.py.
+OPENHANDS_DORMANT_BODY = ('{"detail":"server is in deferred-init state '
+                          '\'dormant\'; call POST /api/init first"}')
+
+# Ce que rend FastAPI sur le chemin du README, qu'aucun routeur ne sert.
+OPENHANDS_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Une API paginée quelconque qui emprunte les deux mêmes noms de champ : sans
+# la bannière du produit sur la première réponse, elle ne doit rien déclencher.
+OPENHANDS_GENERIC_PAGE_BODY = openhands_page_body(items=[
+    {"id": 1, "label": "job-a"}, {"id": 2, "label": "job-b"},
+], next_page_id="2")
+
+# La page republiée au fond du document d'une supervision : c'est l'ancrage sur
+# l'ouverture qui doit l'écarter.
+OPENHANDS_COMPOSITE_PAGE_BODY = ('{"source":"agent-01","page":%s}'
+                                 % OPENHANDS_EMPTY_PAGE_BODY)
+
+# Le document composite inverse : il ouvre sur la page et ajoute une clé
+# derrière le dernier champ, donc c'est l'ancrage de fermeture qui l'écarte.
+OPENHANDS_APPENDED_PAGE_BODY = ('{"items":[],"next_page_id":null,'
+                                '"collected_at":"2026-09-19T00:00:00Z"}')
+
+
+def openhands_block():
+    doc = load(OPENHANDS_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % OPENHANDS_SEARCH_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template ne vise pas GET %s — or c'est la seule des deux routes "
+        "qui soit sous api_router, donc la seule dont le 200 anonyme prouve "
+        "quoi que ce soit" % OPENHANDS_SEARCH_ROUTE
+    )
+    return blocks[0]
+
+
+def openhands_responses(info_status=200, info_body=OPENHANDS_INFO_BODY,
+                        search_status=200,
+                        search_body=OPENHANDS_EMPTY_PAGE_BODY):
+    """
+    Range les réponses dans l'ordre des chemins déclarés par le template :
+    c'est cet ordre qui donne son numéro à chaque body_N sous req-condition.
+    """
+    ordered = []
+    for path in openhands_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        if route == OPENHANDS_INFO_ROUTE:
+            ordered.append((info_status, info_body))
+        elif route == OPENHANDS_SEARCH_ROUTE:
+            ordered.append((search_status, search_body))
+        else:
+            raise AssertionError(
+                "le template interroge un chemin inattendu : %s" % route)
+    return ordered
+
+
+def openhands_fires(**kwargs):
+    block = openhands_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = openhands_responses(**kwargs)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_openhands_probe_reads_the_two_routes_and_neither_writes_nor_runs():
+    doc = load(OPENHANDS_TEMPLATE)
+    declared = set()
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'index des conversations se lit en GET : le template ne doit "
+            "rien envoyer à une instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            declared.add(path.replace("{{BaseURL}}", ""))
+            for forbidden, why in (
+                ("/bash", "bash_router exécuterait une commande sur la machine "
+                          "qui héberge le serveur"),
+                ("/git", "git_router opérerait sur le dépôt de l'espace de "
+                         "travail de l'agent"),
+                ("/settings", "GET /api/settings rend la configuration LLM de "
+                              "l'exploitant, dont l'établissement du constat "
+                              "n'a aucun besoin"),
+                ("/init", "POST /api/init livrerait la configuration d'exécution "
+                          "d'un serveur en attente"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+
+    assert declared == {OPENHANDS_INFO_ROUTE, OPENHANDS_SEARCH_ROUTE}, (
+        "le template doit interroger exactement la bannière et la route "
+        "gardée — %s" % sorted(declared)
+    )
+    assert OPENHANDS_README_SEARCH_ROUTE not in declared, (
+        "le template reprend le chemin du README, %s : api_router impose le "
+        "préfixe /api et ce chemin-là rend 404 sur une instance réelle"
+        % OPENHANDS_README_SEARCH_ROUTE
+    )
+
+    assert openhands_block().get("req-condition") is True, (
+        "sans req-condition, /server_info conclurait seul — or api.py le monte "
+        "par app.include_router(server_details_router), sans dépendance, donc "
+        "il rend 200 à l'anonyme y compris sur une instance dotée d'une clé"
+    )
+
+
+def test_openhands_matcher_needs_the_guarded_route_not_the_open_banner():
+    """
+    Le cœur du constat. /server_info répond à l'identique dans les deux états du
+    produit : c'est le basculement de /api/conversations/search qui sépare une
+    instance ouverte d'une instance gardée.
+    """
+    assert openhands_fires(), (
+        "le template ne reconnaît pas une instance ouverte : bannière du "
+        "produit, puis index des conversations servi à l'anonyme"
+    )
+
+    assert not openhands_fires(info_body=OPENHANDS_INFO_BODY_KEYED,
+                               search_status=401,
+                               search_body=OPENHANDS_DENIED_BODY), (
+        "le template conclut sur la seule bannière : une instance lancée avec "
+        "SESSION_API_KEY rend le même /server_info et refuse la route gardée, "
+        "et elle serait signalée à tort"
+    )
+
+    assert not openhands_fires(search_status=503,
+                               search_body=OPENHANDS_DORMANT_BODY), (
+        "le template conclut sur une instance en deferred_init, dont "
+        "require_initialized 503 toute la route avant le handler : rien n'y a "
+        "été servi, donc rien n'y est prouvé"
+    )
+
+    assert not openhands_fires(search_status=404,
+                               search_body=OPENHANDS_NOT_FOUND_BODY), (
+        "le template conclut sur un 404 : c'est ce que rendrait le chemin du "
+        "README, sans préfixe /api"
+    )
+
+
+def test_openhands_matcher_holds_on_a_fresh_instance_and_on_a_used_one():
+    """
+    Le constat est l'atteignabilité de la route gardée, pas le nombre de
+    conversations : une instance neuve rend « {"items":[],"next_page_id":null} »
+    et doit être signalée comme les autres.
+    """
+    for body, why in (
+        (OPENHANDS_EMPTY_PAGE_BODY, "l'index vide d'une instance neuve"),
+        (OPENHANDS_USED_PAGE_BODY,
+         "l'index d'une instance en service, dont next_page_id porte une chaîne"),
+        (openhands_page_body(indent=2),
+         "la même page réindentée par un intermédiaire qui la relaie"),
+    ):
+        assert openhands_fires(search_body=body), (
+            "le template perd %s" % why
+        )
+
+    for capabilities, why in (
+        (OPENHANDS_CAPABILITIES[:1],
+         "une instance antérieure aux quatre derniers ajouts à capabilities"),
+        (OPENHANDS_CAPABILITIES + ["some_future_capability_v2"],
+         "une instance postérieure, dont la liste s'est allongée"),
+    ):
+        assert openhands_fires(
+            info_body=openhands_server_info_body(capabilities=capabilities)), (
+            "le template perd %s : un seul des littéraux doit être exigé, pas "
+            "la liste entière" % why
+        )
+
+    assert openhands_fires(info_body=openhands_server_info_body(indent=2)), (
+        "le template exige la sérialisation compacte de JSONResponse sur la "
+        "bannière : un intermédiaire qui réindente ce qu'il relaie ferait "
+        "manquer l'instance"
+    )
+
+
+def test_openhands_matcher_refuses_what_carries_the_name_without_the_capability():
+    """
+    « OpenHands Agent Server » est aussi le title de l'application FastAPI : il
+    se lit dans /openapi.json, que la même instance sert, et dans le HTML de
+    /docs. Le littéral de capabilities, lui, est absent du document OpenAPI —
+    pydantic n'appelle pas la fabrique du champ pour produire le schéma,
+    vérifié sur l'instance. C'est la paire qui nomme le produit, pas le title.
+    """
+    assert not openhands_fires(info_body=OPENHANDS_OPENAPI_BODY), (
+        "le template déclenche sur le document OpenAPI que la même instance "
+        "sert : le title y figure deux fois, mais aucune capability, et un "
+        "catch-all qui le rendrait sur /server_info ne prouverait rien"
+    )
+
+    assert not openhands_fires(
+        info_body=openhands_server_info_body(title="Agent Runtime")), (
+        "le template se passe du title : c'est pourtant le littéral que "
+        "ServerInfo fixe en dur, et sans lui la capability seule pourrait "
+        "sortir d'un client qui recopie le vocabulaire du produit"
+    )
+
+    assert not openhands_fires(info_body=OPENHANDS_GENERIC_PAGE_BODY), (
+        "le template déclenche sur une API paginée quelconque servie sur les "
+        "deux routes : rien n'y nomme le produit"
+    )
+
+    for body, why in (
+        (OPENHANDS_COMPOSITE_PAGE_BODY,
+         "la page republiée au fond du document d'une supervision — c'est "
+         "l'ancrage sur l'ouverture qui doit l'écarter"),
+        (OPENHANDS_APPENDED_PAGE_BODY,
+         "un document composite qui ouvre sur la page et ajoute une clé "
+         "derrière next_page_id — c'est l'ancrage de fermeture qui l'écarte"),
+    ):
+        assert not openhands_fires(search_body=body), (
+            "le template conclut sur %s" % why
+        )
+
+
+def test_openhands_extractor_stays_on_the_server_info_response():
+    block = openhands_block()
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "un second extracteur ferait remonter deux fois la même instance sous "
+        "req-condition, qui évalue chaque extracteur contre les deux réponses"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur doit être borné à la réponse de %s — la première requête "
+        "déclarée — puisque c'est la seule à porter la version du paquet"
+        % OPENHANDS_INFO_ROUTE
+    )
+    assert extractor.get("type") == "json", (
+        "/server_info rend un objet JSON : un extracteur regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".version"], (
+        "la version du paquet openhands-agent-server est ce qui date "
+        "l'instance par rapport au correctif #4180, publié à la v1.37.1, qui a "
+        "fait passer l'hôte par défaut de 0.0.0.0 à la boucle locale en "
+        "l'absence de clé — %s" % extractor.get("json")
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_openhands_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs avec le moteur
+    d'expressions de Python plutôt qu'avec le lexer de nuclei : seul un scan
+    contre un vrai serveur ferme la boucle. L'enjeu propre est ici le refus de
+    l'instance gardée — elle sert la même bannière, mot pour mot, et c'est la
+    seconde réponse qui décide.
+    """
+    def scan(search_status, search_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == OPENHANDS_INFO_ROUTE:
+                    self.reply(200, OPENHANDS_INFO_BODY)
+                elif self.path == OPENHANDS_SEARCH_ROUTE:
+                    self.reply(search_status, search_body)
+                else:
+                    self.reply(404, OPENHANDS_NOT_FOUND_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", OPENHANDS_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "openhands-agent-server-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, OPENHANDS_EMPTY_PAGE_BODY)
+    assert sorted(set(seen)) == sorted([OPENHANDS_INFO_ROUTE,
+                                        OPENHANDS_SEARCH_ROUTE]), (
+        "le scan a touché une route que le template ne déclare pas — %s" % seen
+    )
+    assert extracted == ["1.49.2"], (
+        "le scan ne remonte pas la version du paquet, qui date l'instance par "
+        "rapport au correctif #4180 — %s" % extracted
+    )
+
+    for status, body, why in (
+        (401, OPENHANDS_DENIED_BODY,
+         "une instance lancée avec SESSION_API_KEY : elle sert la même "
+         "bannière et refuse la route gardée"),
+        (503, OPENHANDS_DORMANT_BODY,
+         "une instance en deferred_init, dont require_initialized 503 la route "
+         "avant le handler"),
+        (404, OPENHANDS_NOT_FOUND_BODY,
+         "une instance qui ne sert pas ce chemin"),
+        (200, OPENHANDS_COMPOSITE_PAGE_BODY,
+         "la page republiée au fond du document d'une supervision"),
+        (200, OPENHANDS_APPENDED_PAGE_BODY,
+         "un document composite qui ouvre sur la page et ajoute une clé "
+         "derrière next_page_id"),
+    ):
+        _, refused = scan(status, body)
+        assert refused == [], "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

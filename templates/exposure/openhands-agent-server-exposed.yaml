@@ -1,0 +1,236 @@
+id: openhands-agent-server-exposed
+
+info:
+  name: OpenHands Agent Server - API Exposed Without a Session API Key
+  author: popy21
+  severity: critical
+  description: |
+    Le paquet openhands-agent-server (OpenHands/software-agent-sdk) est le
+    serveur REST/WebSocket qui exécute les agents OpenHands V1 : c'est lui qui
+    tient le terminal, l'arbre de fichiers et le dépôt git de l'espace de
+    travail de l'agent. Le produit amont, OpenHands/OpenHands, compte 88 467
+    étoiles ; le dépôt du SDK est actif, dernier push 2026-09-18.
+    GET /server_info nomme le produit sans ambiguïté. server_details_router.py
+    y déclare « class ServerInfo(BaseModel) » avec deux littéraux qui ne sont
+    d'aucun autre service : « title: str = "OpenHands Agent Server" » et une
+    liste capabilities dont la fabrique rend
+    « ["conversation_runtime_routes_v1", "profile_secret_scope_v1",
+    "credential_binding_v1", "credential_binding_readiness_probe_v1",
+    "credential_binding_activation_guard_v1"] ». Le corps relevé sur une 1.49.2
+    lancée par « python -m openhands.agent_server » les porte mot pour mot, à
+    côté de uptime, idle_time, des quatre numéros de version des paquets, du
+    couple build_git_sha / build_git_ref, de python_version, de la liste
+    usable_tools et de conversation_runtime.
+    Mais /server_info ne prouve rien de l'autorisation, et c'est le point que ce
+    template tient : api.py monte « app.include_router(server_details_router) »
+    SANS dépendance, là où il monte « app.include_router(api_router) » avec
+    « APIRouter(prefix="/api", dependencies=dependencies) » où dependencies vaut
+    [Depends(check_session_api_key), Depends(require_initialized)]. Sur une
+    instance dotée d'une clé, /server_info rend 200 à l'anonyme exactement comme
+    sur une instance ouverte — vérifié sur les deux. Il identifie le produit, il
+    ne dit pas si le produit est gardé.
+    La preuve vient donc de la seconde lecture, GET /api/conversations/search,
+    qui est sous api_router. Sur l'instance sans clé elle rend 200 et
+    « {"items":[],"next_page_id":null} » — le modèle ConversationPage de
+    models.py, « items: list[ConversationInfo] » puis
+    « next_page_id: str | None = None ». Sur l'instance lancée avec
+    SESSION_API_KEY elle rend 401 et « {"detail":"Unauthorized"} ». C'est
+    l'écart entre ces deux réponses, et lui seul, qui porte le constat.
+    Le chemin a été relevé sur une instance plutôt que recopié : le README du
+    serveur annonce GET /conversations/search, mais api_router impose le préfixe
+    /api et ce chemin-là rend 404 « {"detail":"Not Found"} ». Même correction sur
+    l'en-tête : le README écrit « If set, all requests must include this key in
+    the Authorization header as Bearer <key> », alors que dependencies.py déclare
+    « _SESSION_API_KEY_HEADER = APIKeyHeader(name="X-Session-API-Key",
+    auto_error=False) ». Sur l'instance à clé, « Authorization: Bearer <clé> »
+    rend 401 et « X-Session-API-Key: <clé> » rend 200 : c'est le README qui est
+    périmé, sur les deux points.
+    L'absence d'authentification est un défaut de configuration par défaut.
+    config.py déclare « session_api_keys: list[str] =
+    Field(default_factory=_default_session_api_keys, description="...Empty list
+    implies the server will be unsecured...") », la fabrique lisant la variable
+    d'environnement SESSION_API_KEY et rendant une liste vide en son absence ;
+    check_session_api_key() ne lève qu'« if config.session_api_keys and
+    session_api_key not in config.session_api_keys », condition fausse tant que
+    la liste est vide. La docstring de get_settings le dit sans détour :
+    « When no session API keys are configured, endpoints are open. »
+    Reste la question de l'interface d'écoute, et elle a changé récemment. Le
+    README donne toujours « --host: Host to bind to (default: 0.0.0.0) », mais
+    __main__.py ne l'applique plus depuis le correctif #4180 (23/07/2026, publié
+    à la v1.37.1) : sans drapeau, l'hôte vaut 127.0.0.1 quand aucune clé n'est
+    configurée et 0.0.0.0 quand il y en a une — vérifié sur les deux
+    lancements. Deux populations restent donc exposées. Les instances antérieures
+    à la v1.37.1, dont le défaut était « default="0.0.0.0" » sans condition. Et
+    toutes celles dont l'exploitant passe l'hôte à la main, ce que le garde-fou
+    autorise en se contentant d'un avertissement — « Binding to all interfaces
+    (%s) without a session API key: the agent server will be unauthenticated and
+    reachable from the network » —, cas de fait général en conteneur : le
+    Dockerfile du serveur n'a ni CMD ni --host, son ENTRYPOINT est
+    « python -m openhands.agent_server », et un port publié sur une écoute
+    loopback ne répondrait pas.
+  impact: |
+    Ce que /api/conversations/search rend est le moins grave de ce que
+    l'exposition ouvre : c'est l'index des conversations de l'exploitant, avec
+    pour chacune son identifiant, son espace de travail, son statut d'exécution
+    et l'agent qui la porte. Sa valeur ici est d'être la preuve, pas le butin.
+    Le butin est sur le même préfixe, derrière la même dépendance absente.
+    api.py monte sous api_router bash_router, file_router, git_router,
+    tool_router, vscode_router et le workspace_router : exécution de commandes
+    et lecture/écriture de fichiers dans l'espace de travail de l'agent, c'est-
+    à-dire sur la machine qui héberge le serveur. POST /api/conversations crée
+    une conversation et les routes de but la font tourner, aux frais du
+    fournisseur de modèle configuré.
+    GET /api/settings rend la configuration persistée, agent et LLM compris ;
+    sur l'instance neuve relevée, elle répond 200 à l'anonyme. Les champs
+    secrets en sortent masqués par défaut — « REDACTED_SECRET_VALUE =
+    "**********" » —, mais _secrets_exposure.py fait dépendre ce masquage du
+    seul en-tête X-Expose-Secrets, dont parse_expose_secrets_header() accepte la
+    valeur « plaintext », et rien d'autre ne le garde. La docstring de
+    get_settings l'énonce elle-même : « All authenticated clients are treated as
+    equally trusted. There is no role-based authorization for X-Expose-Secrets
+    modes — any authenticated client can request plaintext or encrypted
+    exposure », sous l'hypothèse explicite que « Production deployments use
+    session API keys to prevent anonymous access ». Quand cette hypothèse tombe,
+    la demande de valeurs en clair tombe avec elle.
+    Et ce qui est persisté ne l'est en clair que faute de clé : config.py
+    n'établit un chiffreur que si secret_key existe, et avertit sinon —
+    « OH_SECRET_KEY was not defined. Secrets will not... ». Une instance lancée
+    sans SESSION_API_KEY n'a pas non plus de secret_key par défaut, puisque
+    _default_secret_key() retombe précisément sur la clé de session absente.
+  remediation: |
+    Poser une clé de session, qui ferme d'un coup tout /api/* :
+    SESSION_API_KEY=<valeur> — ou OH_SESSION_API_KEYS_0, qui admet la rotation —
+    dans l'environnement du serveur, ou session_api_keys dans le fichier de
+    configuration JSON. Les clients doivent alors présenter « X-Session-API-Key:
+    <clé> », et non « Authorization: Bearer <clé> » comme l'écrit encore le
+    README.
+    Mettre à jour vers la v1.37.1 ou plus récent, où __main__.py ne bascule sur
+    0.0.0.0 que si une clé est configurée. C'est une protection en profondeur,
+    pas la mesure principale : un --host explicite la contourne avec un simple
+    avertissement, et les lancements en conteneur en passent un.
+    Ne pas publier le port en attendant. « -p 127.0.0.1:8000:8000 » restreint la
+    publication à la boucle locale, et un intermédiaire qui authentifie devant le
+    port reste la fermeture la plus sûre. Rien dans ce produit ne joue ce rôle :
+    il n'a ni écran de connexion ni notion de compte.
+    Poser aussi OH_SECRET_KEY, sans quoi les secrets persistés le sont en clair
+    et, par _default_secret_key(), l'absence de clé de session entraîne celle du
+    chiffreur.
+    Vérifier depuis l'extérieur du périmètre, sur la route même qui porte le
+    constat : « curl -s -o /dev/null -w "%{http_code}"
+    http://<hote>:8000/api/conversations/search » doit rendre 401. Le code de
+    /server_info, lui, restera 200 : cette route est montée sans dépendance et
+    répond dans les deux états.
+    Après une exposition, tenir pour compromis l'espace de travail de l'agent —
+    bash_router et file_router y donnent exécution et écriture — et renouveler
+    les clés des fournisseurs de modèle configurées, l'en-tête X-Expose-Secrets
+    ayant pu être demandé en clair par n'importe quel appelant. Contrôler la
+    facturation de ces fournisseurs sur la période : l'inférence anonyme n'a
+    laissé aucune identité d'appelant.
+  reference:
+    - https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-agent-server/openhands/agent_server/server_details_router.py
+    - https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-agent-server/openhands/agent_server/api.py
+    - https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-agent-server/openhands/agent_server/dependencies.py
+    - https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-agent-server/openhands/agent_server/config.py
+    - https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-agent-server/openhands/agent_server/__main__.py
+    - https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-agent-server/openhands/agent_server/settings_router.py
+    - https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-agent-server/openhands/agent_server/README.md
+    - https://github.com/OpenHands/software-agent-sdk/pull/4180
+  metadata:
+    max-request: 2
+    vendor: openhands
+    product: openhands-agent-server
+  tags: ai,llm,agent,openhands,agent-server,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /server_info nomme le produit : le title et les littéraux de
+  # capabilities de ServerInfo n'appartiennent qu'à lui. Mais api.py le monte
+  # par « app.include_router(server_details_router) », sans dépendance, donc il
+  # rend 200 à l'anonyme sur une instance à clé comme sur une instance ouverte
+  # — relevé sur les deux. Seul, il ne conclurait que « c'est bien ce
+  # produit », jamais « il est ouvert ».
+  #
+  # GET /api/conversations/search est sous « APIRouter(prefix="/api",
+  # dependencies=[Depends(check_session_api_key), Depends(require_initialized)])
+  # » : son 200 anonyme EST le constat. Le préfixe /api n'est pas celui du
+  # README, qui écrit /conversations/search — ce chemin-là rend 404 sur une
+  # instance réelle.
+  #
+  # Le préfixe que root_path=_get_root_path(config) introduit quand OH_WEB_URL
+  # est posée ne fait pas manquer la lecture, et ce point a été vérifié plutôt
+  # que supposé : sur une instance lancée avec OH_WEB_URL portant un chemin,
+  # les deux routes répondent 200 sur la forme nue COMME sur la forme préfixée.
+  # {{BaseURL}}, pointé sur le port lui-même, suffit donc dans les deux cas.
+  #
+  # En lecture seule, et strictement. Le même préfixe sert POST
+  # /api/conversations, qui créerait une conversation et ferait tourner un
+  # agent aux frais du fournisseur de modèle configuré ; les routes de
+  # bash_router, qui exécuteraient une commande sur l'hôte ; celles de
+  # file_router, qui écriraient dans l'espace de travail. Ce sont les abus que
+  # le template signale, pas ce qu'un scanner a le droit de faire pour les
+  # établir. GET /api/settings n'est pas joint non plus : son intérêt est la
+  # configuration LLM de l'exploitant, or l'établissement du constat n'en a
+  # aucun besoin, et l'en-tête X-Expose-Secrets encore moins.
+  - method: GET
+    path:
+      - "{{BaseURL}}/server_info"
+      - "{{BaseURL}}/api/conversations/search"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois. Sans lui, /server_info conclurait seul —
+    # or il répond 200 à l'anonyme quel que soit l'état de l'authentification.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le title, pris avec sa clé. ServerInfo le fixe en dur — « title:
+          # str = "OpenHands Agent Server" » —, donc c'est une constante du
+          # produit et non une valeur de déploiement. La forme regex plutôt que
+          # contains absorbe l'intermédiaire qui réindente ce qu'il relaie, là
+          # où FastAPI sérialise compact.
+          - 'status_code_1 == 200 && regex("\"title\"\\s*:\\s*\"OpenHands Agent Server\"", body_1)'
+
+          # Et un littéral de capabilities, qui est ce qui sépare ce serveur du
+          # produit amont : « OpenHands Agent Server » se retrouve dans le
+          # title de l'application FastAPI, donc dans /openapi.json et dans le
+          # HTML de /docs, alors que conversation_runtime_routes_v1 ne sort que
+          # de la fabrique de ce champ-ci. Un seul des cinq est exigé : la
+          # liste s'allonge de version en version, et réclamer les cinq ferait
+          # manquer les instances d'avant le dernier ajout.
+          - 'contains(body_1, "conversation_runtime_routes_v1")'
+
+          # La seconde réponse, et c'est elle qui conclut. ConversationPage
+          # ouvre sur items et ferme sur next_page_id, dans cet ordre — c'est
+          # l'ordre de déclaration du modèle, que pydantic conserve. Les deux
+          # ancres écartent le document composite d'une supervision qui
+          # recopierait la page avant d'y ajouter une clé à elle.
+          #
+          # L'index vide d'une instance neuve satisfait les deux, et c'est
+          # voulu : le constat est l'atteignabilité de la route gardée, pas le
+          # nombre de conversations. Une instance à clé rend ici 401 et
+          # « {"detail":"Unauthorized"} », donc ne satisfait ni le statut ni la
+          # forme ; une instance en deferred_init rend 503 avant d'atteindre le
+          # handler. Dans les deux cas le template se tait.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"items\"\\s*:\\s*\\[", trim_space(body_2))'
+          - 'regex("\"next_page_id\"\\s*:\\s*(null|\"[^\"]*\")\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # La version du paquet openhands-agent-server, et une seule raison de la
+      # relever : elle date l'instance par rapport au correctif #4180, publié à
+      # la v1.37.1, qui a fait passer l'hôte par défaut de 0.0.0.0 à la boucle
+      # locale en l'absence de clé. Une instance antérieure est exposée par son
+      # défaut ; une instance postérieure l'est par un choix de lancement, et le
+      # rapport ne dit pas la même chose dans les deux cas.
+      #
+      # Un seul extracteur, et borné à body_1 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second ferait
+      # remonter deux fois la même instance.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.version'
