@@ -1,0 +1,215 @@
+id: steel-browser-sessions-exposed
+
+info:
+  name: Steel Browser - Session Index Exposed Without Authentication
+  author: popy21
+  severity: high
+  description: |
+    Steel Browser (steel-dev/steel-browser, « Open Source Browser API for AI
+    Agents & Apps », 7 669 étoiles, dépôt actif et non archivé — dernier push
+    2026-09-16) est le bac à sable navigateur que les agents pilotent pour
+    naviguer sur le web : une API HTTP devant une instance Chrome, que l'agent
+    conduit ensuite par CDP.
+    GET /v1/sessions rend l'index de ces sessions. Le préfixe vient de
+    api/src/steel-browser-plugin.ts, qui enregistre sessionsRoutes — comme
+    actionsRoutes, cdpRoutes et filesRoutes — sous « { prefix: "/v1" } », et la
+    route elle-même de api/src/modules/sessions/sessions.routes.ts, où
+    « server.get("/sessions", ...) » déclare « response: { 200:
+    $ref("MultipleSessions") } ». Le handler est api/src/modules/sessions/
+    sessions.controller.ts : handleGetSessions se termine par « return
+    reply.send({ sessions: [currentSession, ...pastSessions] }) ». C'est un
+    objet à clé sessions, pas un tableau nu, et le tableau n'est jamais vide —
+    le constructeur de SessionService (api/src/services/session.service.ts)
+    pose activeSession dès le démarrage, donc une instance qui n'a jamais lancé
+    de navigateur rend quand même une entrée, celle de la session par défaut.
+    La forme du document est fixée par le schéma, pas par l'objet. api/src/
+    plugins/schemas.ts passe les modèles zod par buildJsonSchemas
+    (zodToJsonSchema, target openApi3, $refStrategy « none ») puis
+    fastify.addSchema, et fastify compile un sérialiseur à partir du schéma de
+    réponse : le corps porte les propriétés déclarées, dans l'ordre de
+    déclaration, et rien d'autre. C'est ce qui explique que les champs internes
+    de la session — completion, complete, proxyServer, que le type Session
+    ajoute à SessionDetails — n'apparaissent pas.
+    L'ordre est donc celui du littéral SessionDetails dans api/src/modules/
+    sessions/sessions.schema.ts : id, createdAt, status, duration, eventCount,
+    dimensions, timeout, creditsUsed, websocketUrl, debugUrl, debuggerUrl,
+    sessionViewerUrl, userAgent, proxy, proxyTxBytes, proxyRxBytes,
+    solveCaptcha, isSelenium, deviceConfig. Et « MultipleSessions =
+    z.object({ sessions: z.array(SessionDetails) }) » n'a qu'une propriété,
+    donc sessions ouvre le document.
+    L'absence d'authentification n'est pas un réglage manqué, c'est une
+    fonctionnalité absente du produit. GET /sessions ne porte ni preHandler ni
+    onRequest d'authentification, et pas davantage POST /sessions,
+    GET /sessions/:sessionId, POST /sessions/:sessionId/release,
+    POST /sessions/scrape, POST /sessions/screenshot ni POST /sessions/pdf.
+    api/src/index.ts n'enregistre que fastifySensible et fastifyCors
+    (« origin: true ») avant « server.register(steelBrowserPlugin, ...) », et le
+    plugin n'enregistre que fastifyView, requestLogger, openAPIPlugin,
+    fileStoragePlugin, browserInstancePlugin, seleniumPlugin, browserWebSocket,
+    customBodyParser et browserSessionPlugin — aucun module d'authentification.
+    api/src/env.ts ne déclare aucune variable qui en armerait une, et le
+    document OpenAPI que schemas.ts publie porte « securitySchemes: {} ».
+    Le serveur écoute par défaut sur toutes les interfaces : index.ts lit
+    « HOST = process.env.HOST ?? "0.0.0.0" » et « PORT = ... ?? 3000 », sans
+    qu'aucun drapeau n'ait à être passé.
+    Ce que le template retient du corps est le trio sessionViewerUrl +
+    debuggerUrl + creditsUsed, tenu entre les deux bouts du document. La clé
+    sessions, seule, est le vocabulaire de n'importe quelle API qui liste des
+    sessions ; le statut HTTP ne sépare rien, puisque aucune couche ne filtre en
+    amont et qu'une instance fermée ne répond pas du tout.
+  impact: |
+    La réponse énumère les sessions de navigation de l'agent et livre pour
+    chacune websocketUrl, debugUrl et debuggerUrl — les points d'entrée de
+    pilotage du navigateur, tels que session.service.ts les compose :
+    getBaseUrl("ws"), getUrl("v1/sessions/debug") et
+    getUrl("v1/devtools/inspector.html").
+    Ce que ces URL autorisent à un appelant sans jeton — pilotage CDP complet,
+    lecture des cookies de session de l'agent — n'a pas été relevé à la source
+    ici et n'est donc pas affirmé : c'est à contrôler sur l'instance réelle, et
+    sur la version en place, avant d'en faire une preuve chiffrée. Même réserve
+    pour POST /v1/sessions/scrape, monté sur ce même routeur non protégé : le
+    schéma de son corps de requête n'a pas été vérifié, donc rien n'est annoncé
+    ici quant à un usage en proxy de scraping.
+    Ce que l'index établit à lui seul, en revanche, ne dépend d'aucune
+    vérification supplémentaire. status, duration, eventCount et creditsUsed
+    disent si un navigateur est piloté en ce moment et depuis combien de temps ;
+    proxyTxBytes et proxyRxBytes disent le volume qui a transité ; userAgent,
+    dimensions et deviceConfig donnent l'empreinte que l'agent présente aux
+    sites qu'il visite. sessionViewerUrl et debugUrl, enfin, sont bâtis sur
+    env.DOMAIN quand la variable est posée : l'index nomme alors le domaine
+    public que l'exploitant a configuré, qui n'est pas forcément l'adresse
+    scannée.
+    La portée de cette lecture dépasse l'exposition directe. index.ts
+    enregistre fastifyCors avec « origin: true », donc l'en-tête
+    Access-Control-Allow-Origin reflète l'appelant : n'importe quelle page web
+    que l'exploitant visite peut lire cet index sur une instance que son
+    navigateur atteint, y compris une instance restée sur la boucle locale.
+  remediation: |
+    Il n'y a pas d'authentification à activer : env.ts ne déclare aucune
+    variable qui en arme une, et api/src/plugins/ ne contient aucun module
+    d'authentification. La fermeture est donc réseau, pas applicative.
+    Ne pas publier le port. Poser HOST sur la boucle locale — index.ts lit
+    « process.env.HOST ?? "0.0.0.0" », donc la valeur par défaut est toutes les
+    interfaces — et, sous Docker, publier le port sur 127.0.0.1 plutôt que sur
+    0.0.0.0. Si l'API doit être jointe depuis une autre machine, placer devant
+    elle un intermédiaire qui authentifie, et ne laisser passer que ce dont
+    l'appelant légitime a besoin.
+    Ne pas compter sur la boucle locale seule pour autant : « fastifyCors,
+    { origin: true } » reflète l'origine de l'appelant, donc une page visitée
+    par l'exploitant lit l'index d'une instance liée à 127.0.0.1. Restreindre
+    l'origine à celle du front légitime, ou placer l'API derrière
+    l'intermédiaire ci-dessus, est ce qui retire cette lecture.
+    Vérifier depuis l'extérieur du périmètre : « curl -s -o /dev/null -w
+    "%{http_code}" http://<hote>:3000/v1/sessions » ne doit pas aboutir du tout.
+    Un 200 y rend l'index — le port est celui que rend « process.env.PORT ??
+    3000 ».
+    Après une exposition, tenir l'index pour lu : les sessions qu'il portait,
+    leur durée et l'empreinte du navigateur ont été vues. Établir ensuite, sur
+    la version en place, ce que websocketUrl, debugUrl et debuggerUrl
+    autorisaient sans jeton — c'est ce point, et non l'index, qui décide s'il
+    faut aussi traiter comme compromis ce que l'agent a fait dans ce navigateur.
+  reference:
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/modules/sessions/sessions.routes.ts
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/modules/sessions/sessions.controller.ts
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/modules/sessions/sessions.schema.ts
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/steel-browser-plugin.ts
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/index.ts
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/plugins/schemas.ts
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/services/session.service.ts
+    - https://github.com/steel-dev/steel-browser/blob/main/api/src/env.ts
+  metadata:
+    max-request: 1
+    vendor: steel-dev
+    product: steel-browser
+  tags: ai,llm,agent,browser,steel-browser,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la moins intrusive qui établisse le constat.
+  #
+  # Le même routeur non protégé sert POST /v1/sessions, qui lancerait un
+  # navigateur sur l'instance auditée, POST /v1/sessions/:sessionId/release, qui
+  # couperait la session d'un tiers en cours, et POST /v1/sessions/scrape,
+  # /screenshot et /pdf, qui feraient naviguer le navigateur de la cible vers une
+  # URL choisie par l'appelant. Ce sont les abus que le template signale, pas ce
+  # qu'un scanner a le droit de faire pour les établir.
+  #
+  # GET /v1/health n'est pas interrogé : son handler rend « { status: "ok" } »,
+  # qui ne nomme aucun produit, et le 503 qu'il rend quand le navigateur ne
+  # tourne pas ne dirait rien de l'authentification. Une requête de plus pour
+  # zéro corroboration.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/sessions"
+
+    matchers:
+      # Trois expressions, toutes requises : l'ouverture du document, le trio
+      # propre au produit, la fermeture.
+      #
+      # La première ancre l'enveloppe et exige une entrée. MultipleSessions n'a
+      # qu'une propriété, donc sessions ouvre le corps, et le « [{ » dit que le
+      # tableau n'est pas vide — ce que le handler garantit, puisqu'il préfixe
+      # toujours currentSession, que le constructeur de SessionService crée au
+      # démarrage. Un tableau vide ne viendrait donc pas de ce produit, et ne
+      # porterait de toute façon aucune preuve.
+      #
+      # La deuxième est le constat. « sessions » seul est le vocabulaire de
+      # n'importe quelle API qui liste des sessions ; creditsUsed suivi de
+      # websocketUrl, debugUrl, debuggerUrl et sessionViewerUrl n'appartient
+      # qu'à SessionDetails. La contiguïté n'est pas une supposition : la route
+      # déclare « response: { 200: $ref("MultipleSessions") } », donc fastify
+      # sérialise d'après le schéma, dans l'ordre du littéral zod, et aucun
+      # champ facultatif ne se glisse entre ces cinq-là — dimensions, le seul
+      # optionnel de la zone, est déclaré avant timeout, donc avant le début de
+      # la chaîne.
+      #
+      # Ces cinq champs sont tous requis dans SessionDetails : aucun ne manque
+      # sur une instance fraîche. Les facultatifs — userAgent, proxy,
+      # solveCaptcha, isSelenium, deviceConfig — sont tous déclarés après
+      # sessionViewerUrl, donc leur absence ne casse pas la chaîne.
+      #
+      # La troisième ferme le document. Elle écarte la charge utile recopiée par
+      # un intermédiaire qui ajoute une clé derrière le tableau, là où l'ancrage
+      # d'ouverture, seul, écarte celle qu'un inventaire republie au fond du
+      # sien. Ensemble, elles disent que c'est l'instance qui a répondu.
+      #
+      # Le statut HTTP n'entre dans aucune des trois, et pas par prudence :
+      # aucune couche ne filtre en amont de ce handler, donc une instance
+      # exposée rend 200 et une instance fermée ne répond pas du tout. Le code
+      # ne sépare rien ; le corps, si.
+      #
+      # Les \s* absorbent l'intermédiaire qui réindente ce qu'il relaie, là où
+      # fastify sérialise compact, et le saut de ligne qu'il ajouterait au corps
+      # — le `$` de Go ne tolère pas celui-ci de lui-même, contrairement à celui
+      # de Python.
+      #
+      # Angle mort assumé, le même que pour tout ancrage d'ordre : une version
+      # qui insérerait un champ entre creditsUsed et sessionViewerUrl, ou qui
+      # déclarerait une seconde propriété dans MultipleSessions, ne serait plus
+      # signalée. C'est le prix de ne pas conclure sur un document composite, et
+      # il est payé sciemment.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"sessions"\s*:\s*\[\s*\{'
+          - '"creditsUsed"\s*:\s*-?\d+\s*,\s*"websocketUrl"\s*:\s*"[^"]*"\s*,\s*"debugUrl"\s*:\s*"[^"]*"\s*,\s*"debuggerUrl"\s*:\s*"[^"]*"\s*,\s*"sessionViewerUrl"\s*:\s*"'
+          - '\]\s*\}\s*$'
+        condition: and
+
+    extractors:
+      # Le statut de la première entrée, c'est-à-dire celui de la session
+      # courante — handleGetSessions la préfixe. « live » dit qu'un navigateur
+      # est piloté au moment du scan, « idle » qu'aucun ne l'est encore : c'est
+      # ce qui sépare une instance oubliée d'une instance en production, donc ce
+      # qui décide de l'urgence. L'énumération de SessionDetails en fixe les
+      # quatre valeurs possibles : idle, live, released, failed.
+      #
+      # Un seul relevé, et c'est une contrainte du moteur plutôt qu'un choix de
+      # concision : nuclei émet un résultat par extracteur qui rend quelque
+      # chose, donc un second ferait remonter deux fois la même instance. Le
+      # nombre d'entrées — la session courante plus les sessions passées que
+      # SessionService accumule dans pastSessions — se lit dans la réponse
+      # capturée, il n'a pas à coûter une ligne de rapport de plus.
+      - type: json
+        name: status
+        json:
+          - '.sessions[0].status'

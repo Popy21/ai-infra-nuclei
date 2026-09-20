@@ -32004,6 +32004,503 @@ def test_sillytavern_matcher_compiles_and_fires_against_a_live_server():
         assert refused == [], "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# Steel Browser — steel-dev/steel-browser, le bac à sable navigateur que les
+# agents pilotent pour naviguer sur le web.
+#
+# Ce que cette section amarre tient en trois points. Le premier : la forme du
+# document est fixée par le schéma, pas par l'objet. sessions.routes.ts déclare
+# « response: { 200: $ref("MultipleSessions") } », plugins/schemas.ts enregistre
+# les modèles zod convertis par buildJsonSchemas, et fastify compile alors un
+# sérialiseur d'après le schéma : le corps porte les propriétés déclarées, dans
+# l'ordre du littéral, et rien d'autre — c'est ce qui explique que completion,
+# complete et proxyServer, que le type Session ajoute à SessionDetails, n'y
+# soient pas. L'ordre de creditsUsed, websocketUrl, debugUrl, debuggerUrl et
+# sessionViewerUrl est donc une garantie, pas une observation.
+#
+# Le deuxième : le tableau n'est jamais vide. Le constructeur de SessionService
+# pose activeSession dès le démarrage et handleGetSessions la préfixe —
+# « return reply.send({ sessions: [currentSession, ...pastSessions] }) » —, donc
+# une instance qui n'a jamais lancé de navigateur rend quand même une entrée.
+#
+# Le troisième, et c'est lui qui fait le constat : rien ne filtre en amont. Ni
+# GET /sessions ni aucune des routes voisines ne porte de preHandler ou de
+# onRequest d'authentification, index.ts n'enregistre que fastifySensible et
+# fastifyCors, le plugin n'enregistre aucun module d'authentification et env.ts
+# ne déclare aucune variable qui en armerait une. Une instance fermée ne répond
+# donc pas du tout : le statut ne sépare rien, seul le corps le fait.
+
+STEEL_BROWSER_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                      "steel-browser-sessions-exposed.yaml")
+
+STEEL_BROWSER_SESSIONS_ROUTE = "/v1/sessions"
+
+
+def steel_browser_session(status="idle", credits_used=0, dimensions=True,
+                          optionals=True, device_config=False,
+                          base="http://0.0.0.0:3000/"):
+    """
+    Une entrée de l'index, dans l'ordre où fastify la sérialise — celui du
+    littéral SessionDetails.
+
+    Les valeurs d'URL sont celles que session.service.ts compose pour la session
+    par défaut : getBaseUrl("ws") pour websocketUrl,
+    getUrl("v1/sessions/debug") pour debugUrl,
+    getUrl("v1/devtools/inspector.html") pour debuggerUrl et getBaseUrl() pour
+    sessionViewerUrl.
+
+    `dimensions=False` et `optionals=False` rendent les formes où les champs
+    facultatifs manquent ; `device_config=True` rend celle où le dernier d'entre
+    eux est présent.
+    """
+    payload = {
+        "id": "0b1f1d1e-6f7a-4e26-9a2f-2a5c4d0a1b3c",
+        "createdAt": "2026-09-20T09:00:00.000Z",
+        "status": status,
+        "duration": 128_000,
+        "eventCount": 42,
+    }
+    if dimensions:
+        payload["dimensions"] = {"width": 1920, "height": 1080}
+    payload["timeout"] = 0
+    payload["creditsUsed"] = credits_used
+    payload["websocketUrl"] = "ws://0.0.0.0:3000/"
+    payload["debugUrl"] = base + "v1/sessions/debug"
+    payload["debuggerUrl"] = base + "v1/devtools/inspector.html"
+    payload["sessionViewerUrl"] = base
+    if optionals:
+        payload["userAgent"] = "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0.0.0"
+        payload["proxy"] = ""
+        payload["proxyTxBytes"] = 0
+        payload["proxyRxBytes"] = 0
+        payload["solveCaptcha"] = False
+        payload["isSelenium"] = False
+    else:
+        payload["proxyTxBytes"] = 0
+        payload["proxyRxBytes"] = 0
+    if device_config:
+        payload["deviceConfig"] = {"device": "desktop"}
+    return payload
+
+
+def steel_browser_body(sessions=None, indent=None):
+    """MultipleSessions : une seule propriété, donc sessions ouvre le document."""
+    if sessions is None:
+        sessions = [steel_browser_session()]
+    payload = {"sessions": sessions}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# Ce que rend une instance ouverte qui n'a jamais lancé de navigateur : la
+# session par défaut, seule, avec ses compteurs à zéro.
+STEEL_BROWSER_OPEN_BODY = steel_browser_body()
+
+# La même après quelques navigations : la session courante, puis les sessions
+# passées que SessionService accumule dans pastSessions.
+STEEL_BROWSER_USED_BODY = steel_browser_body(sessions=[
+    steel_browser_session(status="live", credits_used=3),
+    steel_browser_session(status="released", credits_used=1),
+    steel_browser_session(status="failed", credits_used=0),
+])
+
+# Le tableau vide : le handler ne le rend jamais, puisqu'il préfixe toujours
+# currentSession. Et il ne porterait de toute façon aucune preuve.
+STEEL_BROWSER_EMPTY_BODY = steel_browser_body(sessions=[])
+
+# La charge utile entière retrouvée au fond du document d'un inventaire qui
+# l'agrégerait sous une clé à lui : ce n'est pas l'instance qui a répondu.
+STEEL_BROWSER_COMPOSITE_BODY = ('{"steel":%s,"checked_at":0}'
+                                % STEEL_BROWSER_OPEN_BODY)
+
+# La même, recopiée en tête par un intermédiaire qui ajoute une clé derrière le
+# tableau. L'ancrage d'ouverture ne l'écarterait pas seul.
+STEEL_BROWSER_APPENDED_BODY = (STEEL_BROWSER_OPEN_BODY[:-1]
+                               + ',"checked_at":0}')
+
+# N'importe quelle API qui liste des sessions : la clé, et rien du produit.
+STEEL_BROWSER_OTHER_SESSIONS_BODY = (
+    '{"sessions":[{"id":"9f3c","user":"alice","createdAt":"2026-09-20T09:00:00Z",'
+    '"status":"active","lastSeen":"2026-09-20T09:12:00Z"}]}'
+)
+
+# Le document OpenAPI que plugins/schemas.ts publie sous /documentation : il
+# porte les trois noms de champ du trio, en propriétés de schéma. C'est la
+# description du produit, pas la réponse d'une instance.
+STEEL_BROWSER_OPENAPI_BODY = (
+    '{"openapi":"3.0.3","info":{"title":"Steel Browser Instance API",'
+    '"version":"0.0.1"},"components":{"securitySchemes":{},"schemas":'
+    '{"SessionDetails":{"type":"object","properties":{"creditsUsed":'
+    '{"type":"integer"},"websocketUrl":{"type":"string"},"debugUrl":'
+    '{"type":"string"},"debuggerUrl":{"type":"string"},"sessionViewerUrl":'
+    '{"type":"string"}}}}}}'
+)
+
+# Ce que rend fastify quand la route n'existe pas — une instance qui n'est pas
+# ce produit, ou qui le sert sous un autre préfixe.
+STEEL_BROWSER_NOT_FOUND_BODY = (
+    '{"message":"Route GET:/v1/sessions not found","error":"Not Found",'
+    '"statusCode":404}'
+)
+
+# L'état que la remédiation demande : un intermédiaire qui authentifie devant
+# l'API. Le template doit se taire dessus.
+STEEL_BROWSER_PROXY_DENIED_BODY = (
+    '<html>\n<head><title>401 Authorization Required</title></head>\n<body>\n'
+    '<center><h1>401 Authorization Required</h1></center>\n</body>\n</html>\n'
+)
+
+
+def steel_browser_block():
+    doc = load(STEEL_BROWSER_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % STEEL_BROWSER_SESSIONS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant la seule route du "
+        "produit qui établisse le constat sans rien écrire ni rien piloter"
+        % STEEL_BROWSER_SESSIONS_ROUTE
+    )
+    return blocks[0]
+
+
+def steel_browser_fires(status=200, body=None):
+    """
+    Sémantique nuclei d'un bloc à une seule requête. Le paramètre de statut est
+    tenu pour que le cas de l'intermédiaire qui refuse se dise, même si le bloc
+    n'a pas à en dépendre.
+    """
+    block = steel_browser_block()
+    if body is None:
+        body = STEEL_BROWSER_OPEN_BODY
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_steel_browser_probe_reads_the_index_and_neither_launches_nor_drives_a_browser():
+    """
+    Le même routeur non protégé porte tout le reste : POST /v1/sessions
+    lancerait un navigateur sur l'instance auditée, POST
+    /v1/sessions/:sessionId/release couperait la session d'un tiers en cours, et
+    /scrape, /screenshot et /pdf feraient naviguer le navigateur de la cible
+    vers une URL choisie par l'appelant. GET /v1/sessions, lui, lit un index
+    déjà en mémoire.
+    """
+    doc = load(STEEL_BROWSER_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", STEEL_BROWSER_SESSIONS_ROUTE)}, (
+        "le template interroge autre chose que l'index des sessions — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'index se lit en GET : tout ce qui lance, relâche ou pilote une "
+            "session sur ce produit est en POST"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande d'écrire sur l'instance auditée"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/sessions/scrape", "faire naviguer le navigateur de la cible "
+                                     "vers une URL choisie par l'appelant, et "
+                                     "le schéma du corps de cette route n'a de "
+                                     "toute façon pas été vérifié"),
+                ("/sessions/screenshot", "faire naviguer le navigateur de la "
+                                         "cible"),
+                ("/sessions/pdf", "faire naviguer le navigateur de la cible"),
+                ("/release", "relâcher une session couperait la navigation d'un "
+                             "tiers en cours"),
+                ("/context", "le contexte de navigation porte les cookies de la "
+                             "session de l'agent"),
+                ("/live-details", "l'état vivant énumère les pages et les "
+                                  "onglets ouverts par un tiers"),
+                ("/sessions/debug", "la vue de débogage est un point d'entrée "
+                                    "de pilotage, pas une lecture"),
+                ("/devtools/", "l'inspecteur est un point d'entrée de pilotage"),
+                ("/v1/cdp", "le routeur CDP pilote le navigateur"),
+                ("/v1/files", "les fichiers d'une session appartiennent à un "
+                              "tiers"),
+                ("/v1/logs", "les journaux d'une session appartiennent à un "
+                             "tiers"),
+                ("/events", "poster des événements écrirait sur l'instance "
+                            "auditée"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_steel_browser_matcher_rests_on_the_url_trio_not_on_the_sessions_key():
+    """
+    Le point qui fait ce template. « sessions » et une liste d'objets à id et
+    status sont le vocabulaire de n'importe quelle API de session ; creditsUsed
+    suivi de websocketUrl, debugUrl, debuggerUrl et sessionViewerUrl n'appartient
+    qu'à SessionDetails.
+    """
+    assert steel_browser_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance ouverte"
+    )
+
+    for other, why in (
+        (STEEL_BROWSER_OTHER_SESSIONS_BODY,
+         "une API quelconque qui liste des sessions sous la même clé"),
+        (STEEL_BROWSER_OPENAPI_BODY,
+         "le document OpenAPI du produit, qui porte les trois noms de champ en "
+         "propriétés de schéma : c'est la description du produit, pas la "
+         "réponse d'une instance"),
+        (STEEL_BROWSER_EMPTY_BODY,
+         "un tableau vide, que le handler ne rend jamais — il préfixe toujours "
+         "currentSession — et qui ne porterait aucune preuve"),
+        (STEEL_BROWSER_NOT_FOUND_BODY,
+         "le 404 de fastify, c'est-à-dire une instance qui ne sert pas ce chemin"),
+        ("", "une réponse vide"),
+    ):
+        assert not steel_browser_fires(body=other), "le template conclut sur %s" % why
+
+
+def test_steel_browser_matcher_holds_on_a_fresh_instance_and_on_a_used_one():
+    """
+    Les cinq champs de la chaîne sont requis dans SessionDetails, donc présents
+    dès la session par défaut ; les facultatifs — dimensions avant, userAgent,
+    proxy, solveCaptcha, isSelenium et deviceConfig après — ne doivent contraindre
+    ni dans un sens ni dans l'autre. Les exiger ferait manquer exactement les
+    instances les moins configurées.
+    """
+    for body, why in (
+        (STEEL_BROWSER_USED_BODY,
+         "une instance qui pilote un navigateur et en a déjà relâché deux"),
+        (steel_browser_body(sessions=[steel_browser_session(dimensions=False)]),
+         "une session sans dimensions : le champ est facultatif et se déclare "
+         "avant timeout, donc avant le début de la chaîne"),
+        (steel_browser_body(sessions=[steel_browser_session(optionals=False)]),
+         "une session sans userAgent, proxy, solveCaptcha ni isSelenium : tous "
+         "facultatifs, et tous déclarés après sessionViewerUrl"),
+        (steel_browser_body(sessions=[steel_browser_session(device_config=True)]),
+         "une session dont deviceConfig, le dernier champ du schéma, est posé"),
+        (steel_browser_body(sessions=[steel_browser_session(credits_used=1207)]),
+         "une instance qui a consommé des crédits"),
+        (steel_browser_body(sessions=[steel_browser_session(
+            base="https://steel.internal/")]),
+         "une instance dont env.DOMAIN est posé : les URL du trio sont alors "
+         "bâties sur le domaine public, pas sur l'adresse scannée"),
+        (steel_browser_body(indent=2),
+         "un intermédiaire qui réindente ce qu'il relaie, là où fastify "
+         "sérialise compact"),
+        (STEEL_BROWSER_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne au corps relayé"),
+    ):
+        assert steel_browser_fires(body=body), "le template perd %s" % why
+
+
+def test_steel_browser_matcher_refuses_the_payload_republished_by_a_third_party():
+    """
+    Les deux ancrages d'enveloppe, et chacun a sa cible. Celui d'ouverture écarte
+    la charge utile agrégée sous une clé étrangère ; celui de fermeture écarte le
+    document qui la recopie en tête avant d'ajouter la sienne — que le premier
+    laisserait passer.
+    """
+    assert not steel_browser_fires(body=STEEL_BROWSER_COMPOSITE_BODY), (
+        "le template conclut sur la charge utile republiée au fond du document "
+        "d'un inventaire : c'est l'ancrage d'ouverture qui dit que l'instance a "
+        "répondu d'elle-même"
+    )
+    assert not steel_browser_fires(body=STEEL_BROWSER_APPENDED_BODY), (
+        "le template conclut sur un document composite qui ouvre bien sur "
+        "l'index mais ajoute une clé derrière le tableau : sans ancrage de "
+        "fermeture, l'ouverture ne suffit pas"
+    )
+
+
+def test_steel_browser_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le code ne distingue rien ici : aucune couche ne filtre en amont du handler,
+    donc une instance exposée rend 200 et une instance fermée ne répond pas du
+    tout. Un matcher de statut ferait en prime conclure sur le 200 d'un
+    intermédiaire qui sert autre chose sur ce chemin.
+    """
+    block = steel_browser_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : ce qui sépare l'index du produit "
+        "d'une autre réponse est le corps, jamais le code"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : le constat est le "
+            "trio tenu entre les deux ancrages d'enveloppe, et aucune des trois "
+            "ne conclut seule"
+        )
+
+    assert steel_browser_fires(status=304), (
+        "le template dépend du code rendu, alors que le corps est bien l'index "
+        "servi à l'anonyme"
+    )
+
+    assert not steel_browser_fires(status=401,
+                                   body=STEEL_BROWSER_PROXY_DENIED_BODY), (
+        "le template conclut sur l'intermédiaire qui authentifie devant l'API, "
+        "c'est-à-dire sur l'état que la remédiation demande"
+    )
+
+
+def test_steel_browser_reports_the_state_of_the_current_session_and_only_it():
+    """
+    Le relevé dit ce que les matchers laissent libre : le statut de la session
+    courante, c'est-à-dire si un navigateur est piloté au moment du scan.
+
+    Et il est seul, ce qui n'est pas de la concision : nuclei émet un résultat
+    par extracteur qui rend quelque chose, donc un second ferait remonter deux
+    fois la même instance.
+    """
+    extractors = steel_browser_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul extracteur : le moteur émet un résultat par extracteur, donc "
+        f"un second dédoublerait la ligne de rapport — {extractors}"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "le corps est du JSON : une expression jq le lit sans dépendre de la "
+        "sérialisation — %s" % extractor
+    )
+    assert extractor.get("json") == [".sessions[0].status"], (
+        "l'extracteur ne relève pas le statut de la session courante — %s"
+        % extractor
+    )
+
+    document = json.loads(STEEL_BROWSER_USED_BODY)
+    assert document["sessions"][0]["status"] == "live", (
+        "le cas de test ne dit pas ce qu'il croit dire : la session courante "
+        "est la première, puisque handleGetSessions la préfixe"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_steel_browser_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher, et
+    `body_matcher_hits` les réévalue avec le moteur d'expressions de Python
+    plutôt qu'avec celui de Go : seul un scan contre un vrai serveur ferme la
+    boucle. L'enjeu propre est ici le `$`, dont la sémantique diffère entre les
+    deux moteurs — Python le fait aussi correspondre juste avant un saut de ligne
+    final, Go non —, et le corps relayé peut en porter un.
+    """
+    def scan(status, body, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == STEEL_BROWSER_SESSIONS_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, STEEL_BROWSER_NOT_FOUND_BODY)
+
+            def reply(self, code, payload, kind="application/json"):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", STEEL_BROWSER_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "steel-browser-sessions-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan(200, STEEL_BROWSER_OPEN_BODY)
+    assert seen == [STEEL_BROWSER_SESSIONS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        "le scan ne reconnaît pas la réponse d'une instance ouverte, ou il la "
+        f"signale plusieurs fois — {results}"
+    )
+    assert results[0].get("extracted-results") == ["idle"], (
+        "le relevé ne rend pas le statut de la session courante — %s"
+        % results[0].get("extracted-results")
+    )
+
+    _, results = scan(200, STEEL_BROWSER_USED_BODY)
+    assert len(results) == 1, (
+        "le scan perd une instance qui a déjà servi plusieurs sessions, ou il "
+        f"émet une ligne par entrée de l'index — {results}"
+    )
+    assert results[0].get("extracted-results") == ["live"], (
+        "le relevé ne suit pas la session courante, que handleGetSessions "
+        "préfixe — %s" % results[0].get("extracted-results")
+    )
+
+    _, results = scan(200, STEEL_BROWSER_OPEN_BODY + "\n")
+    assert len(results) == 1, (
+        "le scan perd le corps relayé avec un saut de ligne final : le `$` de "
+        f"Go ne se comporte pas comme celui de Python — {results}"
+    )
+
+    _, results = scan(200, steel_browser_body(indent=2))
+    assert len(results) == 1, (
+        f"le scan perd le corps réindenté par un intermédiaire — {results}"
+    )
+
+    for status, body, kind, why in (
+        (200, STEEL_BROWSER_EMPTY_BODY, "application/json",
+         "un tableau vide, que le handler ne rend jamais"),
+        (200, STEEL_BROWSER_OTHER_SESSIONS_BODY, "application/json",
+         "une API quelconque qui liste des sessions sous la même clé"),
+        (200, STEEL_BROWSER_OPENAPI_BODY, "application/json",
+         "le document OpenAPI du produit, qui porte les trois noms de champ"),
+        (200, STEEL_BROWSER_COMPOSITE_BODY, "application/json",
+         "la charge utile republiée au fond du document d'un inventaire"),
+        (200, STEEL_BROWSER_APPENDED_BODY, "application/json",
+         "un document composite qui ouvre sur l'index et ajoute une clé "
+         "derrière le tableau"),
+        (401, STEEL_BROWSER_PROXY_DENIED_BODY, "text/html",
+         "l'intermédiaire qui authentifie devant l'API"),
+        (404, STEEL_BROWSER_NOT_FOUND_BODY, "application/json",
+         "une instance qui ne sert pas ce chemin"),
+    ):
+        _, refused = scan(status, body, kind)
+        assert refused == [], "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
