@@ -1,0 +1,248 @@
+id: sillytavern-exposed
+
+info:
+  name: SillyTavern - Chat Frontend Reachable Without Whitelist or Authentication
+  author: popy21
+  severity: high
+  description: |
+    SillyTavern (SillyTavern/SillyTavern, « LLM Frontend for Power Users. ») est
+    l'une des interfaces de chat auto-hébergées les plus déployées. Elle ne sert
+    pas un modèle : elle relaie le chat vers les back-ends que l'exploitant y a
+    câblés, avec les clés d'API que le serveur conserve pour lui.
+    GET /version est la lecture, et sa réponse porte à elle seule le constat.
+    src/server-main.js déclare « app.get('/version', async function (_, response)
+    { const data = await getVersion(); response.send(data); }); », et getVersion()
+    (src/util.js) se termine par « const agent =
+    `SillyTavern:${pkgVersion}:Cohee#1207`; return { agent, pkgVersion,
+    gitRevision, gitBranch, commitDate: commitDate?.trim() ?? null, isLatest }; ».
+    Express sérialise l'objet dans l'ordre du littéral : agent ouvre le document,
+    isLatest le ferme. La chaîne « SillyTavern: » en tête de la valeur de agent
+    est propre au produit — aucun autre service ne se nomme dans son propre champ
+    d'agent de cette façon — et c'est sur elle, tenue à pkgVersion, que porte le
+    matcher. Jamais sur le statut : la route rend 200 dans les deux états du
+    produit dès lors qu'elle est atteinte, et c'est d'être atteinte qui fait le
+    constat.
+    Ce que la réponse prouve vient de l'ordre des couches, pas du contenu du
+    corps. src/server-main.js monte les contrôles d'accès par app.use avant de
+    déclarer la moindre route, et /version est déclarée après tous :
+    « if (cliArgs.listen && cliArgs.basicAuthMode) { app.use(basicAuthMiddleware); } »,
+    puis « if (cliArgs.whitelistMode) { const whitelistMiddleware = await
+    getWhitelistMiddleware(); app.use(whitelistMiddleware); } », puis
+    « app.use(setUserDataMiddleware); », puis — sous le commentaire « Everything
+    below this line requires authentication » — « app.use(requireLoginMiddleware); ».
+    Chacune de ces trois couches refuse avant d'arriver au handler :
+    basicAuthMiddleware rend 401 avec l'en-tête « WWW-Authenticate: Basic
+    realm="SillyTavern" » et la page unauthorized.html, le middleware de liste
+    blanche rend « res.status(403).send(forbiddenWebpage({ ipDetails })) », et
+    requireLoginMiddleware (src/users.js) rend « if (!request.user) { return
+    response.sendStatus(403); } ». Recevoir la charge utile de getVersion() depuis
+    l'extérieur établit donc les trois négations d'un coup : ni liste blanche, ni
+    authentification basique, ni compte utilisateur ne filtrent l'appelant.
+    La troisième est celle que le corps ne dit pas et que l'ordre des couches
+    donne quand même. setUserDataMiddleware ouvre par « if (!ENABLE_ACCOUNTS) {
+    ... request.user = { profile: DEFAULT_USER, directories }; return next(); } » :
+    quand le mode multi-utilisateur est éteint, l'anonyme EST l'utilisateur par
+    défaut, et requireLoginMiddleware le laisse passer. Allumé et sans session, il
+    n'y a pas de request.user, et la route rend 403. Une réponse en 200 sur
+    /version dit donc aussi qu'aucun compte ne se tient devant les données.
+    Les valeurs par défaut de default/config.yaml situent le défaut de
+    configuration : « listen: false » (« Listen for incoming connections »),
+    « whitelistMode: true » (« Toggle whitelist mode », avec whitelist limitée à
+    ::1 et 127.0.0.1), « basicAuthMode: false » (« Toggle basic authentication for
+    endpoints »), « enableUserAccounts: false » (« Enable multi-user mode »),
+    « port: 8000 », « securityOverride: false » (« Disable startup security checks
+    - NOT RECOMMENDED »). L'authentification est donc éteinte au départ, et elle
+    n'est de toute façon armée que si listen l'est aussi — la condition est
+    « cliArgs.listen && cliArgs.basicAuthMode ». Une instance ouverte pour un
+    accès distant perd sa seule protection résiduelle dès que la liste blanche est
+    levée, ce que fait tout exploitant qui veut y accéder d'ailleurs que de la
+    machine. Le produit le sait : verifySecuritySettings() (src/users.js) n'avertit
+    que sous « if (!listen) { return; } », et le message est « Your current
+    SillyTavern configuration is insecure (listening to non-localhost). Enable
+    whitelisting, basic authentication or user accounts. » C'est un avertissement
+    au démarrage, dans la console du serveur — il ne ferme rien.
+    Deux couches restantes ne rattrapent pas la lecture. hostWhitelistMiddleware
+    est monté sans condition mais rend « if (!hostWhitelistEnabled) { return
+    next(); } », et hostWhitelist.enabled vaut false. Et la protection CSRF, active
+    par défaut, ne garde que les méthodes qui écrivent : elle est sans effet sur un
+    GET, et src/server-main.js sert « app.get('/csrf-token', ...) » AVANT
+    « app.use(csrfSyncProtection.csrfSynchronisedProtection); », donc le même
+    appelant anonyme obtient un jeton valide pour la suite.
+    À la différence de NextChat et LibreChat, déjà couverts, la preuve ne vient
+    pas d'un /api/config qui publierait un drapeau : elle vient de cette signature
+    de version et de la place de la route sous les trois couches.
+  impact: |
+    L'instance relaie le chat vers les back-ends que l'exploitant y a câblés, et
+    les clés vivent côté serveur. src/server-startup.js monte sous la même couche
+    d'authentification — celle que le constat établit comme franchie — les routes
+    de chaque fournisseur : /api/openai, /api/anthropic, /api/google,
+    /api/openrouter, /api/novelai, /api/nanogpt, /api/azure, /api/minimax,
+    /api/volcengine, /api/backends/chat-completions,
+    /api/backends/text-completions, /api/backends/kobold, /api/horde. C'est de
+    l'inférence aux frais de l'exploitant, sous son adresse IP, sur le quota de
+    ses fournisseurs, et sans compte à débiter : enableUserAccounts vaut false,
+    donc l'appelant anonyme est l'utilisateur par défaut et rien ne le distingue
+    du propriétaire dans les journaux.
+    Les données personnelles suivent, sous les mêmes routes : /api/chats porte
+    l'historique des conversations, /api/characters et /api/groups les personas et
+    les cartes de personnage, /api/worldinfo les livres de contexte,
+    /api/settings les réglages complets de l'instance, /api/stats l'usage,
+    /api/backups les sauvegardes, /api/files, /api/avatars et /api/backgrounds les
+    fichiers téléversés. Elles s'écrivent aussi bien qu'elles se lisent —
+    l'écriture réclame le jeton CSRF, que GET /csrf-token délivre au même anonyme.
+    Sur les secrets, la mesure exacte, sans l'exagérer :
+    POST /api/secrets/view et POST /api/secrets/find sont gardées par
+    « if (!allowKeysExposure) » (src/endpoints/secrets.js), et allowKeysExposure
+    vaut false par défaut — la valeur des clés ne ressort donc pas de l'API, sauf
+    pour la courte liste EXPORTABLE_KEYS, qui ne contient que des URL de service
+    de traduction. Ce n'est pas une fuite de secret et il ne faut pas la rapporter
+    comme telle. En revanche POST /api/secrets/read rend l'état des secrets, donc
+    l'inventaire des fournisseurs pour lesquels une clé est posée, et
+    POST /api/secrets/write en inscrit une : les clés ne sont pas lisibles, elles
+    sont utilisables, et la facture l'établit aussi bien qu'une exfiltration.
+    Le reste de la surface est celle d'un poste de travail : /api/extensions
+    installe des extensions, /api/assets et /api/content téléversent et importent,
+    /api/sd, /api/speech, /api/translate, /api/vector, /api/extra/caption et
+    /api/extra/classify font sortir des requêtes de la machine vers des services
+    tiers configurés. Et /api/users porte les routes administratives du mode
+    multi-utilisateur, dont le constat établit précisément qu'il ne garde rien.
+  remediation: |
+    Trois réglages, et ils ne ferment pas la même chose — en poser un seul laisse
+    une partie du constat debout.
+    La liaison d'abord. « listen: false » est le défaut, et c'est lui qui limite
+    le serveur à la machine ; le lever est ce qui ouvre tout le reste. Si l'accès
+    distant n'est pas nécessaire, le laisser à false et passer par un tunnel SSH
+    ou un VPN reste la fermeture la plus sûre. En conteneur, « -p
+    127.0.0.1:8000:8000 » plutôt que « -p 8000:8000 », qui publie sur toutes les
+    interfaces de l'hôte.
+    La liste blanche ensuite : « whitelistMode: true » avec une entrée `whitelist`
+    qui nomme les adresses autorisées. C'est la protection par défaut, et le
+    constat signifie qu'elle a été levée ou contournée. Derrière un intermédiaire,
+    elle ne voit que l'adresse de celui-ci — d'où `enableForwardedWhitelist` et la
+    section `forwardedHeaders`, à ne configurer que si l'intermédiaire réécrit
+    lui-même ces en-têtes, faute de quoi un appelant les fabrique.
+    L'authentification enfin, et c'est la seule qui tienne sur un réseau non
+    maîtrisé : « basicAuthMode: true » avec un `basicAuthUser` dont le couple
+    username/password n'est plus « user » / « password », les valeurs livrées dans
+    default/config.yaml. Attention à la condition du montage — « if (cliArgs.listen
+    && cliArgs.basicAuthMode) » — l'authentification basique n'est active que
+    lorsque listen l'est : la poser sans ouvrir le port ne la met pas à l'épreuve,
+    et l'exploitant peut croire l'avoir vérifiée. Activer aussi
+    « enableUserAccounts: true » et poser un mot de passe sur chaque compte, le
+    mode multi-utilisateur étant la seule couche qui sépare les conversations les
+    unes des autres.
+    Ne pas toucher à « securityOverride », qui vaut false et dont le commentaire
+    du fichier dit « Disable startup security checks - NOT RECOMMENDED » : le
+    passer à true fait taire l'avertissement de verifySecuritySettings() sans rien
+    changer à l'exposition.
+    Vérifier la prise en compte sur la route même qui porte le constat, depuis
+    l'extérieur du périmètre et sans en-tête : « curl -s http://<hote>:8000/version »
+    ne doit plus rendre l'objet à six champs. Un 401 porteur de « WWW-Authenticate:
+    Basic realm="SillyTavern" » dit que l'authentification basique est en place,
+    un 403 que la liste blanche ou la connexion requise ont repris la main.
+    Après une exposition, tenir pour lus l'historique des conversations, les
+    personas, les livres de contexte et les réglages, et pour utilisables les clés
+    d'API câblées : les renouveler chez chaque fournisseur et contrôler la
+    facturation sur la période. Passer ensuite en revue ce qui a pu être écrit —
+    extensions installées, contenus importés, secrets inscrits, comptes créés sous
+    /api/users. Aucune de ces traces ne portera d'identité d'appelant : avec
+    enableUserAccounts à false, tout ce qui a été fait l'a été sous l'utilisateur
+    par défaut.
+  reference:
+    - https://github.com/SillyTavern/SillyTavern/blob/release/src/server-main.js
+    - https://github.com/SillyTavern/SillyTavern/blob/release/src/util.js
+    - https://github.com/SillyTavern/SillyTavern/blob/release/src/users.js
+    - https://github.com/SillyTavern/SillyTavern/blob/release/src/server-startup.js
+    - https://github.com/SillyTavern/SillyTavern/blob/release/src/middleware/whitelist.js
+    - https://github.com/SillyTavern/SillyTavern/blob/release/src/middleware/basicAuth.js
+    - https://github.com/SillyTavern/SillyTavern/blob/release/src/endpoints/secrets.js
+    - https://github.com/SillyTavern/SillyTavern/blob/release/default/config.yaml
+  metadata:
+    max-request: 1
+    vendor: sillytavern
+    product: sillytavern
+    shodan-query: http.title:"SillyTavern"
+  tags: ai,llm,sillytavern,chat,frontend,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier. getVersion() lit
+  # package.json et, quand git est présent, interroge le dépôt local : aucun
+  # back-end n'est joint, aucun modèle n'est appelé, rien n'est écrit.
+  #
+  # En lecture seule, et c'est délibéré. Toutes les routes que le constat établit
+  # comme ouvertes sont hors de portée du template : /api/chats rendrait
+  # l'historique de conversation d'un tiers, /api/characters ses personas,
+  # /api/secrets/read l'inventaire de ses fournisseurs, /api/backends/chat-completions
+  # dépenserait le budget qu'on est censé protéger, et /api/extensions écrirait sur
+  # l'instance auditée. Ce sont les abus que le template signale, pas ce qu'un
+  # scanner a le droit de faire pour les établir.
+  #
+  # GET /csrf-token n'est pas jointe non plus, bien qu'elle soit servie avant la
+  # protection CSRF et qu'elle délivre un jeton au même anonyme. Elle ne corrobore
+  # rien : son corps est « {"token":"<32 octets>"} », un vocabulaire que la moitié
+  # des applications web publient, et le jeton qu'elle rend n'a d'usage que pour
+  # écrire — précisément ce que le template s'interdit.
+  - method: GET
+    path:
+      - "{{BaseURL}}/version"
+
+    matchers:
+      # Deux expressions, une par extrémité du document, et il faut les deux.
+      #
+      # La première ancre l'ouverture et tient la signature à ce qui la date.
+      # Express sérialise l'objet rendu dans l'ordre du littéral de getVersion(),
+      # donc « agent » ouvre le corps et « pkgVersion » le suit immédiatement.
+      # « SillyTavern: » en tête de la valeur de agent est la chaîne propre au
+      # produit — elle est écrite telle quelle dans le gabarit
+      # `SillyTavern:${pkgVersion}:Cohee#1207` — et l'ancrage sur l'ouverture dit
+      # que c'est bien l'instance qui a répondu, non un document tiers qui la
+      # cite. Le deuxième segment est laissé libre : c'est un pseudonyme de
+      # mainteneur, il n'a pas à contraindre le template s'il change un jour.
+      # Le numéro de publication l'est aussi — il change à chaque version, et il
+      # vaut « UNKNOWN » quand la lecture de package.json échoue.
+      #
+      # La seconde ferme le document sur isLatest, dernier champ du littéral.
+      # Elle écarte ce que la première laisse passer : le document composite qui
+      # recopie la charge utile en tête avant d'ajouter une clé à lui. La
+      # première, symétriquement, écarte celui qui la republie au fond du sien.
+      #
+      # gitRevision, gitBranch et commitDate ne sont contraints ni l'un ni
+      # l'autre, et c'est nécessaire : getVersion() ne les remplit que sous
+      # « if (commandExistsSync('git')) », donc une installation par archive ou
+      # par image les rend tous les trois à null. Les exiger ferait manquer
+      # exactement les déploiements les moins suivis.
+      #
+      # Le code HTTP n'entre dans aucune des deux, et pas par prudence : ce que
+      # le constat établit est d'avoir traversé les trois couches montées avant
+      # la route — basicAuthMiddleware, le middleware de liste blanche et
+      # requireLoginMiddleware — et chacune refuse AVANT le handler, avec son
+      # propre code et son propre corps. Recevoir la charge utile de getVersion()
+      # est la preuve ; le 200 qui l'accompagne ne distingue rien, et un
+      # intermédiaire qui réécrit le code ferait manquer l'instance.
+      #
+      # Les \s* absorbent l'intermédiaire qui réindente ce qu'il relaie, là où
+      # Express sérialise compact.
+      #
+      # Angle mort assumé : une version future qui insérerait un champ avant
+      # agent ou après isLatest déplacerait l'une des deux ancres, et l'instance
+      # ne serait plus signalée. C'est le prix de ne pas conclure sur une charge
+      # utile republiée par un tiers, et il est payé sciemment — un champ inséré
+      # entre les deux, lui, ne casse rien.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"agent"\s*:\s*"SillyTavern:[^":]+:[^"]*"\s*,\s*"pkgVersion"\s*:\s*"[^"]+"\s*,'
+          - '"isLatest"\s*:\s*(?:true|false)\s*\}\s*$'
+        condition: and
+
+    extractors:
+      # Le numéro de publication de l'instance, donc quels correctifs lui
+      # manquent. C'est le seul champ du corps qui renseigne au-delà de ce que
+      # les matchers exigent déjà : agent le répète, isLatest ne vaut que pour
+      # une installation git, et les trois champs de dépôt sont null sur les
+      # autres.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.pkgVersion'

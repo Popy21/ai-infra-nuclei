@@ -31545,6 +31545,465 @@ def test_agent_zero_matcher_compiles_and_fires_against_a_live_server():
         assert refused == [], "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# SillyTavern — SillyTavern/SillyTavern, l'interface de chat auto-hébergée. Elle
+# ne sert aucun modèle : elle relaie vers les back-ends câblés, avec les clés que
+# le serveur garde pour lui.
+#
+# Ce que cette section amarre tient en trois points. Le premier : la signature.
+# getVersion() (src/util.js) se termine par « const agent =
+# `SillyTavern:${pkgVersion}:Cohee#1207`; return { agent, pkgVersion,
+# gitRevision, gitBranch, commitDate: ..., isLatest }; », et src/server-main.js
+# rend l'objet tel quel — « app.get('/version', async function (_, response) {
+# const data = await getVersion(); response.send(data); }); ». Express sérialise
+# dans l'ordre du littéral : agent ouvre, isLatest ferme. « SillyTavern: » en
+# tête de la valeur de agent est la chaîne propre au produit.
+#
+# Le deuxième : trois champs sur six sont facultatifs. getVersion() ne remplit
+# gitRevision, gitBranch et commitDate que sous « if (commandExistsSync('git')) »,
+# donc une installation par archive ou par image les rend tous à null. Un matcher
+# qui les exigerait manquerait exactement les déploiements les moins suivis.
+#
+# Le troisième, et c'est lui qui fait le constat : ce que la réponse prouve vient
+# de l'ordre des couches, pas du corps. src/server-main.js monte
+# basicAuthMiddleware (sous « cliArgs.listen && cliArgs.basicAuthMode »), le
+# middleware de liste blanche (sous « cliArgs.whitelistMode ») puis, derrière le
+# commentaire « Everything below this line requires authentication »,
+# requireLoginMiddleware — et /version est déclarée après les trois. Chacune
+# refuse avant le handler, avec son propre code et son propre corps : 401 et
+# unauthorized.html pour la première, « res.status(403).send(forbiddenWebpage(...)) »
+# pour la deuxième, « response.sendStatus(403) » pour la troisième. Recevoir la
+# charge utile, c'est les avoir traversées toutes les trois.
+
+SILLYTAVERN_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                    "sillytavern-exposed.yaml")
+
+SILLYTAVERN_VERSION_ROUTE = "/version"
+
+
+def sillytavern_version_body(pkg_version="1.13.5", agent=True, git=True,
+                             is_latest=True, indent=None):
+    """
+    Ce que rend getVersion(), dans l'ordre du littéral de retour — Express
+    sérialise l'objet tel quel, donc agent ouvre le document et isLatest le
+    ferme.
+
+    `git=False` rend la forme d'une installation par archive ou par image : sans
+    binaire git, les trois champs de dépôt restent à leur valeur initiale, null,
+    et isLatest à true.
+    """
+    if agent is True:
+        agent = "SillyTavern:%s:Cohee#1207" % pkg_version
+
+    payload = {"agent": agent, "pkgVersion": pkg_version}
+    if git:
+        payload["gitRevision"] = "a1b2c3d"
+        payload["gitBranch"] = "release"
+        payload["commitDate"] = "2026-09-14 12:00:00 +0000"
+    else:
+        payload["gitRevision"] = None
+        payload["gitBranch"] = None
+        payload["commitDate"] = None
+    payload["isLatest"] = is_latest
+
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# Une instance suivie par git, la forme la plus courante : le guide
+# d'installation fait cloner le dépôt.
+SILLYTAVERN_OPEN_BODY = sillytavern_version_body()
+
+# La même installée par archive ou par image : git absent, donc les trois champs
+# de dépôt à null. Le template doit la reconnaître aussi.
+SILLYTAVERN_NO_GIT_BODY = sillytavern_version_body(git=False)
+
+# Ce que rend requireLoginMiddleware quand enableUserAccounts est allumé et que
+# l'appelant n'a pas de session : « if (!request.user) { return
+# response.sendStatus(403); } », et sendStatus écrit le nom du statut en clair.
+SILLYTAVERN_LOGIN_REQUIRED_BODY = "Forbidden"
+
+# Ce que rend le middleware de liste blanche — la protection par défaut :
+# « res.status(403).send(forbiddenWebpage({ ipDetails })) ».
+SILLYTAVERN_WHITELIST_DENIED_BODY = (
+    '<!DOCTYPE html>\n<html>\n<head><title>SillyTavern</title></head>\n<body>\n'
+    '<h1>Forbidden</h1>\n<p>Your IP address is not whitelisted.</p>\n'
+    '</body>\n</html>\n'
+)
+
+# Ce que rend basicAuthMiddleware sans en-tête Authorization : 401, l'en-tête
+# « WWW-Authenticate: Basic realm="SillyTavern" » et unauthorized.html.
+SILLYTAVERN_BASIC_AUTH_BODY = (
+    '<!DOCTYPE html>\n<html>\n<head><title>SillyTavern</title></head>\n<body>\n'
+    '<h1>Unauthorized</h1>\n</body>\n</html>\n'
+)
+
+# La page d'accueil, servie sur tout chemin que le routeur ne connaît pas une
+# fois apply404Middleware posé — même titre, donc même empreinte Shodan.
+SILLYTAVERN_INDEX_BODY = (
+    '<!DOCTYPE html>\n<html>\n<head>\n<title>SillyTavern</title>\n</head>\n'
+    '<body>\n</body>\n</html>\n'
+)
+
+# La charge utile entière retrouvée au fond du document d'un inventaire qui
+# l'agrégerait sous une clé à lui : ce n'est pas l'instance qui a répondu.
+SILLYTAVERN_COMPOSITE_BODY = ('{"sillytavern":%s,"checked_at":0}'
+                              % SILLYTAVERN_OPEN_BODY)
+
+# La même, recopiée en tête par un intermédiaire qui ajoute une clé derrière le
+# dernier champ. L'ancrage d'ouverture ne l'écarterait pas seul.
+SILLYTAVERN_APPENDED_BODY = SILLYTAVERN_OPEN_BODY[:-1] + ',"checked_at":0}'
+
+# Un service quelconque qui publie son numéro de version : le vocabulaire de
+# n'importe quel endpoint de diagnostic.
+SILLYTAVERN_OTHER_VERSION_BODY = '{"version":"1.13.5","name":"whatever"}'
+
+# Un produit dont le nom d'agent se termine par celui-ci : l'ancrage d'ouverture
+# est ce qui les sépare.
+SILLYTAVERN_LOOKALIKE_BODY = sillytavern_version_body(
+    agent="NotSillyTavern:1.13.5:someone")
+
+
+def sillytavern_block():
+    doc = load(SILLYTAVERN_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % SILLYTAVERN_VERSION_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant la seule route du "
+        "produit dont le corps nomme le produit sans rien écrire"
+        % SILLYTAVERN_VERSION_ROUTE
+    )
+    return blocks[0]
+
+
+def sillytavern_fires(status=200, body=None):
+    """
+    Sémantique nuclei d'un bloc à une seule requête. Le paramètre de statut est
+    tenu pour que les cas des trois couches de refus se disent, même si le bloc
+    n'a pas à en dépendre.
+    """
+    block = sillytavern_block()
+    if body is None:
+        body = SILLYTAVERN_OPEN_BODY
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_sillytavern_probe_reads_the_version_and_never_touches_the_data_nor_the_backends():
+    """
+    La même surface non authentifiée sert tout le reste : /api/chats rendrait
+    l'historique de conversation d'un tiers, /api/characters ses personas,
+    /api/worldinfo ses livres de contexte, /api/secrets/read l'inventaire de ses
+    fournisseurs, /api/backends/chat-completions et /api/openai dépenseraient le
+    budget que le constat est censé protéger, et /api/extensions écrirait sur
+    l'instance auditée. getVersion(), lui, lit package.json et le dépôt local.
+    """
+    doc = load(SILLYTAVERN_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", SILLYTAVERN_VERSION_ROUTE)}, (
+        "le template interroge autre chose que la route de version — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la version se lit en GET : la route n'est déclarée que sous ce "
+            "verbe, et tout ce qui écrit sur ce produit est en POST"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande d'écrire sur l'instance auditée"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode : le contrôle "
+            "ci-dessus ne la verrait pas"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/api/chats", "l'historique de conversation d'un tiers"),
+                ("/api/characters", "les personas et les cartes de personnage"),
+                ("/api/groups", "les personas et les cartes de personnage"),
+                ("/api/worldinfo", "les livres de contexte d'un tiers"),
+                ("/api/secrets", "l'inventaire des fournisseurs câblés est le "
+                                 "renseignement que le constat signale, pas ce "
+                                 "qu'un scanner relève — et /write y inscrirait "
+                                 "une clé"),
+                ("/api/backends/", "les routes de relais dépensent le budget "
+                                   "des fournisseurs câblés"),
+                ("/api/openai", "les routes de fournisseur dépensent le budget "
+                                "de l'exploitant"),
+                ("/api/extensions", "installer une extension serait écrire sur "
+                                    "l'instance auditée"),
+                ("/api/users", "les routes administratives du mode "
+                               "multi-utilisateur"),
+                ("/csrf-token", "le jeton n'a d'usage que pour écrire, et "
+                                "écrire est ce que le template s'interdit"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_sillytavern_matcher_rests_on_the_agent_signature_not_on_a_version_field():
+    """
+    Le point qui fait ce template. « version » et un numéro sont le vocabulaire
+    de n'importe quel endpoint de diagnostic ; « SillyTavern: » en tête de la
+    valeur du champ agent est écrit tel quel dans le gabarit
+    `SillyTavern:${pkgVersion}:Cohee#1207`, et il n'appartient qu'à ce produit.
+    """
+    assert sillytavern_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance ouverte"
+    )
+
+    for other, why in (
+        (SILLYTAVERN_OTHER_VERSION_BODY,
+         "un service quelconque qui publie son numéro de version"),
+        (SILLYTAVERN_LOOKALIKE_BODY,
+         "un produit dont le nom d'agent se termine par celui-ci : c'est "
+         "l'ancrage d'ouverture qui les sépare"),
+        (SILLYTAVERN_INDEX_BODY,
+         "la page d'accueil, que le titre suffirait à confondre avec le produit"),
+        ("", "une réponse vide"),
+    ):
+        assert not sillytavern_fires(body=other), "le template conclut sur %s" % why
+
+
+def test_sillytavern_matcher_holds_without_a_git_checkout():
+    """
+    getVersion() ne remplit gitRevision, gitBranch et commitDate que sous
+    « if (commandExistsSync('git')) » : une installation par archive ou par image
+    les rend tous les trois à null. Les exiger ferait manquer exactement les
+    déploiements les moins suivis — ceux qui ne sont jamais mis à jour, donc ceux
+    qui traînent exposés.
+    """
+    for body, why in (
+        (SILLYTAVERN_NO_GIT_BODY,
+         "une installation sans git : les trois champs de dépôt sont à null"),
+        (sillytavern_version_body(is_latest=False),
+         "une instance en retard sur sa branche de suivi"),
+        (sillytavern_version_body(pkg_version="UNKNOWN",
+                                  agent="SillyTavern:UNKNOWN:Cohee#1207"),
+         "la valeur initiale de pkgVersion, que getVersion() conserve quand la "
+         "lecture de package.json échoue"),
+        (sillytavern_version_body(agent="SillyTavern:1.13.5:someone-else"),
+         "un pseudonyme de mainteneur différent : le second segment de l'agent "
+         "n'a pas à contraindre le template"),
+        (sillytavern_version_body(indent=2),
+         "un intermédiaire qui réindente ce qu'il relaie, là où Express "
+         "sérialise compact"),
+        (SILLYTAVERN_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne au corps relayé"),
+    ):
+        assert sillytavern_fires(body=body), "le template perd %s" % why
+
+
+def test_sillytavern_matcher_refuses_the_payload_republished_by_a_third_party():
+    """
+    Les deux ancrages d'enveloppe, et chacun a sa cible. Celui d'ouverture écarte
+    la charge utile agrégée sous une clé étrangère ; celui de fermeture écarte le
+    document qui la recopie en tête avant d'ajouter la sienne — que le premier
+    laisserait passer.
+    """
+    assert not sillytavern_fires(body=SILLYTAVERN_COMPOSITE_BODY), (
+        "le template conclut sur la charge utile republiée au fond du document "
+        "d'un inventaire : c'est l'ancrage d'ouverture qui dit que l'instance a "
+        "répondu d'elle-même"
+    )
+    assert not sillytavern_fires(body=SILLYTAVERN_APPENDED_BODY), (
+        "le template conclut sur un document composite qui ouvre bien sur la "
+        "réponse mais ajoute une clé derrière isLatest : sans ancrage de "
+        "fermeture, l'ouverture ne suffit pas"
+    )
+
+
+def test_sillytavern_stays_silent_on_each_of_the_three_layers_that_refuse():
+    """
+    Ce que le constat établit est d'avoir traversé les trois couches montées
+    avant la route. Chacune refuse avant le handler, et chacune a son corps :
+    unauthorized.html en 401 pour basicAuthMiddleware,
+    « forbiddenWebpage({ ipDetails }) » en 403 pour la liste blanche — la
+    protection par défaut —, et le « Forbidden » que sendStatus(403) écrit pour
+    requireLoginMiddleware quand le mode multi-utilisateur est allumé. Le
+    template doit se taire sur les trois, sinon il ne dit rien de plus que
+    « une instance existe ici ».
+    """
+    for status, body, why in (
+        (401, SILLYTAVERN_BASIC_AUTH_BODY,
+         "l'authentification basique, qui refuse avant le handler"),
+        (403, SILLYTAVERN_WHITELIST_DENIED_BODY,
+         "la liste blanche, c'est-à-dire la protection par défaut du produit"),
+        (403, SILLYTAVERN_LOGIN_REQUIRED_BODY,
+         "requireLoginMiddleware, qui refuse dès que enableUserAccounts est "
+         "allumé et que l'appelant n'a pas de session"),
+        (404, SILLYTAVERN_INDEX_BODY,
+         "une instance qui ne sert pas ce chemin"),
+    ):
+        assert not sillytavern_fires(status=status, body=body), (
+            "le template conclut sur %s" % why
+        )
+
+
+def test_sillytavern_conclusion_rests_on_the_payload_not_on_the_http_status():
+    """
+    Le code ne distingue rien ici : les trois couches refusent avec le leur, et
+    c'est le corps de getVersion() qui dit qu'aucune n'a filtré. Un matcher de
+    statut ferait en prime manquer l'instance dont un intermédiaire réécrit le
+    code.
+    """
+    block = sillytavern_block()
+
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert "status" not in kinds, (
+        "le bloc porte un matcher de statut : ce qui sépare une instance ouverte "
+        "d'une instance fermée est le corps, jamais le code"
+    )
+
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : le constat est la "
+            "signature d'agent tenue entre les deux ancrages d'enveloppe, et "
+            "aucune des deux ne conclut seule"
+        )
+
+    assert sillytavern_fires(status=304), (
+        "le template dépend du code rendu, alors que le corps est bien celui "
+        "d'une instance SillyTavern qui a répondu à l'anonyme"
+    )
+
+
+def test_sillytavern_extractor_reports_the_release_the_instance_runs():
+    """
+    Le seul champ du corps qui renseigne au-delà de ce que les matchers exigent
+    déjà : agent répète le numéro, isLatest ne vaut que pour une installation
+    git, et les trois champs de dépôt sont null sur les autres.
+    """
+    extractors = sillytavern_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul extracteur : le reste du corps est soit déjà fixé par les "
+        f"matchers, soit null sur une installation sans git — {extractors}"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json" and extractor.get("json") == [".pkgVersion"], (
+        "l'extracteur ne relève pas le numéro de publication — %s" % extractor
+    )
+    assert json.loads(SILLYTAVERN_OPEN_BODY)["pkgVersion"] == "1.13.5", (
+        "le cas de test ne dit pas ce qu'il croit dire"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_sillytavern_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher, et
+    `body_matcher_hits` les réévalue avec le moteur d'expressions de Python
+    plutôt qu'avec celui de Go : seul un scan contre un vrai serveur ferme la
+    boucle. L'enjeu propre est ici le `$`, dont la sémantique diffère entre les
+    deux moteurs — Python le fait aussi correspondre juste avant un saut de ligne
+    final, Go non —, et le corps relayé peut en porter un.
+    """
+    def scan(status, body, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == SILLYTAVERN_VERSION_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, SILLYTAVERN_INDEX_BODY, "text/html")
+
+            def reply(self, code, payload, kind="application/json"):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", SILLYTAVERN_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "sillytavern-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan(200, SILLYTAVERN_OPEN_BODY)
+    assert seen == [SILLYTAVERN_VERSION_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        "le scan ne reconnaît pas la réponse d'une instance ouverte, ou il la "
+        f"signale plusieurs fois — {results}"
+    )
+    assert results[0].get("extracted-results") == ["1.13.5"], (
+        "l'extracteur ne rend pas le numéro de publication de l'instance — %s"
+        % results[0].get("extracted-results")
+    )
+
+    _, results = scan(200, SILLYTAVERN_NO_GIT_BODY)
+    assert len(results) == 1, (
+        "le scan ne reconnaît pas une installation sans git, dont les trois "
+        f"champs de dépôt sont à null — {results}"
+    )
+
+    _, results = scan(200, SILLYTAVERN_OPEN_BODY + "\n")
+    assert len(results) == 1, (
+        "le scan perd le corps relayé avec un saut de ligne final : le `$` de "
+        f"Go ne se comporte pas comme celui de Python — {results}"
+    )
+
+    for status, body, kind, why in (
+        (401, SILLYTAVERN_BASIC_AUTH_BODY, "text/html",
+         "l'authentification basique, qui refuse avant le handler"),
+        (403, SILLYTAVERN_WHITELIST_DENIED_BODY, "text/html",
+         "la liste blanche, c'est-à-dire la protection par défaut du produit"),
+        (403, SILLYTAVERN_LOGIN_REQUIRED_BODY, "text/plain",
+         "requireLoginMiddleware, qui refuse quand le mode multi-utilisateur "
+         "est allumé et que l'appelant n'a pas de session"),
+        (200, SILLYTAVERN_INDEX_BODY, "text/html",
+         "la page d'accueil, dont le titre est celui du produit"),
+        (200, SILLYTAVERN_COMPOSITE_BODY, "application/json",
+         "la charge utile republiée au fond du document d'un inventaire"),
+        (200, SILLYTAVERN_APPENDED_BODY, "application/json",
+         "un document composite qui ouvre sur la réponse et ajoute une clé "
+         "derrière isLatest"),
+        (200, SILLYTAVERN_LOOKALIKE_BODY, "application/json",
+         "un produit dont le nom d'agent se termine par celui-ci"),
+        (200, SILLYTAVERN_OTHER_VERSION_BODY, "application/json",
+         "un service quelconque qui publie son numéro de version"),
+    ):
+        _, refused = scan(status, body, kind)
+        assert refused == [], "le scan conclut sur %s" % why
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
