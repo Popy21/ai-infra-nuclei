@@ -32501,6 +32501,341 @@ def test_steel_browser_matcher_compiles_and_fires_against_a_live_server():
         assert refused == [], "le scan conclut sur %s" % why
 
 
+# --------------------------------------------------------------------------
+# LMDeploy. Une seule route, et elle porte les deux moitiés du constat : GET
+# /v1/models nomme le produit — ModelCard fixe « owned_by: str = 'lmdeploy' »
+# en dur dans lmdeploy/serve/openai/protocol.py, un champ qu'aucun paramètre de
+# `lmdeploy serve api_server` n'expose — et la même route dit si elle est
+# gardée. api_server.py ne monte AuthenticationMiddleware que
+# « if api_keys is not None and (tokens := [key for key in api_keys if key])
+# », et ArgumentHelper.api_keys (lmdeploy/cli/utils.py) déclare
+# « --api-keys, default=None » : sans ce drapeau, /v1/models répond à
+# l'anonyme. Avec lui, la même route rend 401 et un corps entièrement
+# différent — server_utils.AuthenticationMiddleware ne dispense de jeton que
+# /health, /docs, /redoc et /nodes, /v1 n'y figurant pas.
+
+LMDEPLOY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "lmdeploy-unauthenticated-api.yaml")
+
+LMDEPLOY_MODELS_ROUTE = "/v1/models"
+
+
+def lmdeploy_models_body(model_id="internlm2_5-7b-chat", owned_by="lmdeploy",
+                         indent=None):
+    """
+    Ce que rend GET /v1/models : ModelList(data=[ModelCard(...)]), sérialisé par
+    Starlette avec `separators=(",", ":")` dans l'ordre de déclaration des deux
+    modèles — ModelList : object, data ; ModelCard : id, object, created,
+    owned_by, root, parent, permission.
+    """
+    payload = {
+        "object": "list",
+        "data": [{
+            "id": model_id,
+            "object": "model",
+            "created": 1758000000,
+            "owned_by": owned_by,
+            "root": model_id,
+            "parent": None,
+            "permission": [{
+                "id": "modelperm-8pQ3xoWpRhKmVjFZ9nD2sT",
+                "object": "model_permission",
+                "created": 1758000000,
+                "allow_create_engine": False,
+                "allow_sampling": True,
+                "allow_logprobs": True,
+                "allow_search_indices": True,
+                "allow_view": True,
+                "allow_fine_tuning": False,
+                "organization": "*",
+                "group": None,
+                "is_blocking": False,
+            }],
+        }],
+    }
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# L'instance ouverte, une adresse jamais posée.
+LMDEPLOY_OPEN_BODY = lmdeploy_models_body()
+
+# Plusieurs modèles servis : get_model_list() ajoute les adaptateurs LoRA
+# configurés derrière le modèle de base. Seul le premier doit compter.
+LMDEPLOY_MULTI_MODEL_BODY = json.dumps({
+    "object": "list",
+    "data": [
+        json.loads(LMDEPLOY_OPEN_BODY)["data"][0],
+        {**json.loads(LMDEPLOY_OPEN_BODY)["data"][0], "id": "my-lora-adapter",
+         "root": "my-lora-adapter"},
+    ],
+}, separators=(",", ":"))
+
+# Ce que rend AuthenticationMiddleware sur une instance lancée avec
+# --api-keys, à un appelant sans en-tête Authorization : create_error_response
+# sous ErrorCode.UNAUTHORIZED, HTTPStatus.UNAUTHORIZED.
+LMDEPLOY_UNAUTHORIZED_BODY = json.dumps({
+    "message": "Unauthorized.",
+    "type": "authentication_error",
+    "code": 401,
+    "param": None,
+}, separators=(",", ":"))
+
+# vLLM sert la même forme {"object":"list","data":[...]} mais fixe
+# owned_by="vllm" dans sa propre ModelCard : c'est ce littéral, pas la forme,
+# qui doit séparer les deux produits.
+LMDEPLOY_VLLM_LOOKALIKE_BODY = lmdeploy_models_body(owned_by="vllm")
+
+# La charge utile republiée au fond du document d'une supervision qui
+# agrégerait plusieurs sondes sous ses propres clés : ce n'est pas l'instance
+# elle-même qui a répondu en tête.
+LMDEPLOY_COMPOSITE_BODY = ('{"probe":"lmdeploy","upstream":%s}'
+                           % LMDEPLOY_OPEN_BODY)
+
+# Un tableau vide : get_model_list() rend toujours au moins le modèle de base
+# (server_context.async_engine.model_name), donc cette forme n'existe pas en
+# pratique, mais le matcher ne doit pas la confondre avec une instance réelle.
+LMDEPLOY_EMPTY_BODY = '{"object":"list","data":[]}'
+
+
+def lmdeploy_block():
+    doc = load(LMDEPLOY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+             if "{{BaseURL}}%s" % LMDEPLOY_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant la seule route "
+        "du produit dont le corps à la fois le nomme et dit si elle est "
+        "gardée" % LMDEPLOY_MODELS_ROUTE
+    )
+    return blocks[0]
+
+
+def lmdeploy_fires(status=200, body=None, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and` par défaut."""
+    block = lmdeploy_block()
+    if body is None:
+        body = LMDEPLOY_OPEN_BODY
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            header_blob = " ".join(headers.values())
+            words = matcher.get("words") or []
+            hit = (all(w in header_blob for w in words)
+                  if matcher.get("condition") == "and"
+                  else any(w in header_blob for w in words))
+            verdicts.append(hit)
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_lmdeploy_probe_is_a_single_read_only_get_on_v1_models():
+    """
+    La même surface non authentifiée sert POST /v1/chat/completions et
+    /generate, qui lanceraient de l'inférence sur le GPU de l'hôte, et
+    lmdeploy/serve/openai/endpoints/management.py monte sans dépendance propre
+    POST /sleep, /wakeup et les trois routes update_weights* : les mettre en
+    veille ou réécrire leurs poids sont les abus que le template signale, pas
+    ce qu'un scanner a le droit de faire pour les établir.
+    """
+    doc = load(LMDEPLOY_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", LMDEPLOY_MODELS_ROUTE)}, (
+        "le template interroge autre chose que /v1/models — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste des modèles se lit en GET : tout ce qui agit sur le "
+            "moteur ou les poids est en POST"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le bloc enverrait un corps ou une requête brute : rien de ce que "
+            "le template établit ne demande d'écrire sur l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/v1/chat/completions", "lancerait de l'inférence sur le GPU "
+                                        "de l'hôte, aux frais de l'exploitant"),
+                ("/v1/completions", "lancerait de l'inférence sur le GPU de "
+                                    "l'hôte"),
+                ("/generate", "lancerait de l'inférence sur le GPU de l'hôte"),
+                ("/sleep", "mettrait le moteur en veille — un déni de service "
+                          "sur toutes les routes d'inférence"),
+                ("/wakeup", "agirait sur l'état du moteur"),
+                ("/update_weights", "réécrirait les poids du modèle chargé en "
+                                    "mémoire"),
+                ("/terminate", "arrêterait le processus si l'exploitant a posé "
+                               "--allow-terminate-by-client"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+
+
+def test_lmdeploy_matcher_needs_the_owned_by_literal_not_the_generic_shape():
+    """
+    Le cœur du constat. {"object":"list","data":[...]} est la forme de tout
+    serveur compatible OpenAI ; "owned_by":"lmdeploy", à sa place dans l'ordre
+    de déclaration de ModelCard, est ce que seul ce produit rend.
+    """
+    assert lmdeploy_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance ouverte"
+    )
+
+    assert not lmdeploy_fires(status=401, body=LMDEPLOY_UNAUTHORIZED_BODY), (
+        "le template conclut sur le refus d'AuthenticationMiddleware : une "
+        "instance lancée avec --api-keys rend ce corps précis à l'anonyme, "
+        "sans aucune des clés que le matcher exige"
+    )
+
+    assert not lmdeploy_fires(body=LMDEPLOY_VLLM_LOOKALIKE_BODY), (
+        "le template déclenche sur un autre serveur compatible OpenAI qui "
+        "rend la même forme avec un owned_by différent — la spécification "
+        "OpenAI ne fixe pas ce champ, vLLM y met 'vllm'"
+    )
+
+    assert not lmdeploy_fires(body=LMDEPLOY_EMPTY_BODY), (
+        "le template déclenche sur un tableau data vide, que "
+        "get_model_list() ne rend jamais : elle porte toujours au moins le "
+        "modèle de base"
+    )
+
+    assert not lmdeploy_fires(body=LMDEPLOY_COMPOSITE_BODY), (
+        "le template conclut sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage d'ouverture doit dire que "
+        "c'est l'instance elle-même qui a répondu en tête de son document"
+    )
+
+
+def test_lmdeploy_matcher_holds_on_variations_that_do_not_change_the_fact():
+    for body, why in (
+        (LMDEPLOY_MULTI_MODEL_BODY,
+         "plusieurs modèles servis : un adaptateur LoRA chargé derrière le "
+         "modèle de base ne doit pas faire manquer l'instance"),
+        (lmdeploy_models_body(model_id="lmdeploy/llama2-chat-70b-4bit"),
+         "un identifiant de modèle qui porte lui-même des barres obliques"),
+        (lmdeploy_models_body(indent=2),
+         "un intermédiaire qui réindente ce que Starlette sérialise compact"),
+        (LMDEPLOY_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne au corps relayé"),
+    ):
+        assert lmdeploy_fires(body=body), "le template perd %s" % why
+
+
+def test_lmdeploy_matchers_condition_requires_every_clause():
+    block = lmdeploy_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la forme générique "
+        "{\"object\":\"list\",\"data\":[...]} suffirait seule à faire "
+        "remonter n'importe quel serveur compatible OpenAI"
+    )
+    assert len(block.get("matchers") or []) >= 2, (
+        "un seul matcher ne peut pas porter à la fois le statut et la "
+        "signature du produit"
+    )
+
+
+def test_lmdeploy_extractor_reports_the_models_served():
+    extractors = lmdeploy_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        f"un seul extracteur suffit à lister ce que sert l'instance — "
+        f"{extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json" and extractor.get("json") == [".data[].id"], (
+        "l'extracteur ne relève pas l'identifiant de chaque modèle servi — %s"
+        % extractor
+    )
+    assert json.loads(LMDEPLOY_MULTI_MODEL_BODY)["data"][1]["id"] == "my-lora-adapter", (
+        "le cas de test ne dit pas ce qu'il croit dire"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_lmdeploy_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher : seul un scan
+    contre un vrai serveur ferme la boucle, y compris pour l'instance gardée
+    par --api-keys, qui rend 401 sur la même route.
+    """
+    def scan(status=200, body=LMDEPLOY_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == LMDEPLOY_MODELS_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LMDEPLOY_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                  if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "lmdeploy-unauthenticated-api"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [LMDEPLOY_MODELS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        f"le scan ne reconnaît pas la réponse d'une instance ouverte — {results}"
+    )
+    assert results[0].get("extracted-results") == ["internlm2_5-7b-chat"], (
+        "l'extracteur ne rend pas l'identifiant du modèle servi — %s"
+        % results[0].get("extracted-results")
+    )
+
+    _, results = scan(status=401, body=LMDEPLOY_UNAUTHORIZED_BODY)
+    assert results == [], (
+        f"le scan signale une instance gardée par --api-keys — {results}"
+    )
+
+    _, results = scan(body=LMDEPLOY_VLLM_LOOKALIKE_BODY)
+    assert results == [], (
+        f"le scan confond vLLM, qui sert la même forme avec owned_by='vllm', "
+        f"avec LMDeploy — {results}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(

@@ -1,0 +1,157 @@
+id: lmdeploy-unauthenticated-api
+
+info:
+  name: LMDeploy - OpenAI-Compatible API Exposed Without an API Key
+  author: popy21
+  severity: high
+  description: |
+    LMDeploy (InternLM/lmdeploy, 8 085 étoiles, dépôt actif — dernier push
+    2026-09-18) est le moteur d'inférence LLM d'InternLM : `lmdeploy serve
+    api_server` sert une API compatible OpenAI, par défaut sur 0.0.0.0:23333 —
+    `SubCliServe.add_parser_api_server` déclare « --server-name, default='0.0.0.0'
+    » et « --server-port, default=None » dont serve() dit « Effective default is
+    23333 when unset ».
+    GET /v1/models nomme le produit sans ambiguïté. lmdeploy/serve/openai/
+    endpoints/models.py déclare « @router.get('/v1/models') » et rend
+    « ModelList(data=model_cards) » où chaque carte est une
+    « ModelCard(id=model_name, root=model_name, permission=[ModelPermission()])
+    ». protocol.py fixe le reste des champs en dur : « class ModelList(BaseModel):
+    object: str = 'list' » et « class ModelCard(BaseModel): id: str; object: str =
+    'model'; created: int = ...; owned_by: str = 'lmdeploy' ». La valeur littérale
+    « owned_by: str = 'lmdeploy' » n'est exposée par aucun paramètre de
+    `lmdeploy serve api_server` — l'exploitant choisit le chemin du modèle et,
+    au mieux, son nom via --model-name, jamais ce champ — donc « "owned_by":
+    "lmdeploy" » est une constante du produit, pas une valeur de déploiement.
+    Starlette sérialise la réponse avec « separators=(",", ":") », donc sans
+    espace, et dans l'ordre de déclaration des deux modèles : le document ouvre
+    sur « {"object":"list","data":[{"id":...,"object":"model",...,"owned_by":
+    "lmdeploy" ».
+    Mais nommer le produit ne dit rien de l'autorisation, et c'est le point que
+    ce template tient : api_server.py ne monte le contrôle d'accès que sous
+    condition — « if api_keys is not None and (tokens := [key for key in
+    api_keys if key]): app.add_middleware(AuthenticationMiddleware,
+    tokens=tokens) ». `ArgumentHelper.api_keys` dans lmdeploy/cli/utils.py déclare
+    « --api-keys, nargs='*', default=None » : sans ce drapeau, api_keys reste
+    None, la condition est fausse, et AuthenticationMiddleware n'est jamais
+    ajouté à l'application. GET /v1/models n'est protégée par aucune autre
+    dépendance — models.py l'enregistre sur un APIRouter nu, sans
+    Depends(...) — donc l'absence de ce seul middleware suffit à l'ouvrir.
+    Quand la clé est posée, la preuve tient sur la même route. server_utils.py
+    déclare la classe : « Pure ASGI middleware that authenticates each request by
+    checking if the Authorization Bearer token exists ». Ses `skip_prefixes` sont
+    « ['/health', '/docs', '/redoc', '/nodes'] » — /v1 n'y figure pas — et
+    verify_token() exige un en-tête « Authorization: Bearer <clé> » exact,
+    haché en SHA-256 et comparé par secrets.compare_digest. Sans lui,
+    GET /v1/models rend 401 avec un corps entièrement différent :
+    « {"message":"Unauthorized.","type":"authentication_error","code":401,
+    "param":null} », rendu par create_error_response() sous ErrorCode.UNAUTHORIZED
+    — aucune des clés que le matcher exige n'y figure. C'est cet écart de corps
+    sur la même route, et non un second point de contrôle, qui sépare une
+    instance ouverte d'une instance gardée.
+  impact: |
+    Le corps de /v1/models est le moins grave de ce que l'absence de
+    --api-keys ouvre : sa valeur ici est d'être la preuve, pas le butin. Le même
+    processus, sans le même middleware devant lui, sert POST
+    /v1/chat/completions, /v1/completions et /generate : n'importe qui peut
+    lancer de l'inférence sur le GPU de l'hôte, aux frais de l'exploitant, ce qui
+    sature sa mémoire vidéo et son débit et prive les usages légitimes de leur
+    capacité.
+    Le même dispatcher monte aussi, dans lmdeploy/serve/openai/endpoints/
+    management.py, des routes administratives sans dépendance propre : POST
+    /sleep et POST /wakeup mettent le moteur en veille ou le réveillent — un
+    /sleep anonyme est un déni de service immédiat sur toutes les routes
+    d'inférence, jusqu'au /wakeup suivant — et POST /update_weights,
+    /update_weights_from_ipc et /update_weights_from_distributed réécrivent les
+    poids du modèle chargé en mémoire. GET /terminate arrêterait le processus,
+    mais reste fermée par défaut : elle vérifie
+    « if not server_context.allow_terminate_by_client: return
+    create_error_response(...) », un drapeau que l'exploitant doit poser
+    explicitement.
+    L'identifiant rendu par /v1/models — le chemin ou le nom du modèle servi —
+    renseigne aussi sur ce qui tourne : un chemin Hugging Face privé ou un nom de
+    fine-tuning interne s'y lit en clair.
+  remediation: |
+    Lancer `lmdeploy serve api_server` avec --api-keys suivi d'un ou plusieurs
+    jetons : c'est ce qui monte AuthenticationMiddleware et ferme d'un coup
+    /v1/models, /v1/chat/completions et les routes administratives de
+    management.py. Les clients doivent alors présenter « Authorization: Bearer
+    <clé> » — vérifié en SHA-256 par comparaison à temps constant.
+    Ne pas publier le port sur une interface publique en attendant : --server-name
+    vaut 0.0.0.0 par défaut. Le poser à 127.0.0.1, ou publier le conteneur en
+    « -p 127.0.0.1:23333:23333 », restreint l'accès à la boucle locale ; un
+    reverse proxy qui authentifie devant le port reste la fermeture la plus sûre
+    sur un déploiement multi-utilisateur.
+    Vérifier depuis l'extérieur du périmètre, sur la route même qui porte le
+    constat : « curl -s -o /dev/null -w "%{http_code}"
+    http://<hote>:23333/v1/models » doit rendre 401, avec le corps
+    « {"message":"Unauthorized.",... } » et non plus la liste des modèles.
+    Après une exposition, tenir pour consommé le budget GPU sur la période — il
+    n'y a ni notion d'utilisateur ni journal d'appelant tant qu'aucune clé n'est
+    posée — et contrôler que /sleep ou l'un des points update_weights n'a pas été
+    appelé, ce qui daterait un déni de service ou une altération des poids
+    chargés.
+  reference:
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/protocol.py
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/endpoints/models.py
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/api_server.py
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/utils/server_utils.py
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/core/exceptions.py
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/cli/serve.py
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/cli/utils.py
+    - https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/endpoints/management.py
+  metadata:
+    max-request: 1
+    vendor: internlm
+    product: lmdeploy
+  tags: ai,llm,lmdeploy,inference,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier. La même route sert la
+  # preuve d'identité et la preuve d'ouverture : sur une instance gardée par
+  # --api-keys, GET /v1/models sans jeton rend 401 et un corps
+  # « {"message":"Unauthorized.",...} » qui ne porte aucune des clés exigées
+  # ci-dessous — pas besoin d'une seconde route pour établir l'écart.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions lancerait de
+  # l'inférence sur le GPU de l'hôte, POST /sleep mettrait le moteur en veille,
+  # et POST /update_weights réécrirait les poids chargés : ce sont les abus que
+  # le template signale, pas ce qu'un scanner a le droit de faire pour les
+  # établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture, tenu sur l'ordre de déclaration des deux
+      # modèles pydantic. ModelList déclare object puis data ; ModelCard
+      # déclare id, object, created puis owned_by — c'est cette séquence, pas
+      # un mot isolé, qui écarte tout document qui republierait
+      # "owned_by":"lmdeploy" au fond d'un objet composite ou sous une clé
+      # étrangère. Starlette sérialise sans espace, d'où l'absence de \s*
+      # dans les motifs les plus stricts et sa présence seulement où un
+      # intermédiaire pourrait réindenter ce qu'il relaie.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"data"\s*:\s*\[\s*\{\s*"id"\s*:\s*"[^"]*"\s*,\s*"object"\s*:\s*"model"\s*,\s*"created"\s*:\s*\d+\s*,\s*"owned_by"\s*:\s*"lmdeploy"'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le ou les modèles servis, c'est-à-dire le chemin ou le nom que
+      # l'exploitant a passé à `lmdeploy serve api_server` — get_model_list()
+      # y ajoute aussi les adaptateurs LoRA chargés.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'
