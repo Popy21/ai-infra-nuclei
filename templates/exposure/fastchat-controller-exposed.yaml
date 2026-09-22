@@ -1,0 +1,160 @@
+id: fastchat-controller-exposed
+
+info:
+  name: FastChat Controller - Unauthenticated Worker Status Disclosure
+  author: popy21
+  severity: high
+  description: |
+    FastChat (lm-sys/FastChat, 39 545 étoiles, dépôt actif et non archivé —
+    dernier push 2026-05-01 ; dépôt de release de Vicuna et de Chatbot Arena)
+    sert une architecture à trois rôles que le README décrit lui-même :
+    « web servers that interface with users, model workers that host one or
+    more models, and a controller to coordinate the webserver and model
+    workers ». Le contrôleur se lance par « python3 -m fastchat.serve.controller
+    », et create_controller() dans fastchat/serve/controller.py fixe
+    « --port, default=21001 » — c'est ce port que le README documente aussi
+    pour les workers qui s'y enregistrent : « --controller http://localhost:21001
+    ».
+    POST /worker_get_status nomme le produit sans ambiguïté. controller.py
+    enregistre « @app.post("/worker_get_status") » sur un handler qui rend
+    « controller.worker_api_get_status() », dont le corps de méthode construit
+    le dict dans cet ordre exact : « model_names = sorted(list(model_names))
+    ; return {"model_names": model_names, "speed": speed, "queue_length":
+    queue_length} ». FastAPI sérialise avec le JSONResponse de Starlette, qui
+    pose « separators=(",", ":") » et respecte l'ordre d'insertion du dict
+    Python — le document rendu ouvre donc toujours sur
+    « {"model_names":...,"speed":...,"queue_length":... } », y compris sur un
+    contrôleur qui n'a encore aucun worker enregistré, où worker_info est vide
+    et les trois champs valent respectivement [], 0 et 0 : ce squelette
+    minimal suffit déjà à identifier le produit.
+    Le fichier entier ne porte aucune dépendance d'authentification — ni
+    import, ni décorateur, ni vérification d'en-tête ou de jeton nulle part
+    dans controller.py — et le handler accepte un corps vide : il déclare le
+    paramètre « request: Request » mais ne l'exploite jamais, donc rien n'est
+    jamais lu ni validé sur ce que l'appelant envoie.
+    Le même trio identifie tout aussi bien un worker de modèle isolé, et c'est
+    une conséquence du partage de code plutôt qu'une coïncidence :
+    BaseModelWorker.get_status() dans fastchat/serve/base_model_worker.py
+    rend « {"model_names": self.model_names, "speed": 1, "queue_length":
+    self.get_queue_length()} », et fastchat/serve/model_worker.py, vllm_worker.py
+    et sglang_worker.py enregistrent chacun la même route
+    « @app.post("/worker_get_status") » sur ce worker.get_status() hérité,
+    sans rien y ajouter. multi_model_worker.py, qui sert plusieurs modèles
+    depuis un seul processus, recompose le même triplet à la main —
+    « "model_names": [m for w in workers for m in w.model_names], "speed": 1,
+    "queue_length": sum(...) ». Aucun de ces cinq fichiers ne porte de
+    dépendance d'authentification : c'est la même absence, reproduite à
+    l'identique à chaque rôle du produit.
+    La configuration Docker que le projet publie lui-même expose ce contrôleur
+    par défaut plutôt que de le tenir en réserve. docker/docker-compose.yml
+    lance fastchat-controller avec « entrypoint: ["python3.9", "-m",
+    "fastchat.serve.controller", "--host", "0.0.0.0", "--port", "21001"] » et
+    déclare « ports: ["21001:21001"] » : suivre le compose officiel publie
+    donc le port sur l'hôte, alors que create_controller() ne pose
+    « --host » qu'à « localhost » par défaut — l'exposition tient à ce choix
+    de déploiement documenté, pas à un défaut dangereux du binaire seul.
+  impact: |
+    Le corps de /worker_get_status est le moins grave de ce que l'absence
+    d'authentification ouvre sur ce processus : sa valeur ici est de nommer le
+    produit et de dire ce qu'il sert, pas d'être le butin. La même surface
+    monte, sans dépendance propre, POST /register_worker — « data =
+    request.json() ; controller.register_worker(data["worker_name"], ...) »
+    — qui inscrit n'importe quelle adresse comme worker légitime pour
+    n'importe quel nom de modèle. Une fois inscrite, cette adresse entre dans
+    le calcul de get_worker_address(), que fastchat/serve/openai_api_server.py
+    interroge par « POST {controller}/get_worker_address » avant de relayer
+    directement la conversation de l'utilisateur — prompts et system prompts
+    compris — à l'adresse rendue. Un contrôleur ouvert permet donc de détourner
+    vers un hôte tiers le trafic d'inférence destiné à un modèle légitime.
+    Le même dispatcher sert aussi POST /list_models, qui énumère tous les
+    modèles actuellement servis derrière le contrôleur, et POST
+    /refresh_all_workers, qui réinterroge chaque worker enregistré et peut
+    faire tomber ceux qui ne répondent plus à /worker_get_status.
+    Sur un worker de modèle atteint directement plutôt que par le contrôleur,
+    la même absence d'authentification ouvre POST /worker_generate_stream et
+    /worker_generate, qui font tourner de l'inférence sur le GPU de
+    l'exploitant aux frais de celui-ci, et /model_details comme
+    /count_token, qui renseignent sur le modèle chargé et sa configuration.
+  remediation: |
+    Ne pas publier le port du contrôleur, ni celui d'un worker, sur une
+    interface joignable depuis l'extérieur : create_controller() pose
+    « --host » à « localhost » par défaut, donc une instance atteignable a
+    reçu un hôte explicite ou une publication de port, comme le fait le
+    docker-compose.yml officiel du projet avec « --host 0.0.0.0 » et
+    « ports: ["21001:21001"] ». Le fichier ne porte aucun mécanisme
+    d'authentification à activer — la fermeture ne peut venir que du réseau :
+    restreindre l'écoute à une interface interne (127.0.0.1 ou un réseau
+    Docker privé) et placer un reverse proxy qui authentifie devant tout port
+    qui doit rester joignable depuis l'extérieur, contrôleur comme workers.
+    Vérifier depuis l'extérieur du périmètre, sur la route même qui porte le
+    constat : « curl -s -X POST http://<hote>:21001/worker_get_status » ne
+    doit rendre ni connexion acceptée ni le triplet model_names/speed/queue_length
+    — un refus de connexion ou un délai d'attente, pas un document JSON.
+    Après une exposition, tenir pour possible qu'une adresse tierce ait été
+    inscrite par POST /register_worker et contrôler la liste des workers
+    enregistrés avant de considérer le trafic d'inférence comme non détourné ;
+    il n'y a aucun journal d'appelant sur ce port tant qu'aucune authentification
+    réseau n'a été posée devant lui.
+  reference:
+    - https://github.com/lm-sys/FastChat/blob/main/fastchat/serve/controller.py
+    - https://github.com/lm-sys/FastChat/blob/main/fastchat/serve/base_model_worker.py
+    - https://github.com/lm-sys/FastChat/blob/main/fastchat/serve/model_worker.py
+    - https://github.com/lm-sys/FastChat/blob/main/fastchat/serve/vllm_worker.py
+    - https://github.com/lm-sys/FastChat/blob/main/fastchat/serve/sglang_worker.py
+    - https://github.com/lm-sys/FastChat/blob/main/fastchat/serve/multi_model_worker.py
+    - https://github.com/lm-sys/FastChat/blob/main/fastchat/serve/openai_api_server.py
+    - https://github.com/lm-sys/FastChat/blob/main/docker/docker-compose.yml
+    - https://github.com/lm-sys/FastChat/blob/main/README.md
+  metadata:
+    max-request: 1
+    vendor: lm-sys
+    product: fastchat
+  tags: ai,llm,fastchat,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route que le produit partage entre son
+  # contrôleur et chacun de ses workers. controller.py ne porte aucune
+  # dépendance d'authentification, et le handler ignore le corps de la
+  # requête — un POST sans corps suffit, exactement ce que
+  # « request: Request » sans await request.json() laisse passer.
+  #
+  # En lecture seule, et strictement. POST /register_worker inscrirait une
+  # adresse tierce comme worker légitime, et /worker_generate ou
+  # /worker_generate_stream sur un worker atteint directement lanceraient de
+  # l'inférence sur le GPU de l'hôte : ce sont les abus que le template
+  # signale, pas ce qu'un scanner a le droit de faire pour les établir.
+  - method: POST
+    path:
+      - "{{BaseURL}}/worker_get_status"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture, tenu sur l'ordre de déclaration du dict que
+      # worker_api_get_status() construit — model_names, puis speed, puis
+      # queue_length — et que Starlette sérialise sans espace dans cet ordre
+      # d'insertion. Le tableau de model_names n'est pas contraint en
+      # longueur : un contrôleur sans worker enregistré le rend vide, et
+      # c'est encore le même triplet.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"model_names"\s*:\s*\[[^\]]*\]\s*,\s*"speed"\s*:\s*\d+\s*,\s*"queue_length"\s*:\s*\d+\s*\}\s*$'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Les modèles que ce contrôleur ou ce worker sert, dans l'ordre où
+      # sorted(list(model_names)) les rend.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.model_names[]'

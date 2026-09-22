@@ -32836,6 +32836,324 @@ def test_lmdeploy_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# FastChat. Une seule route, partagée sans authentification par le contrôleur
+# et par chaque worker : POST /worker_get_status. controller.py rend
+# « {"model_names": ..., "speed": ..., "queue_length": ...} » dans cet ordre
+# exact — Controller.worker_api_get_status() construit le dict ainsi, et
+# FastAPI/Starlette sérialise sans espace en respectant l'ordre d'insertion —
+# et le fichier ne porte nulle part de dépendance d'authentification. Le même
+# triplet, dans le même ordre, est rendu par BaseModelWorker.get_status() côté
+# worker et par sa recomposition manuelle dans multi_model_worker.py.
+
+FASTCHAT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "fastchat-controller-exposed.yaml")
+
+FASTCHAT_STATUS_ROUTE = "/worker_get_status"
+
+
+def fastchat_status_body(model_names=None, speed=0, queue_length=0, indent=None):
+    """
+    Ce que rend POST /worker_get_status : le dict que
+    Controller.worker_api_get_status() construit, dans son ordre de
+    déclaration — model_names, speed, queue_length —, sérialisé compact par
+    le JSONResponse par défaut de Starlette.
+    """
+    payload = {
+        "model_names": model_names if model_names is not None else [],
+        "speed": speed,
+        "queue_length": queue_length,
+    }
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# Un contrôleur qui vient de démarrer, sans aucun worker enregistré :
+# worker_info est vide, donc model_names, speed et queue_length valent
+# respectivement [], 0 et 0 — et c'est déjà le triplet complet.
+FASTCHAT_EMPTY_CONTROLLER_BODY = fastchat_status_body()
+
+# Un contrôleur avec un worker Vicuna enregistré.
+FASTCHAT_OPEN_BODY = fastchat_status_body(
+    model_names=["vicuna-7b-v1.5"], speed=1, queue_length=0)
+
+# Un worker atteint directement : BaseModelWorker.get_status() rend la même
+# forme, dans le même ordre, pour un seul modèle.
+FASTCHAT_WORKER_BODY = fastchat_status_body(
+    model_names=["fastchat-t5-3b-v1.0"], speed=1, queue_length=2)
+
+# Plusieurs modèles enregistrés derrière un seul contrôleur ou un
+# multi_model_worker : sorted(list(model_names)) les rend triés.
+FASTCHAT_MULTI_MODEL_BODY = fastchat_status_body(
+    model_names=["fastchat-t5-3b-v1.0", "vicuna-7b-v1.5"], speed=2, queue_length=1)
+
+# La charge utile republiée au fond du document d'une supervision qui
+# agrégerait plusieurs sondes sous ses propres clés : ce n'est pas l'instance
+# elle-même qui a répondu en tête de son document.
+FASTCHAT_COMPOSITE_BODY = ('{"probe":"fastchat","upstream":%s}'
+                           % FASTCHAT_OPEN_BODY)
+
+# Une réponse générique qui porterait model_names sous une autre forme —
+# imbriqué dans un objet plutôt qu'à la racine — pour vérifier que l'ancrage
+# d'ouverture ne se contente pas de la présence du mot ailleurs dans le
+# document.
+FASTCHAT_NESTED_BODY = json.dumps(
+    {"status": "ok", "data": json.loads(FASTCHAT_OPEN_BODY)},
+    separators=(",", ":"))
+
+# Les mêmes trois clés, mais dans un autre ordre : aucune implémentation du
+# produit ne les rend ainsi, puisque le dict est construit
+# model_names/speed/queue_length partout — mais un service générique qui
+# porterait par coïncidence les trois mêmes noms de champ ne doit pas suffire
+# à faire conclure.
+FASTCHAT_REORDERED_BODY = json.dumps({
+    "speed": 1,
+    "queue_length": 0,
+    "model_names": ["vicuna-7b-v1.5"],
+}, separators=(",", ":"))
+
+
+def fastchat_block():
+    doc = load(FASTCHAT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+             if "{{BaseURL}}%s" % FASTCHAT_STATUS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas POST %s — c'est pourtant la route que "
+        "le contrôleur et chaque worker rendent sans authentification" %
+        FASTCHAT_STATUS_ROUTE
+    )
+    return blocks[0]
+
+
+def fastchat_fires(status=200, body=None, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and` par défaut."""
+    block = fastchat_block()
+    if body is None:
+        body = FASTCHAT_OPEN_BODY
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            header_blob = " ".join(headers.values())
+            words = matcher.get("words") or []
+            hit = (all(w in header_blob for w in words)
+                  if matcher.get("condition") == "and"
+                  else any(w in header_blob for w in words))
+            verdicts.append(hit)
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_fastchat_probe_is_a_single_read_only_post_with_no_body():
+    """
+    La même absence d'authentification monte POST /register_worker, qui
+    inscrirait une adresse tierce comme worker légitime et détournerait vers
+    elle le trafic d'inférence routé par le contrôleur, et
+    /worker_generate_stream sur un worker atteint directement, qui lancerait
+    de l'inférence sur le GPU de l'hôte : ce sont les abus que le template
+    signale, pas ce qu'un scanner a le droit de faire pour les établir.
+    """
+    doc = load(FASTCHAT_TEMPLATE)
+
+    assert request_routes(doc) == {("POST", FASTCHAT_STATUS_ROUTE)}, (
+        "le template interroge autre chose que POST /worker_get_status — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "POST", (
+            "worker_api_get_status() n'est enregistrée qu'en POST — le "
+            "dispatcher FastAPI rend 405 à toute autre méthode"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le handler ignore le corps de la requête : en envoyer un ne "
+            "renseigne rien de plus et s'écarte du constat « corps vide »"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/register_worker", "inscrirait une adresse tierce comme "
+                                     "worker légitime et détournerait le "
+                                     "trafic d'inférence vers elle"),
+                ("/worker_generate", "lancerait de l'inférence sur le GPU "
+                                     "de l'hôte, aux frais de l'exploitant"),
+                ("/refresh_all_workers", "réinterrogerait chaque worker "
+                                        "enregistré et pourrait en faire "
+                                        "tomber certains"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+
+
+def test_fastchat_matcher_needs_the_field_order_not_the_generic_shape():
+    """
+    Le cœur du constat. Trois clés nommées model_names, speed et
+    queue_length existent ailleurs isolément ; c'est leur présence conjointe,
+    à la racine du document et dans l'ordre où
+    Controller.worker_api_get_status() les construit, qui n'appartient qu'à
+    FastChat.
+    """
+    assert fastchat_fires(), (
+        "le template ne reconnaît pas la réponse d'un contrôleur ou d'un "
+        "worker ouvert"
+    )
+
+    assert fastchat_fires(body=FASTCHAT_EMPTY_CONTROLLER_BODY), (
+        "le template perd un contrôleur qui vient de démarrer sans aucun "
+        "worker enregistré — worker_info vide rend déjà le triplet complet, "
+        "model_names=[], speed=0, queue_length=0"
+    )
+
+    assert not fastchat_fires(body=FASTCHAT_COMPOSITE_BODY), (
+        "le template conclut sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage d'ouverture doit dire que "
+        "c'est l'instance elle-même qui a répondu en tête de son document"
+    )
+
+    assert not fastchat_fires(body=FASTCHAT_NESTED_BODY), (
+        "le template déclenche sur le triplet imbriqué sous une clé data : "
+        "l'ancrage d'ouverture doit exiger model_names à la racine du "
+        "document, pas n'importe où dans l'arbre JSON"
+    )
+
+    assert not fastchat_fires(body=FASTCHAT_REORDERED_BODY), (
+        "le template déclenche sur les trois mêmes noms de champ rendus "
+        "dans un autre ordre — aucune implémentation du produit ne les "
+        "construit ainsi, donc ce corps ne prouve pas FastChat"
+    )
+
+
+def test_fastchat_matcher_holds_on_variations_that_do_not_change_the_fact():
+    for body, why in (
+        (FASTCHAT_WORKER_BODY,
+         "un worker de modèle atteint directement, qui rend la même forme "
+         "que le contrôleur pour un seul modèle"),
+        (FASTCHAT_MULTI_MODEL_BODY,
+         "plusieurs modèles enregistrés derrière un seul contrôleur ou un "
+         "multi_model_worker"),
+        (fastchat_status_body(model_names=["lmsys/vicuna-7b-v1.5"]),
+         "un identifiant de modèle qui porte lui-même une barre oblique"),
+        (fastchat_status_body(model_names=["vicuna-7b-v1.5"], indent=2),
+         "un intermédiaire qui réindente ce que Starlette sérialise compact"),
+        (FASTCHAT_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne au corps relayé"),
+    ):
+        assert fastchat_fires(body=body), "le template perd %s" % why
+
+
+def test_fastchat_matchers_condition_requires_every_clause():
+    block = fastchat_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la présence du seul "
+        "mot model_names suffirait à faire remonter un document sans "
+        "rapport"
+    )
+    assert len(block.get("matchers") or []) >= 2, (
+        "un seul matcher ne peut pas porter à la fois le statut et la "
+        "signature du produit"
+    )
+
+
+def test_fastchat_extractor_reports_the_models_served():
+    extractors = fastchat_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        f"un seul extracteur suffit à lister ce que sert l'instance — "
+        f"{extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json" and extractor.get("json") == [".model_names[]"], (
+        "l'extracteur ne relève pas les modèles servis — %s" % extractor
+    )
+    assert json.loads(FASTCHAT_MULTI_MODEL_BODY)["model_names"] == [
+        "fastchat-t5-3b-v1.0", "vicuna-7b-v1.5"], (
+        "le cas de test ne dit pas ce qu'il croit dire"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_fastchat_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher : seul un
+    scan contre un vrai serveur ferme la boucle, corps de requête vide
+    compris.
+    """
+    def scan(status=200, body=FASTCHAT_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                seen.append(self.path)
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                if self.path == FASTCHAT_STATUS_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", FASTCHAT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                  if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "fastchat-controller-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [FASTCHAT_STATUS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        f"le scan ne reconnaît pas la réponse d'une instance ouverte — {results}"
+    )
+    assert results[0].get("extracted-results") == ["vicuna-7b-v1.5"], (
+        "l'extracteur ne rend pas le modèle servi — %s" % results[0].get(
+            "extracted-results")
+    )
+
+    _, results = scan(body=FASTCHAT_EMPTY_CONTROLLER_BODY)
+    assert len(results) == 1, (
+        f"le scan perd un contrôleur sans worker enregistré — {results}"
+    )
+
+    _, results = scan(status=404, body='{"detail":"Not Found"}')
+    assert results == [], (
+        f"le scan signale une instance qui ne sert pas cette route — {results}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
