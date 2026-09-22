@@ -1,0 +1,153 @@
+id: label-studio-ml-backend-exposed
+
+info:
+  name: Label Studio ML Backend - Unauthenticated Inference Server
+  author: popy21
+  severity: medium
+  description: |
+    Label Studio ML Backend (HumanSignal/label-studio-ml-backend, 1 103 étoiles,
+    dépôt actif — dernier push 2026-09-15) n'est pas Label Studio : c'est le
+    serveur d'inférence que Label Studio interroge pour le pré-annotage et
+    l'apprentissage actif, un produit distinct déjà couvert ailleurs par
+    label-studio-signup-open. Le dépôt publie une SDK Flask commune —
+    label_studio_ml/api.py — et une série d'exemples entretenus qui
+    l'embarquent chacun dans son propre `docker-compose up` :
+    segment_anything_2_image, grounding_dino, grounding_sam, yolo, docling,
+    paddleocr, gliner, watsonX, parmi d'autres. Le README documente le port de
+    tous : « Use the following command to start serving the ML backend at
+    http://localhost:9090 », et _wsgi.py fixe `--host` à `0.0.0.0` par défaut —
+    c'est ce couple que chaque docker-compose.yml de la série republie avec
+    `ports: ["9090:9090"]`.
+    GET /health nomme le produit sans ambiguïté, et / répond à l'identique :
+    api.py déclare les deux décorateurs sur le même handler —
+    « @_server.route('/health', methods=['GET']) » puis
+    « @_server.route('/', methods=['GET']) » — dont le corps est
+    « return jsonify({'status': 'UP', 'model_class': MODEL_CLASS.__name__}) ».
+    Flask sérialise ce dict trié par clé, donc dans l'ordre alphabétique
+    `model_class` avant `status`, en JSON compact et suivi d'un saut de ligne.
+    MODEL_CLASS est fixé par `init_app(model_class, ...)`, que le `_wsgi.py` de
+    chaque exemple appelle avec sa propre classe de modèle — `NewModel` pour
+    segment_anything_2_image, `YOLO` pour yolo, `Docling` pour docling,
+    `GLiNERModel` pour gliner — donc le nom rendu varie avec l'exemple déployé,
+    mais le couple de clés `status`/`model_class` ne varie pas : c'est lui qui
+    signe le produit, jamais la valeur du second champ.
+    Le fichier monte aussi, sans jamais la refuser par défaut, POST /predict —
+    « return jsonify({'results': res}) » —, POST /setup — « return
+    jsonify({'model_version': model_version}) » —, POST /webhook — « response =
+    jsonify({'result': result, 'status': 'ok'}) » — et GET /metrics. La
+    fermeture de toute la surface, /health compris, tient sur une seule
+    condition : `init_app` lit « basic_auth_user = basic_auth_user or
+    os.environ.get('BASIC_AUTH_USER') » puis « basic_auth_pass = basic_auth_pass
+    or os.environ.get('BASIC_AUTH_PASS') », et « if basic_auth_user and
+    basic_auth_pass: BASIC_AUTH = (basic_auth_user, basic_auth_pass) » —
+    BASIC_AUTH ne vaut jamais None que si les deux variables sont posées
+    ensemble. Le `before_request` `check_auth()` ne réclame un en-tête
+    Authorization comparé par `hmac.compare_digest` que « if BASIC_AUTH is not
+    None » : sans les deux variables, aucune requête n'est jamais rejetée, sur
+    aucune route — /health y compris, puisque `before_request` s'applique à
+    tout l'app Flask. Un 200 sur GET /health prouve donc, à lui seul, que le
+    reste de la surface — /predict compris — répond de la même façon à
+    l'anonyme, sans qu'il faille l'interroger séparément. C'est aussi visible
+    dans le docker-compose.yml que chaque exemple publie : `BASIC_AUTH_USER=`
+    et `BASIC_AUTH_PASS=` y figurent vides, en commentaire « specify these
+    parameters if you want to use basic auth for the model server ».
+  impact: |
+    Le corps de /health est le moins grave de ce que l'absence des deux
+    variables ouvre sur ce processus : sa valeur ici est de nommer le produit
+    et le modèle qu'il sert, pas d'être le butin. La même surface, non gardée
+    par la même condition, monte POST /predict — n'importe qui peut faire
+    tourner de l'inférence sur le GPU de l'hôte, aux frais de l'exploitant, ce
+    qui sature sa mémoire vidéo et son débit et prive les usages légitimes de
+    leur capacité — et POST /setup, qui renvoie la version du modèle chargé et
+    peut réinitialiser l'état du modèle pour un projet donné selon ce que
+    `model.get('model_version')` renvoie pour l'implémentation déployée.
+    model_class renseigne aussi, en clair, sur la nature du modèle qui tourne
+    derrière le port — utile pour cibler l'exemple précis (segmentation,
+    détection, OCR, LLM) avant de pousser plus loin.
+  remediation: |
+    Poser BASIC_AUTH_USER et BASIC_AUTH_PASS ensemble dans l'environnement du
+    conteneur avant de démarrer — le docker-compose.yml de chaque exemple les
+    déclare déjà, vides, prêts à être renseignés — puis relancer le service :
+    `init_app` les lit une seule fois au démarrage, donc rien ne s'active sans
+    redémarrage. Une fois posés, `check_auth()` réclame
+    « Authorization: Basic ... » sur toute route, /health comprise, comparée en
+    temps constant par `hmac.compare_digest`.
+    Ne pas se fier au réseau seul en attendant : `_wsgi.py` lie 0.0.0.0 par
+    défaut et le docker-compose officiel publie `9090:9090` sur l'hôte. Publier
+    le conteneur en `-p 127.0.0.1:9090:9090`, ou placer un reverse proxy qui
+    authentifie devant le port, restreint l'accès en dehors de la boucle locale
+    en l'absence des deux variables.
+    Vérifier depuis l'extérieur du périmètre, sur la route même qui porte le
+    constat : sur une instance fermée, GET /health doit rendre 401 et le corps
+    texte « Unauthorized », plus un en-tête `WWW-Authenticate: Basic
+    realm="Login required"` — pas le couple JSON status/model_class.
+    Le schéma exact attendu par POST /predict et l'effet précis de POST /setup
+    sur le modèle en place dépendent de l'exemple déployé et n'ont pas été
+    vérifiés ici sur une instance réelle : ne pas les présumer, et contrôler ces
+    deux routes sur l'implémentation concernée avant d'en tirer une conclusion
+    au-delà de ce que /health établit seul.
+  reference:
+    - https://github.com/HumanSignal/label-studio-ml-backend
+    - https://github.com/HumanSignal/label-studio-ml-backend/blob/master/label_studio_ml/api.py
+    - https://github.com/HumanSignal/label-studio-ml-backend/blob/master/label_studio_ml/exceptions.py
+    - https://github.com/HumanSignal/label-studio-ml-backend/blob/master/README.md
+    - https://github.com/HumanSignal/label-studio-ml-backend/blob/master/label_studio_ml/examples/segment_anything_2_image/_wsgi.py
+    - https://github.com/HumanSignal/label-studio-ml-backend/blob/master/label_studio_ml/examples/segment_anything_2_image/docker-compose.yml
+  metadata:
+    max-request: 1
+    vendor: humansignal
+    product: label-studio-ml-backend
+  tags: ai,ml,mlops,label-studio,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture. GET /health et GET / partagent le même handler dans
+  # api.py — interroger les deux rendrait deux fois le même constat — et
+  # before_request s'applique à toute l'app Flask, donc ce même GET, sans en-
+  # tête Authorization, prouve déjà l'absence des deux variables BASIC_AUTH_USER
+  # / BASIC_AUTH_PASS sur le reste de la surface, POST /predict compris.
+  #
+  # En lecture seule, et strictement. POST /predict lancerait de l'inférence
+  # sur le GPU de l'hôte, POST /setup construirait un modèle pour un projet
+  # donné et POST /webhook déclencherait model.fit() sur un événement
+  # d'entraînement : ce sont les abus que le template signale, pas ce qu'un
+  # scanner a le droit de faire pour les établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/health"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture et de fermeture du corps entier, tenu sur
+      # l'ordre alphabétique que Flask impose à jsonify() par défaut :
+      # model_class avant status. Les deux clés ensemble, jamais l'une sans
+      # l'autre — "status":"UP" seul est le vocabulaire de tout actionneur
+      # Spring Boot, et un matcher qui s'y arrêterait déclencherait sur eux
+      # aussi. Borner au document entier, pas à une sous-chaîne, écarte à la
+      # fois une supervision qui republierait ce couple au fond d'un objet
+      # composite et un serveur qui y ajouterait des champs que
+      # MODEL_CLASS.__name__ seul ne produit jamais.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"model_class"\s*:\s*"[A-Za-z_][A-Za-z0-9_]*"\s*,\s*"status"\s*:\s*"UP"\s*\}\s*$'
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le nom de la classe Python du modèle réellement servi derrière ce
+      # port — segment_anything_2_image rend NewModel, yolo rend YOLO,
+      # docling rend Docling — ce qui distingue l'exemple déployé sans avoir
+      # à en interroger une seconde route.
+      - type: json
+        part: body
+        name: model_class
+        json:
+          - '.model_class'

@@ -33154,6 +33154,295 @@ def test_fastchat_matcher_compiles_and_fires_against_a_live_server():
     )
 
 
+# --------------------------------------------------------------------------
+# Label Studio ML Backend. Produit distinct de Label Studio (déjà couvert par
+# label-studio-signup-open) : c'est le serveur d'inférence Flask que Label
+# Studio interroge pour le pré-annotage et l'apprentissage actif. GET /health
+# et GET / partagent le même handler dans label_studio_ml/api.py —
+# « return jsonify({'status': 'UP', 'model_class': MODEL_CLASS.__name__}) »
+# — que Flask sérialise trié par clé (model_class avant status). init_app()
+# ne monte before_request check_auth() que si BASIC_AUTH_USER et
+# BASIC_AUTH_PASS sont tous deux posés ; sans eux, aucune route n'est jamais
+# gardée, /health comprise.
+
+LSML_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                             "label-studio-ml-backend-exposed.yaml")
+
+LSML_HEALTH_ROUTE = "/health"
+
+
+def lsml_health_body(model_class="NewModel", indent=None):
+    """
+    Ce que rend GET /health : jsonify({'status': 'UP', 'model_class':
+    MODEL_CLASS.__name__}), sérialisé par Flask trié par clé — model_class
+    avant status — et suivi d'un saut de ligne.
+    """
+    payload = {"model_class": model_class, "status": "UP"}
+    if indent is not None:
+        return json.dumps(payload, indent=indent) + "\n"
+    return json.dumps(payload, separators=(",", ":")) + "\n"
+
+
+# L'instance ouverte, avec le nom de classe que segment_anything_2_image
+# passe à init_app().
+LSML_OPEN_BODY = lsml_health_body()
+
+# Ce que before_request/check_auth() rend quand BASIC_AUTH_USER et
+# BASIC_AUTH_PASS sont posés et qu'aucun en-tête Authorization valide n'est
+# fourni : un texte brut, pas du JSON.
+LSML_UNAUTHORIZED_BODY = "Unauthorized"
+
+# Le squelette exact de l'actionneur Spring Boot — {"status":"UP"} seul —
+# qu'un matcher qui ne porterait que sur "status":"UP" confondrait avec ce
+# produit.
+LSML_SPRING_ACTUATOR_BODY = '{"status":"UP"}'
+
+# La même paire républiée au fond du document d'une supervision qui
+# agrégerait plusieurs sondes sous ses propres clés.
+LSML_COMPOSITE_BODY = '{"probe":"lsml","upstream":%s}' % LSML_OPEN_BODY.strip()
+
+# Les deux mêmes champs, dans l'ordre inverse : aucune implémentation du
+# produit ne les rend ainsi — jsonify() sérialise toujours trié par clé.
+LSML_REORDERED_BODY = '{"status":"UP","model_class":"NewModel"}\n'
+
+
+def lsml_block():
+    doc = load(LSML_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+             if "{{BaseURL}}%s" % LSML_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant l'unique route "
+        "qui nomme le produit et prouve à elle seule l'absence des deux "
+        "variables BASIC_AUTH_USER/BASIC_AUTH_PASS, before_request "
+        "s'appliquant à toute l'app Flask" % LSML_HEALTH_ROUTE
+    )
+    return blocks[0]
+
+
+def lsml_fires(status=200, body=None, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and` par défaut."""
+    block = lsml_block()
+    if body is None:
+        body = LSML_OPEN_BODY
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            header_blob = " ".join(headers.values())
+            words = matcher.get("words") or []
+            hit = (all(w in header_blob for w in words)
+                  if matcher.get("condition") == "and"
+                  else any(w in header_blob for w in words))
+            verdicts.append(hit)
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_lsml_probe_is_a_single_read_only_get_on_health():
+    """
+    La même absence de before_request monte, sans dépendance propre, POST
+    /predict — lancerait de l'inférence sur le GPU de l'hôte —, POST /setup
+    — construirait un modèle pour un projet donné — et POST /webhook —
+    déclencherait model.fit() sur un événement d'entraînement : ce sont les
+    abus que le template signale, pas ce qu'un scanner a le droit de faire
+    pour les établir.
+    """
+    doc = load(LSML_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", LSML_HEALTH_ROUTE)}, (
+        "le template interroge autre chose que GET /health — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "le health-check se lit en GET : tout ce qui exécute le modèle "
+            "ou modifie son état est en POST"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le bloc enverrait un corps ou une requête brute : rien de ce "
+            "que le template établit ne demande d'écrire sur l'instance "
+            "auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/predict", "lancerait de l'inférence sur le GPU de "
+                            "l'hôte, aux frais de l'exploitant"),
+                ("/setup", "construirait un modèle pour un projet donné"),
+                ("/webhook", "déclencherait model.fit() sur un événement "
+                            "d'entraînement"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+
+
+def test_lsml_matcher_needs_both_keys_jointly_not_status_alone():
+    """
+    Le cœur du constat, et le point que le roadmap souligne nommément :
+    "status":"UP" seul est le vocabulaire de tout actionneur Spring Boot,
+    model_class seul ne prouve rien — c'est la présence conjointe des deux,
+    à la racine du document et dans l'ordre où Flask les sérialise, qui
+    n'appartient qu'à ce produit.
+    """
+    assert lsml_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance ouverte"
+    )
+
+    assert not lsml_fires(status=401, body=LSML_UNAUTHORIZED_BODY,
+                           headers={"Content-Type": "text/html; charset=utf-8",
+                                    "WWW-Authenticate": 'Basic realm="Login required"'}), (
+        "le template conclut sur le refus que check_auth() rend à "
+        "l'anonyme quand BASIC_AUTH_USER/BASIC_AUTH_PASS sont posés : un "
+        "texte brut, sans aucune des clés que le matcher exige"
+    )
+
+    assert not lsml_fires(body=LSML_SPRING_ACTUATOR_BODY), (
+        "le template déclenche sur {\"status\":\"UP\"} seul, le squelette "
+        "de tout actionneur Spring Boot — model_class doit être exigé lui "
+        "aussi"
+    )
+
+    assert not lsml_fires(body=LSML_COMPOSITE_BODY), (
+        "le template conclut sur la charge utile républiée au fond du "
+        "document d'une supervision : l'ancrage d'ouverture doit dire que "
+        "c'est l'instance elle-même qui a répondu en tête de son document"
+    )
+
+    assert not lsml_fires(body=LSML_REORDERED_BODY), (
+        "le template déclenche sur les deux mêmes champs rendus dans "
+        "l'ordre inverse — jsonify() les sérialise toujours triés par clé, "
+        "donc ce corps ne prouve pas ce produit"
+    )
+
+
+def test_lsml_matcher_holds_on_variations_that_do_not_change_the_fact():
+    for body, why in (
+        (lsml_health_body(model_class="YOLO"),
+         "un nom de classe de modèle différent — chaque exemple du dépôt "
+         "appelle init_app() avec sa propre classe"),
+        (lsml_health_body(model_class="GLiNERModel"),
+         "un nom de classe qui porte lui-même des majuscules internes"),
+        (lsml_health_body(indent=2),
+         "un intermédiaire qui réindente ce que Flask sérialise compact"),
+        (LSML_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne supplémentaire au "
+         "corps relayé"),
+    ):
+        assert lsml_fires(body=body), "le template perd %s" % why
+
+
+def test_lsml_matchers_condition_requires_every_clause():
+    block = lsml_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon \"status\":\"UP\" "
+        "seul suffirait à faire remonter n'importe quel actionneur Spring "
+        "Boot"
+    )
+    assert len(block.get("matchers") or []) >= 2, (
+        "un seul matcher ne peut pas porter à la fois le statut et la "
+        "signature du produit"
+    )
+
+
+def test_lsml_extractor_reports_the_model_class_served():
+    extractors = lsml_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        f"un seul extracteur suffit à nommer le modèle réellement servi — "
+        f"{extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json" and extractor.get("json") == [".model_class"], (
+        "l'extracteur ne relève pas le nom de la classe du modèle servi — %s"
+        % extractor
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_lsml_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher : seul un
+    scan contre un vrai serveur ferme la boucle, y compris pour l'instance
+    gardée par BASIC_AUTH_USER/BASIC_AUTH_PASS, qui rend 401 sur cette même
+    route.
+    """
+    def scan(status=200, body=LSML_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == LSML_HEALTH_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"error":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LSML_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                  if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "label-studio-ml-backend-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [LSML_HEALTH_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        f"le scan ne reconnaît pas la réponse d'une instance ouverte — {results}"
+    )
+    assert results[0].get("extracted-results") == ["NewModel"], (
+        "l'extracteur ne rend pas le nom de la classe du modèle servi — %s"
+        % results[0].get("extracted-results")
+    )
+
+    _, results = scan(status=401, body=LSML_UNAUTHORIZED_BODY,
+                       content_type="text/html; charset=utf-8")
+    assert results == [], (
+        f"le scan signale une instance gardée par BASIC_AUTH_USER/"
+        f"BASIC_AUTH_PASS — {results}"
+    )
+
+    _, results = scan(body=LSML_SPRING_ACTUATOR_BODY)
+    assert results == [], (
+        f"le scan confond un actionneur Spring Boot, qui sert "
+        f"{{\"status\":\"UP\"}} seul, avec ce produit — {results}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
 def test_nuclei_validates_the_whole_pack():
     r = subprocess.run(
