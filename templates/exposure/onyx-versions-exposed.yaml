@@ -1,0 +1,97 @@
+id: onyx-versions-exposed
+
+info:
+  name: Onyx (ex-Danswer) - Unauthenticated Versions Endpoint Exposed
+  author: popy21
+  severity: low
+  description: |
+    Onyx (onyx-dot-app/onyx, anciennement Danswer) est une plateforme de
+    recherche d'entreprise et de chat RAG auto-hébergée : elle indexe les
+    connecteurs de l'organisation — Confluence, Google Drive, Slack, Jira — et
+    répond aux questions à partir de ces documents.
+    GET /versions est déclarée « @router.get("/versions", tags=PUBLIC_API_TAGS) »
+    dans backend/onyx/server/manage/get_state.py, et la route figure dans
+    PUBLIC_ENDPOINT_SPECS de backend/onyx/server/auth_check.py sous la forme
+    « ("/versions", {"GET"}) » : elle est volontairement exemptée
+    d'authentification, alors que le reste de l'API l'exige toujours — le mode
+    AUTH_TYPE=disabled a été retiré du produit.
+    Le handler get_versions() rend un modèle AllVersions, trois blocs stable, dev
+    et migration, chacun un ContainerVersions à quatre champs déclarés dans cet
+    ordre dans backend/onyx/server/manage/models.py : « onyx », « relational_db »,
+    « index », « nginx ». La clé littérale « onyx » en tête de chaque bloc est le
+    nom du produit ; la structure entière — trois blocs nommés, quatre clés
+    chacun, dans cet ordre — n'appartient qu'à lui.
+    Le routeur est monté sans préfixe (API_PREFIX vide par défaut) et le
+    reverse-proxy nginx du déploiement Docker officiel
+    (deployment/data/nginx/app.conf.template) route « ^/(api|openapi.json) »
+    vers le serveur d'API en retirant « /api » : la route se lit donc en
+    /api/versions sur le port publié par nginx (80, ou 3000 selon le compose).
+  impact: |
+    Le renseignement est limité, d'où la sévérité : les valeurs du bloc
+    « stable » et « dev » sont les dernières étiquettes publiées sur Docker Hub
+    pour onyx-backend, onyx-web-server et onyx-model-server, pas la version de
+    l'instance elle-même. Mais la réponse identifie avec certitude un Onyx
+    joignable depuis l'extérieur, c'est-à-dire un point d'entrée vers un index
+    qui agrège les documents internes de l'organisation, et désigne la pile
+    déployée par le compose de référence : PostgreSQL, Vespa et nginx avec leurs
+    étiquettes d'image. Une réponse 200 établit en outre que le serveur d'API
+    sort vers Internet : get_versions() interroge hub.docker.com à chaque appel,
+    et une instance isolée rend une erreur 500.
+  remediation: |
+    La route est publique par construction dans PUBLIC_ENDPOINT_SPECS : aucun
+    réglage d'Onyx ne la ferme. Ne pas publier l'instance sur Internet — lier le
+    port de nginx à 127.0.0.1 dans le compose (« 127.0.0.1:80:80 ») et y accéder
+    par VPN ou par un reverse-proxy authentifiant — ou refuser /api/versions au
+    niveau du proxy frontal (« location = /api/versions { return 404; } »), la
+    route ne servant qu'à comparer les images à celles de Docker Hub.
+    Vérifier depuis l'extérieur : « curl -s http://<hote>/api/versions » ne doit
+    plus rendre le document AllVersions.
+  reference:
+    - https://github.com/onyx-dot-app/onyx/blob/main/backend/onyx/server/manage/get_state.py
+    - https://github.com/onyx-dot-app/onyx/blob/main/backend/onyx/server/manage/models.py
+    - https://github.com/onyx-dot-app/onyx/blob/main/backend/onyx/server/auth_check.py
+    - https://github.com/onyx-dot-app/onyx/blob/main/deployment/data/nginx/app.conf.template
+    - https://github.com/onyx-dot-app/onyx
+  metadata:
+    max-request: 1
+    vendor: onyx-dot-app
+    product: onyx
+  tags: ai,llm,rag,onyx,danswer,enterprise-search,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la seule route qui soit publique par déclaration et
+  # qui nomme le produit. GET /api/version, sa voisine, rend
+  # {"backend_version": ...} : une clé qu'aucune structure ne distingue.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/versions"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le document entier, ancré aux deux bouts. FastAPI sérialise le modèle
+      # AllVersions compact et dans l'ordre de déclaration — stable, dev,
+      # migration, puis onyx, relational_db, index, nginx dans chaque bloc. Les
+      # valeurs sont laissées libres : les étiquettes suivent Docker Hub. Les
+      # \s* tolèrent un intermédiaire qui réindente ce qu'il relaie.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"stable"\s*:\s*\{\s*"onyx"\s*:\s*"[^"]*"\s*,\s*"relational_db"\s*:\s*"[^"]*"\s*,\s*"index"\s*:\s*"[^"]*"\s*,\s*"nginx"\s*:\s*"[^"]*"\s*\}\s*,\s*"dev"\s*:\s*\{\s*"onyx"\s*:\s*"[^"]*"\s*,\s*"relational_db"\s*:\s*"[^"]*"\s*,\s*"index"\s*:\s*"[^"]*"\s*,\s*"nginx"\s*:\s*"[^"]*"\s*\}\s*,\s*"migration"\s*:\s*\{\s*"onyx"\s*:\s*"[^"]*"\s*,\s*"relational_db"\s*:\s*"[^"]*"\s*,\s*"index"\s*:\s*"[^"]*"\s*,\s*"nginx"\s*:\s*"[^"]*"\s*\}\s*\}\s*$'
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # La dernière étiquette stable publiée sur Docker Hub, telle que
+      # l'instance la voit — pas sa propre version.
+      - type: json
+        part: body
+        name: latest-stable
+        json:
+          - '.stable.onyx'

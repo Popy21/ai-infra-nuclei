@@ -33451,3 +33451,171 @@ def test_nuclei_validates_the_whole_pack():
     )
     combined = r.stdout + r.stderr
     assert "All templates validated successfully" in combined, combined[-2000:]
+
+
+# --------------------------------------------------------------------------
+# Onyx (ex-Danswer). GET /versions est déclarée dans
+# backend/onyx/server/manage/get_state.py et listée dans PUBLIC_ENDPOINT_SPECS
+# de backend/onyx/server/auth_check.py : publique par construction. Le
+# handler rend un AllVersions — stable, dev, migration — dont chaque bloc est
+# un ContainerVersions à quatre champs, onyx, relational_db, index, nginx,
+# sérialisés compacts dans l'ordre de déclaration. Le nginx du compose
+# officiel sert l'API sous /api en retirant ce préfixe.
+
+ONYX_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "onyx-versions-exposed.yaml")
+
+ONYX_VERSIONS_ROUTE = "/api/versions"
+
+
+def onyx_versions_body(stable="v2.9.4", dev="v3.0.0-beta.2", indent=None):
+    """Ce que rend get_versions(), avec les littéraux du handler."""
+    def block(onyx):
+        return {"onyx": onyx, "relational_db": "postgres:15.2-alpine",
+                "index": "vespaengine/vespa:8.277.17",
+                "nginx": "nginx:1.25.5-alpine"}
+    payload = {"stable": block(stable), "dev": block(dev),
+               "migration": block("airgapped-intfloat-nomic-migration")}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+ONYX_OPEN_BODY = onyx_versions_body()
+
+# Instance isolée : get_versions() n'atteint pas hub.docker.com et FastAPI
+# rend l'exception non rattrapée.
+ONYX_AIRGAPPED_BODY = "Internal Server Error"
+
+# Le même document républié au fond de celui d'une supervision.
+ONYX_COMPOSITE_BODY = '{"probe":"onyx","upstream":%s}' % ONYX_OPEN_BODY
+
+# Un document qui a les trois blocs mais pas la clé « onyx » : ce n'est pas
+# le modèle ContainerVersions.
+ONYX_OTHER_PRODUCT_BODY = ONYX_OPEN_BODY.replace('"onyx":', '"app":')
+
+# La voisine GET /api/version, qui ne nomme pas le produit.
+ONYX_SINGLE_VERSION_BODY = '{"backend_version":"v2.9.4"}'
+
+
+def onyx_block():
+    doc = load(ONYX_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % ONYX_VERSIONS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % ONYX_VERSIONS_ROUTE
+    return blocks[0]
+
+
+def onyx_fires(status=200, body=None, headers=None):
+    block = onyx_block()
+    body = ONYX_OPEN_BODY if body is None else body
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            blob = " ".join(headers.values())
+            verdicts.append(any(w in blob for w in matcher.get("words") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_onyx_probe_is_a_single_get_on_versions():
+    doc = load(ONYX_TEMPLATE)
+    assert request_routes(doc) == {("GET", ONYX_VERSIONS_ROUTE)}, (
+        f"le template interroge autre chose que GET /api/versions — "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert onyx_block().get("matchers-condition") == "and"
+    assert load(ONYX_TEMPLATE)["info"]["severity"] == "low"
+
+
+def test_onyx_matcher_needs_the_whole_allversions_document():
+    assert onyx_fires(), "le template ne reconnaît pas la réponse d'Onyx"
+    for body, why in (
+        (onyx_versions_body(indent=2), "un intermédiaire qui réindente"),
+        (onyx_versions_body(stable="v1.0.0", dev="v1.1.0-beta.7"),
+         "d'autres étiquettes Docker Hub"),
+    ):
+        assert onyx_fires(body=body), "le template perd %s" % why
+
+    for status, body, why in (
+        (500, ONYX_AIRGAPPED_BODY, "l'erreur d'une instance isolée"),
+        (200, ONYX_COMPOSITE_BODY, "le document républié par une supervision"),
+        (200, ONYX_OTHER_PRODUCT_BODY, "trois blocs sans la clé « onyx »"),
+        (200, ONYX_SINGLE_VERSION_BODY, "la voisine /api/version"),
+    ):
+        assert not onyx_fires(status=status, body=body), (
+            "le template déclenche sur %s" % why
+        )
+    assert not onyx_fires(headers={"Content-Type": "text/html"}), (
+        "le template déclenche sur une page HTML"
+    )
+
+
+def test_onyx_extractor_reads_the_latest_stable_tag():
+    extractors = onyx_block().get("extractors") or []
+    assert [(e.get("type"), e.get("json")) for e in extractors] == [
+        ("json", [".stable.onyx"])], extractors
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_onyx_matcher_compiles_and_fires_against_a_live_server():
+    def scan(status=200, body=ONYX_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == ONYX_VERSIONS_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                # -s low : une configuration nuclei qui restreint les
+                # sévérités écarterait sinon le template sans le dire.
+                ["nuclei", "-t", ONYX_TEMPLATE, "-s", "low",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [ONYX_VERSIONS_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "onyx-versions-exposed"
+    assert results[0].get("extracted-results") == ["v2.9.4"], results[0]
+
+    _, results = scan(status=500, body=ONYX_AIRGAPPED_BODY, content_type="text/plain")
+    assert results == [], results
+
+    _, results = scan(body=ONYX_OTHER_PRODUCT_BODY)
+    assert results == [], results
