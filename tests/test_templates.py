@@ -33797,3 +33797,264 @@ def test_khoj_matcher_compiles_and_fires_against_a_live_server():
 
     _, results = scan(body=KHOJ_NESTED_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Argilla. api/routes.py monte le sous-app /api/v1 par une boucle
+# include_router() sans jamais lui passer dependencies= : le contrôle d'accès
+# est délégué route par route, via un paramètre Security(auth.get_current_user)
+# que chaque handler de datasets.py déclare individuellement. Les deux routes
+# de api/handlers/v1/info.py — get_status() et get_version() — ne le portent
+# pas. Status sérialise version, search_engine et memory dans cet ordre de
+# déclaration du modèle pydantic, et memory_status() (contexts/info.py) réécrit
+# chaque valeur de memory_info()._asdict() en un entier suivi d'un caractère
+# d'unité (K/M/G/T/P/B) — jamais un nombre brut d'octets — avec rss toujours en
+# tête, sur toutes les plateformes que psutil supporte.
+
+ARGILLA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "argilla-status-exposed.yaml")
+
+ARGILLA_STATUS_ROUTE = "/api/v1/status"
+ARGILLA_VERSION_ROUTE = "/api/v1/version"
+
+
+def argilla_status_body(version="2.8.0dev0", memory_first_key="rss", memory_first_value="214M"):
+    """
+    Ce que get_status() rend : Status(version=..., search_engine=...,
+    memory=...) sérialisé dans l'ordre de déclaration du modèle pydantic.
+    """
+    return ('{"version":"%s","search_engine":{"name":"argilla-es",'
+            '"cluster_name":"es-argilla-local","tagline":"You Know, for Search"},'
+            '"memory":{"%s":"%s","vms":"1G"}}'
+            % (version, memory_first_key, memory_first_value))
+
+
+def argilla_version_body(version="2.8.0dev0"):
+    return '{"version":"%s"}' % version
+
+
+ARGILLA_STATUS_BODY = argilla_status_body()
+ARGILLA_VERSION_BODY = argilla_version_body()
+
+# Le document entier republié au fond de celui d'une supervision.
+ARGILLA_COMPOSITE_BODY = '{"probe":"argilla","upstream":%s}' % ARGILLA_STATUS_BODY
+
+# memory_info() republié en nombres bruts d'octets : ce n'est pas ce que
+# _memory_size() écrit sur cette route, qui rend toujours une chaîne.
+ARGILLA_RAW_MEMORY_BODY = (
+    '{"version":"2.8.0dev0","search_engine":{"tagline":"You Know, for Search"},'
+    '"memory":{"rss":214000000,"vms":1000000000}}'
+)
+
+# Un service générique qui rend un couple version/status sans le trio propre à
+# Status.
+ARGILLA_OTHER_PRODUCT_BODY = '{"version":"1.2.3","status":"ok"}'
+
+# La seule clé que /api/v1/version rend aussi, sans search_engine ni memory :
+# ce que rendrait un produit dont l'endpoint de statut ne fait que reprendre
+# celui de version.
+ARGILLA_VERSION_ONLY_STATUS_BODY = '{"version":"1.2.3"}'
+
+# Les trois clés de tête réordonnées : Status ne les sérialise jamais dans un
+# autre ordre que celui de sa déclaration pydantic.
+ARGILLA_REORDERED_BODY = (
+    '{"search_engine":{},"version":"2.8.0dev0","memory":{"rss":"1M"}}'
+)
+
+
+def argilla_block():
+    doc = load(ARGILLA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(ARGILLA_STATUS_ROUTE) for p in (b.get("path") or []))]
+    assert blocks, f"le template n'interroge pas {ARGILLA_STATUS_ROUTE}"
+    return blocks[0]
+
+
+def argilla_requests():
+    """(méthode, chemin) de chaque requête, dans l'ordre déclaré — cet ordre
+    donne son numéro à chaque body_N."""
+    block = argilla_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def argilla_fires(status=(200, ARGILLA_STATUS_BODY), version=(200, ARGILLA_VERSION_BODY)):
+    scenario = {ARGILLA_STATUS_ROUTE: status, ARGILLA_VERSION_ROUTE: version}
+    block = argilla_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in argilla_requests():
+        assert route in scenario, f"le template interroge un chemin inattendu : {route}"
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_argilla_probe_reads_two_routes_and_touches_nothing_else():
+    assert argilla_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent"
+    )
+    assert argilla_requests() == [
+        ("GET", ARGILLA_STATUS_ROUTE),
+        ("GET", ARGILLA_VERSION_ROUTE),
+    ], (
+        "les deux requêtes ne sont plus celles que le template documente — "
+        f"{argilla_requests()}"
+    )
+
+    doc = load(ARGILLA_TEMPLATE)
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", f"{method} {route} : le constat se lit sans rien écrire"
+        for forbidden, why in (
+            ("/datasets", "datasets.py exige Security(auth.get_current_user) par "
+                          "route : l'interroger sans jeton ne prouverait rien de "
+                          "plus que /status"),
+            ("/workspaces", "workspaces.py porte la même dépendance par route"),
+            ("/me", "GET /me rendrait l'identité de l'appelant authentifié, pas "
+                    "celle du serveur"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+
+def test_argilla_matcher_needs_the_status_trio_and_the_bare_version():
+    assert argilla_fires(), "le template ne reconnaît pas une instance Argilla ouverte"
+
+    for version in ("2.8.0dev0", "2.7.1", "2.10.0rc1"):
+        assert argilla_fires(
+            status=(200, argilla_status_body(version=version)),
+            version=(200, argilla_version_body(version=version)),
+        ), f"le template dépend d'un numéro de version précis — ici {version}"
+
+    assert argilla_fires(status=(200, (
+        '{\n  "version": "2.8.0dev0",\n  "search_engine": {},\n'
+        '  "memory": {"rss": "214M"}\n}'
+    ))), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    for body, why in (
+        (ARGILLA_COMPOSITE_BODY, "le document entier retrouvé au fond d'une "
+                                 "supervision — l'ancrage sur l'accolade ouvrante "
+                                 "dit que l'instance a répondu d'elle-même"),
+        (ARGILLA_RAW_MEMORY_BODY, "memory_info() republié en nombres bruts "
+                                  "d'octets, alors que _memory_size() n'écrit "
+                                  "jamais autre chose qu'un entier suivi d'un "
+                                  "caractère d'unité"),
+        (ARGILLA_OTHER_PRODUCT_BODY, "un service générique qui republie un "
+                                     "couple version/status sans le trio propre "
+                                     "à Status"),
+        (ARGILLA_VERSION_ONLY_STATUS_BODY, "une route de statut qui ne rend que "
+                                           "la version, sans search_engine ni "
+                                           "memory"),
+        (ARGILLA_REORDERED_BODY, "les trois clés de tête réordonnées, alors que "
+                                 "Status ne les sérialise jamais autrement que "
+                                 "dans l'ordre de sa déclaration pydantic"),
+    ):
+        assert not argilla_fires(status=(200, body)), f"le template déclenche sur {why}"
+
+    assert not argilla_fires(status=(401, ARGILLA_STATUS_BODY)), (
+        "le template ignore le statut : il conclurait même quand la route est "
+        "gardée par un proxy placé devant l'instance"
+    )
+
+
+def test_argilla_conclusion_needs_the_corroborating_version_route():
+    assert not argilla_fires(version=(404, '{"detail":"Not Found"}')), (
+        "le template conclut sans corroboration par la route disjointe : c'est "
+        "elle qui écarte un cache ou un proxy qui rejouerait la première "
+        "réponse depuis un contenu figé"
+    )
+
+
+def test_argilla_conclusion_is_carried_by_the_dsl_alone():
+    block = argilla_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_argilla_extractor_reports_the_version_from_the_status_response():
+    extractors = argilla_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul renseignement à faire remonter par instance : le numéro de "
+        "version"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — c'est /api/v1/status qui "
+        "porte le renseignement complet, /api/v1/version n'étant interrogée "
+        "que pour corroborer"
+    )
+    assert extractor.get("json") == [".version"], (
+        "l'extracteur ne lit pas .version — c'est pourtant ce qui date "
+        "l'instance et se compare aux correctifs publiés depuis"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_argilla_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue le motif en Python plutôt qu'avec le lexer de
+    nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle de l'expression DSL.
+    """
+    def scan(status_body=ARGILLA_STATUS_BODY, status_code=200,
+             version_body=ARGILLA_VERSION_BODY):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == ARGILLA_STATUS_ROUTE:
+                    self.reply(status_code, status_body)
+                elif self.path == ARGILLA_VERSION_ROUTE:
+                    self.reply(200, version_body)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}')
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", ARGILLA_TEMPLATE, "-s", "low",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        return [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+
+    results = scan()
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "argilla-status-exposed"
+    assert results[0].get("extracted-results") == ["2.8.0dev0"], results[0]
+
+    assert scan(status_body=ARGILLA_OTHER_PRODUCT_BODY) == [], (
+        "le scan déclenche sur un service générique version/status"
+    )
+    assert scan(status_body=ARGILLA_RAW_MEMORY_BODY) == [], (
+        "le scan déclenche sur memory_info() republié en nombres bruts"
+    )

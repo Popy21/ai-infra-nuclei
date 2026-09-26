@@ -1,0 +1,150 @@
+id: argilla-status-exposed
+
+info:
+  name: Argilla - Unauthenticated Server Status and Version Disclosure
+  author: popy21
+  severity: low
+  description: |
+    Argilla (argilla-io/argilla) est la plateforme d'annotation de données pour
+    le fine-tuning et le RLHF. Son serveur, argilla-server, monte son API
+    interne en une ligne — `argilla_server/_app.py` déclare
+    « app.mount("/api/v1", api_v1) » — et `api/routes.py` construit ce sous-app
+    par une boucle de `include_router()` sur une quinzaine de routeurs
+    (datasets, workspaces, records, users, settings, webhooks, info, …), sans
+    jamais lui passer de `dependencies=[Depends(...)]`. Le contrôle d'accès de
+    ce sous-app est donc entièrement délégué à chaque handler, un par un : dans
+    `api/handlers/v1/datasets/datasets.py`, chaque route porte
+    « current_user: User = Security(auth.get_current_user) » en paramètre de
+    fonction, et c'est cette dépendance-là, répétée route par route, qui exige
+    un jeton.
+    `api/handlers/v1/info.py` ne la porte pas. « @router.get("/version") »
+    déclare « async def get_version(): return Version(version=
+    info.argilla_version()) », sans aucun paramètre. « @router.get("/status") »
+    déclare « async def get_status(search_engine: SearchEngine =
+    Depends(get_search_engine)): return Status(version=info.argilla_version(),
+    search_engine=await search_engine.info(), memory=info.memory_status()) » —
+    la seule dépendance de la signature sert à obtenir le client du moteur de
+    recherche, pas à authentifier l'appelant. Les deux modèles pydantic
+    (`api/schemas/v1/info.py`) sont plats et déclarés dans cet ordre :
+    « class Version(BaseModel): version: str » et « class Status(BaseModel):
+    version: str; search_engine: dict; memory: dict ». Rien au niveau ASGI ne
+    comble l'absence : `_app.py` ne monte que `CORSMiddleware` et
+    `BrotliMiddleware` sur l'application FastAPI racine, avant de monter
+    `api_v1` en tant que sous-application — aucun intergiciel n'intercepte ce
+    qui l'atteint.
+    Les deux valeurs composites se lisent dans `contexts/info.py` et
+    `search_engine/elasticsearch.py`. `memory_status()` lit
+    « psutil.Process(os.getpid()).memory_info()._asdict() » et réécrit chaque
+    valeur avec `_memory_size()`, qui rend un entier suivi d'un seul caractère
+    d'unité — K, M, G, T, P ou B — jamais un nombre brut d'octets ; le premier
+    champ que psutil insère dans ce namedtuple, sur Linux comme sur macOS et
+    Windows, est toujours `rss`. `search_engine.info()` rend
+    « await self.client.info() », la réponse brute du client Elasticsearch (ou
+    OpenSearch) configuré — nom de cluster, numéro de version du moteur,
+    tagline. Le trio de clés de tête que Status sérialise dans son ordre de
+    déclaration — version (chaîne), search_engine (objet), memory (objet dont
+    la première valeur est un entier suivi d'une unité) — est propre à cette
+    route : aucun autre produit ne republie memory_info() sous cette forme.
+    Le quickstart Docker officiel (`examples/deployments/docker/docker-compose.yaml`,
+    documenté par `argilla/docs/getting_started/how-to-deploy-argilla-with-docker.md`)
+    publie le service avec « ports: ["6900:6900"] ».
+  impact: |
+    Un appelant anonyme obtient, en une lecture, le numéro de version exact
+    d'argilla-server — donc les correctifs de sécurité qui lui manquent —, le
+    moteur de recherche configuré et sa propre version (Elasticsearch ou
+    OpenSearch, avec son nom de cluster et son numéro de build), ainsi qu'un
+    aperçu de la mémoire résidente du processus serveur, une télémétrie
+    interne qu'un appelant sans compte n'a aucune raison d'obtenir. GET
+    /api/v1/version rend le même numéro de version isolé, ce qui confirme la
+    lecture sans ambiguïté : un scanner sait alors, sans authentification,
+    qu'il fait face à Argilla, sa version précise et son moteur de recherche.
+    Le reste de l'API v1 — datasets, workspaces, records, users — exige un
+    `Security(auth.get_current_user)` par endpoint et n'est pas concerné par ce
+    constat, ce qui borne la sévérité à low : aucune donnée annotée, aucun
+    identifiant et aucune capacité d'écriture ne sont accessibles par cette
+    voie.
+  remediation: |
+    Argilla ne propose aucun réglage pour fermer ces deux routes : l'absence de
+    dépendance d'authentification est écrite dans le code de info.py, ce n'est
+    pas un oubli de configuration côté exploitant. La fermeture est donc
+    réseau ou périmétrique. Le quickstart officiel publie le service sur
+    « 6900:6900 » ; restreindre cette publication à « 127.0.0.1:6900:6900 »
+    quand l'instance n'a pas à être jointe depuis l'extérieur de l'hôte, ou
+    placer un reverse proxy qui authentifie devant tout le préfixe /api/v1/.
+    Vérifier ensuite, depuis l'extérieur du périmètre, que GET /api/v1/status
+    et GET /api/v1/version ne répondent plus à l'anonyme, et tenir pour connus
+    d'un attaquant potentiel la version du serveur et le moteur de recherche
+    déjà observés le cas échéant.
+  reference:
+    - https://github.com/argilla-io/argilla
+    - https://github.com/argilla-io/argilla/blob/main/argilla-server/src/argilla_server/api/handlers/v1/info.py
+    - https://github.com/argilla-io/argilla/blob/main/argilla-server/src/argilla_server/api/schemas/v1/info.py
+    - https://github.com/argilla-io/argilla/blob/main/argilla-server/src/argilla_server/api/routes.py
+    - https://github.com/argilla-io/argilla/blob/main/argilla-server/src/argilla_server/contexts/info.py
+    - https://github.com/argilla-io/argilla/blob/main/argilla-server/src/argilla_server/search_engine/elasticsearch.py
+    - https://github.com/argilla-io/argilla/blob/main/argilla-server/src/argilla_server/_app.py
+    - https://github.com/argilla-io/argilla/blob/main/argilla-server/src/argilla_server/api/handlers/v1/datasets/datasets.py
+    - https://github.com/argilla-io/argilla/blob/main/examples/deployments/docker/docker-compose.yaml
+    - https://github.com/argilla-io/argilla/blob/main/argilla/docs/getting_started/how-to-deploy-argilla-with-docker.md
+  metadata:
+    max-request: 2
+    vendor: argilla-io
+    product: argilla-server
+  tags: ai,ml,annotation,rlhf,argilla,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première porte tout le constat : get_status() ne dépend
+  # d'aucune identité, seulement du client de recherche déjà configuré au
+  # démarrage du serveur, et rend trois champs déjà en mémoire ou déjà
+  # calculés — rien n'est écrit, rien n'est lancé. La seconde, GET
+  # /api/v1/version, ne dépend de rien du tout et rend le même numéro de
+  # version isolé : elle confirme la première sans lui ajouter de risque.
+  #
+  # En lecture seule, et strictement. Le même sous-app /api/v1 porte les
+  # routeurs datasets, workspaces, records et users, qui liraient ou
+  # écriraient les jeux de données annotés de l'exploitant ; aucun n'est
+  # interrogé ici.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/status"
+      - "{{BaseURL}}/api/v1/version"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux réponses à la fois : la seconde est une corroboration, pas
+    # une alternative.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture du document de Status, dans l'ordre de déclaration du
+          # modèle pydantic : version (une chaîne) puis search_engine (un
+          # objet qui s'ouvre). Cet ancrage écarte la même paire de clés
+          # retrouvée au fond d'un document composite qu'une supervision
+          # agrégerait sous une clé à elle.
+          - 'status_code_1 == 200 && regex("^\\{\\s*\"version\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"search_engine\"\\s*:\\s*\\{", trim_space(body_1))'
+
+          # Le champ memory, et la forme propre à _memory_size() : un entier
+          # suivi d'un seul caractère d'unité (K/M/G/T/P/B), jamais un compte
+          # brut d'octets — c'est ce qui sépare cette sonde d'un endpoint de
+          # diagnostic générique qui republierait memory_info() en chiffres
+          # nus. rss est le premier champ que psutil insère dans le
+          # namedtuple sur toutes les plateformes.
+          - 'regex("\"memory\"\\s*:\\s*\\{\\s*\"rss\"\\s*:\\s*\"[0-9]+[KMGTPB]\"", body_1)'
+
+          # La confirmation : le même produit, sur sa route la plus nue,
+          # rend un objet à un seul champ. get_version() ne dépend de rien et
+          # ne peut donc pas échouer différemment de get_status() sur une
+          # instance dont le moteur de recherche serait indisponible.
+          - 'status_code_2 == 200 && regex("^\\{\\s*\"version\"\\s*:\\s*\"[^\"]+\"\\s*\\}\\s*$", trim_space(body_2))'
+
+    extractors:
+      # Le numéro de version exact, donc les correctifs qui manquent à
+      # l'instance. Un seul extracteur : search_engine et memory n'ajoutent
+      # rien qu'un rapport de scan doive répéter par instance.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.version'

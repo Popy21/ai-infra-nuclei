@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-102 templates, 99 produits.
+103 templates, 100 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -37,6 +37,7 @@ amont.
 | agentos | [`agno-agentos-config-exposed`](templates/exposure/agno-agentos-config-exposed.yaml) | high |
 | aim | [`aim-tracking-server-exposed`](templates/exposure/aim-tracking-server-exposed.yaml) | medium |
 | anythingllm | [`anythingllm-exposed`](templates/exposure/anythingllm-exposed.yaml) | high |
+| argilla-server | [`argilla-status-exposed`](templates/exposure/argilla-status-exposed.yaml) | low |
 | autogen-studio | [`autogen-studio-no-auth`](templates/exposure/autogen-studio-no-auth.yaml) | high |
 | automatic1111-stable-diffusion-webui | [`automatic1111-api-exposed`](templates/exposure/automatic1111-api-exposed.yaml) | high |
 | bentoml | [`bentoml-yatai-exposed`](templates/exposure/bentoml-yatai-exposed.yaml) | high |
