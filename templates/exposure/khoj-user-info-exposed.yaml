@@ -1,0 +1,133 @@
+id: khoj-user-info-exposed
+
+info:
+  name: Khoj - Unauthenticated User Info Disclosure in Anonymous Mode
+  author: popy21
+  severity: high
+  description: |
+    Khoj (khoj-ai/khoj, ~37 000 étoiles, dépôt actif en 2026) est un assistant
+    IA personnel auto-hébergé — un « second cerveau » qui indexe les documents
+    de l'utilisateur et répond aux questions dessus via une API REST.
+    GET /api/v1/user est déclarée « @api.get("/v1/user", ...) » dans
+    src/khoj/routers/api.py, le routeur api étant monté sous le préfixe /api
+    par « app.include_router(api, prefix="/api") » dans configure.py. Le
+    handler user_info() porte le décorateur « @requires(["authenticated"]) »
+    de starlette.authentication, comme la quasi-totalité des routes du fichier
+    — l'authentification n'est donc pas absente, elle est satisfaite en
+    silence.
+    C'est UserAuthenticationBackend.authenticate(), dans src/khoj/configure.py,
+    qui la satisfait : à défaut de session, de jeton porteur ou de client
+    identifié par ailleurs, la dernière branche de la méthode teste
+    « if state.anonymous_mode: » et, si elle est vraie, récupère l'utilisateur
+    dont le nom est littéralement « default » — celui que
+    _initialize_default_user() crée au démarrage — et rend
+    « AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user)
+    ». Chaque requête entrante devient ainsi authentifiée comme ce compte
+    unique, sans jeton ni cookie, ce qui suffit à lever la dépendance sur
+    n'importe quelle route de l'API.
+    anonymous_mode est activé par le drapeau --anonymous-mode, lu dans
+    src/khoj/main.py par « state.anonymous_mode = args.anonymous_mode » — et
+    c'est exactement le drapeau que le docker-compose.yml officiel du dépôt
+    pose sur le service server : « command: --host="0.0.0.0" --port=42110 -vv
+    --anonymous-mode --non-interactive », avec « ports: ["42110:42110"] »
+    déjà publié sans commentaire à lever. C'est la configuration par défaut
+    documentée pour l'auto-hébergement mono-utilisateur, pas un choix isolé.
+    Le corps que rend user_info() nomme le produit sans ambiguïté : le handler
+    construit le dict « user_info = {"email": user.email, "username":
+    user.username, "photo": user_picture, "is_active": is_active,
+    "has_documents": has_documents, "khoj_version": state.khoj_version} » puis
+    le sert par « Response(content=json.dumps(user_info),
+    media_type="application/json", status_code=200) » — un json.dumps() nu,
+    sans séparateurs resserrés ni tri des clés, qui respecte donc l'ordre
+    d'insertion du dict et les espaces par défaut du module json. La clé
+    « khoj_version », tirée de « version("khoj") » dans main.py, n'appartient
+    qu'à ce produit.
+  impact: |
+    La réponse identifie le compte auquel le serveur vient de rattacher la
+    requête anonyme — « default », l'adresse e-mail que
+    _initialize_default_user() lui a assignée à la création (sauf remplacement
+    ultérieur), et si des documents ont déjà été indexés (has_documents) —
+    ainsi que la version exacte de Khoj en service (khoj_version), utile pour
+    cibler une CVE connue de cette version précise.
+    is_active reflète ici le scope "premium" que l'authentification silencieuse
+    accorde au compte default en mode anonyme, donc vaut true par défaut : le
+    même mécanisme qui lève l'authentification élève aussi le compte au niveau
+    payant sur l'instance exposée. Comme la dépendance levée est la même sur
+    tout le fichier, l'exposition ne s'arrête pas à cette lecture : les autres
+    routes de src/khoj/routers/api.py portent le même décorateur et le même
+    contournement, dont la suppression du compte (DELETE /api/self) et l'accès
+    aux documents indexés par l'utilisateur — le second cerveau que Khoj
+    promet de garder privé devient lisible et modifiable par quiconque atteint
+    le port.
+  remediation: |
+    anonymous_mode n'est pas un défaut du binaire mais un drapeau que le
+    docker-compose.yml officiel active explicitement avec --anonymous-mode :
+    l'ôter (ou le remplacer par une configuration d'authentification complète,
+    Google OAuth ou compte email/mot de passe) referme la branche silencieuse
+    de UserAuthenticationBackend.authenticate() sur laquelle tout le reste
+    repose. Tant que le mode anonyme reste nécessaire pour un usage
+    mono-utilisateur, ne jamais publier le port 42110 sur une interface
+    joignable depuis Internet : lier --host à 127.0.0.1 ou restreindre le port
+    au réseau Docker interne, et placer un reverse-proxy authentifiant devant
+    tout accès distant. Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hote>:42110/api/v1/user » ne doit rendre ni le document décrit ici
+    ni un 200 sur cette route.
+  reference:
+    - https://github.com/khoj-ai/khoj/blob/master/src/khoj/routers/api.py
+    - https://github.com/khoj-ai/khoj/blob/master/src/khoj/configure.py
+    - https://github.com/khoj-ai/khoj/blob/master/src/khoj/main.py
+    - https://github.com/khoj-ai/khoj/blob/master/src/khoj/utils/cli.py
+    - https://github.com/khoj-ai/khoj/blob/master/docker-compose.yml
+  metadata:
+    max-request: 1
+    vendor: khoj-ai
+    product: khoj
+  tags: ai,llm,khoj,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route qui nomme le compte auquel le serveur
+  # vient de rattacher la requête anonyme. Le routeur api est monté sous
+  # /api dans configure.py, donc la route déclarée "/v1/user" se lit
+  # /api/v1/user depuis l'extérieur.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/user"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le document entier, ancré aux deux bouts, sur l'ordre d'insertion du
+      # dict que user_info() construit — email, username, photo, is_active,
+      # has_documents, khoj_version — sérialisé par un json.dumps() nu, donc
+      # avec les espaces par défaut du module (", " et ": "). Les \s*
+      # tolèrent un intermédiaire qui resserre ou réindente ce qu'il relaie.
+      # "photo" est nul tant qu'aucun compte Google n'est lié ; les deux
+      # écritures sont admises.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"email"\s*:\s*"[^"]*"\s*,\s*"username"\s*:\s*"[^"]*"\s*,\s*"photo"\s*:\s*(?:"[^"]*"|null)\s*,\s*"is_active"\s*:\s*(?:true|false)\s*,\s*"has_documents"\s*:\s*(?:true|false)\s*,\s*"khoj_version"\s*:\s*"[^"]*"\s*\}\s*$'
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      # Le compte auquel le serveur a rattaché la requête anonyme — "default"
+      # tant que personne n'a désactivé le mode anonyme.
+      - type: json
+        part: body
+        name: username
+        json:
+          - '.username'
+
+      # La version exacte du serveur, utile pour cibler une CVE connue.
+      - type: json
+        part: body
+        name: khoj-version
+        json:
+          - '.khoj_version'

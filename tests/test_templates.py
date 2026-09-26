@@ -33619,3 +33619,181 @@ def test_onyx_matcher_compiles_and_fires_against_a_live_server():
 
     _, results = scan(body=ONYX_OTHER_PRODUCT_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Khoj. GET /v1/user est déclarée dans src/khoj/routers/api.py, décorée
+# @requires(["authenticated"]), et le routeur api est monté sous /api dans
+# configure.py — la route se lit /api/v1/user. En anonymous_mode,
+# UserAuthenticationBackend.authenticate() rattache silencieusement chaque
+# requête sans identifiant au compte "default", ce qui suffit à lever la
+# dépendance. user_info() rend un dict à six clés dans cet ordre — email,
+# username, photo, is_active, has_documents, khoj_version — via un
+# json.dumps() nu, donc avec les espaces par défaut du module (", " et ": ").
+
+KHOJ_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "khoj-user-info-exposed.yaml")
+
+KHOJ_USER_ROUTE = "/api/v1/user"
+
+
+def khoj_user_body(email="default@example.com", username="default", photo=None,
+                    is_active=True, has_documents=False, khoj_version="1.42.8"):
+    """Ce que rend user_info(), avec les littéraux du handler et json.dumps() nu."""
+    payload = {"email": email, "username": username, "photo": photo,
+               "is_active": is_active, "has_documents": has_documents,
+               "khoj_version": khoj_version}
+    return json.dumps(payload)
+
+
+KHOJ_OPEN_BODY = khoj_user_body()
+
+# Un compte lié à Google porte une photo au lieu de null.
+KHOJ_WITH_PHOTO_BODY = khoj_user_body(photo="https://lh3.googleusercontent.com/a/x")
+
+# Le même document republié au fond de celui d'une supervision.
+KHOJ_COMPOSITE_BODY = '{"probe":"khoj","upstream":%s}' % KHOJ_OPEN_BODY
+
+# Un objet utilisateur générique, sans les six clés du modèle Khoj.
+KHOJ_GENERIC_USER_BODY = json.dumps({"email": "default@example.com",
+                                      "username": "default", "is_active": True})
+
+# Les mêmes six clés, mais imbriquées sous une autre clé — ce n'est pas le
+# document que user_info() rend directement.
+KHOJ_NESTED_BODY = '{"user":%s}' % KHOJ_OPEN_BODY
+
+# Les mêmes six clés, réordonnées — user_info() ne les construit que dans
+# l'ordre email, username, photo, is_active, has_documents, khoj_version.
+KHOJ_REORDERED_BODY = json.dumps({"username": "default", "email": "default@example.com",
+                                   "photo": None, "is_active": True,
+                                   "has_documents": False, "khoj_version": "1.42.8"})
+
+
+def khoj_block():
+    doc = load(KHOJ_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % KHOJ_USER_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % KHOJ_USER_ROUTE
+    return blocks[0]
+
+
+def khoj_fires(status=200, body=None, headers=None):
+    block = khoj_block()
+    body = KHOJ_OPEN_BODY if body is None else body
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            blob = " ".join(headers.values())
+            verdicts.append(any(w in blob for w in matcher.get("words") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_khoj_probe_is_a_single_get_on_user():
+    doc = load(KHOJ_TEMPLATE)
+    assert request_routes(doc) == {("GET", KHOJ_USER_ROUTE)}, (
+        f"le template interroge autre chose que GET /api/v1/user — "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert khoj_block().get("matchers-condition") == "and"
+    assert load(KHOJ_TEMPLATE)["info"]["severity"] == "high"
+
+
+def test_khoj_matcher_needs_the_whole_user_info_document():
+    assert khoj_fires(), "le template ne reconnaît pas la réponse de Khoj"
+    for body, why in (
+        (khoj_user_body(email="alice@example.com", username="alice"),
+         "un autre compte que le default anonyme"),
+        (KHOJ_WITH_PHOTO_BODY, "un compte lié à Google, avec une photo non nulle"),
+        (khoj_user_body(is_active=False, has_documents=True),
+         "d'autres valeurs de is_active et has_documents"),
+    ):
+        assert khoj_fires(body=body), "le template perd %s" % why
+
+    for status, body, why in (
+        (200, KHOJ_COMPOSITE_BODY, "le document républié par une supervision"),
+        (200, KHOJ_GENERIC_USER_BODY, "un objet utilisateur générique sans les six clés"),
+        (200, KHOJ_NESTED_BODY, "les six clés imbriquées sous une autre clé"),
+        (200, KHOJ_REORDERED_BODY, "les six clés dans un autre ordre"),
+    ):
+        assert not khoj_fires(status=status, body=body), (
+            "le template déclenche sur %s" % why
+        )
+    assert not khoj_fires(headers={"Content-Type": "text/html"}), (
+        "le template déclenche sur une page HTML"
+    )
+
+
+def test_khoj_extractors_read_the_account_and_the_version():
+    extractors = khoj_block().get("extractors") or []
+    assert [(e.get("type"), e.get("json")) for e in extractors] == [
+        ("json", [".username"]),
+        ("json", [".khoj_version"]),
+    ], extractors
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_khoj_matcher_compiles_and_fires_against_a_live_server():
+    def scan(status=200, body=KHOJ_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == KHOJ_USER_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", KHOJ_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [KHOJ_USER_ROUTE], seen
+    assert len(results) == 2, (
+        "le scan ne produit pas exactement deux résultats — un par "
+        f"extracteur : {results}"
+    )
+    assert {item.get("template-id") for item in results} == {"khoj-user-info-exposed"}
+    extracted = [value for item in results
+                 for value in (item.get("extracted-results") or [])]
+    assert sorted(extracted) == sorted(["default", "1.42.8"]), extracted
+
+    _, results = scan(body=KHOJ_GENERIC_USER_BODY)
+    assert results == [], results
+
+    _, results = scan(body=KHOJ_NESTED_BODY)
+    assert results == [], results
