@@ -34429,3 +34429,250 @@ def test_txtai_matcher_compiles_and_fires_against_a_live_server():
         "le scan conclut sur un runtime compatible OpenAI, dont le document "
         "OpenAPI ne porte aucun chemin du quatuor"
     )
+
+
+# --------------------------------------------------------------------------
+# LitServe (Lightning-AI/LitServe) : serveur d'inférence minimal qui enveloppe
+# un LitAPI dans une application FastAPI. src/litserve/server.py enregistre
+# l'endpoint interne d'information par « @self.app.get(self.info_path,
+# dependencies=[Depends(self.setup_auth())]) » — self.info_path vaut « /info »
+# par défaut — et le handler rend une JSONResponse dont le corps est
+# {"model": self.model_metadata, "server": {"devices": ..., "workers_per_device":
+# ..., "timeout": ..., "stream": {...}, "max_payload_size": ..., "track_requests":
+# ...}}. setup_auth() rend le callback authorize() du LitAPI s'il existe, sinon
+# api_key_auth si LIT_SERVER_API_KEY est définie, et sinon no_auth — un
+# passe-plat qui ne vérifie rien (litserve/auth.py) : par défaut, /info comme
+# /predict répondent sans identifiant. Le constat porte sur l'objet « server »,
+# dont la conjonction workers_per_device + max_payload_size + track_requests est
+# propre à LitServe, et jamais sur le seul statut HTTP.
+
+LITSERVE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "litserve-info-exposed.yaml")
+
+LITSERVE_INFO_ROUTE = "/info"
+
+
+def litserve_info_body(model=None, devices=("cpu",), workers_per_device=1,
+                       timeout=30, stream=None, max_payload_size=None,
+                       track_requests=False, indent=None):
+    """
+    Ce que rend le handler info() : le dict des attributs fixés au démarrage,
+    dans l'ordre de déclaration du code source, sérialisé par la JSONResponse de
+    Starlette — compacte par défaut, réindentée si `indent` est passé comme le
+    ferait un proxy qui relaie.
+    """
+    stream = {"/predict": False} if stream is None else stream
+    document = {
+        "model": model,
+        "server": {
+            "devices": list(devices),
+            "workers_per_device": workers_per_device,
+            "timeout": timeout,
+            "stream": stream,
+            "max_payload_size": max_payload_size,
+            "track_requests": track_requests,
+        },
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+LITSERVE_INFO_BODY = litserve_info_body()
+
+# Un déploiement GPU multi-workers, avec une taille de charge utile plafonnée et
+# le suivi de requêtes activé : rien de tout cela ne change le constat.
+LITSERVE_GPU_BODY = litserve_info_body(devices=("cuda:0", "cuda:1"),
+                                       workers_per_device=2, timeout=False,
+                                       max_payload_size=5000000,
+                                       track_requests=True)
+
+# model_metadata renseigné : l'exploitant a passé un dict au serveur.
+LITSERVE_WITH_MODEL_BODY = litserve_info_body(model={"name": "resnet50",
+                                                     "version": "1"})
+
+# Le document entier retrouvé au fond de celui d'une supervision : l'objet
+# « server » est présent, mais l'instance n'a pas servi le document elle-même.
+LITSERVE_COMPOSITE_BODY = '{"probe":"litserve","upstream":%s}' % LITSERVE_INFO_BODY
+
+# Un service compatible OpenAI qui ouvre lui aussi sur « model » mais ne porte
+# aucun objet « server ».
+LITSERVE_OPENAI_LIKE_BODY = json.dumps({"model": "gpt-4o", "object": "list",
+                                        "data": []}, separators=(",", ":"))
+
+# Les six clés du bloc « server » réordonnées : info() ne les sérialise que dans
+# l'ordre devices, workers_per_device, timeout, stream, max_payload_size,
+# track_requests.
+LITSERVE_REORDERED_BODY = (
+    '{"model":null,"server":{"workers_per_device":1,"devices":["cpu"],'
+    '"track_requests":false,"timeout":30,"stream":{"/predict":false},'
+    '"max_payload_size":null}}'
+)
+
+# Le même bloc amputé de max_payload_size : ce n'est plus la conjonction propre
+# à LitServe.
+LITSERVE_MISSING_KEY_BODY = (
+    '{"model":null,"server":{"devices":["cpu"],"workers_per_device":1,'
+    '"timeout":30,"stream":{"/predict":false},"track_requests":false}}'
+)
+
+
+def litserve_block():
+    doc = load(LITSERVE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LITSERVE_INFO_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /info"
+    return blocks[0]
+
+
+def litserve_fires(body=None, headers=None):
+    block = litserve_block()
+    body = LITSERVE_INFO_BODY if body is None else body
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "word" and matcher.get("part") == "header":
+            blob = " ".join(headers.values())
+            verdicts.append(any(w in blob for w in matcher.get("words") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_litserve_probe_is_a_single_get_on_info():
+    doc = load(LITSERVE_TEMPLATE)
+    assert request_routes(doc) == {("GET", LITSERVE_INFO_ROUTE)}, (
+        "le template interroge autre chose que GET /info — le même serveur nu "
+        "porte POST /predict et, selon le LitSpec, /v1/chat/completions, qui "
+        "feraient tourner un modèle aux frais de l'exploitant : "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert litserve_block().get("matchers-condition") == "and"
+    assert load(LITSERVE_TEMPLATE)["info"]["severity"] == "medium"
+
+
+def test_litserve_matcher_needs_the_server_object_not_a_generic_model_doc():
+    assert litserve_fires(), "le template ne reconnaît pas la réponse de /info"
+    for body, why in (
+        (LITSERVE_GPU_BODY, "un déploiement GPU multi-workers, timeout désactivé "
+                            "et suivi de requêtes actif"),
+        (LITSERVE_WITH_MODEL_BODY, "model_metadata renseigné par un dict"),
+        (litserve_info_body(stream={"/predict": True, "/embed": False}),
+         "plusieurs chemins d'API montés"),
+        (litserve_info_body(indent=2), "un intermédiaire qui réindente ce que "
+                                       "Starlette sérialise compact"),
+    ):
+        assert litserve_fires(body=body), "le template perd %s" % why
+
+    for body, why in (
+        (LITSERVE_COMPOSITE_BODY, "le document républié par une supervision — "
+                                  "l'ancrage sur « {\"model\": » dit que "
+                                  "l'instance a répondu d'elle-même"),
+        (LITSERVE_OPENAI_LIKE_BODY, "un service compatible OpenAI qui ouvre sur "
+                                    "« model » mais ne porte aucun objet server"),
+        (LITSERVE_REORDERED_BODY, "les six clés du bloc server réordonnées, alors "
+                                  "que info() ne les sérialise que dans l'ordre "
+                                  "de déclaration du code"),
+        (LITSERVE_MISSING_KEY_BODY, "le bloc server amputé de max_payload_size — "
+                                    "ce n'est plus la conjonction propre à "
+                                    "LitServe"),
+    ):
+        assert not litserve_fires(body=body), "le template déclenche sur %s" % why
+
+    assert not litserve_fires(headers={"Content-Type": "text/html"}), (
+        "le template déclenche sur une page HTML"
+    )
+
+
+def test_litserve_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in (litserve_block().get("matchers") or [])]
+    assert "status" not in kinds, (
+        "le template porte un matcher de statut : /info rend 200 sur n'importe "
+        "quel serveur vivant, le constat doit reposer sur l'objet server que le "
+        "corps décrit, pas sur le code HTTP"
+    )
+    assert "regex" in kinds, (
+        "le discriminant est la forme du bloc server dans le corps : sans "
+        "matcher regex, rien ne le porte"
+    )
+
+
+def test_litserve_extractor_reports_the_device_inventory():
+    extractors = litserve_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul renseignement à faire remonter par instance : la topologie "
+        f"matérielle exposée — {extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".server.devices"], (
+        "l'extracteur ne lit pas .server.devices — c'est pourtant la liste des "
+        "accélérateurs sur lesquels tourne l'inférence non protégée"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_litserve_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle de la regex et de la requête de l'extracteur.
+    """
+    def scan(body=LITSERVE_INFO_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == LITSERVE_INFO_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LITSERVE_TEMPLATE, "-s", "medium",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan(body=LITSERVE_GPU_BODY)
+    assert seen == [LITSERVE_INFO_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "litserve-info-exposed"
+    assert results[0].get("extracted-results") == [
+        json.dumps(["cuda:0", "cuda:1"], separators=(",", ":"))], results[0]
+
+    _, results = scan(body=LITSERVE_OPENAI_LIKE_BODY)
+    assert results == [], results
+
+    _, results = scan(body=LITSERVE_COMPOSITE_BODY)
+    assert results == [], results
