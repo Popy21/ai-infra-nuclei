@@ -1,0 +1,175 @@
+id: txtai-api-exposed
+
+info:
+  name: txtai API - Unauthenticated Embeddings Database and Semantic Search API
+  author: popy21
+  severity: high
+  description: |
+    txtai (neuml/txtai) est un framework de recherche sémantique et une base de
+    données d'embeddings très déployé en amont des pipelines RAG — environ 13 000
+    étoiles, dépôt actif, dernier push 2026-09-25. Son service HTTP est lancé par
+    « uvicorn "txtai.api:app" », et l'application est construite dans
+    src/python/txtai/api/application.py par « return FastAPI(lifespan=lifespan,
+    dependencies=dependencies if dependencies else None) », les routeurs étant
+    montés dynamiquement selon la config par « application.include_router(router) »
+    au fil du lifespan.
+    Le routeur des embeddings — src/python/txtai/api/routers/embeddings.py —
+    déclare le jeu de routes propre au produit, une par une : @router.get("/search"),
+    @router.post("/batchsearch"), @router.post("/add"), @router.post("/addobject"),
+    @router.post("/addimage"), @router.get("/index"), @router.get("/upsert"),
+    @router.post("/delete"), @router.post("/reindex"), @router.get("/count"),
+    @router.post("/explain"), @router.post("/batchexplain"),
+    @router.get("/transform") et @router.post("/batchtransform"). Ces routes sont
+    greffées sans préfixe, donc GET /openapi.json — que FastAPI sert par défaut —
+    les énumère à la racine, et c'est ce document que la première lecture lit.
+    L'absence d'authentification est le défaut du produit, documenté dans
+    neuml.github.io/txtai/api/security/ : « The default implementation of an API
+    service runs via HTTP and is fully open. » L'autorisation par jeton n'est armée
+    que si la variable d'environnement TOKEN — un hachage SHA-256 — est passée à
+    uvicorn : create() ne fait alors que « token = os.environ.get("TOKEN"); if
+    token: dependencies.append(Depends(Authorization(token))) », cette dépendance
+    globale exigeant ensuite « Authorization: Bearer <jeton> » sur chaque route.
+    Sans TOKEN, la liste reste vide, dependencies vaut None, et toutes les routes
+    répondent sans en-tête d'autorisation.
+    Le quatuor /batchtransform + /batchexplain + /addobject + /reindex est ce qui
+    nomme txtai : il ne se retrouve ni sur les runtimes compatibles OpenAI, ni sur
+    les bases vectorielles que le pack couvre déjà, et c'est sur ce jeu de chemins
+    que le constat s'appuie — jamais sur le statut HTTP. Mais /openapi.json ne
+    prouve pas l'absence d'autorisation : FastAPI monte ce document hors de la
+    dépendance globale, donc il répond aussi bien sur une instance armée d'un TOKEN
+    que sur une instance ouverte. La preuve vient donc de la seconde lecture, GET
+    /count, portée par le même routeur non protégé : count() rend le nombre de
+    documents indexés, un entier. Un 200 et un entier nu sur cette route disent que
+    le plan de données répond sans jeton ; une instance à TOKEN y rend un refus,
+    pas un compteur.
+  impact: |
+    Le renseignement d'abord, et il n'est que le témoin : GET /count publie la
+    taille de l'index d'embeddings de l'organisation, donc dit s'il y a un corpus à
+    lire et combien il pèse. Mais l'énumération du document OpenAPI livre surtout la
+    carte du plan de données, et chacune de ses routes répond au même anonyme,
+    faute de dépendance à traverser.
+    En lecture, GET /search et POST /batchsearch interrogent le corpus vectorisé :
+    txtai stocke le texte des documents à côté de leur vecteur, donc la recherche
+    sémantique restitue les passages indexés — documentation interne, tickets,
+    contrats, tout ce qui alimente l'assistant — classés par proximité, ce qui
+    désigne le sensible sans qu'il faille tout tirer. GET /transform et POST
+    /batchtransform font tourner le modèle d'embeddings aux frais de l'exploitant,
+    sur GPU compris, pour qui atteint le port.
+    En écriture, le même routeur non protégé porte POST /add, GET /upsert et POST
+    /delete : un tiers réécrit ou supprime les documents que le modèle citera
+    ensuite comme sources, c'est-à-dire empoisonne les réponses de l'assistant sans
+    jamais toucher au modèle. POST /reindex reconstruit l'index à partir d'une
+    configuration fournie par l'appelant, et POST /addobject / POST /addimage y
+    injectent des contenus arbitraires. Rien de tout cela ne sera attribué : le
+    serveur n'a jamais réclamé d'identité, donc aucune trace n'en portera.
+  remediation: |
+    Poser TOKEN=<hachage SHA-256> dans l'environnement d'uvicorn, ce qui ferme
+    d'un coup toutes les routes : la dépendance globale exige alors « Authorization:
+    Bearer <jeton> », vérifié par un hmac.compare_digest contre le hachage. C'est un
+    jeton statique partagé, sans identité d'appelant ni piste d'audit, et sa
+    rotation demande un redémarrage ; il doit de plus être échangé sur HTTPS, faute
+    de quoi il transite en clair, comme le rappelle la documentation du produit.
+    Ce jeton ne protège pas /openapi.json, /docs ni /redoc, que FastAPI monte hors
+    de la dépendance : les désactiver en production (openapi_url=None) pour ne pas
+    donner la carte des routes à un anonyme.
+    La fermeture réelle reste celle du réseau. Lier uvicorn à 127.0.0.1 quand
+    l'instance n'a pas à être atteinte depuis l'extérieur, et ne pas publier le port
+    du conteneur sur une interface publique ; quand l'API doit être joignable, la
+    placer derrière un intermédiaire qui authentifie tout le préfixe. Après une
+    exposition, tenir le corpus pour lu — le texte y est stocké en clair à côté des
+    vecteurs — et, les verbes d'écriture ayant été ouverts au même titre que ceux de
+    lecture, en contrôler le contenu plutôt que de le supposer intact : un document
+    réécrit par /add, /upsert ou /reindex reste cité comme source par l'assistant
+    qu'il alimente.
+  reference:
+    - https://github.com/neuml/txtai/blob/master/src/python/txtai/api/routers/embeddings.py
+    - https://github.com/neuml/txtai/blob/master/src/python/txtai/api/application.py
+    - https://github.com/neuml/txtai/blob/master/src/python/txtai/api/authorization.py
+    - https://neuml.github.io/txtai/api/security/
+    - https://github.com/neuml/txtai
+  metadata:
+    max-request: 2
+    vendor: neuml
+    product: txtai
+  tags: ai,llm,rag,embeddings,vectordb,txtai,neuml,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /openapi.json nomme le produit par son jeu de routes. Le routeur des
+  # embeddings greffe /search, /batchsearch, /add, /addobject, /addimage, /index,
+  # /upsert, /delete, /reindex, /count, /explain, /batchexplain, /transform et
+  # /batchtransform sans préfixe, donc ces chemins sont les clés du document à la
+  # racine. Mais FastAPI monte /openapi.json hors de la dépendance globale que
+  # TOKEN pose : cette route répond sur une instance armée d'un jeton comme sur une
+  # instance ouverte. Seule, elle dirait « c'est bien txtai », jamais « il est
+  # ouvert ».
+  #
+  # GET /count est la preuve. count() est déclarée @router.get("/count") sur le même
+  # routeur que les verbes d'écriture, donc porte la dépendance globale quand elle
+  # existe : son 200 et son entier nu disent que le plan de données répond sans
+  # jeton. Une instance à TOKEN y rend un refus, pas un compteur.
+  #
+  # En lecture seule, et strictement. Le même routeur nu sert GET /search et POST
+  # /batchsearch, qui liraient le corpus vectorisé ; /transform et /batchtransform,
+  # qui feraient tourner le modèle aux frais de l'exploitant ; /add, /upsert,
+  # /delete et /reindex, qui réécriraient l'index d'embeddings de l'organisation.
+  # Ce sont les abus que le constat signale, ce n'est pas ce qu'un scanner a le
+  # droit de faire pour l'établir. /count ne touche rien : il lit un compteur déjà
+  # tenu par l'index.
+  - method: GET
+    path:
+      - "{{BaseURL}}/openapi.json"
+      - "{{BaseURL}}/count"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte sur
+    # les deux réponses à la fois. Sans lui, le jeu de routes conclurait seul — or
+    # /openapi.json répond quel que soit l'état de l'autorisation.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document OpenAPI, ancré sur son ouverture : get_openapi() sérialise
+          # « {"openapi":"3.1.0",... » et FastAPI l'écrit compact. Exiger cette
+          # ouverture dit que l'instance a servi le document elle-même, et écarte la
+          # page d'une supervision qui recopierait ces chemins sous une clé à elle.
+          # Le titre n'est pas exigé : l'app est créée sans argument title, donc
+          # info.title vaut le « FastAPI » par défaut — générique, il ne nommerait
+          # rien.
+          - 'status_code_1 == 200 && regex("^\\s*\\{\\s*\"openapi\"\\s*:", body_1)'
+
+          # Le quatuor propre à txtai, chacun tenu pour une clé de chemin par ses
+          # guillemets. Aucun runtime compatible OpenAI ni aucune base vectorielle
+          # du pack ne sert cette conjonction : /batchtransform et /batchexplain
+          # sont les formes par lot du transform et de l'explain de txtai,
+          # /addobject l'ajout d'un objet binaire, /reindex la reconstruction de
+          # l'index. C'est ce jeu de chemins qui porte l'identification — pas le
+          # statut HTTP, pas le titre.
+          - 'contains(body_1, "\"/batchtransform\"")'
+          - 'contains(body_1, "\"/batchexplain\"")'
+          - 'contains(body_1, "\"/addobject\"")'
+          - 'contains(body_1, "\"/reindex\"")'
+
+          # La seconde réponse, et c'est elle qui conclut. count() rend
+          # « application.get().count() », un entier, que FastAPI sérialise en
+          # nombre nu. Un 200 et un corps qui n'est qu'un entier disent que la route
+          # gardée a répondu sans « Authorization: Bearer ». Une instance à TOKEN y
+          # rend 403 « {"detail":"Not authenticated"} » ou 401, donc ne satisfait ni
+          # le statut ni la forme.
+          - 'status_code_2 == 200 && regex("^[0-9]+$", trim_space(body_2))'
+
+    extractors:
+      # Le nombre de documents indexés, borné à body_2 : c'est la taille du corpus
+      # exposé, et le seul chiffre de ces deux réponses qui renseigne l'exploitant.
+      # Un seul extracteur, et borné : sous req-condition le moteur évalue les
+      # extracteurs contre chaque réponse, donc en ajouter un second ferait remonter
+      # deux fois la même instance. info.title vaut « FastAPI » et info.version
+      # « 0.1.0 » par défaut — ni l'un ni l'autre ne vaut d'être relevé.
+      - type: regex
+        part: body_2
+        name: document_count
+        group: 1
+        regex:
+          - '^\s*([0-9]+)'

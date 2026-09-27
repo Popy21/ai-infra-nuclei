@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-103 templates, 100 produits.
+104 templates, 101 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -128,6 +128,7 @@ amont.
 | text-generation-webui | [`text-generation-webui-internal-api-exposed`](templates/exposure/text-generation-webui-internal-api-exposed.yaml) | high |
 | torchserve | [`torchserve-management-api-open`](templates/exposure/torchserve-management-api-open.yaml) | critical |
 | triton-inference-server | [`triton-inference-server-exposed`](templates/exposure/triton-inference-server-exposed.yaml) | high |
+| txtai | [`txtai-api-exposed`](templates/exposure/txtai-api-exposed.yaml) | high |
 | unstructured-api | [`unstructured-api-exposed`](templates/exposure/unstructured-api-exposed.yaml) | medium |
 | vane | [`vane-config-exposed`](templates/exposure/vane-config-exposed.yaml) | high |
 | vespa | [`vespa-config-server-exposed`](templates/exposure/vespa-config-server-exposed.yaml) | critical |

@@ -34058,3 +34058,374 @@ def test_argilla_matcher_compiles_and_fires_against_a_live_server():
     assert scan(status_body=ARGILLA_RAW_MEMORY_BODY) == [], (
         "le scan déclenche sur memory_info() republié en nombres bruts"
     )
+
+
+# --------------------------------------------------------------------------
+# txtai : framework de recherche sémantique et base de données d'embeddings
+# (neuml/txtai), servi par « uvicorn "txtai.api:app" ». Trois points sont à
+# amarrer ici, et le premier commande les deux autres.
+#
+# L'application est créée sans argument title — « FastAPI(lifespan=lifespan,
+# dependencies=dependencies if dependencies else None) » — donc info.title vaut
+# le « FastAPI » par défaut, générique. L'identification ne peut donc pas
+# reposer sur le titre : elle repose sur le jeu de routes que le routeur des
+# embeddings greffe à la racine, et sur le quatuor /batchtransform +
+# /batchexplain + /addobject + /reindex qu'aucun runtime compatible OpenAI ni
+# aucune base vectorielle du pack ne sert.
+#
+# Mais /openapi.json ne prouve pas l'absence d'autorisation : FastAPI monte ce
+# document hors de la dépendance globale que TOKEN pose, donc il répond aussi
+# bien sur une instance armée que sur une instance ouverte. La preuve vient de
+# GET /count, portée par le routeur non protégé — count() rend un entier, et un
+# 200 sur cette route dit que le plan de données répond sans jeton. Une instance
+# à TOKEN y rend un refus, pas un compteur. C'est cette séparation, et le fait
+# qu'aucune des deux réponses ne conclue seule, que cette section vérifie.
+
+TXTAI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "txtai-api-exposed.yaml")
+
+TXTAI_OPENAPI_ROUTE = "/openapi.json"
+TXTAI_COUNT_ROUTE = "/count"
+
+# Le jeu de routes que src/python/txtai/api/routers/embeddings.py déclare, dans
+# l'ordre du fichier. Les quatre du milieu du quatuor sont ce qui nomme txtai.
+TXTAI_ROUTES = [
+    "/search", "/batchsearch", "/add", "/addobject", "/addimage", "/index",
+    "/upsert", "/delete", "/reindex", "/count", "/explain", "/batchexplain",
+    "/transform", "/batchtransform",
+]
+
+TXTAI_GET_ROUTES = {"/search", "/index", "/upsert", "/count", "/transform"}
+
+
+def txtai_openapi_body(title="FastAPI", version="0.1.0", routes=TXTAI_ROUTES,
+                       indent=None):
+    """
+    Ce que rend GET /openapi.json : le document que get_openapi() construit
+    depuis app.title, app.version et les routes greffées sans préfixe. `title`
+    et `version` valent les défauts de FastAPI, faute d'argument passé au
+    constructeur ; `routes` réécrit le jeu de chemins, `indent` réécrit le
+    document comme le ferait un proxy qui réindente ce qu'il relaie.
+    """
+    document = {
+        "openapi": "3.1.0",
+        "info": {"title": title, "version": version},
+        "paths": {
+            route: {
+                ("get" if route in TXTAI_GET_ROUTES else "post"): {
+                    "summary": route.strip("/").capitalize(),
+                }
+            }
+            for route in routes
+        },
+        "components": {"schemas": {}},
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+TXTAI_OPENAPI_BODY = txtai_openapi_body()
+
+# Ce que rend GET /count sur une instance ouverte : count() rend
+# « application.get().count() », un entier, que FastAPI sérialise en nombre nu.
+TXTAI_COUNT_BODY = "1042"
+
+# Le refus d'une instance armée d'un TOKEN. HTTPBearer(auto_error=True) rend 403
+# « Not authenticated » quand l'en-tête manque ; Authorization rend 401 quand il
+# est présent mais faux. Ni l'un ni l'autre n'est un entier nu sous 200.
+TXTAI_NOT_AUTH_BODY = json.dumps({"detail": "Not authenticated"},
+                                 separators=(",", ":"))
+TXTAI_BAD_TOKEN_BODY = json.dumps({"detail": "Invalid Authorization Token"},
+                                  separators=(",", ":"))
+
+# Le 404 de FastAPI sur une route qui n'est pas montée.
+TXTAI_ABSENT_BODY = json.dumps({"detail": "Not Found"}, separators=(",", ":"))
+
+# Le document OpenAPI d'un runtime compatible OpenAI : même forme, même titre
+# par défaut, mais aucun chemin du quatuor.
+TXTAI_OPENAI_COMPAT_BODY = txtai_openapi_body(
+    routes=["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+            "/v1/models"])
+
+# Une supervision qui recopie les chemins du quatuor sous une clé à elle, sans
+# être le document OpenAPI de l'instance.
+TXTAI_COMPOSITE_BODY = json.dumps(
+    {"upstream": {"routes": ["/batchtransform", "/batchexplain",
+                             "/addobject", "/reindex"]},
+     "scraped_at": 0},
+    separators=(",", ":"))
+
+
+def txtai_block():
+    doc = load(TXTAI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % TXTAI_OPENAPI_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /openapi.json — c'est pourtant le "
+        "document qui énumère le jeu de routes propre à txtai"
+    )
+    return blocks[0]
+
+
+def txtai_requests():
+    """(méthode, chemin) de chaque requête, dans l'ordre déclaré."""
+    block = txtai_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def txtai_fires(openapi=(200, TXTAI_OPENAPI_BODY), count=(200, TXTAI_COUNT_BODY)):
+    scenario = {
+        TXTAI_OPENAPI_ROUTE: openapi,
+        TXTAI_COUNT_ROUTE: count,
+    }
+    block = txtai_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in txtai_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que l'API ne sert pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_txtai_probe_reads_two_routes_and_never_touches_the_index():
+    """
+    Deux lectures, dans l'ordre, et rien de plus. Le même routeur nu sert POST
+    /add, GET /upsert, POST /delete et POST /reindex, qui réécriraient l'index
+    d'embeddings, et /search, /transform, /batchtransform, qui liraient le
+    corpus ou feraient tourner le modèle aux frais de l'exploitant : c'est
+    l'abus que le template signale, et le constater ne demande pas d'y toucher.
+    """
+    doc = load(TXTAI_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", TXTAI_OPENAPI_ROUTE),
+        ("GET", TXTAI_COUNT_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert txtai_requests() == [
+        ("GET", TXTAI_OPENAPI_ROUTE),
+        ("GET", TXTAI_COUNT_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {txtai_requests()}"
+    )
+
+    assert txtai_block().get("method") == "GET", (
+        "les deux routes sont servies en GET — /openapi.json par FastAPI, "
+        "@router.get(\"/count\") pour l'autre ; toute autre méthode ne "
+        "mesurerait que le 405, et un POST sur le routeur ferait tourner le "
+        "modèle ou réécrirait l'index"
+    )
+
+    assert txtai_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et « le jeu de routes est celui de "
+        "txtai » conclurait sans « /count répond sans jeton » — or "
+        "/openapi.json répond quel que soit l'état de l'autorisation"
+    )
+
+
+def test_txtai_matcher_rests_on_the_quartet_not_on_a_generic_openapi():
+    assert txtai_fires(), (
+        "le template ne reconnaît pas les réponses que rendent /openapi.json "
+        "et /count sur une instance ouverte"
+    )
+
+    assert not txtai_fires(openapi=(200, TXTAI_OPENAI_COMPAT_BODY)), (
+        "le template déclenche sur le document OpenAPI d'un runtime compatible "
+        "OpenAI : même forme et même titre par défaut, mais aucun chemin du "
+        "quatuor — c'est ce jeu de chemins qui sépare"
+    )
+
+    for dropped in ("/batchtransform", "/batchexplain", "/addobject",
+                    "/reindex"):
+        remaining = [r for r in TXTAI_ROUTES if r != dropped]
+        assert not txtai_fires(
+            openapi=(200, txtai_openapi_body(routes=remaining))), (
+            "le template conclut alors qu'un membre du quatuor manque du "
+            f"document — {dropped} : les quatre sont exigés ensemble"
+        )
+
+    assert not txtai_fires(openapi=(200, TXTAI_COMPOSITE_BODY)), (
+        "le template déclenche sur une supervision qui recopie les chemins du "
+        "quatuor sous une clé à elle : l'ancrage sur l'ouverture « {\"openapi\": "
+        "» est ce qui dit que l'instance a servi le document elle-même"
+    )
+
+    assert not txtai_fires(openapi=(404, TXTAI_ABSENT_BODY)), (
+        "le template conclut sans que le document OpenAPI soit servi — rien "
+        "n'énumère alors le jeu de routes"
+    )
+
+    assert txtai_fires(openapi=(200, txtai_openapi_body(title="my-search"))), (
+        "le template exige un titre particulier : l'app est créée sans "
+        "argument title, donc info.title est un défaut de FastAPI qu'un "
+        "déploiement peut certes réécrire, mais qui ne conditionne rien"
+    )
+
+    assert txtai_fires(
+        openapi=(200, txtai_openapi_body(indent=2)),
+        count=(200, "  " + TXTAI_COUNT_BODY + "\n")), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : la JSONResponse de FastAPI écrit compact, un proxy ne s'y "
+        "tient pas"
+    )
+
+
+def test_txtai_count_arm_proves_the_absence_of_authorization():
+    assert not txtai_fires(count=(403, TXTAI_NOT_AUTH_BODY)), (
+        "le template conclut alors que /count refuse par 403 « Not "
+        "authenticated » : une instance armée d'un TOKEN sert toujours "
+        "/openapi.json, mais garde le plan de données"
+    )
+
+    assert not txtai_fires(count=(401, TXTAI_BAD_TOKEN_BODY)), (
+        "le template conclut sur un 401 « Invalid Authorization Token » : la "
+        "route gardée n'a pas répondu sans jeton"
+    )
+
+    assert not txtai_fires(count=(200, json.dumps({"count": 5}))), (
+        "le template admet un objet JSON sous /count : count() rend un entier "
+        "nu, pas un objet — un serveur qui répond autrement n'est pas la route "
+        "gardée de txtai"
+    )
+
+    assert not txtai_fires(count=(404, TXTAI_ABSENT_BODY)), (
+        "le template conclut alors que /count n'est pas montée — le routeur "
+        "des embeddings n'est pas actif, il n'y a pas d'index à atteindre"
+    )
+
+    assert not txtai_fires(count=(200, TXTAI_COUNT_BODY),
+                           openapi=(401, TXTAI_OPENAPI_BODY)), (
+        "le template conclut sur le document OpenAPI servi sous un statut de "
+        "refus — un cache peut relayer l'ancienne réponse sous le statut du "
+        "proxy qui la garde désormais"
+    )
+
+    assert txtai_fires(count=(200, "0")), (
+        "le template exige un index peuplé : count() rend 0 sur une instance "
+        "ouverte mais vide, et le constat est l'atteignabilité de la route "
+        "gardée, pas le nombre de documents"
+    )
+
+
+def test_txtai_conclusion_is_carried_by_the_dsl_alone():
+    block = txtai_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+
+
+def test_txtai_extractor_reports_the_document_count():
+    extractors = txtai_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur les évalue contre chaque réponse, et la même instance serait "
+        "signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — le document OpenAPI n'a pas "
+        "de compteur à en tirer, et un extracteur non borné remonterait deux "
+        "fois l'instance"
+    )
+
+    matched = re.search(extractor.get("regex", [""])[0], "  " + TXTAI_COUNT_BODY)
+    assert matched and matched.group(extractor.get("group", 0)) == "1042", (
+        "l'extracteur ne relève pas le nombre de documents indexés — c'est "
+        "pourtant la taille du corpus exposé, le seul chiffre utile des deux "
+        "réponses"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_txtai_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs en Python plutôt
+    qu'avec le lexer de nuclei : seul un scan contre un vrai serveur ferme la
+    boucle. L'ancrage du document OpenAPI et le refus de /count sous TOKEN en
+    sont les enjeux propres.
+    """
+    def scan(openapi_status, openapi_body, count_status, count_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == TXTAI_OPENAPI_ROUTE:
+                    self.reply(openapi_status, openapi_body)
+                elif self.path == TXTAI_COUNT_ROUTE:
+                    self.reply(count_status, count_body)
+                else:
+                    self.reply(404, TXTAI_ABSENT_BODY)
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", TXTAI_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "txtai-api-exposed"}, r.stdout + r.stderr
+        return seen, [value for item in results
+                      for value in (item.get("extracted-results") or [])]
+
+    seen, extracted = scan(200, TXTAI_OPENAPI_BODY, 200, TXTAI_COUNT_BODY)
+    assert sorted(set(seen)) == sorted([TXTAI_OPENAPI_ROUTE,
+                                        TXTAI_COUNT_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert extracted == ["1042"], (
+        f"le scan ne remonte pas le nombre de documents indexés — {extracted}"
+    )
+
+    _, guarded = scan(200, TXTAI_OPENAPI_BODY, 403, TXTAI_NOT_AUTH_BODY)
+    assert guarded == [], (
+        "le scan conclut sur une instance dont /openapi.json répond mais dont "
+        "/count refuse : le plan de données est gardé par un TOKEN"
+    )
+
+    _, compat = scan(200, TXTAI_OPENAI_COMPAT_BODY, 200, "5")
+    assert compat == [], (
+        "le scan conclut sur un runtime compatible OpenAI, dont le document "
+        "OpenAPI ne porte aucun chemin du quatuor"
+    )
