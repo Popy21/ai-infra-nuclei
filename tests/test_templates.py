@@ -34676,3 +34676,233 @@ def test_litserve_matcher_compiles_and_fires_against_a_live_server():
 
     _, results = scan(body=LITSERVE_COMPOSITE_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Verba (weaviate/Verba, « The Golden RAGtriever ») : l'application RAG de
+# référence éditée par Weaviate. goldenverba/server/api.py monte une application
+# FastAPI (« app = FastAPI(lifespan=lifespan) ») sans aucune brique
+# d'authentification — pas de jeton, de clé, de session ni d'OAuth. Son seul
+# intergiciel, check_same_origin, compare l'en-tête origin à base_url et rend un
+# 403 « Not allowed » sur tout chemin /api/ dont l'origine ne correspond pas ;
+# une requête sans en-tête origin y échoue (origin vaut None). Mais il exempte
+# /api/health en toute première ligne — « if request.url.path == "/api/health":
+# return await call_next(request) » — si bien que health_check() répond à un
+# appelant anonyme quelle que soit son origine. Le handler rend une JSONResponse
+# {"message":"Alive!","production":production,"gtag":tag,"deployments":...,
+# "default_deployment":...} ; en mode Local, deployments porte la carte des
+# connexions Weaviate configurées (« await manager.get_deployments() »). Le
+# constat porte sur le couple « "message":"Alive!" » + deployments +
+# default_deployment, propre à Verba, jamais sur le statut HTTP ni sur « Alive! »
+# seul.
+
+VERBA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "verba-health-exposed.yaml")
+
+VERBA_HEALTH_ROUTE = "/api/health"
+
+
+def verba_health_body(production="Local", gtag="", deployments=None,
+                      default_deployment="", indent=None):
+    """
+    Ce que rend health_check() : le dict dans l'ordre de déclaration du code —
+    message, production, gtag, deployments, default_deployment — sérialisé par la
+    JSONResponse de Starlette, compacte par défaut, réindentée si `indent` est
+    passé comme le ferait un proxy qui relaie.
+    """
+    if deployments is None:
+        deployments = ({"Weaviate": "http://localhost:8080"} if production == "Local"
+                       else {"WEAVIATE_URL_VERBA": "", "WEAVIATE_API_KEY_VERBA": ""})
+    document = {
+        "message": "Alive!",
+        "production": production,
+        "gtag": gtag,
+        "deployments": deployments,
+        "default_deployment": default_deployment,
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+VERBA_HEALTH_BODY = verba_health_body()
+
+# Un déploiement hébergé : production autre que Local, deployments rabattu sur
+# les deux clés vides du code, tag GA renseigné, default_deployment nommé. Le
+# constat tient — les cinq clés sont là dans le même ordre.
+VERBA_HOSTED_BODY = verba_health_body(production="Production", gtag="G-ABCD1234",
+                                      default_deployment="Weaviate")
+
+# Le document entier retrouvé au fond de celui d'une supervision : les cinq clés
+# sont présentes, mais l'instance n'a pas servi le document elle-même — l'ancrage
+# sur « ^{"message": » doit le rejeter.
+VERBA_COMPOSITE_BODY = '{"probe":"verba","upstream":%s}' % VERBA_HEALTH_BODY
+
+# Une sonde de santé banale qui rend « Alive! » seul : « Alive! » ne suffit pas,
+# il n'y a ni deployments ni default_deployment.
+VERBA_BARE_ALIVE_BODY = json.dumps({"message": "Alive!"}, separators=(",", ":"))
+
+# Un autre service qui ouvre lui aussi sur « "message":"Alive!" » mais enchaîne
+# sur d'autres clés : ni production en deuxième position, ni deployments, ni
+# default_deployment. L'ancrage de tête le rejette.
+VERBA_OTHER_HEALTH_BODY = json.dumps(
+    {"message": "Alive!", "status": "ok", "details": {"db": "up"}},
+    separators=(",", ":"))
+
+# La tête exacte de Verba — message, production, gtag — mais amputée de
+# deployments : ce n'est plus la conjonction propre au produit.
+VERBA_MISSING_DEPLOYMENTS_BODY = (
+    '{"message":"Alive!","production":"Local","gtag":"","default_deployment":""}')
+
+
+def verba_block():
+    doc = load(VERBA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % VERBA_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/health"
+    return blocks[0]
+
+
+def verba_fires(body=None):
+    block = verba_block()
+    body = VERBA_HEALTH_BODY if body is None else body
+    verdicts = [body_matcher_hits(m, body) for m in block.get("matchers") or []]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_verba_probe_is_a_single_get_on_health():
+    doc = load(VERBA_TEMPLATE)
+    assert request_routes(doc) == {("GET", VERBA_HEALTH_ROUTE)}, (
+        "le template interroge autre chose que GET /api/health — c'est la seule "
+        "route que l'intergiciel « même origine » exempte ; les routes "
+        "d'ingestion et d'interrogation, elles, se heurtent à un 403 sans "
+        "en-tête origin et liraient la base RAG ou feraient tourner le LLM : "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert load(VERBA_TEMPLATE)["info"]["severity"] == "medium"
+
+
+def test_verba_matcher_needs_the_health_document_not_a_bare_alive():
+    assert verba_fires(), "le template ne reconnaît pas la réponse de /api/health"
+    for body, why in (
+        (VERBA_HOSTED_BODY, "un déploiement hébergé, deployments rabattu sur les "
+                            "clés vides et un tag GA renseigné"),
+        (verba_health_body(deployments={"Weaviate": "https://x.weaviate.cloud",
+                                        "Docker": "http://weaviate:8080"}),
+         "plusieurs connexions Weaviate cartographiées en mode Local"),
+        (verba_health_body(indent=2), "un intermédiaire qui réindente ce que "
+                                      "Starlette sérialise compact"),
+    ):
+        assert verba_fires(body=body), "le template perd %s" % why
+
+    for body, why in (
+        (VERBA_COMPOSITE_BODY, "le document républié par une supervision — "
+                               "l'ancrage sur « ^{\"message\": » dit que "
+                               "l'instance a répondu d'elle-même"),
+        (VERBA_BARE_ALIVE_BODY, "une sonde de santé qui rend « Alive! » seul, "
+                                "sans deployments ni default_deployment"),
+        (VERBA_OTHER_HEALTH_BODY, "un service qui ouvre sur « Alive! » puis "
+                                  "enchaîne sur d'autres clés que production"),
+        (VERBA_MISSING_DEPLOYMENTS_BODY, "la tête de Verba amputée de "
+                                         "deployments — ce n'est plus la "
+                                         "conjonction propre au produit"),
+        ("<!DOCTYPE html><html><body>Alive!</body></html>",
+         "une page HTML qui contient le mot « Alive! »"),
+    ):
+        assert not verba_fires(body=body), "le template déclenche sur %s" % why
+
+
+def test_verba_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in (verba_block().get("matchers") or [])]
+    assert "status" not in kinds, (
+        "le template porte un matcher de statut : /api/health rend 200 sur "
+        "n'importe quel serveur vivant, le constat doit reposer sur le couple "
+        "« Alive! » + deployments + default_deployment que le corps décrit, pas "
+        "sur le code HTTP"
+    )
+    assert "regex" in kinds, (
+        "le discriminant est la forme du document de santé dans le corps : sans "
+        "matcher regex, rien ne le porte"
+    )
+
+
+def test_verba_extractor_reports_the_deployment_mode():
+    extractors = verba_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul renseignement à faire remonter par instance : le mode de "
+        f"déploiement — {extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".production"], (
+        "l'extracteur ne lit pas .production — c'est pourtant lui qui dit si "
+        "deployments porte la carte des connexions Weaviate (mode Local) ou des "
+        "clés vides"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_verba_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle de la regex et de la requête de l'extracteur.
+    """
+    def scan(body=VERBA_HEALTH_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == VERBA_HEALTH_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", VERBA_TEMPLATE, "-s", "medium",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan(body=VERBA_HOSTED_BODY)
+    assert seen == [VERBA_HEALTH_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "verba-health-exposed"
+    assert any("Production" in r for r in results[0].get("extracted-results") or []), (
+        results[0]
+    )
+
+    _, results = scan(body=VERBA_BARE_ALIVE_BODY)
+    assert results == [], results
+
+    _, results = scan(body=VERBA_COMPOSITE_BODY)
+    assert results == [], results

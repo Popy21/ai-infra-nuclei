@@ -1,0 +1,137 @@
+id: verba-health-exposed
+
+info:
+  name: Verba - Unauthenticated Health Endpoint Deployment Disclosure
+  author: popy21
+  severity: medium
+  description: |
+    Verba (weaviate/Verba, « The Golden RAGtriever ») est l'application RAG de
+    référence éditée par Weaviate : chat, ingestion de documents et
+    interrogation d'un corpus vectorisé. Son serveur, `goldenverba/server/api.py`,
+    monte une application FastAPI (`app = FastAPI(lifespan=lifespan)`) sans
+    aucune brique d'authentification : le fichier n'importe ni jeton, ni clé,
+    ni session, ni fournisseur OAuth, et ne déclare aucune dépendance de
+    vérification. Le seul intergiciel qu'il installe est un contrôle « même
+    origine » — `@app.middleware("http") async def check_same_origin(...)` —
+    qui compare l'en-tête `origin` de la requête à `request.base_url`. Or un
+    en-tête d'origine est entièrement contrôlé par tout client non-navigateur :
+    il ne filtre pas un scanner, il oriente un navigateur.
+    Ce même intergiciel exempte explicitement la route de santé, en toute
+    première ligne : « if request.url.path == "/api/health": return await
+    call_next(request) » — la route répond donc à un appelant anonyme quelle
+    que soit son origine, et même sans en-tête `origin` du tout. Le handler
+    « @app.get("/api/health") async def health_check() » rend littéralement une
+    JSONResponse dont le contenu est, dans cet ordre : « {"message": "Alive!",
+    "production": production, "gtag": tag, "deployments": deployments,
+    "default_deployment": os.getenv("DEFAULT_DEPLOYMENT", "")} ». `production`
+    vaut la variable d'environnement `VERBA_PRODUCTION` ou « Local » à défaut,
+    `tag` vaut `VERBA_GOOGLE_TAG`. En mode « Local », le champ `deployments` est
+    alimenté par « await manager.get_deployments() », c'est-à-dire les points de
+    connexion Weaviate configurés sur l'instance ; dans les autres modes il est
+    rabattu sur deux clés vides. Starlette sérialise ce dict compact, dans
+    l'ordre de déclaration.
+    Le constat porte sur le couple « "message":"Alive!" » + `deployments` +
+    `default_deployment` sur ce chemin, propre à Verba : c'est cette conjonction
+    de clés, non le statut HTTP ni « Alive! » seul, qui distingue la sonde. Les
+    routes d'ingestion et d'interrogation — donc la lecture de la base RAG et la
+    consommation du LLM configuré — sont servies par la même application, mais
+    l'intergiciel « même origine » rend un 403 « Not allowed » sur tout chemin
+    « /api/ » dès que l'en-tête `origin` ne correspond pas à `base_url` (une
+    requête sans `origin` échoue à la comparaison, `origin` valant `None`).
+    Seule `/api/health`, exemptée, répond à l'anonyme, et c'est ce qui borne la
+    sévérité à medium.
+  impact: |
+    Un appelant anonyme obtient, en une lecture et sans le moindre identifiant,
+    la confirmation qu'il fait face à une instance Verba, le mode de déploiement
+    exact (`production` : « Local » ou la valeur de `VERBA_PRODUCTION`), le tag
+    Google Analytics configuré (`gtag`), le déploiement Weaviate par défaut
+    (`default_deployment`) et, en mode « Local », la carte des points de
+    connexion Weaviate renvoyée par `manager.get_deployments()` — c'est-à-dire
+    les cibles vers lesquelles pointe la base vectorielle de l'application, une
+    télémétrie interne qu'un tiers sans compte n'a aucune raison d'obtenir. La
+    seule présence de la route sur une adresse publique établit qu'un service
+    RAG est joignable là, avec son corpus vectorisé et le LLM qu'il consomme
+    derrière les routes voisines.
+    Ces routes voisines — ingestion de fichiers, interrogation, génération — ne
+    sont pas concernées par ce constat : le contrôle « même origine » leur rend
+    un 403 à une requête dont l'en-tête `origin` ne correspond pas, ce qui borne
+    la sévérité à medium. L'exposition demeure celle d'un renseignement de
+    reconnaissance et de configuration, pas d'un accès direct aux documents
+    indexés — l'accessibilité effective de ces routes depuis l'extérieur se
+    relève sur l'instance réelle, elle ne se déduit pas de la seule santé.
+  remediation: |
+    Il n'y a pas de réglage produit qui ferme cette route : l'exemption de
+    `/api/health` est écrite dans le code de l'intergiciel, ce n'est pas un
+    oubli de configuration côté exploitant, et la sonde est faite pour répondre
+    à un orchestrateur. La fermeture est donc réseau ou périmétrique — ne pas
+    publier le port du conteneur Verba sur une interface publique, et quand un
+    proxy le publie, lui faire refuser `/api/health` pour ne laisser passer que
+    ce que l'application sert à ses utilisateurs authentifiés côté navigateur.
+    Tenir ensuite pour connus d'un attaquant potentiel le mode de déploiement et
+    les points de connexion Weaviate déjà observés le cas échéant, et vérifier
+    depuis l'extérieur du périmètre que `/api/health` ne répond plus à l'anonyme.
+    Ne pas confondre le contrôle « même origine » avec une authentification : il
+    ne filtre pas un client qui pose lui-même son en-tête `origin`.
+  reference:
+    - https://github.com/weaviate/Verba
+    - https://github.com/weaviate/Verba/blob/main/goldenverba/server/api.py
+  metadata:
+    max-request: 1
+    vendor: weaviate
+    product: verba
+  tags: ai,llm,rag,verba,weaviate,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la seule route que l'intergiciel « même origine »
+  # exempte. GET /api/health répond à l'anonyme quelle que soit son origine —
+  # la toute première ligne de check_same_origin le laisse passer avant toute
+  # comparaison. Rien n'est écrit, rien n'est lancé : health_check() ne fait que
+  # relire des attributs déjà fixés au démarrage et, en mode Local, la carte des
+  # déploiements Weaviate déjà configurés.
+  #
+  # En lecture seule, et strictement. La même application sert l'ingestion,
+  # l'interrogation et la génération, qui liraient la base RAG et feraient
+  # tourner le LLM aux frais de l'exploitant ; mais ces routes « /api/ » se
+  # heurtent au 403 « Not allowed » de l'intergiciel dès que l'en-tête origin ne
+  # correspond pas à base_url (une requête sans origin y échoue). Le template ne
+  # les interroge pas : leur accessibilité depuis l'extérieur se relève sur une
+  # instance réelle, elle ne se devine pas.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/health"
+
+    matchers:
+      # Le discriminant est la forme exacte du document que health_check() rend,
+      # jamais le statut HTTP — /api/health répond 200 sur n'importe quel
+      # serveur vivant, et « Alive! » seul est une réponse de santé banale.
+      #
+      # Premier motif : l'ouverture du document, dans l'ordre où Starlette
+      # sérialise le dict — message, puis production, puis gtag. L'ancrage sur
+      # « ^{"message":"Alive!" » dit que l'instance a répondu d'elle-même, ce qui
+      # écarte le même triplet retrouvé au fond du document d'une supervision qui
+      # l'agrégerait sous une clé à elle. Les \s* absorbent la réindentation d'un
+      # proxy qui relaierait ce que Starlette écrit compact.
+      #
+      # Puis les deux clés qui, avec « Alive! », rendent la signature propre à
+      # Verba : deployments (la carte des connexions Weaviate en mode Local) et
+      # default_deployment. Aucun autre produit ne republie « Alive! » à côté de
+      # ces deux clés-là.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"message"\s*:\s*"Alive!"\s*,\s*"production"\s*:\s*"[^"]*"\s*,\s*"gtag"\s*:'
+          - '"deployments"\s*:'
+          - '"default_deployment"\s*:'
+        condition: and
+
+    extractors:
+      # Le mode de déploiement : « Local » dit que le champ deployments porte la
+      # carte des connexions Weaviate configurées, une autre valeur dit qu'il est
+      # rabattu sur des clés vides. Un seul renseignement à faire remonter par
+      # instance ; la carte deployments elle-même n'a pas à peupler un rapport de
+      # scan ligne par ligne.
+      - type: json
+        part: body
+        name: production
+        json:
+          - '.production'

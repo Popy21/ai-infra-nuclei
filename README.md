@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-105 templates, 102 produits.
+106 templates, 103 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -132,6 +132,7 @@ amont.
 | txtai | [`txtai-api-exposed`](templates/exposure/txtai-api-exposed.yaml) | high |
 | unstructured-api | [`unstructured-api-exposed`](templates/exposure/unstructured-api-exposed.yaml) | medium |
 | vane | [`vane-config-exposed`](templates/exposure/vane-config-exposed.yaml) | high |
+| verba | [`verba-health-exposed`](templates/exposure/verba-health-exposed.yaml) | medium |
 | vespa | [`vespa-config-server-exposed`](templates/exposure/vespa-config-server-exposed.yaml) | critical |
 | vllm | [`vllm-unauthenticated-api`](templates/exposure/vllm-unauthenticated-api.yaml) | high |
 | weaviate | [`weaviate-anonymous-access`](templates/exposure/weaviate-anonymous-access.yaml) | high |
