@@ -1,0 +1,126 @@
+id: privategpt-artifacts-exposed
+
+info:
+  name: PrivateGPT - Unauthenticated Ingested Documents Disclosure
+  author: popy21
+  severity: high
+  description: |
+    PrivateGPT (zylon-ai/private-gpt, 57k+ étoiles, dépôt actif — version 1.1.0
+    publiée le 2026-09-15) est une plateforme RAG auto-hébergée très répandue qui
+    ingère des documents privés et les interroge par LLM local. Le routeur
+    d'ingestion expose la liste des documents déjà ingérés sans authentification
+    par défaut.
+    private_gpt/server/ingest/ingest_router.py déclare
+    « ingest_router = APIRouter(prefix="/v1/artifacts",
+    dependencies=[Depends(authenticated)], tags=["Artifacts"], ...) » puis la
+    route « @ingest_router.get("/list", response_model=IngestResponse, ...) » —
+    d'où le chemin GET /v1/artifacts/list. Le handler « list_ingested » rend
+    « IngestResponse(object="list", model="private-gpt", data=ingested_documents) »
+    où « ingested_documents = list(service.get_ingested_files(collection)) » ;
+    le paramètre « collection » vaut « pgpt_collection » par défaut, donc la
+    route répond sans aucun paramètre. Le modèle IngestResponse sérialise, dans
+    l'ordre de déclaration, « object: Literal["list"] », « model:
+    Literal["private-gpt"] » et « data: list[IngestedDoc] », soit en sortie
+    compacte {"object":"list","model":"private-gpt","data":[...]} ; chaque entrée
+    de data est un IngestedDoc {"object":"ingest.document","artifact":<id>,
+    "doc_metadata":{...}} (private_gpt/server/ingest/model.py). La valeur littérale
+    « "model":"private-gpt" » est codée en dur dans le champ « model » de
+    IngestResponse — c'est la signature propre au produit.
+    L'absence d'authentification est un défaut de configuration par défaut, lu
+    dans private_gpt/server/utils/auth.py : « if not settings().server.auth.enabled:
+    ... def authenticated() -> bool: return True » — quand server.auth.enabled
+    vaut false, la dépendance « authenticated » du routeur est un passe-plat qui
+    retourne True sans rien vérifier. settings.yaml fixe « server.auth.enabled:
+    false » par défaut (et « port: 8080 »), donc le contrôle se réduit à un no-op
+    tant que l'opérateur ne l'active pas. Le constat porte sur la conjonction
+    « "object":"list" » ancrée en tête du document et « "model":"private-gpt" »,
+    jamais sur le seul statut HTTP — /list rend 200 sur n'importe quel serveur
+    vivant.
+  impact: |
+    Un appelant anonyme énumère, en une lecture, l'intégralité des documents
+    ingérés dans la base RAG : pour chaque IngestedDoc, l'identifiant d'artefact
+    (artifact) et le dictionnaire doc_metadata — nom de fichier, département,
+    version, numéro et nombre de pages, et toute autre métadonnée que
+    l'exploitant a attachée. La liste des fichiers privés indexés (rapports
+    financiers, politiques RH, manuels internes) et leur nomenclature sont ainsi
+    divulguées sans identifiant.
+    Le renseignement n'est pas la seule perte. Le même routeur non protégé, par
+    la même dépendance no-op, sert POST /v1/artifacts (ingestion de contenu
+    arbitraire) et POST /v1/artifacts/delete (suppression de documents ingérés),
+    et l'instance sert par ailleurs l'API de complétion — l'attaquant peut
+    empoisonner ou vider le corpus RAG et interroger le LLM aux frais de
+    l'opérateur, /list venant d'en cartographier le contenu.
+  remediation: |
+    Activer l'authentification embarquée : poser « server.auth.enabled: true »
+    dans settings.yaml (ou la variable d'environnement correspondante) et
+    définir « server.auth.secret » sur une valeur robuste — auth.py bascule alors
+    sur « _simple_authentication », qui exige l'en-tête « Authorization » attendu
+    sur l'ensemble des routes du routeur. Le mécanisme fourni reste volontairement
+    simple ; pour un déploiement exposé, préférer un reverse proxy authentifiant
+    en amont.
+    À défaut, la fermeture est réseau : ne pas publier le port du serveur (8080
+    par défaut) sur une interface joignable depuis Internet, lier l'écoute au
+    réseau interne, et placer devant tout accès distant un proxy qui authentifie
+    l'ensemble du préfixe — /v1/artifacts/list, les endpoints d'ingestion et de
+    suppression et l'API de complétion passent par la même dépendance nue.
+    Vérifier depuis l'extérieur du périmètre que « curl -s
+    http://<hote>:8080/v1/artifacts/list » ne rend plus l'objet décrit ici, et
+    tenir pour connus d'un attaquant les documents et métadonnées déjà observés
+    le cas échéant.
+  reference:
+    - https://github.com/zylon-ai/private-gpt
+    - https://github.com/zylon-ai/private-gpt/blob/main/private_gpt/server/ingest/ingest_router.py
+    - https://github.com/zylon-ai/private-gpt/blob/main/private_gpt/server/utils/auth.py
+    - https://github.com/zylon-ai/private-gpt/blob/main/settings.yaml
+  metadata:
+    max-request: 1
+    vendor: zylon-ai
+    product: privategpt
+  tags: ai,llm,privategpt,zylon-ai,rag,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route d'inventaire des documents ingérés. Le
+  # handler list_ingested() énumère les fichiers déjà indexés et n'exécute aucun
+  # modèle : le constat se lit sans rien écrire ni rien faire tourner. Le même
+  # routeur nu porte POST /v1/artifacts (ingestion) et POST /v1/artifacts/delete
+  # (suppression), qui modifieraient le corpus ; ni l'un ni l'autre n'est
+  # interrogé ici. La route accepte le paramètre collection, dont la valeur par
+  # défaut « pgpt_collection » rend la requête complète sans argument.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/artifacts/list"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le document se lit en un seul ancrage, sur la forme exacte que rend
+      # IngestResponse en sortie compacte de FastAPI. Il doit s'ouvrir sur
+      # « {"object":"list", » — l'ancrage en tête écarte le même triplet retrouvé
+      # au fond d'un document composite qu'une supervision agrégerait sous une clé
+      # à elle : l'instance a servi le document elle-même — puis enchaîner
+      # immédiatement « "model":"private-gpt", » — la valeur littérale codée en
+      # dur dans le champ model, propre au produit — puis l'ouverture du tableau
+      # « "data":[ ». « "object":"list" » seul est générique (une liste de modèles
+      # compatible OpenAI l'ouvre pareil) ; c'est sa conjonction avec
+      # « "model":"private-gpt" », dans l'ordre de déclaration du modèle, qui est
+      # le discriminant. Le tableau peut être vide sur une instance sans document
+      # ingéré, ce qui ne change pas le constat : l'API répond sans jeton. Les
+      # \s* tolèrent un intermédiaire qui réindente ce que FastAPI sérialise
+      # compact. Le constat ne repose jamais sur le seul statut HTTP.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"model"\s*:\s*"private-gpt"\s*,\s*"data"\s*:\s*\['
+
+    extractors:
+      # Les documents privés que l'instance expose : la liste des identifiants
+      # d'artefacts déjà ingérés dans le corpus RAG non protégé.
+      - type: json
+        part: body
+        name: artifacts
+        json:
+          - '.data[].artifact'

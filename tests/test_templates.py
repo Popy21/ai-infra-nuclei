@@ -34906,3 +34906,258 @@ def test_verba_matcher_compiles_and_fires_against_a_live_server():
 
     _, results = scan(body=VERBA_COMPOSITE_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# PrivateGPT (zylon-ai/private-gpt, plateforme RAG auto-hébergée, 57k+ étoiles) :
+# private_gpt/server/ingest/ingest_router.py déclare « ingest_router =
+# APIRouter(prefix="/v1/artifacts", dependencies=[Depends(authenticated)], ...) »
+# et la route « @ingest_router.get("/list", response_model=IngestResponse) » —
+# d'où GET /v1/artifacts/list. Le handler list_ingested() rend
+# « IngestResponse(object="list", model="private-gpt", data=ingested_documents) » ;
+# IngestResponse sérialise, dans l'ordre de déclaration, object: Literal["list"],
+# model: Literal["private-gpt"] et data: list[IngestedDoc], soit
+# {"object":"list","model":"private-gpt","data":[{"object":"ingest.document",
+# "artifact":<id>,"doc_metadata":{...}}]}. La dépendance « authenticated » est un
+# passe-plat qui « return True » tant que server.auth.enabled vaut false
+# (défaut de settings.yaml, port 8080) — private_gpt/server/utils/auth.py. Le
+# constat porte sur la conjonction « "object":"list" » ancrée en tête et la
+# valeur littérale « "model":"private-gpt" », jamais sur le seul statut HTTP.
+
+PRIVATEGPT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "privategpt-artifacts-exposed.yaml")
+
+PRIVATEGPT_LIST_ROUTE = "/v1/artifacts/list"
+
+
+def privategpt_ingested_doc(artifact, doc_metadata=None):
+    """Une entrée IngestedDoc, dans l'ordre de déclaration du modèle."""
+    return {
+        "object": "ingest.document",
+        "artifact": artifact,
+        "doc_metadata": doc_metadata,
+    }
+
+
+def privategpt_list_body(data=None, indent=None):
+    """
+    Ce que rend list_ingested() : IngestResponse dans l'ordre de déclaration —
+    object, model, data — sérialisé par FastAPI, compact par défaut, réindenté si
+    `indent` est passé comme le ferait un proxy qui relaie.
+    """
+    if data is None:
+        data = [privategpt_ingested_doc(
+            "quarterly_report_q1",
+            {"file_name": "Q1_Report.pdf", "department": "finance"})]
+    document = {"object": "list", "model": "private-gpt", "data": data}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+PRIVATEGPT_LIST_BODY = privategpt_list_body()
+
+# Une instance fraîche sans document ingéré : data est vide, mais l'API répond
+# tout de même sans jeton — le constat tient.
+PRIVATEGPT_EMPTY_BODY = privategpt_list_body(data=[])
+
+# Plusieurs documents privés indexés : la carte du corpus RAG que l'appelant
+# anonyme énumère.
+PRIVATEGPT_MULTI_BODY = privategpt_list_body(data=[
+    privategpt_ingested_doc("annual_report",
+                            {"file_name": "2023_Annual.pdf", "department": "finance"}),
+    privategpt_ingested_doc("policy_manual",
+                            {"file_name": "employee_policy.docx", "department": "hr"}),
+])
+
+# Le document entier retrouvé au fond de celui d'une supervision : le triplet est
+# présent, mais l'instance n'a pas servi le document elle-même — l'ancrage sur
+# « ^{"object":"list", » doit le rejeter.
+PRIVATEGPT_COMPOSITE_BODY = '{"probe":"privategpt","upstream":%s}' % PRIVATEGPT_LIST_BODY
+
+# Une liste de modèles compatible OpenAI : elle ouvre elle aussi sur
+# « "object":"list" » mais enchaîne sur « data » sans champ « model » codé en
+# dur — c'est justement ce que le discriminant écarte.
+PRIVATEGPT_OPENAI_LIST_BODY = json.dumps(
+    {"object": "list", "data": [{"id": "gpt-4o", "object": "model"}]},
+    separators=(",", ":"))
+
+# Le triplet réordonné — model avant object : IngestResponse ne sérialise que
+# dans l'ordre object, model, data.
+PRIVATEGPT_REORDERED_BODY = (
+    '{"model":"private-gpt","object":"list","data":[]}')
+
+# La liste sans le champ « model » : ce n'est plus la conjonction propre au
+# produit.
+PRIVATEGPT_MISSING_MODEL_BODY = '{"object":"list","data":[]}'
+
+# La même forme mais un autre identifiant de modèle : « private-gpt » est la
+# valeur littérale codée en dur, aucun autre modèle ne la porte.
+PRIVATEGPT_WRONG_MODEL_BODY = '{"object":"list","model":"gpt-4","data":[]}'
+
+
+def privategpt_block():
+    doc = load(PRIVATEGPT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % PRIVATEGPT_LIST_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /v1/artifacts/list"
+    return blocks[0]
+
+
+def privategpt_fires(body=None, headers=None):
+    block = privategpt_block()
+    body = PRIVATEGPT_LIST_BODY if body is None else body
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "word" and matcher.get("part") == "header":
+            blob = " ".join(headers.values())
+            verdicts.append(any(w in blob for w in matcher.get("words") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_privategpt_probe_is_a_single_get_on_list():
+    doc = load(PRIVATEGPT_TEMPLATE)
+    assert request_routes(doc) == {("GET", PRIVATEGPT_LIST_ROUTE)}, (
+        "le template interroge autre chose que GET /v1/artifacts/list — le même "
+        "routeur nu porte POST /v1/artifacts (ingestion) et POST "
+        "/v1/artifacts/delete (suppression), qui modifieraient le corpus RAG : "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert privategpt_block().get("matchers-condition") == "and"
+    assert load(PRIVATEGPT_TEMPLATE)["info"]["severity"] == "high"
+
+
+def test_privategpt_matcher_needs_the_model_marker_not_a_generic_list():
+    assert privategpt_fires(), "le template ne reconnaît pas la réponse de /list"
+    for body, why in (
+        (PRIVATEGPT_EMPTY_BODY, "une instance fraîche dont data est vide — l'API "
+                                "répond tout de même sans jeton"),
+        (PRIVATEGPT_MULTI_BODY, "plusieurs documents privés indexés"),
+        (privategpt_list_body(indent=2), "un intermédiaire qui réindente ce que "
+                                         "FastAPI sérialise compact"),
+    ):
+        assert privategpt_fires(body=body), "le template perd %s" % why
+
+    for body, why in (
+        (PRIVATEGPT_COMPOSITE_BODY, "le document républié par une supervision — "
+                                    "l'ancrage sur « ^{\"object\":\"list\", » dit "
+                                    "que l'instance a répondu d'elle-même"),
+        (PRIVATEGPT_OPENAI_LIST_BODY, "une liste de modèles compatible OpenAI qui "
+                                      "ouvre sur « object:list » sans champ model "
+                                      "codé en dur"),
+        (PRIVATEGPT_REORDERED_BODY, "le triplet réordonné, alors qu'IngestResponse "
+                                    "ne sérialise que dans l'ordre object, model, "
+                                    "data"),
+        (PRIVATEGPT_MISSING_MODEL_BODY, "la liste privée du champ model — ce n'est "
+                                        "plus la conjonction propre au produit"),
+        (PRIVATEGPT_WRONG_MODEL_BODY, "un autre identifiant de modèle que la valeur "
+                                      "littérale « private-gpt » codée en dur"),
+    ):
+        assert not privategpt_fires(body=body), "le template déclenche sur %s" % why
+
+    assert not privategpt_fires(headers={"Content-Type": "text/html"}), (
+        "le template déclenche sur une page HTML"
+    )
+
+
+def test_privategpt_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in (privategpt_block().get("matchers") or [])]
+    assert "status" not in kinds, (
+        "le template porte un matcher de statut : /v1/artifacts/list rend 200 sur "
+        "n'importe quel serveur vivant, le constat doit reposer sur le couple "
+        "« object:list » + « model:private-gpt » que le corps décrit, pas sur le "
+        "code HTTP"
+    )
+    assert "regex" in kinds, (
+        "le discriminant est la forme de l'IngestResponse dans le corps : sans "
+        "matcher regex, rien ne le porte"
+    )
+
+
+def test_privategpt_extractor_reports_the_ingested_artifacts():
+    extractors = privategpt_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul renseignement à faire remonter par instance : les identifiants "
+        f"des documents ingérés — {extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à s'en "
+        "charger"
+    )
+    assert extractor.get("json") == [".data[].artifact"], (
+        "l'extracteur ne lit pas .data[].artifact — c'est pourtant la liste des "
+        "documents privés exposés dans le corpus RAG non protégé"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_privategpt_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle de la regex et de la requête de l'extracteur.
+    """
+    def scan(body=PRIVATEGPT_LIST_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == PRIVATEGPT_LIST_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", PRIVATEGPT_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan(body=PRIVATEGPT_MULTI_BODY)
+    assert seen == [PRIVATEGPT_LIST_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "privategpt-artifacts-exposed"
+    extracted = results[0].get("extracted-results") or []
+    assert "annual_report" in extracted and "policy_manual" in extracted, results[0]
+
+    # data vide : l'API répond sans jeton, le template déclenche quand même.
+    _, results = scan(body=PRIVATEGPT_EMPTY_BODY)
+    assert len(results) == 1, results
+
+    _, results = scan(body=PRIVATEGPT_OPENAI_LIST_BODY)
+    assert results == [], results
+
+    _, results = scan(body=PRIVATEGPT_COMPOSITE_BODY)
+    assert results == [], results
