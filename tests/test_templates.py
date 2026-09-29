@@ -35161,3 +35161,195 @@ def test_privategpt_matcher_compiles_and_fires_against_a_live_server():
 
     _, results = scan(body=PRIVATEGPT_COMPOSITE_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Marker (datalab-to/marker) : le convertisseur PDF → markdown/JSON déployé en
+# amont des pipelines RAG. Son serveur HTTP est lancé par la commande
+# marker_server (pyproject : « marker_server = "marker.scripts.server:server_cli" »).
+# marker/scripts/server.py construit l'application en une seule expression —
+# « app = FastAPI(lifespan=lifespan) » — sans titre, sans dépendance de sécurité
+# ni intergiciel d'authentification ; les seules routes sont GET /, POST /marker
+# et POST /marker/upload. Le handler racine « @app.get("/") async def root() »
+# rend une HTMLResponse dont le corps est écrit littéralement dans le fichier :
+# « <h1>Marker API</h1> » suivi des liens « <a href="/docs">API Documentation</a> »
+# et « <a href="/marker">Run marker (post request only)</a> ». Le constat porte
+# sur le titre « Marker API » conjoint au lien /marker « Run marker (post request
+# only) », propre au produit, jamais sur le statut HTTP ni sur « Marker API »
+# seul. La détection reste en lecture seule sur GET / ; POST /marker (qui lit un
+# « filepath » fourni par l'appelant) et POST /marker/upload ne sont pas
+# interrogés.
+
+MARKER_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "marker-server-exposed.yaml")
+
+MARKER_ROOT_ROUTE = "/"
+
+
+def marker_root_body(indent="    "):
+    """
+    Ce que rend root() : le fragment HTML littéral de la HTMLResponse écrite dans
+    marker/scripts/server.py. `indent` reproduit l'indentation des <li> — celle
+    du code source par défaut, une autre valeur simulant un proxy qui réindente
+    ce qu'il relaie.
+    """
+    return (
+        "\n<h1>Marker API</h1>\n<ul>\n"
+        '%s<li><a href="/docs">API Documentation</a></li>\n'
+        '%s<li><a href="/marker">Run marker (post request only)</a></li>\n'
+        "</ul>\n" % (indent, indent)
+    )
+
+
+MARKER_ROOT_BODY = marker_root_body()
+
+# Le fragment retrouvé au fond du document d'une passerelle qui l'agrégerait sous
+# une balise à elle : le titre et le lien sont présents, mais l'instance n'a pas
+# servi la page elle-même — l'ancrage sur « ^\s*<h1> » doit le rejeter.
+MARKER_COMPOSITE_BODY = "<html><body>%s</body></html>" % MARKER_ROOT_BODY
+
+# Le titre « Marker API » seul, sans le lien /marker : c'est un titre banal
+# qu'une passerelle pourrait citer, ce n'est plus la conjonction propre au
+# produit.
+MARKER_BARE_HEADING_BODY = "\n<h1>Marker API</h1>\n<ul>\n</ul>\n"
+
+# Le lien /marker mais sous un autre titre que <h1>Marker API</h1> : l'ancrage de
+# tête le rejette.
+MARKER_OTHER_HEADING_BODY = (
+    "\n<h2>Convert</h2>\n<ul>\n"
+    '    <li><a href="/marker">Run marker (post request only)</a></li>\n'
+    "</ul>\n"
+)
+
+# Une page qui mentionne « Marker API » en prose, sans le titre en ouverture ni
+# le lien : rien de la signature.
+MARKER_PROSE_BODY = (
+    "<!DOCTYPE html><html><body><p>This is a Marker API gateway.</p></body></html>"
+)
+
+
+def marker_block():
+    doc = load(MARKER_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MARKER_ROOT_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /"
+    return blocks[0]
+
+
+def marker_fires(body=None):
+    block = marker_block()
+    body = MARKER_ROOT_BODY if body is None else body
+    verdicts = [body_matcher_hits(m, body) for m in block.get("matchers") or []]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_marker_probe_is_a_single_get_on_root():
+    doc = load(MARKER_TEMPLATE)
+    assert request_routes(doc) == {("GET", MARKER_ROOT_ROUTE)}, (
+        "le template interroge autre chose que GET / — c'est la seule route en "
+        "lecture ; POST /marker lit un « filepath » fourni par l'appelant et "
+        "POST /marker/upload convertit un document soumis, aux frais de "
+        f"l'exploitant : {sorted(request_routes(doc))}"
+    )
+    assert doc["info"]["severity"] == "medium"
+
+
+def test_marker_matcher_needs_the_page_not_a_bare_heading():
+    assert marker_fires(), "le template ne reconnaît pas la page de GET /"
+    for body, why in (
+        (marker_root_body(indent="  "), "un intermédiaire qui réindente ce que "
+                                        "la HTMLResponse écrit"),
+        (marker_root_body(indent=""), "un intermédiaire qui retire l'indentation "
+                                      "des <li>"),
+    ):
+        assert marker_fires(body=body), "le template perd %s" % why
+
+    for body, why in (
+        (MARKER_COMPOSITE_BODY, "le fragment républié par une passerelle — "
+                                "l'ancrage sur « ^\\s*<h1> » dit que l'instance "
+                                "a répondu d'elle-même"),
+        (MARKER_BARE_HEADING_BODY, "le titre « Marker API » seul, sans le lien "
+                                   "/marker — ce n'est plus la conjonction "
+                                   "propre au produit"),
+        (MARKER_OTHER_HEADING_BODY, "le lien /marker sous un autre titre que "
+                                    "<h1>Marker API</h1>"),
+        (MARKER_PROSE_BODY, "une page qui cite « Marker API » en prose, sans le "
+                            "titre en ouverture ni le lien"),
+    ):
+        assert not marker_fires(body=body), "le template déclenche sur %s" % why
+
+
+def test_marker_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in (marker_block().get("matchers") or [])]
+    assert "status" not in kinds, (
+        "le template porte un matcher de statut : GET / rend 200 sur n'importe "
+        "quel serveur vivant, le constat doit reposer sur le titre « Marker "
+        "API » conjoint au lien /marker que le corps décrit, pas sur le code HTTP"
+    )
+    assert "regex" in kinds, (
+        "le discriminant est la forme de la page dans le corps : sans matcher "
+        "regex, rien ne le porte"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_marker_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle de la regex.
+    """
+    def scan(body=MARKER_ROOT_BODY, content_type="text/html; charset=utf-8"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == MARKER_ROOT_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MARKER_TEMPLATE, "-s", "medium",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [MARKER_ROOT_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "marker-server-exposed"
+
+    # Le titre seul, sans le lien /marker : le template ne doit pas déclencher.
+    _, results = scan(body=MARKER_BARE_HEADING_BODY)
+    assert results == [], results
+
+    # Le fragment républié par une passerelle : l'ancrage de tête le rejette.
+    _, results = scan(body=MARKER_COMPOSITE_BODY)
+    assert results == [], results

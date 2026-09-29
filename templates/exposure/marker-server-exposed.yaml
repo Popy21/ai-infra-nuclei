@@ -1,0 +1,122 @@
+id: marker-server-exposed
+
+info:
+  name: Marker - Unauthenticated Document Conversion API Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Marker (datalab-to/marker) est le convertisseur PDF → markdown/JSON que l'on
+    pose le plus couramment en amont des pipelines RAG. Son serveur HTTP est lancé
+    par la commande `marker_server` — pyproject.toml déclare le point d'entrée
+    « marker_server = "marker.scripts.server:server_cli" ».
+    GET / est la lecture qui nomme le produit. Le handler racine, déclaré
+    « @app.get("/") async def root() » dans marker/scripts/server.py, rend une
+    HTMLResponse dont le corps est écrit littéralement dans le fichier source :
+    « <h1>Marker API</h1> » suivi de deux liens en liste, « <a href="/docs">API
+    Documentation</a> » et « <a href="/marker">Run marker (post request
+    only)</a> ». C'est ce fragment — le titre « Marker API » conjoint au lien
+    /marker « Run marker (post request only) » — qui distingue l'instance. Le
+    statut HTTP ne porte rien : la racine répond 200 sur n'importe quel serveur
+    vivant, et « Marker API » seul est un titre qu'une passerelle pourrait citer.
+    C'est la conjonction du titre et du lien, propre au produit, qui fait le
+    constat.
+    L'absence d'authentification n'est pas un réglage manqué mais une
+    fonctionnalité absente du produit. L'application est construite en une seule
+    expression — « app = FastAPI(lifespan=lifespan) » — sans titre, sans
+    dépendance de sécurité, sans intergiciel d'authentification, ni sur
+    l'application ni sur les routes ; les seules routes déclarées sont GET /,
+    POST /marker et POST /marker/upload. Il n'y a donc rien à activer et rien à
+    mal configurer. GET /openapi.json le confirme à la main — le chemin est servi
+    par défaut, ni openapi_url ni docs_url n'étant redéfinis — puisqu'il énumère
+    les chemins /marker et /marker/upload, absents de toute autre API ; mais le
+    fragment de la racine suffit et la détection n'a pas à l'interroger.
+    La liaison par défaut va dans le sens de l'isolement : server_cli porte
+    « @click.option("--host", type=str, default="127.0.0.1") » et
+    « @click.option("--port", type=int, default=8000) », puis lance
+    « uvicorn.run(app, host=host, port=port) ». L'exposition survient dès que
+    l'opérateur passe « --host 0.0.0.0 » ou publie le port du conteneur. Le
+    constat, lui, reste en lecture seule sur GET /.
+  impact: |
+    POST /marker et POST /marker/upload sont servies par le même serveur nu, et
+    c'est là qu'est le risque : de la conversion de documents gratuite sur le
+    matériel de l'exploitant, sans compte à débiter et sans limite de débit.
+    POST /marker reçoit un CommonParams dont le champ « filepath » est un chemin
+    fourni par l'appelant et lu côté serveur — convert_pdf() passe ce chemin à
+    PdfConverter, qui ouvre le fichier sur le système de fichiers du serveur, et
+    text_from_rendered() renvoie le texte converti dans la réponse : ce que le
+    serveur a lu, l'appelant anonyme le lit. POST /marker/upload reçoit un
+    document arbitraire (UploadFile) écrit dans ./uploads, converti, puis effacé.
+    Le pipeline Marker — analyse de mise en page, OCR, reconstruction des
+    tableaux — tourne sur le matériel de l'exploitant : le dictionnaire de
+    modèles est chargé au démarrage par le lifespan (« app_data["models"] =
+    create_model_dict() »), donc prêt à servir le premier venu sur le GPU, le MPS
+    ou le CPU de la machine.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé d'identité,
+    donc aucune trace n'en portera. La détection, elle, ne touche à rien — GET /
+    ne rend qu'un fragment HTML statique écrit dans le code source.
+  remediation: |
+    Il n'y a rien à activer dans le produit : marker/scripts/server.py ne déclare
+    aucun champ de clé d'API ni aucune dépendance d'authentification, donc aucune
+    variable d'environnement ne ferme ces routes. Le contrôle d'accès se pose à
+    l'extérieur — un intermédiaire qui authentifie devant le port
+    (authentification HTTP, mTLS, oauth2-proxy), ou l'isolement réseau pur et
+    simple.
+    Restreindre l'écoute d'abord : garder « --host 127.0.0.1 » — c'est déjà le
+    défaut — quand l'instance n'a pas à être atteinte depuis l'extérieur de la
+    machine, et « -p 127.0.0.1:8000:8000 » côté conteneur, là où « -p 8000:8000 »
+    publie le port sur toutes les interfaces de l'hôte.
+    Après une exposition, tenir chaque POST /marker et POST /marker/upload du
+    journal pour une conversion qu'un tiers a fait tourner sur le matériel de
+    l'exploitant, et vérifier si les valeurs de « filepath » pointaient vers des
+    fichiers que l'appelant n'avait aucune raison de faire lire. Vérifier enfin,
+    depuis l'extérieur du périmètre, que GET / ne rend plus la page « Marker API »
+    à l'anonyme.
+  reference:
+    - https://github.com/datalab-to/marker/blob/master/marker/scripts/server.py
+    - https://github.com/datalab-to/marker/blob/master/pyproject.toml
+    - https://github.com/datalab-to/marker
+  metadata:
+    max-request: 1
+    vendor: datalab-to
+    product: marker
+  tags: ai,llm,rag,marker,datalab-to,pdf,document-conversion,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et c'est la seule route du produit qui ne lui fasse rien
+  # faire : root() rend un fragment HTML littéral écrit dans le fichier source,
+  # sans toucher au disque ni réveiller le pipeline de conversion.
+  #
+  # En lecture seule, et rien d'autre. Le même serveur nu sert POST /marker, qui
+  # ferait lire au serveur un « filepath » arbitraire et rendrait ce qu'il en a
+  # tiré, et POST /marker/upload, qui convertit un document soumis — c'est l'abus
+  # que le constat signale, ce n'est pas ce qu'un scanner a le droit de faire pour
+  # l'établir.
+  #
+  # GET /openapi.json corrobore à la main — il énumère /marker et /marker/upload,
+  # absents de toute autre API — mais la page de la racine suffit à nommer le
+  # produit, et la détection n'a pas à l'interroger.
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+
+    matchers:
+      # Le discriminant est la forme exacte de la page que root() rend, jamais le
+      # statut HTTP — la racine répond 200 sur n'importe quel serveur vivant.
+      #
+      # Premier motif : le titre, ancré sur l'ouverture du corps. La HTMLResponse
+      # commence par « <h1>Marker API</h1> » ; l'ancrage sur « ^\s*<h1> » dit que
+      # l'instance a répondu d'elle-même, ce qui écarte le même titre retrouvé au
+      # fond du document d'une passerelle qui l'agrégerait sous une clé à elle. Les
+      # \s* absorbent la réindentation d'un proxy qui relaierait le fragment.
+      #
+      # Second motif : le lien /marker « Run marker (post request only) ». C'est
+      # lui qui rend la signature propre à Marker — « Marker API » seul est un
+      # titre banal, mais aucun autre produit ne publie ce lien-là, au texte exact,
+      # pointant vers /marker. Les deux motifs doivent passer ensemble : le titre
+      # nomme, le lien confirme.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*<h1>\s*Marker API\s*</h1>'
+          - '<a\s+href="/marker"\s*>\s*Run marker \(post request only\)\s*</a>'
+        condition: and
