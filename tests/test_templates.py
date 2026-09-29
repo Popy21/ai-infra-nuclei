@@ -35353,3 +35353,70 @@ def test_marker_matcher_compiles_and_fires_against_a_live_server():
     # Le fragment républié par une passerelle : l'ancrage de tête le rejette.
     _, results = scan(body=MARKER_COMPOSITE_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Vanna (vanna-ai/vanna) : framework text-to-SQL dont l'application web est
+# lancée par VannaFlaskApp(vn).run(). src/vanna/legacy/flask/__init__.py déclare
+# « auth: AuthInterface = NoAuth() » par défaut ; GET /api/v0/get_config porte
+# @self.requires_auth et rend jsonify({"type": "config", "config": config}).
+# self.config contient toujours « allow_llm_to_see_data », clé propre au produit.
+# Flask trie les clés : « config » précède « type ». Le constat repose sur le
+# corps, jamais sur le statut ; run_sql, generate_sql, train et
+# generate_questions (qui génère) ne sont pas interrogés.
+
+VANNA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "vanna-flask-no-auth.yaml")
+
+VANNA_ROUTE = "/api/v0/get_config"
+
+VANNA_BODY = (
+    '{"config":{"allow_llm_to_see_data":false,"chart":true,"debug":true},'
+    '"type":"config"}\n'
+)
+VANNA_BODY_PRETTY = (
+    '{\n  "config": {\n    "allow_llm_to_see_data": false,\n    "chart": true,\n'
+    '    "debug": true\n  },\n  "type": "config"\n}\n'
+)
+
+
+def vanna_block():
+    doc = load(VANNA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % VANNA_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % VANNA_ROUTE
+    return blocks[0]
+
+
+def vanna_fires(body):
+    verdicts = [body_matcher_hits(m, body)
+                for m in vanna_block().get("matchers") or []
+                if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert verdicts, "bloc sans matcher de corps"
+    return all(verdicts)
+
+
+def test_vanna_probe_is_a_single_get_on_get_config():
+    doc = load(VANNA_TEMPLATE)
+    assert request_routes(doc) == {("GET", VANNA_ROUTE)}, sorted(request_routes(doc))
+    assert doc["info"]["severity"] == "high"
+
+
+def test_vanna_matcher_needs_the_config_envelope_and_product_key():
+    assert vanna_fires(VANNA_BODY)
+    assert vanna_fires(VANNA_BODY_PRETTY)
+
+    for body, why in (
+        ('{"type":"config"}', "l'enveloppe seule, sans objet config"),
+        ('{"config":{"debug":true},"type":"config"}',
+         "une config sans la clé propre à Vanna"),
+        ('{"config":{"allow_llm_to_see_data":false},"type":"other"}',
+         "un autre type"),
+        ('{"detail":"Not Found"}', "une 404 JSON"),
+    ):
+        assert not vanna_fires(body), "le template déclenche sur %s" % why
+
+
+def test_vanna_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in vanna_block().get("matchers") or []]
+    assert "status" not in kinds
+    assert "regex" in kinds

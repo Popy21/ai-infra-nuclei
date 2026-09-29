@@ -1,0 +1,84 @@
+id: vanna-flask-no-auth
+
+info:
+  name: Vanna - Unauthenticated Text-to-SQL Flask App Exposed
+  author: popy21
+  severity: high
+  description: |
+    Vanna (vanna-ai/vanna) est le framework text-to-SQL open source le plus
+    déployé : l'utilisateur pose une question en langage naturel, Vanna génère le
+    SQL puis l'exécute sur la base connectée. L'application web intégrée est
+    lancée par « VannaFlaskApp(vn).run() ».
+    src/vanna/legacy/flask/__init__.py déclare, dans VannaFlaskApp.__init__,
+    « auth: AuthInterface = NoAuth() » par défaut. Le décorateur
+    « @self.requires_auth » appelle « self.auth.get_user(flask.request) » puis
+    teste « self.auth.is_logged_in(user) » ; NoAuth satisfaisant toujours cette
+    condition, tout appelant passe tant que l'opérateur n'a pas fourni sa propre
+    implémentation d'AuthInterface.
+    GET /api/v0/get_config porte lui-même ce décorateur et rend
+    « jsonify({"type": "config", "config": config}) » : une réponse 200 dont le
+    corps porte « "type":"config" » et le dictionnaire de configuration de
+    l'application prouve, dans le même temps, que l'instance est Vanna et qu'elle
+    tourne sans authentification. Le dictionnaire self.config contient toujours
+    « allow_llm_to_see_data », clé propre au produit. Le statut HTTP ne porte
+    rien. La lecture reste sans effet : get_config ne génère rien et ne touche ni
+    la base ni le LLM.
+  impact: |
+    La même surface non authentifiée sert POST /api/v0/run_sql (exécution de SQL
+    arbitraire sur la base connectée), POST /api/v0/generate_sql et POST
+    /api/v0/train : lecture, écriture et suppression sur la base de données de
+    l'organisation, plus la consommation du LLM configuré, aux frais de
+    l'opérateur.
+  remediation: |
+    Fournir une implémentation d'AuthInterface à VannaFlaskApp
+    (« VannaFlaskApp(vn, auth=MyAuth()) ») plutôt que le NoAuth par défaut, et
+    connecter Vanna à la base avec un compte en lecture seule. Ne pas publier le
+    port de l'application : l'écouter en 127.0.0.1 ou placer devant un
+    intermédiaire qui authentifie (authentification HTTP, mTLS, oauth2-proxy).
+    Après une exposition, tenir chaque appel à run_sql, generate_sql et train du
+    journal pour non attribué et faire tourner les identifiants de la base et du
+    LLM.
+  reference:
+    - https://github.com/vanna-ai/vanna/blob/main/src/vanna/legacy/flask/__init__.py
+    - https://github.com/vanna-ai/vanna
+  metadata:
+    max-request: 1
+    vendor: vanna-ai
+    product: vanna
+  tags: ai,llm,text-to-sql,vanna,flask,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route qui porte elle-même @requires_auth. Le même
+  # serveur nu sert POST /api/v0/run_sql, generate_sql et train, et GET
+  # /api/v0/generate_questions déclenche une génération : aucun n'est interrogé.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v0/get_config"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le discriminant est le corps, jamais le statut. Flask trie les clés de
+      # jsonify par défaut (« config » précède « type ») et indente en mode
+      # debug : les motifs sont donc indépendants de l'ordre et tolèrent les
+      # espaces. « "type":"config" » seul est générique ; sa conjonction avec
+      # « config » ouvrant un objet et avec « allow_llm_to_see_data », clé de
+      # self.config propre à Vanna, est la signature.
+      - type: regex
+        part: body
+        regex:
+          - '"type"\s*:\s*"config"'
+          - '"config"\s*:\s*\{'
+          - '"allow_llm_to_see_data"\s*:\s*(true|false)'
+        condition: and
+
+    extractors:
+      - type: json
+        part: body
+        name: config
+        json:
+          - '.config'
