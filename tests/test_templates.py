@@ -35420,3 +35420,235 @@ def test_vanna_conclusion_rests_on_the_body_never_on_the_status():
     kinds = [m.get("type") for m in vanna_block().get("matchers") or []]
     assert "status" not in kinds
     assert "regex" in kinds
+
+
+# --------------------------------------------------------------------------
+# exo agrège plusieurs machines en un cluster et sert des API compatibles
+# OpenAI, Claude et Ollama depuis un nœud. GET /state rend l'état global : le
+# handler get_state() renvoie self.state, que FastAPI sérialise par alias, donc
+# en camelCase (State(FrozenModel), alias_generator=to_camel). Le corps s'ouvre
+# sur "instances"/"tasks" — le vocabulaire de tout ordonnanceur — mais porte
+# plus loin le couple propre à exo, "lastEventAppliedIdx" (entier) et
+# "nodeIdentities" (la carte des nœuds). La signature doit tenir à ce couple,
+# jamais au statut, traverser les versions (les deux clés sont présentes dès le
+# premier état, cluster au repos compris) et refuser un ordonnanceur quelconque
+# servant /state. Le template ne touche ni POST /instance, POST /place_instance
+# ni DELETE /instance/{instance_id}, qui modifient le parc.
+
+EXO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "exo-cluster-state-exposed.yaml")
+
+EXO_ROUTE = "/state"
+
+# Réponse de GET /state, telle que FastAPI sérialise State par alias : ordre de
+# déclaration, camelCase, compact. Cluster à deux nœuds avec une instance.
+EXO_STATE_BODY = (
+    '{"instances":{"inst-7f":{"model":"llama-3.1-70b"}},"runners":{},'
+    '"downloads":{},"tasks":{},"lastSeen":{"node-a1b2":1759300000.42,'
+    '"node-c3d4":1759300000.51},"topology":{"nodes":["node-a1b2","node-c3d4"],'
+    '"links":[]},"lastEventAppliedIdx":1427,'
+    '"nodeIdentities":{"node-a1b2":{"nodeId":"node-a1b2","platform":"darwin"},'
+    '"node-c3d4":{"nodeId":"node-c3d4","platform":"linux"}},'
+    '"nodeMemory":{"node-a1b2":{"total":137438953472}},'
+    '"nodeDisk":{"node-a1b2":{"total":2000398934016}},'
+    '"nodeSystem":{"node-a1b2":{"os":"macOS","arch":"arm64"}},'
+    '"nodeNetwork":{"node-a1b2":{"ifaces":["en0"]}},'
+    '"nodeBackends":{"node-a1b2":["mlx"]},"instanceLinks":{},'
+    '"customModelCards":{}}'
+)
+
+# Cluster fraîchement démarré, un seul nœud, aucune instance : l'index
+# d'événement vaut -1 avant tout événement appliqué. Les deux clés du couple
+# restent sérialisées — le template doit toujours déclencher.
+EXO_IDLE_STATE_BODY = (
+    '{"instances":{},"runners":{},"downloads":{},"tasks":{},'
+    '"lastSeen":{"node-a1b2":1759300000.0},"topology":{"nodes":["node-a1b2"]},'
+    '"lastEventAppliedIdx":-1,'
+    '"nodeIdentities":{"node-a1b2":{"nodeId":"node-a1b2"}},'
+    '"nodeMemory":{},"customModelCards":{}}'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. Le même état, réindenté.
+EXO_REFORMATTED_STATE_BODY = (
+    '{\n  "instances": {},\n  "tasks": {},\n'
+    '  "lastEventAppliedIdx": 42,\n'
+    '  "nodeIdentities": {\n    "node-a1b2": {"nodeId": "node-a1b2"}\n  }\n}'
+)
+
+# Un ordonnanceur quelconque sert lui aussi un /state avec instances, tasks et
+# une topologie : ce vocabulaire n'appartient à personne, et le couple exo y est
+# absent. Le template ne doit pas déclencher.
+OTHER_SCHEDULER_STATE_BODY = (
+    '{"instances":{"i-1":{}},"tasks":{},"topology":{"nodes":[]},'
+    '"nodes":{"n1":{"cpu":8}},"version":"1.4.2"}'
+)
+
+# La casse exacte compte : une sérialisation snake_case des mêmes champs n'est
+# pas exo tel qu'il rend /state, et ne doit pas déclencher.
+EXO_SNAKE_CASE_BODY = (
+    '{"instances":{},"last_event_applied_idx":5,"node_identities":{"n1":{}}}'
+)
+
+
+def exo_block():
+    doc = load(EXO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % EXO_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % EXO_ROUTE
+    return blocks[0]
+
+
+def exo_fires(body):
+    verdicts = [body_matcher_hits(m, body)
+                for m in exo_block().get("matchers") or []
+                if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert verdicts, "bloc sans matcher de corps"
+    return all(verdicts)
+
+
+def test_exo_probe_is_a_single_get_on_state_and_never_mutates_the_cluster():
+    doc = load(EXO_TEMPLATE)
+    assert request_routes(doc) == {("GET", EXO_ROUTE)}, sorted(request_routes(doc))
+    assert doc["info"]["severity"] == "high"
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'état se lit en GET : le même routeur sert POST /instance, POST "
+            "/place_instance et DELETE /instance/{instance_id}, qui chargent et "
+            "déchargent des modèles sur le parc — le template ne doit rien "
+            "envoyer qui modifie l'instance qu'il découvre"
+        )
+        for path in (block.get("path") or []):
+            assert "/instance" not in path, (
+                "le template touche une route /instance : il chargerait ou "
+                "déchargerait un modèle sur les machines de l'opérateur, l'abus "
+                "qu'il est censé signaler"
+            )
+
+
+def test_exo_matcher_rests_on_the_state_couple_not_on_generic_scheduler_keys():
+    block = exo_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert exo_fires(EXO_STATE_BODY), (
+        "le template ne reconnaît pas une réponse /state d'exo"
+    )
+    assert exo_fires(EXO_IDLE_STATE_BODY), (
+        "le template rate un cluster au repos (lastEventAppliedIdx à -1, aucune "
+        "instance) — précisément l'instance qui traîne exposée"
+    )
+    assert exo_fires(EXO_REFORMATTED_STATE_BODY), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not exo_fires(OTHER_SCHEDULER_STATE_BODY), (
+        "le template déclenche sur un ordonnanceur quelconque servant /state : "
+        "instances, tasks et topology sont le vocabulaire commun, le couple "
+        "lastEventAppliedIdx + nodeIdentities est le discriminant"
+    )
+    assert not exo_fires(EXO_SNAKE_CASE_BODY), (
+        "le template déclenche sur une sérialisation snake_case : exo rend /state "
+        "par alias camelCase, et la casse exacte est la signature"
+    )
+
+    # Le couple est exigé entier : une seule des deux clés ne suffit pas.
+    assert not exo_fires('{"lastEventAppliedIdx":7,"foo":{}}'), (
+        "le template déclenche sur lastEventAppliedIdx seul"
+    )
+    assert not exo_fires('{"nodeIdentities":{"n1":{}},"foo":1}'), (
+        "le template déclenche sur nodeIdentities seul"
+    )
+
+    # Collisions internes au pack : aucun autre produit couvert ne porte ce
+    # couple, et deux templates ne doivent pas revendiquer la même instance.
+    for other_body in (VLLM_MODELS_BODY, LANGFLOW_WHOAMI_BODY,
+                       LOCALAI_SYSTEM_BODY):
+        assert not exo_fires(other_body), (
+            "le template déclenche sur un runtime déjà couvert par son propre "
+            "template"
+        )
+
+
+def test_exo_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in exo_block().get("matchers") or []]
+    assert "status" not in kinds, (
+        "le constat ne doit jamais tenir au statut : /state répond 200 sur tout "
+        "serveur vivant"
+    )
+    assert "regex" in kinds
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_exo_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei, et l'extracteur gojq « .nodeIdentities | keys » n'est pas
+    compilé par `nuclei -validate` : seul un scan contre un vrai serveur ferme
+    la boucle sur la compilation réelle de la regex et de la requête.
+    """
+    def scan(body=EXO_STATE_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == EXO_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", EXO_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [EXO_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "exo-cluster-state-exposed"
+    # L'extracteur rend les identifiants des nœuds, triés par gojq keys.
+    assert results[0].get("extracted-results") == ['["node-a1b2","node-c3d4"]'], (
+        results[0].get("extracted-results")
+    )
+
+    # Un ordonnanceur quelconque servant /state : le couple exo est absent, le
+    # template ne doit pas déclencher.
+    _, results = scan(body=OTHER_SCHEDULER_STATE_BODY)
+    assert results == [], results
+
+    # Une sérialisation snake_case des mêmes champs : la casse est la signature.
+    _, results = scan(body=EXO_SNAKE_CASE_BODY)
+    assert results == [], results

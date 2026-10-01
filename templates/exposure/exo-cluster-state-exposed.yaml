@@ -1,0 +1,130 @@
+id: exo-cluster-state-exposed
+
+info:
+  name: exo - Unauthenticated Cluster State Disclosure
+  author: popy21
+  severity: high
+  description: |
+    exo (exo-explore/exo) est le moteur d'inférence distribué qui agrège
+    plusieurs machines en un seul cluster et sert, depuis un unique nœud, des API
+    compatibles OpenAI (/v1/chat/completions), Claude (/v1/messages) et Ollama
+    (/ollama/api/chat) ; d'après le README, l'API et le tableau de bord écoutent
+    sur le port 52415. GET /state rend l'état global du cluster sans
+    authentification.
+    src/exo/api/main.py enregistre la route par « self.app.get("/state")(self.get_state) »
+    (plus la variante « self.app.get("/state/{path:path}")(self.get_state) »
+    pour naviguer dans un sous-chemin). Le handler « def get_state(self, path:
+    str = "") » rend, sans sous-chemin, « self.state » — un objet State que
+    FastAPI sérialise par jsonable_encoder, soit par alias ; la variante à
+    sous-chemin navigue dans « self.state.model_dump(by_alias=True) ». Ce sont
+    donc les alias camelCase qui sont exposés.
+    src/exo/shared/types/state.py déclare « class State(FrozenModel) » avec
+    « model_config = ConfigDict(alias_generator=to_camel, ...) » et
+    « from pydantic.alias_generators import to_camel ». Les champs snake_case
+    (instances, runners, downloads, tasks, last_seen, topology,
+    last_event_applied_idx, node_identities, node_memory, node_disk, node_system,
+    node_network, node_thunderbolt, node_backends, instance_links,
+    custom_model_cards…) ressortent donc en camelCase : le corps s'ouvre sur
+    {"instances":{...},"runners":{...},"downloads":{...},"tasks":{...},
+    "lastSeen":{...},"topology":{...},"lastEventAppliedIdx":<int>,
+    "nodeIdentities":{...},"nodeMemory":{...},…,"customModelCards":{...}}.
+    Le constat tient au couple « lastEventAppliedIdx » (entier) + « nodeIdentities »,
+    propre à exo : c'est sur ces deux clés que porte le matcher, jamais sur le
+    statut HTTP — /state répond 200 sur n'importe quel serveur vivant, et
+    « instances » ou « tasks » seuls sont le vocabulaire de tout ordonnanceur.
+    L'absence d'authentification est une fonctionnalité absente du produit, non
+    un réglage manqué : src/exo/api/main.py ne monte aucun intergiciel ni aucune
+    dépendance de vérification de clé ou de jeton sur l'application ni sur les
+    routes, et lie le serveur par « cfg.bind = [f"0.0.0.0:{self.port}"] »,
+    c'est-à-dire toutes les interfaces, sans qu'aucun drapeau n'ait à être passé.
+    Il n'y a donc rien à activer et rien à mal configurer : la fermeture est
+    réseau ou périmétrique. La casse exacte des clés se relève sur une instance
+    réelle avant d'écrire le matcher ; les motifs tolèrent par ailleurs la
+    réindentation d'un intermédiaire qui relaierait ce que FastAPI sérialise
+    compact.
+  impact: |
+    Un appelant anonyme obtient, en une lecture, la cartographie complète du
+    cluster : identités des nœuds (nodeIdentities), mémoire (nodeMemory), disque
+    (nodeDisk), système (nodeSystem), réseau (nodeNetwork) et topologie
+    (topology), plus l'inventaire des instances de modèles, des runners et des
+    téléchargements en cours. C'est une télémétrie interne qu'un tiers sans
+    compte n'a aucune raison d'obtenir, et elle décrit le parc matériel de
+    l'opérateur machine par machine.
+    Le renseignement n'est pas la seule perte. Le même routeur non protégé sert
+    POST /instance et POST /place_instance (chargement et placement d'un modèle
+    sur le parc) et DELETE /instance/{instance_id} (déchargement) : un anonyme
+    charge et décharge des modèles sur les machines de l'opérateur. Et les API
+    compatibles OpenAI, Claude et Ollama servies par la même instance donnent
+    l'inférence gratuite sur ce matériel, aux frais de l'opérateur, /state venant
+    d'en cartographier les nœuds et la capacité.
+  remediation: |
+    Il n'y a pas de réglage produit à activer : src/exo/api/main.py ne déclare
+    aucune dépendance d'authentification, donc aucune variable d'environnement ne
+    ferme /state ni les routes voisines. Le contrôle d'accès se pose à
+    l'extérieur — un intermédiaire qui authentifie devant le port 52415
+    (authentification HTTP, mTLS, oauth2-proxy), ou l'isolement réseau pur et
+    simple.
+    Restreindre l'écoute d'abord : le serveur se lie à 0.0.0.0, donc ne pas
+    publier le port 52415 sur une interface joignable depuis Internet, lier
+    l'accès au réseau interne du cluster, et « -p 127.0.0.1:52415:52415 » côté
+    conteneur là où « -p 52415:52415 » le publie sur toutes les interfaces de
+    l'hôte.
+    Après une exposition, tenir pour connus d'un attaquant la carte des nœuds et
+    la capacité déjà observées, relire les journaux pour tout POST /instance,
+    POST /place_instance, DELETE /instance/{instance_id} et tout appel aux API
+    d'inférence non attribués, et vérifier depuis l'extérieur du périmètre que
+    GET /state ne rend plus l'objet décrit ici à l'anonyme.
+  reference:
+    - https://github.com/exo-explore/exo
+    - https://github.com/exo-explore/exo/blob/main/src/exo/api/main.py
+    - https://github.com/exo-explore/exo/blob/main/src/exo/shared/types/state.py
+  metadata:
+    max-request: 1
+    vendor: exo-explore
+    product: exo
+  tags: ai,llm,inference,exo,exo-explore,cluster,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route qui rend l'état global du cluster. Le handler
+  # get_state() rend self.state sans sous-chemin et n'exécute aucun modèle : le
+  # constat se lit sans rien écrire ni rien faire tourner. Le même routeur nu
+  # porte POST /instance et POST /place_instance (chargement et placement d'un
+  # modèle) et DELETE /instance/{instance_id} (déchargement), qui modifieraient
+  # le parc ; aucun n'est interrogé ici.
+  - method: GET
+    path:
+      - "{{BaseURL}}/state"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le discriminant est le corps, jamais le statut — /state répond 200 sur
+      # n'importe quel serveur vivant. Le couple propre à exo, exigé ensemble :
+      # « lastEventAppliedIdx », l'index d'événement entier (le « :\s*-?\d+ »
+      # écarte une clé homonyme dont la valeur ne serait pas un entier), et
+      # « nodeIdentities », la carte des nœuds, ouvrant un objet. Chaque clé est
+      # à elle seule une signature camelCase propre au produit ; les exiger
+      # toutes deux, sans supposer leur adjacence, tient à travers les versions
+      # tout en écartant un ordonnanceur quelconque qui servirait « instances »
+      # ou « tasks » sous /state. Les \s* absorbent la réindentation d'un proxy
+      # qui relaierait ce que FastAPI sérialise compact.
+      - type: regex
+        part: body
+        regex:
+          - '"lastEventAppliedIdx"\s*:\s*-?\d+'
+          - '"nodeIdentities"\s*:\s*\{'
+        condition: and
+
+    extractors:
+      # Les nœuds du cluster que l'instance expose : les identifiants de la carte
+      # nodeIdentities, soit le parc machine par machine. Un identifiant par
+      # nœud suffit au rapport ; les identités complètes n'ont pas à le peupler.
+      - type: json
+        part: body
+        name: nodes
+        json:
+          - '.nodeIdentities | keys'
