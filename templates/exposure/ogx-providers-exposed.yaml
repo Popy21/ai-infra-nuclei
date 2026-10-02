@@ -1,0 +1,141 @@
+id: ogx-providers-exposed
+
+info:
+  name: OGX (ex-Llama Stack) - Unauthenticated Provider Map Disclosure
+  author: popy21
+  severity: high
+  description: |
+    OGX (dépôt llamastack/llama-stack, dont le README annonce « Llama Stack is
+    now OGX ») est un serveur d'API agentique compatible OpenAI — chat
+    completions, embeddings, Responses API, vector stores — qui route les
+    requêtes vers des fournisseurs enfichables (inférence, mémoire, stockage
+    vectoriel). Il écoute sur le port 8321 par défaut. GET /v1/providers rend la
+    liste des fournisseurs configurés sans authentification.
+    src/ogx_api/providers/fastapi_routes.py enregistre « @router.get("/providers")
+    » et « @router.get("/providers/{provider_id}") » sous le préfixe
+    f"/{OGX_API_V1}", où « OGX_API_V1 = "v1" » (src/ogx_api/version.py) — donc
+    /v1/providers et /v1/providers/{provider_id} — sans aucune dépendance
+    d'authentification ni marqueur de route publique sur l'une ou l'autre.
+    Le corps est un ListProvidersResponse (src/ogx_api/admin/models.py) :
+    « data: list[ProviderInfo] », et chaque ProviderInfo porte exactement les
+    champs « api », « provider_id », « provider_type », « config » et « health »,
+    tous Field(...), donc toujours présents. La réponse s'ouvre donc sur
+    {"data":[{"api":...,"provider_id":...,"provider_type":"remote::ollama",
+    "config":{...},"health":{...}}, ...]}.
+    Les provider_type portent le format « remote::<fournisseur> » :
+    src/ogx/distributions/starter/config.yaml, la distribution « starter »
+    livrée par défaut, déclare remote::cerebras, remote::ollama, remote::vllm,
+    remote::fireworks et remote::together, et sa section « server: » ne déclare
+    que « port: 8321 », sans bloc « auth ».
+    L'absence d'authentification est le défaut du produit, non un réglage manqué :
+    src/ogx/core/server/server.py n'ajoute AuthenticationMiddleware que sous
+    « if config.server.auth: if config.server.auth.provider_config: », et sous la
+    condition inverse « if not (config.server.auth and
+    config.server.auth.provider_config): » le serveur journalise littéralement
+    « Authentication is not configured. All API endpoints are accessible without
+    credentials. ». src/ogx/core/datatypes.py confirme le défaut :
+    « auth: AuthenticationConfig | None = Field(default=None, ...) » et
+    « port: int = Field(default=8321, ...) ». Rien n'est donc à mal configurer :
+    sans bloc auth explicite, chaque route reste atteignable par quiconque
+    atteint le port.
+    Le discriminant est le corps, jamais le statut — /v1/providers répond 200 sur
+    toute instance vivante. Le motif propre au produit est « "provider_type":
+    "remote:: » conjoint aux clés « provider_id » et « health » : les trois
+    ensemble ne se lisent que sur la réponse ProviderInfo d'OGX, là où
+    « provider_id » ou « health » seuls appartiennent au vocabulaire générique de
+    n'importe quelle API. La casse exacte des clés se relève sur une instance
+    réelle avant d'écrire le matcher ; les \s* absorbent la réindentation d'un
+    intermédiaire qui relaierait ce que FastAPI sérialise compact.
+  impact: |
+    Un appelant anonyme obtient la cartographie des back-ends de l'organisation :
+    pour chaque fournisseur, l'api qu'il implémente (inférence, mémoire, stockage
+    vectoriel…), son provider_id, son provider_type (remote::ollama,
+    remote::vllm, remote::fireworks, remote::together, remote::cerebras… ou leurs
+    équivalents de stockage) et l'état de santé renvoyé par health. C'est la
+    liste des fournisseurs d'inférence et de stockage que l'opérateur a câblés,
+    machine par machine et compte par compte.
+    src/ogx/core/providers.py construit cette liste à partir de
+    redact_sensitive_fields(run_config.model_dump()) : les secrets de « config »
+    sont masqués, et il n'y a donc pas de fuite de clé d'API à annoncer. La perte
+    reste le renseignement — un tiers sans compte apprend sur quels fournisseurs
+    et quels modèles l'organisation s'appuie — doublée de l'abus : le même serveur
+    sans authentification sert l'inférence compatible OpenAI (chat completions,
+    embeddings, Responses API) en routant vers ces fournisseurs, c'est-à-dire aux
+    frais des comptes fournisseurs configurés, /v1/providers venant d'en dresser
+    l'inventaire.
+  remediation: |
+    Configurer l'authentification : src/ogx/core/server/server.py ne monte
+    AuthenticationMiddleware que si « config.server.auth.provider_config » est
+    renseigné, donc renseigner le bloc « server.auth » avec un provider_config
+    dans le fichier de distribution — sans lui, le serveur journalise lui-même
+    que « All API endpoints are accessible without credentials » et chaque route
+    reste publique. Tant que l'authentification n'est pas posée, ne pas publier le
+    port 8321 sur une interface joignable depuis Internet : le lier à une
+    interface interne, et « -p 127.0.0.1:8321:8321 » côté conteneur là où
+    « -p 8321:8321 » le publie sur toutes les interfaces de l'hôte. Un
+    intermédiaire qui authentifie devant le port (mTLS, oauth2-proxy) ferme la
+    même surface quand le bloc auth natif n'est pas une option.
+    Après une exposition, tenir pour connus d'un attaquant la liste des
+    fournisseurs et des modèles déjà cartographiés, relire les journaux d'appels
+    non attribués aux routes d'inférence (chat completions, embeddings, Responses
+    API) qui auraient routé vers les comptes fournisseurs, et vérifier depuis
+    l'extérieur du périmètre que GET /v1/providers ne rend plus l'inventaire à
+    l'anonyme.
+  reference:
+    - https://github.com/llamastack/llama-stack
+    - https://github.com/llamastack/llama-stack/blob/main/src/ogx_api/providers/fastapi_routes.py
+    - https://github.com/llamastack/llama-stack/blob/main/src/ogx_api/admin/models.py
+    - https://github.com/llamastack/llama-stack/blob/main/src/ogx/core/server/server.py
+    - https://github.com/llamastack/llama-stack/blob/main/src/ogx/core/datatypes.py
+    - https://github.com/llamastack/llama-stack/blob/main/src/ogx/distributions/starter/config.yaml
+  metadata:
+    max-request: 1
+    vendor: llamastack
+    product: llama-stack
+  tags: ai,llm,inference,ogx,llama-stack,llamastack,providers,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur la route qui rend la liste des fournisseurs. Le
+  # handler list_providers() ne fait que lire la configuration — il ne route
+  # aucune requête vers un fournisseur et n'exécute aucun modèle : le constat se
+  # lit sans rien déclencher. Le même serveur sans garde sert par ailleurs
+  # l'inférence compatible OpenAI (chat completions, embeddings, Responses API),
+  # qui routerait vers les comptes fournisseurs ; aucune de ces routes n'est
+  # interrogée ici.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/providers"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le discriminant est le corps, jamais le statut — /v1/providers répond 200
+      # sur toute instance vivante. Le motif propre à OGX, exigé entier : le
+      # provider_type au format « remote:: » (la façon dont OGX nomme un
+      # fournisseur distant), conjoint aux deux autres champs requis de
+      # ProviderInfo, « provider_id » et « health ». Pris isolément, provider_id
+      # ou health est le vocabulaire de n'importe quelle API ; les trois ensemble
+      # ne se lisent que sur la réponse ProviderInfo. Les \s* absorbent la
+      # réindentation d'un proxy qui relaierait ce que FastAPI sérialise compact.
+      - type: regex
+        part: body
+        regex:
+          - '"provider_type"\s*:\s*"remote::'
+          - '"provider_id"\s*:\s*"'
+          - '"health"\s*:\s*\{'
+        condition: and
+
+    extractors:
+      # Les provider_type de la liste : la cartographie des back-ends que
+      # l'instance expose (remote::ollama, remote::vllm, remote::fireworks…),
+      # soit le renseignement même que /v1/providers livre à l'anonyme. Collectés
+      # en un seul tableau pour ne remonter qu'une ligne par instance.
+      - type: json
+        part: body
+        name: providers
+        json:
+          - '[.data[].provider_type]'

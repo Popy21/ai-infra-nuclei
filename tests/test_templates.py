@@ -35652,3 +35652,241 @@ def test_exo_matcher_compiles_and_fires_against_a_live_server():
     # Une sérialisation snake_case des mêmes champs : la casse est la signature.
     _, results = scan(body=EXO_SNAKE_CASE_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# OGX (ex-Llama Stack, dépôt llamastack/llama-stack) est un serveur d'API
+# agentique compatible OpenAI qui route vers des fournisseurs enfichables, port
+# 8321 par défaut. GET /v1/providers rend un ListProvidersResponse — « data:
+# list[ProviderInfo] » — où chaque ProviderInfo porte api, provider_id,
+# provider_type, config et health (src/ogx_api/admin/models.py). Les
+# provider_type portent le format « remote::<fournisseur> ». L'authentification
+# est absente par défaut : server.py ne monte AuthenticationMiddleware que si
+# config.server.auth.provider_config est renseigné. Le discriminant produit est
+# « "provider_type":"remote:: » conjoint aux clés provider_id et health ; la
+# signature doit tenir à ce triplet, jamais au statut (/v1/providers répond 200
+# sur toute instance vivante), traverser les versions et refuser une API
+# quelconque dont la réponse porterait provider_id ou health isolément. Le
+# template ne touche pas les routes d'inférence (chat completions, embeddings,
+# Responses API), qui routeraient vers les comptes fournisseurs.
+
+OGX_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "ogx-providers-exposed.yaml")
+
+OGX_ROUTE = "/v1/providers"
+
+# Réponse de GET /v1/providers, telle que FastAPI sérialise ListProvidersResponse
+# puis ProviderInfo : ordre de déclaration (api, provider_id, provider_type,
+# config, health), compact. Deux fournisseurs distants, secrets de config masqués
+# par redact_sensitive_fields.
+OGX_PROVIDERS_BODY = (
+    '{"data":[{"api":"inference","provider_id":"ollama",'
+    '"provider_type":"remote::ollama",'
+    '"config":{"url":"http://localhost:11434"},'
+    '"health":{"status":"OK","message":null}},'
+    '{"api":"inference","provider_id":"vllm",'
+    '"provider_type":"remote::vllm",'
+    '"config":{"url":"http://vllm:8000/v1","api_token":"********"},'
+    '"health":{"status":"OK","message":null}}]}'
+)
+
+# Fournisseur en erreur, health non « OK » : le triplet reste sérialisé — le
+# template doit toujours déclencher, le constat ne portant pas sur l'état de
+# santé mais sur l'exposition de la carte.
+OGX_UNHEALTHY_BODY = (
+    '{"data":[{"api":"vector_io","provider_id":"faiss",'
+    '"provider_type":"remote::chromadb","config":{"url":"http://chroma:8000"},'
+    '"health":{"status":"Error","message":"connection refused"}}]}'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. Le même inventaire, réindenté.
+OGX_REFORMATTED_BODY = (
+    '{\n  "data": [\n    {\n      "api": "inference",\n'
+    '      "provider_id": "fireworks",\n'
+    '      "provider_type": "remote::fireworks",\n'
+    '      "config": {},\n'
+    '      "health": {\n        "status": "OK"\n      }\n    }\n  ]\n}'
+)
+
+# Une API quelconque dont la réponse porte « provider_id » et « health » — le
+# vocabulaire générique — mais aucun provider_type au format remote:: : le
+# triplet OGX est incomplet, le template ne doit pas déclencher.
+OGX_GENERIC_BODY = (
+    '{"data":[{"provider_id":"svc-1","health":{"status":"up"},'
+    '"region":"eu-west-1"}]}'
+)
+
+# Une instance OGX dont tous les fournisseurs sont inline (inline::), non
+# distants : le format remote:: est absent, le template ne doit pas déclencher —
+# c'est le choix assumé de matcher sur remote::, que la distribution par défaut
+# livre.
+OGX_INLINE_ONLY_BODY = (
+    '{"data":[{"api":"inference","provider_id":"meta-reference",'
+    '"provider_type":"inline::meta-reference","config":{},'
+    '"health":{"status":"OK"}}]}'
+)
+
+
+def ogx_block():
+    doc = load(OGX_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % OGX_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % OGX_ROUTE
+    return blocks[0]
+
+
+def ogx_fires(body):
+    verdicts = [body_matcher_hits(m, body)
+                for m in ogx_block().get("matchers") or []
+                if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert verdicts, "bloc sans matcher de corps"
+    return all(verdicts)
+
+
+def test_ogx_probe_is_a_single_get_on_providers_and_never_routes_inference():
+    doc = load(OGX_TEMPLATE)
+    assert request_routes(doc) == {("GET", OGX_ROUTE)}, sorted(request_routes(doc))
+    assert doc["info"]["severity"] == "high"
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la carte des fournisseurs se lit en GET : le même serveur sans garde "
+            "sert l'inférence compatible OpenAI (chat completions, embeddings, "
+            "Responses API) qui routerait vers les comptes fournisseurs — le "
+            "template ne doit rien envoyer qui consomme ces comptes"
+        )
+        for path in (block.get("path") or []):
+            for route in ("/chat/completions", "/embeddings", "/responses"):
+                assert route not in path, (
+                    "le template touche une route d'inférence : il routerait une "
+                    "requête vers les comptes fournisseurs de l'opérateur, l'abus "
+                    "qu'il est censé signaler"
+                )
+
+
+def test_ogx_matcher_rests_on_the_remote_provider_triplet_not_on_generic_keys():
+    block = ogx_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert ogx_fires(OGX_PROVIDERS_BODY), (
+        "le template ne reconnaît pas une réponse /v1/providers d'OGX"
+    )
+    assert ogx_fires(OGX_UNHEALTHY_BODY), (
+        "le template rate une instance dont un fournisseur est en erreur — le "
+        "constat porte sur l'exposition de la carte, pas sur l'état de santé"
+    )
+    assert ogx_fires(OGX_REFORMATTED_BODY), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not ogx_fires(OGX_GENERIC_BODY), (
+        "le template déclenche sur une API quelconque servant provider_id et "
+        "health : le format provider_type remote:: est le discriminant, pas ces "
+        "deux clés génériques"
+    )
+    assert not ogx_fires(OGX_INLINE_ONLY_BODY), (
+        "le template déclenche sur des fournisseurs inline:: : le matcher est "
+        "ancré sur remote::, que la distribution par défaut livre"
+    )
+
+    # Le triplet est exigé entier : aucune des clés seule ne suffit.
+    assert not ogx_fires('{"provider_type":"remote::ollama"}'), (
+        "le template déclenche sur provider_type remote:: seul"
+    )
+    assert not ogx_fires('{"provider_id":"ollama","health":{"status":"OK"}}'), (
+        "le template déclenche sur provider_id + health sans remote::"
+    )
+
+    # Collisions internes au pack : aucun autre produit couvert ne porte ce
+    # triplet, et deux templates ne doivent pas revendiquer la même instance.
+    for other_body in (VLLM_MODELS_BODY, LANGFLOW_WHOAMI_BODY,
+                       LOCALAI_SYSTEM_BODY, EXO_STATE_BODY):
+        assert not ogx_fires(other_body), (
+            "le template déclenche sur un runtime déjà couvert par son propre "
+            "template"
+        )
+
+
+def test_ogx_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in ogx_block().get("matchers") or []]
+    assert "status" not in kinds, (
+        "le constat ne doit jamais tenir au statut : /v1/providers répond 200 sur "
+        "toute instance vivante"
+    )
+    assert "regex" in kinds
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_ogx_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei, et l'extracteur gojq « [.data[].provider_type] » n'est pas
+    compilé par `nuclei -validate` : seul un scan contre un vrai serveur ferme
+    la boucle sur la compilation réelle de la regex et de la requête.
+    """
+    def scan(body=OGX_PROVIDERS_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == OGX_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", OGX_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [OGX_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "ogx-providers-exposed"
+    # L'extracteur collecte les provider_type en un seul tableau.
+    assert results[0].get("extracted-results") == [
+        '["remote::ollama","remote::vllm"]'
+    ], results[0].get("extracted-results")
+
+    # Une API quelconque servant provider_id et health sans remote:: : le triplet
+    # est incomplet, le template ne doit pas déclencher.
+    _, results = scan(body=OGX_GENERIC_BODY)
+    assert results == [], results
+
+    # Des fournisseurs inline:: : le matcher est ancré sur remote::.
+    _, results = scan(body=OGX_INLINE_ONLY_BODY)
+    assert results == [], results
