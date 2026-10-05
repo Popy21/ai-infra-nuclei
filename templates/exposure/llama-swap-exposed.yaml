@@ -1,0 +1,159 @@
+id: llama-swap-exposed
+
+info:
+  name: llama-swap - Unauthenticated Model Inventory Disclosure
+  author: popy21
+  severity: high
+  description: |
+    llama-swap (mostlygeek/llama-swap) est un proxy compatible OpenAI qui charge
+    et décharge à la demande des serveurs d'inférence locaux — llama.cpp et ses
+    forks, vLLM, stable-diffusion.cpp, ComfyUI… — derrière un point d'entrée
+    unique. GET /v1/models rend l'inventaire des modèles configurés sans
+    authentification.
+    internal/server/api.go : « handleListModels » construit chaque entrée par le
+    « newRecord » local, qui écrit les littéraux « Object: "model" », « OwnedBy:
+    "llama-swap" » et « Status: map[string]any{"value": status} » (le status
+    valant "loaded" ou "unloaded" selon « modelStatus »), puis encode
+    « map[string]any{"object": "list", "data": data} ». La structure
+    « modelRecord » porte les tags json « id », « object », « created »,
+    « owned_by », « name,omitempty », « description,omitempty », … et
+    « status » ; « id », « object », « created », « owned_by » et « status » sont
+    donc toujours sérialisés. L'enveloppe étant une map Go, encoding/json en
+    trie les clés : le corps réel s'ouvre sur {"data":[{"id":...,
+    "object":"model","created":...,"owned_by":"llama-swap",...,
+    "status":{"value":"unloaded"}}],"object":"list"} — « data » avant « object ».
+    Le matcher ne suppose donc aucun ordre.
+    L'absence d'authentification est un défaut de configuration, pas une
+    fonctionnalité absente : internal/server/server.go monte ces routes derrière
+    « apiChain := chain.New(authMW) » avec « authMW := CreateAuthMiddleware(s.cfg) »,
+    mais internal/server/auth.go court-circuite l'intergiciel — son commentaire
+    dit « When no keys are configured the middleware is a pass-through » et le
+    corps « if len(keys) == 0 { return next } ». internal/config/config.go
+    déclare « RequiredAPIKeys []string `yaml:"apiKeys"` » sans valeur par défaut,
+    et docs/config.example.yaml le documente mot pour mot : « optional, default:
+    [] » et « when empty (the default) authorization will not be checked as
+    llama-swap is default-allow ». La clé est donc à poser, et rien ne la pose à
+    la place de l'exploitant.
+    Côté publication, le README livre « -p 9292:8080 » (ligne de commande comme
+    fichier compose), donne « 0.0.0.0:8080 » pour défaut de
+    « LLAMA_SWAP_LISTEN » dans l'image, et recommande « Keep `LLAMA_SWAP_LISTEN`
+    on `0.0.0.0` whenever you publish a port » — un conteneur qui se lierait à
+    son propre loopback ne serait pas joignable à travers -p. L'écoute sur
+    toutes les interfaces n'est donc pas l'erreur : c'est la publication du port
+    qui l'est.
+    Le discriminant est la valeur littérale « "owned_by":"llama-swap" », propre
+    au produit, qui le distingue des runtimes compatibles OpenAI déjà couverts
+    par le pack et servant le même endpoint (vLLM, LM Studio, SGLang, LMDeploy,
+    Speaches…). Elle est exigée avec « "object":"model" » et l'enveloppe de
+    statut « "status":{"value":...} », propre à llama-swap là où les autres
+    rendent un « permission » ou rien. Jamais sur « "object":"list" » seul, qui
+    est la forme de tout listing OpenAI, ni sur le statut HTTP — /v1/models
+    répond 200 sur toute instance vivante. GET /health n'est pas interrogé : son
+    « handleHealth » rend le texte brut « OK », générique. GET /running ne l'est
+    pas non plus : il vaut {"running":[]} tant qu'aucun modèle n'est chargé, donc
+    il ne prouve rien sur une instance au repos.
+  impact: |
+    Un appelant anonyme obtient l'inventaire des modèles que l'exploitant sert —
+    identifiants, nom et description renseignés dans la configuration, et pour
+    chacun l'état loaded/unloaded, c'est-à-dire ce qui occupe le GPU à l'instant
+    de la lecture.
+    Le renseignement n'est pas la seule perte, parce que « apiChain » est le même
+    intergiciel neutralisé partout. GET /running rend une liste de
+    « runningModel » (tags json « model », « state », « cmd », « proxy », « ttl »,
+    « name », « description ») : le champ « cmd » livre la commande configurée des
+    serveurs amont, donc les chemins des modèles sur le disque de l'hôte et les
+    options de lancement. GET /upstream/{upstreamPath...} atteint directement les
+    serveurs d'inférence derrière le proxy. GET /logs et GET /logs/stream rendent
+    les journaux, et GET /api/hardware l'instantané matériel relevé au démarrage
+    du processus.
+    Et le même routeur sert POST /v1/chat/completions ainsi que POST
+    /api/models/unload et POST /api/models/unload/{model...} : un anonyme
+    consomme le GPU de l'exploitant pour son propre compte, et décharge les
+    modèles chargés — un déni de service bon marché contre les clients légitimes,
+    chaque rechargement coûtant le temps de remise en mémoire des poids.
+  remediation: |
+    Renseigner « apiKeys » dans le fichier de configuration : c'est le réglage
+    natif, et sans lui internal/server/auth.go rend l'intergiciel passant pour
+    toutes les routes de « apiChain ». docs/config.example.yaml en donne la forme
+    (une liste de chaînes non vides, avec les macros « ${env.VAR} » pour garder
+    les secrets hors du fichier) et rappelle que vide — le défaut — vaut
+    default-allow. Une clé statique partagée ferme l'accès anonyme mais ne
+    remplace pas une authentification par utilisateur.
+    Ne pas publier le port en attendant. Le README recommande de laisser
+    « LLAMA_SWAP_LISTEN » sur « 0.0.0.0 » dès qu'un port est publié, donc le
+    durcissement ne se joue pas sur l'adresse d'écoute mais sur la publication :
+    « -p 127.0.0.1:9292:8080 » là où « -p 9292:8080 » publie sur toutes les
+    interfaces de l'hôte, ou « --network host » avec
+    « LLAMA_SWAP_LISTEN=localhost:8080 » pour borner llama-swap à l'hôte
+    lui-même. Un intermédiaire qui authentifie devant le port (mTLS,
+    oauth2-proxy) ferme la même surface.
+    Après une exposition, tenir pour connus d'un attaquant l'inventaire des
+    modèles déjà lu et, si /running a répondu, les lignes de commande et les
+    chemins des modèles sur disque. Relire les journaux pour tout appel non
+    attribué à POST /v1/chat/completions, POST /api/models/unload[/{model}] et
+    /upstream/, puis vérifier depuis l'extérieur du périmètre que GET /v1/models
+    ne rend plus l'inventaire à l'anonyme.
+  reference:
+    - https://github.com/mostlygeek/llama-swap
+    - https://github.com/mostlygeek/llama-swap/blob/main/internal/server/api.go
+    - https://github.com/mostlygeek/llama-swap/blob/main/internal/server/server.go
+    - https://github.com/mostlygeek/llama-swap/blob/main/internal/server/auth.go
+    - https://github.com/mostlygeek/llama-swap/blob/main/internal/config/config.go
+    - https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml
+  metadata:
+    max-request: 1
+    vendor: mostlygeek
+    product: llama-swap
+  tags: ai,llm,inference,llama-swap,llamaswap,proxy,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur l'inventaire. handleListModels n'énumère que la
+  # configuration et l'état des processus locaux : il ne charge aucun modèle et
+  # n'exécute aucune inférence, le constat se lit donc sans rien déclencher. Le
+  # même routeur sans garde porte POST /v1/chat/completions (qui consommerait le
+  # GPU) et POST /api/models/unload[/{model}] (qui déchargerait les modèles de
+  # l'exploitant) ; aucun n'est interrogé ici. GET /running n'est pas interrogé
+  # non plus : il rend {"running":[]} sur une instance au repos, donc il ne
+  # prouve rien — c'est /v1/models qui porte le littéral produit.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le discriminant est le corps, jamais le statut — /v1/models répond 200
+      # sur toute instance vivante, et la forme {"object":"list","data":[...]}
+      # est celle de tous les runtimes compatibles OpenAI déjà couverts par le
+      # pack, qui servent le même endpoint. Le trio, exigé ensemble :
+      # « "owned_by":"llama-swap" », le littéral que newRecord écrit sur chaque
+      # entrée et qui nomme le produit ; « "object":"model" », le littéral de la
+      # même entrée ; et « "status":{"value":...} », l'enveloppe de statut propre
+      # à llama-swap, là où vLLM rend un « permission » et où l'API d'OpenAI ne
+      # rend rien. Les trois champs sont sans omitempty dans modelRecord, donc
+      # toujours sérialisés — y compris sur une instance dont aucun modèle n'est
+      # chargé, où le status vaut "unloaded". Les \s* absorbent la réindentation
+      # d'un intermédiaire qui relaierait ce que le serveur sérialise compact, et
+      # aucun motif ne suppose l'ordre des clés : l'enveloppe est une map Go, que
+      # encoding/json trie, donc « data » y précède « object ».
+      - type: regex
+        part: body
+        regex:
+          - '"owned_by"\s*:\s*"llama-swap"'
+          - '"object"\s*:\s*"model"'
+          - '"status"\s*:\s*\{\s*"value"\s*:'
+        condition: and
+
+    extractors:
+      # Les identifiants de l'inventaire : le renseignement même que /v1/models
+      # livre à l'anonyme, soit les modèles que l'exploitant sert. Collectés en
+      # un seul tableau pour ne remonter qu'une ligne par instance.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '[.data[].id]'

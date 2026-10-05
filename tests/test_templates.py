@@ -35890,3 +35890,272 @@ def test_ogx_matcher_compiles_and_fires_against_a_live_server():
     # Des fournisseurs inline:: : le matcher est ancré sur remote::.
     _, results = scan(body=OGX_INLINE_ONLY_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# llama-swap (mostlygeek/llama-swap) est un proxy compatible OpenAI qui charge et
+# décharge à la demande des serveurs d'inférence locaux derrière un point
+# d'entrée unique. GET /v1/models rend l'inventaire : handleListModels construit
+# chaque entrée par newRecord, qui écrit les littéraux Object: "model", OwnedBy:
+# "llama-swap" et Status: map[string]any{"value": status}
+# (internal/server/api.go), puis encode map[string]any{"object": "list", "data":
+# data} — une map Go, donc encoding/json en trie les clés et « data » précède
+# « object » dans le corps réel. Le discriminant produit est la valeur littérale
+# « "owned_by":"llama-swap" », exigée avec « "object":"model" » et l'enveloppe
+# « "status":{"value":...} » : la forme {"object":"list","data":[...]} seule est
+# celle de tous les runtimes compatibles OpenAI du pack, qui servent le même
+# endpoint. La signature doit tenir à ce trio, jamais au statut (/v1/models
+# répond 200 sur toute instance vivante), reconnaître une instance au repos (tous
+# les status à "unloaded") et refuser les autres runtimes déjà couverts.
+# L'authentification est passante par défaut : auth.go rend l'intergiciel
+# transparent sous « if len(keys) == 0 { return next } », et RequiredAPIKeys
+# (yaml « apiKeys ») n'a pas de valeur par défaut. Le template ne touche ni POST
+# /v1/chat/completions, ni POST /api/models/unload[/{model}], ni /upstream/, que
+# le même apiChain neutralisé expose.
+
+LLAMASWAP_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "llama-swap-exposed.yaml")
+
+LLAMASWAP_ROUTE = "/v1/models"
+
+# Réponse de GET /v1/models, telle que le serveur la sérialise : entrées triées
+# par ID (sort.Slice), champs dans l'ordre de déclaration de modelRecord (id,
+# object, created, owned_by, name, description, …, meta, status), enveloppe
+# triée par encoding/json (« data » avant « object »), compact, avec le retour à
+# la ligne que json.NewEncoder ajoute. Un modèle chargé, un modèle au repos.
+LLAMASWAP_MODELS_BODY = (
+    '{"data":[{"id":"qwen3-coder","object":"model","created":1759000000,'
+    '"owned_by":"llama-swap","name":"Qwen3 Coder 30B",'
+    '"description":"modele de code local",'
+    '"meta":{"llamaswap":{"aliases":["coder"],"type":"model"}},'
+    '"status":{"value":"loaded"}},'
+    '{"id":"smollm2","object":"model","created":1759000000,'
+    '"owned_by":"llama-swap","meta":{"llamaswap":{"type":"model"}},'
+    '"status":{"value":"unloaded"}}],"object":"list"}\n'
+)
+
+# Instance au repos : aucun modèle chargé, donc modelStatus rend "unloaded"
+# partout, et ni name ni description ne sont renseignés (omitempty les retire).
+# Le trio reste sérialisé — le template doit toujours déclencher, le constat
+# portant sur l'exposition de l'inventaire, pas sur ce qui occupe le GPU.
+LLAMASWAP_IDLE_BODY = (
+    '{"data":[{"id":"smollm2","object":"model","created":1759000000,'
+    '"owned_by":"llama-swap","meta":{"llamaswap":{"type":"model"}},'
+    '"status":{"value":"unloaded"}}],"object":"list"}\n'
+)
+
+# Le serveur sérialise compact, mais un intermédiaire peut reformater le corps
+# qu'il relaie. Le même inventaire, réindenté.
+LLAMASWAP_REFORMATTED_BODY = (
+    '{\n  "data": [\n    {\n      "id": "smollm2",\n'
+    '      "object": "model",\n      "created": 1759000000,\n'
+    '      "owned_by": "llama-swap",\n'
+    '      "status": {\n        "value": "unloaded"\n      }\n    }\n  ],\n'
+    '  "object": "list"\n}\n'
+)
+
+# Instance dont la configuration ne liste aucun modèle (ou dont tous portent
+# « unlisted: true ») : data est vide, donc aucun littéral produit n'est
+# sérialisé. Le template ne doit pas déclencher — c'est le prix assumé d'ancrer
+# le constat sur « owned_by », et une instance sans modèle n'a par ailleurs rien
+# à livrer de son inventaire.
+LLAMASWAP_EMPTY_BODY = '{"data":[],"object":"list"}\n'
+
+# Une passerelle qui imiterait la forme des entrées — object "model" et
+# l'enveloppe de statut — sans porter le littéral produit : le trio est
+# incomplet, le template ne doit pas déclencher.
+LLAMASWAP_NO_OWNER_BODY = (
+    '{"data":[{"id":"gpt-4o","object":"model","created":1759000000,'
+    '"status":{"value":"loaded"}}],"object":"list"}\n'
+)
+
+# Un produit homonyme par préfixe : « llama-swapper » n'est pas « llama-swap »,
+# et le motif ferme la valeur sur son guillemet plutôt que de s'arrêter au
+# préfixe.
+LLAMASWAP_LOOKALIKE_BODY = LLAMASWAP_IDLE_BODY.replace(
+    '"owned_by":"llama-swap"', '"owned_by":"llama-swapper"'
+)
+
+
+def llamaswap_block():
+    doc = load(LLAMASWAP_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LLAMASWAP_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % LLAMASWAP_ROUTE
+    return blocks[0]
+
+
+def llamaswap_fires(body):
+    verdicts = [body_matcher_hits(m, body)
+                for m in llamaswap_block().get("matchers") or []
+                if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert verdicts, "bloc sans matcher de corps"
+    return all(verdicts)
+
+
+def test_llamaswap_probe_reads_the_inventory_and_neither_infers_nor_unloads():
+    doc = load(LLAMASWAP_TEMPLATE)
+    routes = request_routes(doc)
+    assert routes == {("GET", LLAMASWAP_ROUTE)}, sorted(routes)
+    assert doc["info"]["severity"] == "high"
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : le même apiChain neutralisé sert POST "
+            "/v1/chat/completions, qui consommerait le GPU de l'exploitant, et "
+            "POST /api/models/unload, qui déchargerait ses modèles"
+        )
+        for path in (block.get("path") or []):
+            for route in ("/chat/completions", "/completions", "/embeddings",
+                          "/api/models/unload", "/upstream"):
+                assert route not in path, (
+                    "le template touche %s : il déclencherait l'abus qu'il est "
+                    "censé signaler — inférence sur le GPU de l'exploitant ou "
+                    "déchargement de ses modèles" % route
+                )
+        # /running livre les lignes de commande des serveurs amont, mais vaut
+        # {"running":[]} tant qu'aucun modèle n'est chargé : il ne prouverait
+        # rien sur une instance au repos, et ce n'est pas lui qui porte le
+        # littéral produit.
+        assert "/running" not in str(block.get("path") or []), (
+            "le template s'appuie sur /running, vide sur une instance au repos"
+        )
+
+
+def test_llamaswap_matcher_rests_on_the_owner_literal_not_on_the_openai_shape():
+    block = llamaswap_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    assert llamaswap_fires(LLAMASWAP_MODELS_BODY), (
+        "le template ne reconnaît pas une réponse /v1/models de llama-swap"
+    )
+    assert llamaswap_fires(LLAMASWAP_IDLE_BODY), (
+        "le template rate une instance au repos — le constat porte sur "
+        "l'exposition de l'inventaire, pas sur ce qui occupe le GPU"
+    )
+    assert llamaswap_fires(LLAMASWAP_REFORMATTED_BODY), (
+        "le template dépend de la sérialisation compacte du serveur : un "
+        "intermédiaire qui reformate le corps le mettrait en défaut"
+    )
+
+    assert not llamaswap_fires(LLAMASWAP_NO_OWNER_BODY), (
+        "le template déclenche sans le littéral « owned_by »:« llama-swap » : "
+        "c'est lui qui nomme le produit, pas la forme des entrées"
+    )
+    assert not llamaswap_fires(LLAMASWAP_LOOKALIKE_BODY), (
+        "le motif s'arrête au préfixe « llama-swap » et prend un homonyme pour "
+        "le produit : la valeur doit être fermée sur son guillemet"
+    )
+    assert not llamaswap_fires(LLAMASWAP_EMPTY_BODY), (
+        "le template déclenche sur une enveloppe vide : il ne reste alors que "
+        "{\"object\":\"list\"}, la forme de tout listing compatible OpenAI"
+    )
+
+    # Le trio est exigé entier : aucun des trois champs seul ne suffit.
+    for body, why in (
+        ('{"owned_by":"llama-swap"}', "le littéral produit seul"),
+        ('{"object":"model"}', "l'objet d'une entrée seul"),
+        ('{"status":{"value":"loaded"}}', "l'enveloppe de statut seule"),
+        ('{"object":"list","data":[]}', "la forme générique d'un listing OpenAI"),
+    ):
+        assert not llamaswap_fires(body), "le template déclenche sur %s" % why
+
+    # Collisions internes au pack : /v1/models est servi par tous les runtimes
+    # compatibles OpenAI déjà couverts, et deux templates ne doivent pas
+    # revendiquer la même instance.
+    for other_body in (OTHER_OPENAI_API_BODY, VLLM_MODELS_BODY,
+                       LMSTUDIO_MODELS_BODY, LOCALAI_OPENAI_MODELS_BODY,
+                       PRIVATEGPT_LIST_BODY):
+        assert not llamaswap_fires(other_body), (
+            "le template déclenche sur un runtime compatible OpenAI qui n'est "
+            "pas llama-swap"
+        )
+
+
+def test_llamaswap_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in llamaswap_block().get("matchers") or []]
+    assert "status" not in kinds, (
+        "le constat ne doit jamais tenir au statut : /v1/models répond 200 sur "
+        "toute instance vivante"
+    )
+    assert "regex" in kinds
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_llamaswap_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei, et l'extracteur gojq « [.data[].id] » n'est pas compilé par
+    `nuclei -validate` : seul un scan contre un vrai serveur ferme la boucle sur
+    la compilation réelle de la regex et de la requête.
+    """
+    def scan(body=LLAMASWAP_MODELS_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == LLAMASWAP_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, "404 page not found\n", "text/plain")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LLAMASWAP_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [LLAMASWAP_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "llama-swap-exposed"
+    # L'extracteur collecte les identifiants en un seul tableau, dans l'ordre où
+    # le serveur les trie.
+    assert results[0].get("extracted-results") == [
+        '["qwen3-coder","smollm2"]'
+    ], results[0].get("extracted-results")
+
+    # Une instance au repos : le trio reste sérialisé, le template déclenche.
+    _, results = scan(body=LLAMASWAP_IDLE_BODY)
+    assert len(results) == 1, results
+
+    # Un autre runtime compatible OpenAI sur le même endpoint : le littéral
+    # produit est absent, le template ne doit pas déclencher.
+    _, results = scan(body=VLLM_MODELS_BODY)
+    assert results == [], results
+
+    # Une enveloppe vide : il ne reste que la forme générique d'un listing.
+    _, results = scan(body=LLAMASWAP_EMPTY_BODY)
+    assert results == [], results
