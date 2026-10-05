@@ -36159,3 +36159,366 @@ def test_llamaswap_matcher_compiles_and_fires_against_a_live_server():
     # Une enveloppe vide : il ne reste que la forme générique d'un listing.
     _, results = scan(body=LLAMASWAP_EMPTY_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# NVIDIA NIM est la gamme de microservices d'inférence conteneurisés de NVIDIA —
+# NIM for LLMs, for VLMs, Speech, et les NIM par modèle. Produit distinct de
+# Triton (le serveur qui tourne dans le conteneur) et de Dynamo (l'orchestration
+# au-dessus), tous deux déjà couverts. GET /v1/metadata rend le descriptif du
+# déploiement, et la difficulté est que le corps documenté n'est pas le même
+# partout : l'exemple verbatim de la référence ASR des NIM Speech porte
+# « version », « selectedModelProfileId », « modelInfo »,
+# « repository_override », « assetInfo » et « licenseInfo », mais les notes de
+# version 1.14.0 des NIM LLM disent que « when calling the v1/metadata API, the
+# following fields under modelInfo are missing: repository_override and
+# selectedModelProfileId ». La signature ne peut donc pas tenir à ces deux clés,
+# et c'est l'opérateur Kubernetes de NVIDIA qui donne le contrat stable :
+# internal/nimmodels/models.go déclare MetadataV1{ModelInfo
+# []MetadataV1ModelInfo `json:"modelInfo"`} et MetadataV1ModelInfo{ShortName
+# `json:"shortName"`, ModelUrl `json:"modelUrl"`}, sans omitempty, et c'est tout
+# ce qu'il lit pour nommer le modèle d'un NIMService. « assetInfo » complète le
+# quatuor. Le schéma de modelUrl n'est pas exigé : ngc:// est le cas courant,
+# mais la référence des variables d'environnement nomme aussi les dépôts hf://.
+# Le template ne touche ni POST /v1/chat/completions, ni /v1/completions, ni
+# /v1/embeddings, que le même serveur sans garde expose — le quickstart les
+# interroge sans en-tête d'autorisation, et la référence d'API précise que « NIM
+# does not validate the x-api-key header ».
+
+NIM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "nvidia-nim-metadata-exposed.yaml")
+
+NIM_ROUTE = "/v1/metadata"
+
+# L'exemple verbatim de la référence ASR des NIM Speech, placeholders remplacés
+# par des valeurs plausibles : l'ordre des clés et les six champs sont ceux de
+# la documentation.
+NIM_SPEECH_METADATA_BODY = (
+    '{"version":"1.5.1",'
+    '"selectedModelProfileId":"5b0b4b6b0e8a4e1ab2f1c3d4e5f60718",'
+    '"modelInfo":[{"modelUrl":"ngc://nim/nvidia/parakeet-1-1b-ctc-riva:1.5.1",'
+    '"shortName":"parakeet-1-1b-ctc-riva:1.5.1"}],'
+    '"repository_override":"","assetInfo":[],"licenseInfo":{}}'
+)
+
+# La réponse d'un NIM LLM telle que les notes de version 1.14.0 la décrivent :
+# « repository_override » et « selectedModelProfileId » manquent. C'est la
+# moitié du produit, et c'est elle qui interdit d'ancrer la signature sur ces
+# deux clés — le template doit déclencher ici.
+NIM_LLM_METADATA_BODY = (
+    '{"version":"1.14.0",'
+    '"modelInfo":[{"modelUrl":"ngc://nim/meta/llama-3_1-8b-instruct:1.14.0",'
+    '"shortName":"llama-3_1-8b-instruct:1.14.0"}],'
+    '"assetInfo":[],"licenseInfo":{}}'
+)
+
+# Un NIM pointé sur un dépôt Hugging Face : la référence des variables
+# d'environnement documente « HF_TOKEN » pour « downloading private or gated
+# models from hf:// repositories », donc le schéma de modelUrl n'appartient pas
+# à la signature — seul le couple de clés y appartient.
+NIM_HF_METADATA_BODY = (
+    '{"version":"1.14.0",'
+    '"modelInfo":[{"modelUrl":"hf://mistralai/Mistral-7B-Instruct-v0.3",'
+    '"shortName":"Mistral-7B-Instruct-v0.3"}],'
+    '"assetInfo":[],"licenseInfo":{}}'
+)
+
+# L'espacement exact du test de bout en bout de l'opérateur NVIDIA, qui
+# sérialise la réponse d'un NIM « when nimservice only supports /v1/metadata » :
+# un espace après chaque deux-points. Les \s* du matcher sont là pour lui — et
+# pour l'intermédiaire qui réindenterait un corps relayé.
+NIM_OPERATOR_SPACING_BODY = (
+    '{"modelInfo": [{"shortName": "dummy-model:dummy-version", '
+    '"modelUrl": "ngc://org/team/dummy-model:dummy-version"}], '
+    '"assetInfo": []}'
+)
+
+# Le même descriptif, réindenté par un intermédiaire.
+NIM_REFORMATTED_BODY = (
+    '{\n  "version": "1.14.0",\n  "modelInfo": [\n    {\n'
+    '      "modelUrl": "ngc://nim/meta/llama-3_1-8b-instruct:1.14.0",\n'
+    '      "shortName": "llama-3_1-8b-instruct:1.14.0"\n    }\n  ],\n'
+    '  "assetInfo": [],\n  "licenseInfo": {}\n}\n'
+)
+
+# Deux GPU, deux entrées : le descriptif reste le même, le template déclenche et
+# l'extracteur rend les deux origines.
+NIM_MULTI_MODEL_BODY = (
+    '{"version":"1.14.0",'
+    '"modelInfo":[{"modelUrl":"ngc://nim/meta/llama-3_1-8b-instruct:1.14.0",'
+    '"shortName":"llama-3_1-8b-instruct:1.14.0"},'
+    '{"modelUrl":"ngc://nim/nvidia/nv-embedqa-e5-v5:1.14.0",'
+    '"shortName":"nv-embedqa-e5-v5:1.14.0"}],'
+    '"assetInfo":[],"licenseInfo":{}}'
+)
+
+# Le mock minimal du test de l'opérateur, pris tel quel : écrit à la main pour
+# vérifier la bascule de /v1/models vers /v1/metadata, pas pour décrire le corps
+# d'un NIM. Sans « assetInfo » le quatuor est incomplet et le template ne
+# déclenche pas — c'est le prix assumé d'ancrer le constat à la famille NIM
+# plutôt qu'au seul couple shortName/modelUrl, que l'exemple verbatim et les
+# notes de version sérialisent tous deux aux côtés de assetInfo.
+NIM_NO_ASSETINFO_BODY = (
+    '{"modelInfo": [{"shortName": "dummy-model:dummy-version", '
+    '"modelUrl": "ngc://org/team/dummy-model:dummy-version"}]}'
+)
+
+# Un descriptif dont modelInfo est vide : aucun modelUrl, aucun shortName
+# sérialisé. Le template ne doit pas déclencher — un NIM sans modèle servi n'a
+# rien à livrer de son déploiement.
+NIM_EMPTY_MODELINFO_BODY = (
+    '{"version":"1.14.0","selectedModelProfileId":"5b0b4b6b0e8a",'
+    '"modelInfo":[],"repository_override":"","assetInfo":[],"licenseInfo":{}}'
+)
+
+# Les deux clés les plus caractéristiques du corps documenté, seules : exiger
+# « selectedModelProfileId » ou « repository_override » aurait raté les NIM LLM,
+# et les servir sans modelInfo ne prouve rien.
+NIM_PROFILE_ONLY_BODY = (
+    '{"version":"1.5.1","selectedModelProfileId":"5b0b4b6b0e8a",'
+    '"repository_override":"","licenseInfo":{}}'
+)
+
+# Une passerelle qui nommerait ses modèles avec les mêmes clés camelCase sans
+# être un NIM : « assetInfo » manque, le quatuor est incomplet.
+NIM_LOOKALIKE_REGISTRY_BODY = (
+    '{"modelInfo":[{"modelUrl":"s3://bucket/models/mixtral",'
+    '"shortName":"mixtral"}],"deployedAt":"2026-01-01T00:00:00Z"}'
+)
+
+
+def nim_block():
+    doc = load(NIM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % NIM_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % NIM_ROUTE
+    return blocks[0]
+
+
+def nim_fires(body):
+    verdicts = [body_matcher_hits(m, body)
+                for m in nim_block().get("matchers") or []
+                if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert verdicts, "bloc sans matcher de corps"
+    return all(verdicts)
+
+
+def test_nim_probe_reads_the_metadata_and_never_runs_an_inference():
+    doc = load(NIM_TEMPLATE)
+    routes = request_routes(doc)
+    assert routes == {("GET", NIM_ROUTE)}, sorted(routes)
+    assert doc["info"]["severity"] == "high"
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "le descriptif se lit en GET : le même serveur sans garde sert POST "
+            "/v1/chat/completions, et le quickstart démontre qu'il répond sans "
+            "en-tête d'autorisation — l'appeler consommerait les GPU de "
+            "l'exploitant, qui est précisément l'abus signalé"
+        )
+        for path in (block.get("path") or []):
+            for route in ("/chat/completions", "/completions", "/embeddings",
+                          "/audio/transcriptions", "/audio/translations"):
+                assert route not in path, (
+                    "le template touche %s : il ferait tourner le modèle sur "
+                    "les accélérateurs de l'exploitant, aux frais de "
+                    "celui-ci" % route
+                )
+        # /v1/models est servi par NIM comme par la dizaine de runtimes
+        # compatibles OpenAI du pack : sa forme ne nomme aucun produit, et
+        # l'interroger ferait concourir ce template avec tous les autres sur la
+        # même réponse.
+        assert "/v1/models" not in str(block.get("path") or []), (
+            "le template s'appuie sur /v1/models, de forme OpenAI générique"
+        )
+        # /v1/health/ready rend {"status":"ready"} : vrai de tout service qui
+        # implémente une sonde, et muet sur le produit.
+        assert "/health" not in str(block.get("path") or []), (
+            "le template s'appuie sur une sonde de disponibilité générique"
+        )
+
+
+def test_nim_matcher_holds_on_the_llm_shape_the_release_notes_describe():
+    """
+    Le cœur du constat. Le seul corps verbatim que NVIDIA publie est celui des
+    NIM Speech, et il porte « selectedModelProfileId » et
+    « repository_override » — les deux clés les plus caractéristiques. Les notes
+    de version 1.14.0 des NIM LLM disent qu'elles manquent à leur réponse : une
+    signature ancrée sur elles raterait toute la famille LLM, qui est celle que
+    le quickstart publie sur « -p 8000:8000 ».
+    """
+    block = nim_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    body_matchers = [m for m in (block.get("matchers") or [])
+                     if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert body_matchers, "aucun matcher sur le corps : la réponse n'est pas vérifiée"
+
+    needles = []
+    for matcher in body_matchers:
+        needles.extend(matcher.get("regex") or [])
+        needles.extend(matcher.get("words") or [])
+    for absent in ("selectedModelProfileId", "repository_override"):
+        assert not any(absent in n for n in needles), (
+            "le matcher exige « %s », que les notes de version 1.14.0 donnent "
+            "pour manquant dans la réponse des NIM LLM : le template raterait "
+            "la famille que le quickstart publie sur le port 8000" % absent
+        )
+
+    assert nim_fires(NIM_LLM_METADATA_BODY), (
+        "le template rate la réponse d'un NIM LLM, à laquelle manquent "
+        "« repository_override » et « selectedModelProfileId »"
+    )
+    assert nim_fires(NIM_SPEECH_METADATA_BODY), (
+        "le template rate l'exemple verbatim de la référence ASR des NIM Speech"
+    )
+    assert nim_fires(NIM_HF_METADATA_BODY), (
+        "le template dépend du schéma « ngc:// » : la même documentation nomme "
+        "les dépôts hf://, et le constat porte sur l'exposition de l'endpoint, "
+        "pas sur la provenance du modèle"
+    )
+    assert nim_fires(NIM_OPERATOR_SPACING_BODY), (
+        "le template dépend d'une sérialisation compacte : le test de "
+        "l'opérateur NVIDIA écrit un espace après chaque deux-points"
+    )
+    assert nim_fires(NIM_REFORMATTED_BODY), (
+        "un intermédiaire qui réindenterait le corps relayé mettrait le "
+        "template en défaut"
+    )
+    assert nim_fires(NIM_MULTI_MODEL_BODY), (
+        "le template rate un NIM qui sert plusieurs modèles"
+    )
+
+
+def test_nim_matcher_rests_on_the_metadata_quartet_not_on_a_model_listing():
+    assert not nim_fires(NIM_EMPTY_MODELINFO_BODY), (
+        "le template déclenche sur un modelInfo vide : ni modelUrl ni shortName "
+        "n'y sont sérialisés, et un NIM sans modèle servi ne livre rien de son "
+        "déploiement"
+    )
+    assert not nim_fires(NIM_PROFILE_ONLY_BODY), (
+        "le template déclenche sans modelInfo : le descriptif n'est alors pas "
+        "celui d'un déploiement qui sert quelque chose"
+    )
+    assert not nim_fires(NIM_NO_ASSETINFO_BODY), (
+        "le template déclenche sur le mock minimal de l'opérateur, écrit à la "
+        "main pour vérifier une bascule d'endpoint : le constat est ancré à la "
+        "famille NIM par « assetInfo », que l'exemple verbatim et les notes de "
+        "version sérialisent tous deux"
+    )
+    assert not nim_fires(NIM_LOOKALIKE_REGISTRY_BODY), (
+        "le template déclenche sur un registre de modèles qui n'est pas un NIM"
+    )
+
+    # Le quatuor est exigé entier : aucune clé seule ne suffit.
+    for body, why in (
+        ('{"modelInfo":[]}', "le tableau seul"),
+        ('{"shortName":"llama"}', "le nom court seul"),
+        ('{"modelUrl":"ngc://nim/meta/llama"}', "l'origine seule"),
+        ('{"assetInfo":[]}', "le tableau des ressources seul"),
+        ('{"version":"1.14.0","licenseInfo":{}}', "la version et la licence"),
+    ):
+        assert not nim_fires(body), "le template déclenche sur %s" % why
+
+    # Collisions internes au pack : NIM sert aussi /v1/models, et un cache
+    # indexé sur l'hôte plutôt que sur le chemin pourrait relayer la réponse
+    # d'un autre runtime compatible OpenAI.
+    for other_body in (OTHER_OPENAI_API_BODY, VLLM_MODELS_BODY,
+                       LMSTUDIO_MODELS_BODY, LOCALAI_OPENAI_MODELS_BODY,
+                       LLAMASWAP_MODELS_BODY, SGLANG_MODEL_INFO_BODY):
+        assert not nim_fires(other_body), (
+            "le template déclenche sur un runtime compatible OpenAI qui n'est "
+            "pas un NIM"
+        )
+
+
+def test_nim_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in nim_block().get("matchers") or []]
+    assert "status" not in kinds, (
+        "le constat ne doit jamais tenir au statut : /v1/metadata répond 200 "
+        "sur tout NIM vivant"
+    )
+    assert "regex" in kinds
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_nim_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei, et l'extracteur gojq « [.modelInfo[].modelUrl] » n'est pas
+    compilé par `nuclei -validate` : seul un scan contre un vrai serveur ferme
+    la boucle sur la compilation réelle de la regex et de la requête.
+    """
+    def scan(body=NIM_LLM_METADATA_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == NIM_ROUTE:
+                    self.reply(200, body, content_type)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", NIM_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [NIM_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "nvidia-nim-metadata-exposed"
+    # L'extracteur rend l'origine du modèle servi, schéma compris : c'est le
+    # renseignement que l'endpoint livre à l'anonyme.
+    assert results[0].get("extracted-results") == [
+        '["ngc://nim/meta/llama-3_1-8b-instruct:1.14.0"]'
+    ], results[0].get("extracted-results")
+
+    # Plusieurs modèles : une seule ligne, les deux origines.
+    _, results = scan(body=NIM_MULTI_MODEL_BODY)
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [
+        '["ngc://nim/meta/llama-3_1-8b-instruct:1.14.0",'
+        '"ngc://nim/nvidia/nv-embedqa-e5-v5:1.14.0"]'
+    ], results[0].get("extracted-results")
+
+    # L'exemple verbatim des NIM Speech : le template déclenche aussi là.
+    _, results = scan(body=NIM_SPEECH_METADATA_BODY)
+    assert len(results) == 1, results
+
+    # Un modelInfo vide : aucune clé imbriquée n'est sérialisée.
+    _, results = scan(body=NIM_EMPTY_MODELINFO_BODY)
+    assert results == [], results
+
+    # Un runtime compatible OpenAI relayé sur le même chemin.
+    _, results = scan(body=VLLM_MODELS_BODY)
+    assert results == [], results

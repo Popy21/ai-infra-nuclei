@@ -1,0 +1,177 @@
+id: nvidia-nim-metadata-exposed
+
+info:
+  name: NVIDIA NIM - Unauthenticated Deployment Metadata Disclosure
+  author: popy21
+  severity: high
+  description: |
+    NVIDIA NIM est la gamme de microservices d'inférence conteneurisés de
+    NVIDIA — NIM for LLMs, for VLMs, Speech, et les NIM par modèle. C'est un
+    produit distinct de Triton et de Dynamo, déjà couverts par le pack : Triton
+    est le serveur d'inférence qui tourne à l'intérieur du conteneur, Dynamo la
+    couche d'orchestration qui se place au-dessus, et un NIM est l'image qui
+    emballe un modèle, son profil d'optimisation et une API HTTP. Les NIM LLM
+    servent cette API sur le port 8000 (« By default, these endpoints are served
+    on port 8000 », quickstart), les NIM Speech sur 9000 via
+    « NIM_HTTP_API_PORT », la documentation ASR notant que 8000 reste réservé au
+    Triton interne.
+    GET /v1/metadata est l'endpoint de gestion qui rend le descriptif du
+    déploiement. La référence d'API des NIM LLM le documente auprès de GET
+    /v1/version, GET /v1/license et GET /v1/manifest — « Returns deployment
+    metadata including the active model profile ID and name » — mais sans
+    exemple de corps. L'exemple verbatim vient de la référence ASR des NIM
+    Speech : {"version":"1.5.1","selectedModelProfileId":"<profile-hash>",
+    "modelInfo":[{"modelUrl":"ngc://nim/nvidia/parakeet-1-1b-ctc-riva:<tag>",
+    "shortName":"parakeet-1-1b-ctc-riva:<tag>"}],"repository_override":"",
+    "assetInfo":[],"licenseInfo":{}}.
+    Le matcher ne reprend pas ce corps tel quel, parce qu'il n'est pas celui des
+    NIM LLM. Les notes de version 1.14.0 portent le constat en toutes lettres :
+    « When calling the v1/metadata API, the following fields under modelInfo are
+    missing: repository_override and selectedModelProfileId. » Ces deux clés ne
+    peuvent donc pas porter la signature, et c'est l'opérateur Kubernetes de
+    NVIDIA qui donne le contrat stable : internal/nimmodels/models.go déclare
+    « MetadataV1URI = "/v1/metadata" », puis « MetadataV1 { ModelInfo
+    []MetadataV1ModelInfo `json:"modelInfo"` } » et « MetadataV1ModelInfo {
+    ShortName string `json:"shortName"` ; ModelUrl string `json:"modelUrl"` } » —
+    trois tags sans omitempty, et c'est tout ce que l'opérateur lit pour nommer
+    le modèle d'un NIMService. Son propre test de bout en bout sérialise la
+    réponse d'un NIM qui « only supports /v1/metadata » comme {"modelInfo":
+    [{"shortName": "dummy-model:dummy-version", "modelUrl":
+    "ngc://org/team/dummy-model:dummy-version"}]} — espace après les
+    deux-points, d'où les \s* du matcher. « assetInfo » complète le quatuor : il
+    est sérialisé dans l'exemple verbatim même vide, et les notes de version qui
+    énumèrent les champs manquants ne le citent pas.
+    L'absence d'authentification est le défaut du produit, pas un oubli de
+    l'exploitant. La référence des variables d'environnement ne documente aucune
+    variable d'authentification des requêtes entrantes : « NGC_API_KEY » ne sert
+    qu'au téléchargement des modèles depuis NGC et « HF_TOKEN » qu'aux dépôts
+    hf://, la seule protection entrante étant « NIM_SSL_MODE », opt-in, dont le
+    défaut est « DISABLED - plain HTTP ». La référence d'API le dit elle-même :
+    « NIM does not validate the x-api-key header. » Et le quickstart lance
+    « docker run --gpus=all -e NGC_API_KEY=$NGC_API_KEY -v
+    "$LOCAL_NIM_CACHE:/opt/nim/.cache" -p 8000:8000 ${NIM_LLM_IMAGE} » — la
+    publication du port sur toutes les interfaces de l'hôte — puis interroge
+    POST /v1/chat/completions sans le moindre en-tête d'autorisation.
+    Jamais sur le statut HTTP, qui vaut 200 sur tout NIM vivant, ni sur GET
+    /v1/models, de forme OpenAI générique et servi à l'identique par la dizaine
+    de runtimes déjà couverts par le pack. Le quatuor exigé est « modelInfo »
+    comme tableau, « shortName » et « modelUrl » à l'intérieur, et « assetInfo ».
+    Le schéma de « modelUrl » n'est volontairement pas exigé : « ngc:// » est
+    l'origine NGC du cas courant, mais la même documentation nomme les dépôts
+    hf://, et le constat porte sur l'exposition de l'endpoint, pas sur la
+    provenance du modèle — l'extracteur rend l'URL entière, schéma compris.
+  impact: |
+    Un appelant anonyme obtient le descriptif du déploiement : la version du
+    microservice, l'identifiant du profil d'optimisation retenu au démarrage
+    pour les GPU visibles, et pour chaque modèle servi son « shortName » et son
+    « modelUrl » — donc l'origine du modèle dans le registre, organisation et
+    équipe NGC comprises quand l'URL est en ngc://. Le profil nomme le moteur,
+    la précision et le degré de parallélisme de tenseurs, c'est-à-dire la forme
+    du matériel derrière l'endpoint.
+    Le renseignement n'est pas la perte principale. Le même serveur sans garde
+    sert POST /v1/chat/completions, et le quickstart démontre qu'il répond sans
+    en-tête d'autorisation : un tiers fait tourner le modèle sur les GPU de
+    l'exploitant pour son propre compte, aux frais de celui-ci, et la facture
+    d'une instance GPU louée à l'heure se paie en continu pendant que
+    l'inférence tourne. GET /v1/manifest livre par ailleurs le catalogue complet
+    des profils de l'image, GET /v1/license les informations de licence, et
+    /v1/metrics l'activité au format Prometheus — donc le volume d'inférence
+    réellement servi, qui dit si l'abus est remarqué.
+  remediation: |
+    Ne pas publier le port. Le produit n'offre aucune authentification des
+    requêtes entrantes : la référence des variables d'environnement n'en
+    documente aucune, et la référence d'API précise que l'en-tête x-api-key
+    n'est pas validé. Le durcissement se joue donc en amont du conteneur —
+    « -p 127.0.0.1:8000:8000 » là où le quickstart écrit « -p 8000:8000 », qui
+    publie sur toutes les interfaces de l'hôte, ou une mise en réseau interne
+    sans publication du tout.
+    Placer une authentification devant le port pour tout accès qui doit sortir
+    de l'hôte : un mandataire qui valide un jeton, ou « NIM_SSL_MODE=MTLS » avec
+    NIM_SSL_KEY_PATH, NIM_SSL_CERTS_PATH et NIM_SSL_CA_CERTS_PATH, qui est le
+    seul réglage natif vérifiant quelque chose du client. « NIM_SSL_MODE=TLS »
+    chiffre le transport mais n'authentifie personne : il ne ferme pas l'accès
+    anonyme.
+    Après une exposition, tenir pour connus de l'attaquant la version, le profil
+    retenu et les modèles servis avec leur origine de registre. Relire
+    /v1/metrics et les journaux du conteneur pour toute inférence non attribuée
+    sur /v1/chat/completions, /v1/completions et /v1/embeddings, puis vérifier
+    depuis l'extérieur du périmètre que GET /v1/metadata ne rend plus le
+    descriptif du déploiement à l'anonyme.
+  reference:
+    - https://docs.nvidia.com/nim/large-language-models/latest/reference/api-reference.html
+    - https://docs.nvidia.com/nim/large-language-models/latest/reference/environment-variables.html
+    - https://docs.nvidia.com/nim/large-language-models/latest/get-started/quickstart.html
+    - https://docs.nvidia.com/nim/large-language-models/1.14.0/release-notes.html
+    - https://docs.nvidia.com/nim/speech/latest/reference/api-references/asr/http-asr.html
+    - https://github.com/NVIDIA/k8s-nim-operator/blob/main/internal/nimmodels/models.go
+  metadata:
+    max-request: 1
+    vendor: nvidia
+    product: nim
+  tags: ai,llm,inference,nvidia,nim,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur l'endpoint de gestion. /v1/metadata ne rend que le
+  # descriptif du déploiement tel qu'il a été résolu au démarrage : aucune
+  # inférence, aucun chargement, aucune écriture d'état. Le même serveur sans
+  # garde porte POST /v1/chat/completions, /v1/completions et /v1/embeddings,
+  # dont chaque appel consommerait les GPU de l'exploitant — aucun n'est
+  # interrogé ici. GET /v1/models ne l'est pas non plus : sa forme est celle de
+  # l'API d'OpenAI, servie à l'identique par tous les runtimes du pack, et elle
+  # ne nomme pas NIM. GET /v1/health/ready ne l'est pas davantage : il rend
+  # {"status":"ready"}, générique.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/metadata"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le discriminant est le corps, jamais le statut — /v1/metadata répond 200
+      # sur tout NIM vivant. Le quatuor, exigé ensemble :
+      #
+      # « modelInfo » comme tableau, « shortName » et « modelUrl » à l'intérieur :
+      # c'est le contrat que l'opérateur Kubernetes de NVIDIA lit lui-même
+      # (internal/nimmodels/models.go, MetadataV1 et MetadataV1ModelInfo), trois
+      # tags json sans omitempty, donc toujours sérialisés dès qu'un modèle est
+      # servi. La paire camelCase shortName/modelUrl imbriquée sous modelInfo
+      # n'appartient à aucun autre produit du pack.
+      #
+      # « assetInfo » ancre la réponse à la famille NIM : il est sérialisé dans
+      # l'exemple verbatim de la référence ASR même vide, et les notes de version
+      # 1.14.0, qui énumèrent les champs que les NIM LLM omettent, ne le citent
+      # pas.
+      #
+      # Ni « selectedModelProfileId » ni « repository_override » n'y figurent,
+      # alors qu'ils sont les plus caractéristiques du corps documenté : ces
+      # mêmes notes de version disent qu'ils manquent à la réponse des NIM LLM,
+      # donc les exiger raterait la moitié du produit.
+      #
+      # Les \s* absorbent l'espacement : le test de l'opérateur sérialise
+      # « "shortName": "..." » avec un espace après les deux-points, et un
+      # intermédiaire qui réindenterait le corps relayé n'a pas à s'en tenir au
+      # compact. Aucun motif ne suppose l'ordre des clés.
+      - type: regex
+        part: body
+        regex:
+          - '"modelInfo"\s*:\s*\['
+          - '"shortName"\s*:\s*"'
+          - '"modelUrl"\s*:\s*"'
+          - '"assetInfo"\s*:'
+        condition: and
+
+    extractors:
+      # L'origine des modèles servis, qui est le renseignement que l'endpoint
+      # livre à l'anonyme : le dépôt et la version de chaque modèle, avec son
+      # schéma — « ngc:// » dit le registre NGC, et l'organisation et l'équipe
+      # qui y publient. Collectées en un seul tableau pour ne remonter qu'une
+      # ligne par instance.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '[.modelInfo[].modelUrl]'

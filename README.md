@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-112 templates, 109 produits.
+113 templates, 110 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -103,6 +103,7 @@ amont.
 | mlserver | [`mlserver-metadata-exposed`](templates/exposure/mlserver-metadata-exposed.yaml) | high |
 | nemo-guardrails | [`nemo-guardrails-server-exposed`](templates/exposure/nemo-guardrails-server-exposed.yaml) | high |
 | nextchat | [`nextchat-open-instance`](templates/exposure/nextchat-open-instance.yaml) | high |
+| nim | [`nvidia-nim-metadata-exposed`](templates/exposure/nvidia-nim-metadata-exposed.yaml) | high |
 | ollama | [`ollama-model-pull-abuse`](templates/exposure/ollama-model-pull-abuse.yaml) | high |
 | ollama | [`ollama-unauthenticated-api`](templates/exposure/ollama-unauthenticated-api.yaml) | high |
 | onyx | [`onyx-versions-exposed`](templates/exposure/onyx-versions-exposed.yaml) | low |
