@@ -36522,3 +36522,432 @@ def test_nim_matcher_compiles_and_fires_against_a_live_server():
     # Un runtime compatible OpenAI relayé sur le même chemin.
     _, results = scan(body=VLLM_MODELS_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Open Notebook (lfnovo/open-notebook) : assistant de recherche auto-hébergé,
+# « An Open Source implementation of Notebook LM », dont l'API FastAPI écoute
+# sur 5055 et l'interface Next.js sur 8502. GET /api/auth/status — router
+# préfixé /auth dans api/routers/auth.py, monté sous /api par api/main.py —
+# rend « {"auth_enabled": auth_enabled, "message": "Authentication is required"
+# if auth_enabled else "Authentication is disabled"} », auth_enabled valant
+# « bool(get_secret_from_env("OPEN_NOTEBOOK_PASSWORD")) ». La réponse d'une
+# instance sans mot de passe est donc l'aveu lui-même, et c'est sur lui que le
+# constat tient — jamais sur le statut, la route étant dans les excluded_paths
+# du middleware et répondant 200 dans les deux états.
+#
+# L'aveu seul ne nomme pas le produit : « auth_enabled » est un nom que Bifrost
+# (is_auth_enabled) et SkyPilot (basic_auth_enabled) approchent, et un message
+# d'authentification désactivée peut s'écrire ailleurs. Le template le lie
+# donc à l'une des deux signatures que api/main.py sert hors authentification :
+# le corps entier de « / », {"message":"Open Notebook API is running"}, ou le
+# titre du document OpenAPI, « "title":"Open Notebook API" ». L'une suffit, et
+# stop-at-first-match évite de joindre /openapi.json quand « / » a confirmé.
+#
+# L'absence d'authentification est un défaut de configuration : api/auth.py
+# saute toute vérification — « # Skip authentication if no password is set » —
+# dès que la variable manque, et le docker-compose.yml officiel ne la définit
+# pas tout en publiant « 8502:8502 » et « 5055:5055 ». Le template ne joint
+# aucune route de données : GET /api/notebooks énumérerait les carnets, et
+# /api/search ou /api/chat feraient travailler les LLM de l'exploitant.
+
+OPEN_NOTEBOOK_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                      "open-notebook-auth-disabled.yaml")
+
+OPEN_NOTEBOOK_STATUS_ROUTE = "/api/auth/status"
+OPEN_NOTEBOOK_ROOT_ROUTE = "/"
+OPEN_NOTEBOOK_OPENAPI_ROUTE = "/openapi.json"
+
+
+def open_notebook_status_body(auth_enabled=False, indent=None):
+    """
+    Ce que get_auth_status() rend, sérialisé par FastAPI : compact, dans
+    l'ordre d'insertion du dict — auth_enabled puis message — et le message
+    qui va avec le booléen.
+    """
+    document = {
+        "auth_enabled": auth_enabled,
+        "message": ("Authentication is required" if auth_enabled
+                    else "Authentication is disabled"),
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def open_notebook_openapi_body(title="Open Notebook API", indent=None):
+    """
+    Ce que rend GET /openapi.json : le document que get_openapi() construit
+    depuis app.title et app.description, suivi des routes montées sous /api.
+    """
+    document = {
+        "openapi": "3.1.0",
+        "info": {
+            "title": title,
+            "description": "API for Open Notebook - Research Assistant",
+            "version": "0.1.0",
+        },
+        "paths": {
+            "/api/auth/status": {"get": {"tags": ["auth"],
+                                         "summary": "Get Auth Status"}},
+            "/api/notebooks": {"get": {"tags": ["notebooks"],
+                                       "summary": "Get Notebooks"}},
+            "/": {"get": {"summary": "Root"}},
+            "/health": {"get": {"summary": "Health"}},
+        },
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+# L'instance sans mot de passe : l'aveu, exactement comme FastAPI l'écrit.
+OPEN_NOTEBOOK_OPEN_BODY = '{"auth_enabled":false,"message":"Authentication is disabled"}'
+
+# L'instance à OPEN_NOTEBOOK_PASSWORD : même route, même 200, l'autre corps.
+OPEN_NOTEBOOK_CLOSED_BODY = open_notebook_status_body(auth_enabled=True)
+
+OPEN_NOTEBOOK_ROOT_BODY = '{"message":"Open Notebook API is running"}'
+OPEN_NOTEBOOK_OPENAPI_BODY = open_notebook_openapi_body()
+
+# La sonde que le template n'interroge pas : {"status":"healthy"} est celle de
+# n'importe quel service.
+OPEN_NOTEBOOK_HEALTH_BODY = '{"status":"healthy"}'
+
+OPEN_NOTEBOOK_NOT_FOUND = (404, '{"detail":"Not Found"}')
+
+# Ce que rend le port 8502 : next.config.ts réécrit /api/* vers l'API, donc
+# /api/auth/status y rend le même aveu, mais « / » y est l'application Next.js
+# et /openapi.json n'y est pas réécrit.
+OPEN_NOTEBOOK_UI_HTML = (
+    '<!DOCTYPE html><html lang="en"><head><title>Open Notebook</title></head>'
+    '<body><div id="__next"></div></body></html>'
+)
+
+# L'aveu républié au fond du document d'une supervision, puis prolongé d'une
+# clé à elle : les deux ancrages écartent chacun l'une des deux formes.
+OPEN_NOTEBOOK_COMPOSITE_BODY = ('{"probe":"open-notebook","upstream":%s}'
+                                % OPEN_NOTEBOOK_OPEN_BODY)
+OPEN_NOTEBOOK_APPENDED_BODY = (
+    '{"auth_enabled":false,"message":"Authentication is disabled","checked_at":0}'
+)
+
+# Les deux clés réordonnées : le handler construit toujours auth_enabled puis
+# message, et FastAPI ne trie pas.
+OPEN_NOTEBOOK_REORDERED_BODY = (
+    '{"message":"Authentication is disabled","auth_enabled":false}'
+)
+
+# Le booléen sans le message, le message sans le booléen, et le couple
+# contradictoire qu'aucune branche du handler ne rend.
+OPEN_NOTEBOOK_FLAG_ONLY_BODY = '{"auth_enabled":false}'
+OPEN_NOTEBOOK_MESSAGE_ONLY_BODY = '{"message":"Authentication is disabled"}'
+OPEN_NOTEBOOK_CONTRADICTORY_BODY = (
+    '{"auth_enabled":false,"message":"Authentication is required"}'
+)
+
+# Un autre produit qui publierait le même booléen avec son propre message.
+OPEN_NOTEBOOK_OTHER_FLAG_BODY = '{"auth_enabled":false,"message":"anonymous mode"}'
+
+# Une autre API FastAPI, vivante, qui rend sa bannière sur « / » et son titre
+# par défaut dans /openapi.json : aucune des deux signatures n'est la bonne.
+OPEN_NOTEBOOK_OTHER_ROOT_BODY = '{"message":"Research API is running"}'
+OPEN_NOTEBOOK_OTHER_OPENAPI_BODY = open_notebook_openapi_body(title="FastAPI")
+
+
+def open_notebook_block():
+    doc = load(OPEN_NOTEBOOK_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % OPEN_NOTEBOOK_STATUS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % OPEN_NOTEBOOK_STATUS_ROUTE
+    return blocks[0]
+
+
+def open_notebook_requests():
+    """(méthode, chemin) de chaque requête, dans l'ordre déclaré — cet ordre
+    donne son numéro à chaque body_N."""
+    block = open_notebook_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def open_notebook_fires(status=(200, OPEN_NOTEBOOK_OPEN_BODY),
+                        root=(200, OPEN_NOTEBOOK_ROOT_BODY),
+                        openapi=(200, OPEN_NOTEBOOK_OPENAPI_BODY)):
+    scenario = {
+        OPEN_NOTEBOOK_STATUS_ROUTE: status,
+        OPEN_NOTEBOOK_ROOT_ROUTE: root,
+        OPEN_NOTEBOOK_OPENAPI_ROUTE: openapi,
+    }
+    block = open_notebook_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in open_notebook_requests():
+        assert route in scenario, f"le template interroge un chemin inattendu : {route}"
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : l'aveu n'est pas lié à une signature"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_open_notebook_probe_reads_the_admission_first_and_touches_no_notebook():
+    block = open_notebook_block()
+    doc = load(OPEN_NOTEBOOK_TEMPLATE)
+    assert doc["info"]["severity"] == "high"
+
+    assert block.get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et l'aveu conclurait sans signature"
+    )
+    assert block.get("stop-at-first-match") is True, (
+        "sans stop-at-first-match, le moteur réévalue le matcher après "
+        "/openapi.json et remonte deux fois l'instance que « / » a déjà "
+        "confirmée — et la troisième requête part pour rien"
+    )
+    assert open_notebook_requests() == [
+        ("GET", OPEN_NOTEBOOK_STATUS_ROUTE),
+        ("GET", OPEN_NOTEBOOK_ROOT_ROUTE),
+        ("GET", OPEN_NOTEBOOK_OPENAPI_ROUTE),
+    ], (
+        "les trois requêtes ne sont plus celles que le template documente — "
+        "l'aveu d'abord, puis la signature la plus légère, puis le document "
+        f"OpenAPI en dernier recours : {open_notebook_requests()}"
+    )
+    assert doc["info"]["metadata"]["max-request"] == 3
+
+    for method, route in sorted(request_routes(doc)):
+        assert method == "GET", f"{method} {route} : le constat se lit sans rien écrire"
+        for forbidden, why in (
+            ("/api/notebooks", "GET /api/notebooks énumérerait les carnets de "
+                               "l'exploitant : le constat tient sans les lire"),
+            ("/api/sources", "les sources sont les documents ingérés — c'est "
+                             "ce que le template est censé protéger"),
+            ("/api/notes", "les notes sont le travail de l'exploitant"),
+            ("/api/search", "/api/search ferait travailler les modèles "
+                            "d'embedding de l'exploitant"),
+            ("/api/chat", "/api/chat consommerait les LLM de l'exploitant, "
+                          "qui est précisément l'abus signalé"),
+            ("/api/credentials", "les clés de fournisseur n'ont pas à "
+                                 "transiter par un rapport de scan"),
+            ("/api/models", "l'inventaire des modèles ne prouve rien de plus "
+                            "que l'aveu"),
+            ("/health", "{\"status\":\"healthy\"} est la sonde de n'importe "
+                        "quel service"),
+        ):
+            assert forbidden not in route, f"{route} : {why}"
+
+    assert not block.get("extractors"), (
+        "le corps de /api/auth/status ne porte que deux constantes déjà fixées "
+        "par le matcher, et /openapi.json ne part pas quand « / » a confirmé : "
+        "un extracteur n'ajouterait rien, ou serait vide une fois sur deux"
+    )
+
+
+def test_open_notebook_matcher_needs_the_whole_admission_not_a_lone_flag():
+    assert open_notebook_fires(), (
+        "le template ne reconnaît pas une instance Open Notebook sans mot de "
+        "passe"
+    )
+
+    assert open_notebook_fires(
+        status=(200, open_notebook_status_body(indent=2) + "\n"),
+        root=(200, '{\n  "message": "Open Notebook API is running"\n}\n'),
+        openapi=(200, open_notebook_openapi_body(indent=2)),
+    ), (
+        "le template exige la sérialisation compacte de FastAPI : un "
+        "intermédiaire qui réindenterait ce qu'il relaie ferait manquer "
+        "l'instance"
+    )
+
+    assert not open_notebook_fires(status=(200, OPEN_NOTEBOOK_CLOSED_BODY)), (
+        "le template déclenche sur l'instance fermée : même route, même 200, "
+        "mais « auth_enabled » vaut true et le message dit « required »"
+    )
+
+    for body, why in (
+        (OPEN_NOTEBOOK_COMPOSITE_BODY, "l'aveu républié au fond du document d'une "
+                                       "supervision — l'ancrage d'ouverture dit "
+                                       "que l'instance a répondu d'elle-même"),
+        (OPEN_NOTEBOOK_APPENDED_BODY, "l'aveu prolongé d'une clé étrangère — "
+                                      "l'ancrage de fin dit que le document est "
+                                      "celui du handler et rien de plus"),
+        (OPEN_NOTEBOOK_REORDERED_BODY, "les deux clés réordonnées, alors que le "
+                                       "handler construit toujours auth_enabled "
+                                       "puis message"),
+        (OPEN_NOTEBOOK_FLAG_ONLY_BODY, "le booléen seul : Bifrost et SkyPilot "
+                                       "publient des booléens voisins, et un "
+                                       "drapeau ne nomme aucun produit"),
+        (OPEN_NOTEBOOK_MESSAGE_ONLY_BODY, "le message seul, qu'un autre service "
+                                          "peut écrire"),
+        (OPEN_NOTEBOOK_CONTRADICTORY_BODY, "le couple contradictoire — false et "
+                                           "« required » — qu'aucune branche du "
+                                           "handler ne rend"),
+        (OPEN_NOTEBOOK_OTHER_FLAG_BODY, "un autre produit qui publie le même "
+                                        "booléen avec son propre message"),
+        (OPEN_NOTEBOOK_HEALTH_BODY, "la sonde générique relayée sur ce chemin"),
+        (OPEN_NOTEBOOK_UI_HTML, "une page HTML servie sur ce chemin"),
+    ):
+        assert not open_notebook_fires(status=(200, body)), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_open_notebook_conclusion_needs_one_of_the_two_product_signatures():
+    # « / » suffit : /openapi.json peut être absent, ou ne pas être joint.
+    assert open_notebook_fires(openapi=OPEN_NOTEBOOK_NOT_FOUND), (
+        "le template exige /openapi.json alors que « / » a déjà nommé le "
+        "produit : stop-at-first-match ne joint pas le document OpenAPI dans "
+        "ce cas, et la seconde branche doit pouvoir rester vide"
+    )
+    # /openapi.json suffit aussi : une instance dont « / » est réécrit par un
+    # intermédiaire n'en est pas moins ouverte.
+    assert open_notebook_fires(root=OPEN_NOTEBOOK_NOT_FOUND), (
+        "le template exige « / » alors que le titre du document OpenAPI a "
+        "nommé le produit"
+    )
+    assert open_notebook_fires(root=(200, OPEN_NOTEBOOK_OTHER_ROOT_BODY)), (
+        "une bannière étrangère sur « / » ne doit pas empêcher /openapi.json "
+        "de confirmer"
+    )
+
+    # Mais aucune des deux : l'aveu ne nomme pas le produit.
+    assert not open_notebook_fires(root=OPEN_NOTEBOOK_NOT_FOUND,
+                                   openapi=OPEN_NOTEBOOK_NOT_FOUND), (
+        "le template conclut sur l'aveu seul, sans qu'aucune signature n'ait "
+        "nommé Open Notebook"
+    )
+    assert not open_notebook_fires(root=(200, OPEN_NOTEBOOK_OTHER_ROOT_BODY),
+                                   openapi=(200, OPEN_NOTEBOOK_OTHER_OPENAPI_BODY)), (
+        "le template déclenche sur une autre API FastAPI qui publierait le "
+        "même aveu : une bannière étrangère et le titre par défaut ne sont pas "
+        "les signatures d'Open Notebook"
+    )
+    # Le port 8502, par construction : l'aveu y est relayé, mais « / » est
+    # l'application Next.js et /openapi.json n'y est pas réécrit.
+    assert not open_notebook_fires(root=(200, OPEN_NOTEBOOK_UI_HTML),
+                                   openapi=OPEN_NOTEBOOK_NOT_FOUND), (
+        "le template déclenche sur le port de l'interface, où aucune des deux "
+        "signatures de l'API n'est servie — c'est la limite que le template "
+        "documente, pas un oubli"
+    )
+
+    # Le couple de signatures est exigé entier : la signature sans l'aveu ne
+    # dit rien d'une instance protégée.
+    assert not open_notebook_fires(status=(200, OPEN_NOTEBOOK_CLOSED_BODY),
+                                   root=(200, OPEN_NOTEBOOK_ROOT_BODY),
+                                   openapi=(200, OPEN_NOTEBOOK_OPENAPI_BODY)), (
+        "le template conclut sur les signatures du produit sans l'aveu : il "
+        "signalerait toute instance Open Notebook, protégée ou non"
+    )
+
+
+def test_open_notebook_conclusion_rests_on_the_bodies_never_on_the_status():
+    block = open_notebook_block()
+    matchers = block.get("matchers") or []
+    kinds = {m.get("type") for m in matchers}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier l'aveu à une signature par leur numéro"
+    )
+    for matcher in matchers:
+        assert matcher.get("condition") != "and", (
+            "les deux expressions sont deux signatures alternatives : les "
+            "exiger ensemble ferait manquer l'instance dont « / » a confirmé "
+            "et dont /openapi.json n'est pas joint"
+        )
+        for expression in matcher.get("dsl") or []:
+            assert "status_code" not in expression, (
+                "le constat tient au statut : /api/auth/status figure dans les "
+                "excluded_paths du middleware et rend 200 à l'anonyme sur une "
+                "instance fermée comme sur une instance ouverte"
+            )
+    # Le corps est la preuve, quel que soit le code qui l'accompagne.
+    assert open_notebook_fires(status=(203, OPEN_NOTEBOOK_OPEN_BODY)), (
+        "un intermédiaire qui réécrit le code HTTP ferait manquer une instance "
+        "dont le corps dit pourtant que l'authentification est désactivée"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_open_notebook_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python plutôt qu'avec le lexer de
+    nuclei, et il reçoit toujours les trois réponses : seul un scan contre un
+    vrai serveur ferme la boucle sur la compilation réelle des expressions, et
+    sur ce que stop-at-first-match fait vraiment des requêtes restantes.
+    """
+    def scan(status_body=OPEN_NOTEBOOK_OPEN_BODY,
+             root=(200, OPEN_NOTEBOOK_ROOT_BODY, "application/json"),
+             openapi=(200, OPEN_NOTEBOOK_OPENAPI_BODY, "application/json")):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == OPEN_NOTEBOOK_STATUS_ROUTE:
+                    self.reply(200, status_body, "application/json")
+                elif self.path == OPEN_NOTEBOOK_ROOT_ROUTE:
+                    self.reply(*root)
+                elif self.path == OPEN_NOTEBOOK_OPENAPI_ROUTE:
+                    self.reply(*openapi)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", OPEN_NOTEBOOK_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    # L'instance ouverte : « / » confirme, /openapi.json n'est pas joint, et
+    # l'instance n'est remontée qu'une fois.
+    seen, results = scan()
+    assert seen == [OPEN_NOTEBOOK_STATUS_ROUTE, OPEN_NOTEBOOK_ROOT_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "open-notebook-auth-disabled"
+
+    # « / » réécrit par un intermédiaire : /openapi.json prend le relais.
+    seen, results = scan(root=(200, "<html><body>Bienvenue</body></html>", "text/html"))
+    assert seen == [OPEN_NOTEBOOK_STATUS_ROUTE, OPEN_NOTEBOOK_ROOT_ROUTE,
+                    OPEN_NOTEBOOK_OPENAPI_ROUTE], seen
+    assert len(results) == 1, results
+
+    # L'instance fermée : même route, même 200, l'autre corps.
+    _, results = scan(status_body=OPEN_NOTEBOOK_CLOSED_BODY)
+    assert results == [], results
+
+    # Le port de l'interface : l'aveu relayé, aucune signature de l'API.
+    _, results = scan(root=(200, OPEN_NOTEBOOK_UI_HTML, "text/html"),
+                      openapi=(404, '{"detail":"Not Found"}', "application/json"))
+    assert results == [], results
+
+    # Une autre API FastAPI qui publierait le même aveu.
+    _, results = scan(root=(200, OPEN_NOTEBOOK_OTHER_ROOT_BODY, "application/json"),
+                      openapi=(200, OPEN_NOTEBOOK_OTHER_OPENAPI_BODY, "application/json"))
+    assert results == [], results
