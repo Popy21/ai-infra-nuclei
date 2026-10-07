@@ -1,0 +1,197 @@
+id: mastra-agents-exposed
+
+info:
+  name: Mastra - Unauthenticated Agent Inventory And System Prompt Disclosure
+  author: popy21
+  severity: high
+  description: |
+    Mastra (mastra-ai/mastra, ~28 500 étoiles, dépôt non archivé) est un
+    framework TypeScript d'agents, de workflows et de RAG. « mastra build »
+    produit un serveur Hono — packages/deployer/src/server/index.ts construit
+    « new Hono<{ Bindings: Bindings; Variables: Variables }>() » et le lance par
+    « serve » de @hono/node-server — qui sert l'API sous « /api » et le Studio à
+    la racine, sur le port 4111.
+    GET /api/agents est déclaré par packages/server/src/server/handlers/agents.ts :
+    « LIST_AGENTS_ROUTE = createRoute({ method: 'GET', path: '/agents',
+    responseType: 'json', ..., responseSchema: listAgentsResponseSchema,
+    requiresAuth: true, ... }) », le préfixe venant du déployeur — « const
+    apiPrefix = server?.apiPrefix ?? '/api' » — et de la documentation
+    (mastra.ai/docs/server/server-adapters : « By default, Mastra routes are
+    registered at /api/agents, /api/workflows, etc. »). Le handler remplit
+    « const serializedAgents: Record<string, SerializedAgentWithId> = {} » par
+    « serializedAgents[id] = { id, ...rest } » et le rend tel quel : un objet
+    indexé par identifiant d'agent, chaque valeur ouvrant sur « id ».
+    formatAgentList y écrit, dans cet ordre, id, name, description, metadata,
+    instructions, agents, tools, workflows, skills, workspaceTools,
+    browserTools, hasBrowser, workspaceId, inputProcessors, outputProcessors,
+    « ...getAgentModelRef(agent.model, llm) » — soit « provider » et
+    « modelId », tirés de parseModelString() pour un modèle déclaré en chaîne
+    et de « llm?.getProvider() » / « llm?.getModelId() » sinon —, modelVersion,
+    supportsMemory, defaultOptions, …, source et hasDraft. « instructions »
+    vaut « await agent.getInstructions({ requestContext }) », le prompt système
+    de l'agent, chaîne ou SystemMessage. Hono sérialise compact, dans cet ordre
+    d'insertion ; les champs restés undefined disparaissent du document, et
+    packages/server/src/server/schemas/agents.ts déclare en conséquence
+    « listAgentsResponseSchema = z.record(z.string(), serializedAgentSchema) »
+    avec instructions, provider et modelId optionnels.
+    L'absence d'authentification est le défaut du produit, documentée sur
+    mastra.ai/docs/server/auth — « Authentication is optional. If no auth is
+    configured, all routes and Studio are publicly accessible. » — et lisible
+    dans packages/server/src/server/server-adapter/index.ts :
+    getEffectiveAuthConfig() rend « null » quand ni studio.auth ni server.auth
+    n'est renseigné (« // No auth configured »), et checkRouteAuth() enchaîne
+    « // No auth config means no auth required » puis « return null ». Le
+    « requiresAuth: true » de la route ne pèse donc qu'une fois server.auth
+    posé ; alors le defaultAuthConfig (auth/defaults.ts) protège « /api/* » en
+    ne laissant publics que « /api » et « /api/auth/* », et l'anonyme reçoit un
+    401 « {"error":"Invalid or expired token"} » (auth/helpers.ts). Seul le
+    corps sépare les deux états.
+    La liaison réseau est le second défaut. mastra.ai/reference/configuration
+    donne « localhost » pour server.host (surchargé par MASTRA_HOST) et 4111
+    pour server.port (surchargé par PORT), mais le déployeur écrit « const
+    bindHost = serverOptions?.host ?? process.env.MASTRA_HOST », « const host =
+    bindHost ?? 'localhost' » puis « serve({ fetch: app.fetch, port, hostname:
+    bindHost, ... }) » : « localhost » ne sert qu'à l'URL affichée, et
+    @hono/node-server appelle « server.listen(options?.port ?? 3000,
+    options.hostname, ...) » avec un hostname undefined — Node écoute alors sur
+    toutes les interfaces. Dans un conteneur ou sur un PaaS, le serveur est
+    donc joignable dès que le port est publié, et ouvert tant que server.auth
+    manque.
+    Le constat tient au corps, jamais au statut : la route rend 200 à l'anonyme
+    sur l'instance ouverte et 401 sur l'instance fermée, et GET /health —
+    monté avant l'intergiciel d'authentification, « c.json({ success: true },
+    200) » — répond pareil dans les deux cas et ne nomme rien. La signature
+    est l'objet indexé par identifiant dont chaque valeur ouvre sur « id »,
+    avec « instructions », le couple « provider » + « modelId » et
+    « supportsMemory » — ce dernier toujours sérialisé, puisque formatAgentList
+    le replie sur « true ». Une instance sans agent enregistré rend « {} » :
+    non concluant, le template se tait.
+  impact: |
+    « instructions » livre les prompts système de tous les agents enregistrés,
+    « tools » leur inventaire d'outils avec identifiants, descriptions et
+    schémas d'entrée, « agents » et « workflows » les sous-agents et workflows
+    qu'ils orchestrent, « provider » et « modelId » le fournisseur et le modèle
+    que l'exploitant paie, « metadata » et « defaultOptions » le reste de leur
+    configuration.
+    L'énumération n'est pas la seule perte, parce que le même fichier déclare,
+    sous la même absence de garde, POST /agents/:agentId/generate, POST
+    /agents/:agentId/stream et POST /agents/:agentId/clone — « requiresAuth:
+    true » sur chacun, sans effet tant que server.auth manque. Les clés de
+    l'objet rendu sont exactement les « :agentId » que ces routes attendent :
+    un anonyme fait tourner les agents, outils compris — donc ce que les outils
+    touchent, bases, API internes, navigateur ou espace de travail —, aux frais
+    des clés de modèle de l'exploitant, et les clone. Les autres routeurs
+    montés sous /api (workflows, mémoire, outils, stockage) répondent au même
+    appelant, puisque c'est la configuration d'authentification, pas la route,
+    qui manque. Sans authentification il n'y a pas d'identité : aucun journal
+    ne nommera l'appelant.
+  remediation: |
+    Configurer « server.auth » dans l'instance Mastra — MastraJwtAuth, Clerk,
+    Supabase, Firebase, WorkOS ou Auth0 selon mastra.ai/docs/server/auth — ce
+    qui arme le « requiresAuth: true » que la route porte déjà et fait
+    protéger « /api/* » par le defaultAuthConfig. Si « server.apiPrefix » a été
+    changé, mettre à jour « server.auth.protected » et « server.auth.public »
+    en conséquence : la documentation prévient que les motifs par défaut
+    cessent alors de couvrir les routes intégrées.
+    Ne pas publier le port en attendant. Poser « server.host » ou MASTRA_HOST
+    à « 127.0.0.1 » pour que « hostname » soit effectivement transmis à
+    serve(), ou lier la publication du conteneur à l'hôte
+    (« 127.0.0.1:4111:4111 »), ou placer un intermédiaire qui authentifie
+    devant le port.
+    Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hôte>:4111/api/agents » doit rendre un 401 et non l'objet indexé
+    par identifiant. Après une exposition, tenir les prompts système et
+    l'inventaire des outils pour lus, relire les journaux des fournisseurs de
+    modèles pour toute consommation non attribuée, faire tourner les clés de
+    fournisseur que les agents utilisent, et chercher dans le stockage les
+    agents clonés ou les threads créés pendant la fenêtre.
+  reference:
+    - https://github.com/mastra-ai/mastra/blob/main/packages/server/src/server/handlers/agents.ts
+    - https://github.com/mastra-ai/mastra/blob/main/packages/server/src/server/schemas/agents.ts
+    - https://github.com/mastra-ai/mastra/blob/main/packages/server/src/server/server-adapter/index.ts
+    - https://github.com/mastra-ai/mastra/blob/main/packages/server/src/server/auth/defaults.ts
+    - https://github.com/mastra-ai/mastra/blob/main/packages/server/src/server/auth/helpers.ts
+    - https://github.com/mastra-ai/mastra/blob/main/packages/deployer/src/server/index.ts
+    - https://mastra.ai/docs/server/auth
+    - https://mastra.ai/docs/server/server-adapters
+    - https://mastra.ai/reference/configuration
+  metadata:
+    max-request: 1
+    vendor: mastra-ai
+    product: mastra
+  tags: ai,llm,agent,mastra,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sur l'inventaire. Le handler de LIST_AGENTS_ROUTE
+  # sérialise la configuration des agents — getInstructions, listTools, getLLM
+  # — sans en faire tourner aucun : le constat se lit sans rien déclencher. Le
+  # même fichier porte POST /agents/:agentId/generate, /stream et /clone, qui
+  # exécuteraient ou dupliqueraient les agents de l'exploitant ; aucun n'est
+  # interrogé ici. GET /health ne l'est pas non plus : monté avant
+  # l'intergiciel d'authentification, il rend {"success":true} sur une instance
+  # fermée comme sur une instance ouverte, donc il ne prouve rien.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/agents"
+
+    matchers-condition: and
+    matchers:
+      # L'ancrage. Le handler rend « serializedAgents[id] = { id, ...rest } »
+      # pour chaque agent : un objet indexé par identifiant, dont chaque valeur
+      # ouvre sur « id ». L'ancrage sur l'ouverture du corps écarte la même
+      # charge utile retrouvée au fond d'un document composite qu'une
+      # supervision agrégerait sous une clé à elle, et une instance sans agent
+      # — « {} » — ne passe pas : non concluant, délibérément. Les \s*
+      # absorbent la réindentation d'un intermédiaire qui relaierait ce que
+      # Hono sérialise compact.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"[^"]+"\s*:\s*\{\s*"id"\s*:\s*"'
+
+      # Le prompt système : « instructions = await agent.getInstructions({
+      # requestContext }) », chaîne ou SystemMessage, donc rien n'est exigé de
+      # la valeur. Le champ est le renseignement même que la route livre à
+      # l'anonyme — c'est lui qui fait la sévérité — et la clé que l'API
+      # Assistants d'OpenAI écrit aussi, d'où les deux autres.
+      - type: regex
+        part: body
+        regex:
+          - '"instructions"\s*:'
+
+      # La référence de modèle, « ...getAgentModelRef(agent.model, llm) » :
+      # « provider » et « modelId », les deux exigés. C'est le vocabulaire de
+      # Mastra là où l'API Assistants écrit « model », Agno « available_models »
+      # et Letta « llm_config ». Tous deux sont optionnels dans le schéma — ils
+      # manquent si getLLM() a échoué — et une instance qui ne les porte pas
+      # n'est pas remontée : c'est le prix d'une signature qui nomme le produit.
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          - '"provider"\s*:\s*"'
+          - '"modelId"\s*:\s*"'
+
+      # Le quatrième terme, toujours sérialisé : formatAgentList replie
+      # « supportsMemory » sur « true » quand l'agent n'expose pas la méthode,
+      # donc le booléen est présent sur chaque entrée. « provider » + « modelId »
+      # est aussi le vocabulaire des objets de modèle du Vercel AI SDK, qu'une
+      # application maison peut sérialiser ; « supportsMemory » n'y figure pas.
+      - type: regex
+        part: body
+        regex:
+          - '"supportsMemory"\s*:\s*(?:true|false)'
+
+    extractors:
+      # Les identifiants des agents — exactement les « :agentId » que POST
+      # /agents/:agentId/generate attend — et, pour chacun, le modèle qu'il
+      # pointe, donc le fournisseur dont les clés paient l'exécution. Un seul
+      # extracteur et un seul tableau : nuclei remonte une ligne par extracteur
+      # nommé, et le constat n'en vaut qu'une par instance. gojq parcourt
+      # l'objet par clés triées, pas dans l'ordre du handler ; le « // "?" »
+      # marque l'entrée dont getLLM() n'a pas rendu de référence.
+      - type: json
+        part: body
+        name: agents
+        json:
+          - '[.[] | .id + "=" + (.provider // "?") + "/" + (.modelId // "?")]'

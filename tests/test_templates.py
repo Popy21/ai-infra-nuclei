@@ -36951,3 +36951,399 @@ def test_open_notebook_matcher_compiles_and_fires_against_a_live_server():
     _, results = scan(root=(200, OPEN_NOTEBOOK_OTHER_ROOT_BODY, "application/json"),
                       openapi=(200, OPEN_NOTEBOOK_OTHER_OPENAPI_BODY, "application/json"))
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Mastra (mastra-ai/mastra) : framework TypeScript d'agents, de workflows et de
+# RAG, dont « mastra build » produit un serveur Hono servant l'API sous /api et
+# le Studio à la racine, sur 4111. GET /api/agents — LIST_AGENTS_ROUTE dans
+# packages/server/src/server/handlers/agents.ts, « method: 'GET', path:
+# '/agents', responseSchema: listAgentsResponseSchema, requiresAuth: true » —
+# rend « serializedAgents[id] = { id, ...rest } » pour chaque agent : un objet
+# indexé par identifiant dont chaque valeur ouvre sur « id », puis name,
+# description, metadata, instructions (« await agent.getInstructions({
+# requestContext }) »), agents, tools, workflows, …, « ...getAgentModelRef(
+# agent.model, llm) » soit provider et modelId, modelVersion, supportsMemory
+# (replié sur true), defaultOptions, …, source, hasDraft. JSON.stringify
+# retire les champs undefined, et le schéma déclare instructions, provider et
+# modelId optionnels en conséquence.
+#
+# Le « requiresAuth: true » ne pèse qu'une fois server.auth posé :
+# getEffectiveAuthConfig() rend null sans configuration (« // No auth
+# configured ») et checkRouteAuth() enchaîne « // No auth config means no auth
+# required » — la documentation le dit en une phrase, « Authentication is
+# optional. If no auth is configured, all routes and Studio are publicly
+# accessible. » L'instance fermée rend 401 {"error":"Invalid or expired
+# token"} sur la même route : seul le corps sépare les deux états, jamais le
+# statut. La signature est l'objet indexé dont chaque valeur ouvre sur « id »,
+# avec « instructions », le couple « provider » + « modelId » et
+# « supportsMemory » ; « {} » — aucun agent enregistré — est non concluant. Le
+# template ne joint ni POST /agents/:agentId/generate, /stream ou /clone, qui
+# exécuteraient ou dupliqueraient les agents, ni /health, générique.
+
+MASTRA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "mastra-agents-exposed.yaml")
+
+MASTRA_ROUTE = "/api/agents"
+
+
+def mastra_agent(agent_id, name, instructions, provider, model_id,
+                 drop=(), **extra):
+    """
+    Une entrée telle que formatAgentList la rend et que le handler la range —
+    « serializedAgents[id] = { id, ...rest } » : id d'abord, puis les champs
+    dans l'ordre du littéral de retour. JSON.stringify retire les champs
+    undefined, d'où `drop` : getLLM() ou getInstructions() qui échoue fait
+    disparaître provider/modelId ou instructions du document.
+    """
+    entry = {
+        "id": agent_id,
+        "name": name,
+        "description": "Agent %s" % name.lower(),
+        "instructions": instructions,
+        "agents": {},
+        "tools": {
+            "lookupTool": {
+                "id": "lookup",
+                "description": "Lit une fiche dans la base interne",
+                "inputSchema": '{"json":{"type":"object","properties":'
+                               '{"key":{"type":"string"}}}}',
+            },
+        },
+        "workflows": {},
+        "skills": [],
+        "workspaceTools": [],
+        "browserTools": [],
+        "hasBrowser": False,
+        "inputProcessors": [],
+        "outputProcessors": [],
+        "provider": provider,
+        "modelId": model_id,
+        "modelVersion": "v2",
+        "supportsMemory": True,
+        "defaultOptions": {},
+        "source": "code",
+        "hasDraft": False,
+    }
+    entry.update(extra)
+    for key in drop:
+        entry.pop(key, None)
+    return entry
+
+
+def mastra_agents_body(*agents, indent=None):
+    """Ce que c.json(serializedAgents) écrit : compact, indexé par id."""
+    document = {agent["id"]: agent for agent in agents}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+# Un agent déclaré avec un modèle en chaîne — parseModelString("openai/
+# gpt-4o-mini") donne provider et modelId — et des instructions en chaîne.
+MASTRA_WEATHER_AGENT = mastra_agent(
+    "weatherAgent", "Weather Agent",
+    "You are a helpful weather assistant. Use the lookupTool to fetch the "
+    "forecast before answering.",
+    "openai", "gpt-4o-mini",
+)
+
+# Un agent stocké, dont les instructions sont un SystemMessage et non une
+# chaîne : rien n'est exigé de la valeur d'« instructions ».
+MASTRA_SUPPORT_AGENT = mastra_agent(
+    "supportAgent", "Support Agent",
+    {"role": "system",
+     "content": "Tu es l'assistant support interne. Ne divulgue jamais les "
+                "tarifs négociés."},
+    "anthropic", "claude-sonnet-4-5",
+    source="stored", status="published",
+)
+
+MASTRA_AGENTS_BODY = mastra_agents_body(MASTRA_WEATHER_AGENT, MASTRA_SUPPORT_AGENT)
+MASTRA_SINGLE_AGENT_BODY = mastra_agents_body(MASTRA_WEATHER_AGENT)
+
+# Hono sérialise compact ; un intermédiaire peut réindenter ce qu'il relaie.
+MASTRA_REFORMATTED_BODY = mastra_agents_body(MASTRA_WEATHER_AGENT,
+                                             MASTRA_SUPPORT_AGENT, indent=2)
+
+# L'instance sans agent enregistré : l'objet est vide, et il ne nomme rien.
+MASTRA_EMPTY_BODY = "{}"
+
+# getLLM() a échoué pour le seul agent : getAgentModelRef rend deux undefined,
+# JSON.stringify les retire, et la signature est incomplète — prix assumé.
+MASTRA_NO_MODEL_REF_BODY = mastra_agents_body(mastra_agent(
+    "weatherAgent", "Weather Agent", "You are a helpful weather assistant.",
+    None, None, drop=("provider", "modelId", "modelVersion"),
+))
+
+# getInstructions() a échoué : le champ qui fait la sévérité manque.
+MASTRA_NO_INSTRUCTIONS_BODY = mastra_agents_body(mastra_agent(
+    "weatherAgent", "Weather Agent", None, "openai", "gpt-4o-mini",
+    drop=("instructions",),
+))
+
+# L'instance à server.auth : même route, l'autre corps, et un 401.
+MASTRA_UNAUTHORIZED_BODY = '{"error":"Invalid or expired token"}'
+
+# GET /health, monté avant l'intergiciel d'authentification : générique.
+MASTRA_HEALTH_BODY = '{"success":true}'
+
+# Le Studio, servi à la racine par le même serveur.
+MASTRA_STUDIO_HTML = (
+    '<!doctype html><html lang="en"><head><title>Mastra Studio</title></head>'
+    '<body><div id="root"></div></body></html>'
+)
+
+# L'inventaire républié au fond du document d'une supervision — la première
+# valeur est une chaîne —, puis enveloppé sous une seule clé — la première
+# valeur est un objet, mais il n'ouvre pas sur « id ».
+MASTRA_COMPOSITE_BODY = '{"probe":"mastra","upstream":%s}' % MASTRA_AGENTS_BODY
+MASTRA_WRAPPED_BODY = '{"upstream":%s}' % MASTRA_AGENTS_BODY
+
+# L'API Assistants d'OpenAI écrit aussi « instructions », mais en liste, avec
+# « model » et sans provider/modelId.
+MASTRA_OPENAI_ASSISTANTS_BODY = (
+    '{"object":"list","data":[{"id":"asst_abc123","object":"assistant",'
+    '"created_at":1759000000,"name":"Math Tutor",'
+    '"instructions":"You are a personal math tutor.","model":"gpt-4o",'
+    '"tools":[]}],"first_id":"asst_abc123","last_id":"asst_abc123",'
+    '"has_more":false}'
+)
+
+# Un autre framework qui indexerait ses agents par identifiant, « id » en
+# tête et « instructions » comprises, mais avec « model » : le couple
+# provider/modelId manque, supportsMemory aussi.
+MASTRA_OTHER_AGENT_RECORD_BODY = (
+    '{"support":{"id":"support","name":"Support",'
+    '"instructions":"Tu es le support.","model":"gpt-4o","tools":[]}}'
+)
+
+# Une application maison qui sérialise ses objets de modèle du Vercel AI SDK :
+# provider et modelId y sont, « id » et « instructions » non.
+MASTRA_AI_SDK_MODELS_BODY = (
+    '{"chat":{"specificationVersion":"v2","provider":"openai.chat",'
+    '"modelId":"gpt-4o"}}'
+)
+
+# La même, étoffée jusqu'à porter « id » en tête et des instructions : il ne
+# manque que « supportsMemory », et c'est lui qui doit retenir le template.
+MASTRA_AI_SDK_WITH_ID_BODY = (
+    '{"chat":{"id":"chat","instructions":"Réponds en français.",'
+    '"specificationVersion":"v2","provider":"openai.chat","modelId":"gpt-4o"}}'
+)
+
+
+def mastra_block():
+    doc = load(MASTRA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MASTRA_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % MASTRA_ROUTE
+    return blocks[0]
+
+
+def mastra_fires(body):
+    verdicts = [body_matcher_hits(m, body)
+                for m in mastra_block().get("matchers") or []
+                if m.get("type") in ("word", "regex") and m.get("part") == "body"]
+    assert verdicts, "bloc sans matcher de corps"
+    return all(verdicts)
+
+
+def test_mastra_probe_reads_the_inventory_and_runs_no_agent():
+    doc = load(MASTRA_TEMPLATE)
+    routes = request_routes(doc)
+    assert routes == {("GET", MASTRA_ROUTE)}, sorted(routes)
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 1
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : le même fichier déclare POST "
+            "/agents/:agentId/generate, /stream et /clone, qui feraient "
+            "tourner ou dupliqueraient les agents de l'exploitant"
+        )
+        for path in (block.get("path") or []):
+            for route, why in (
+                ("/generate", "exécuterait un agent, outils compris, sur les "
+                              "clés de modèle de l'exploitant"),
+                ("/stream", "exécuterait un agent, en flux"),
+                ("/clone", "dupliquerait un agent dans le stockage de "
+                           "l'exploitant"),
+                ("/model", "changerait le modèle d'un agent"),
+                ("/api/workflows", "l'inventaire des workflows ne prouve rien "
+                                   "de plus que celui des agents"),
+                ("/api/memory", "la mémoire est le travail de l'exploitant"),
+                ("/health", "{\"success\":true} est servi avant l'intergiciel "
+                            "d'authentification et ne nomme rien"),
+            ):
+                assert route not in path, f"le template touche {route} : {why}"
+
+    extractors = mastra_block().get("extractors") or []
+    assert [e.get("name") for e in extractors] == ["agents"], (
+        "un seul extracteur, qui rend les identifiants d'agents — les "
+        ":agentId que /generate attend — avec le modèle pointé : nuclei "
+        "remonte une ligne par extracteur nommé, et le constat n'en vaut "
+        "qu'une par instance"
+    )
+    assert all(e.get("type") == "json" for e in extractors)
+
+
+def test_mastra_matcher_rests_on_the_agent_record_not_on_a_lone_field():
+    block = mastra_block()
+
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée"
+    )
+
+    assert mastra_fires(MASTRA_AGENTS_BODY), (
+        "le template ne reconnaît pas une réponse /api/agents de Mastra"
+    )
+    assert mastra_fires(MASTRA_SINGLE_AGENT_BODY), (
+        "le template rate une instance à un seul agent"
+    )
+    assert mastra_fires(MASTRA_REFORMATTED_BODY), (
+        "le template dépend de la sérialisation compacte de Hono : un "
+        "intermédiaire qui réindente le corps le mettrait en défaut"
+    )
+
+    assert not mastra_fires(MASTRA_EMPTY_BODY), (
+        "le template déclenche sur « {} » : une instance sans agent "
+        "enregistré ne nomme rien, et le constat est non concluant"
+    )
+    assert not mastra_fires(MASTRA_NO_MODEL_REF_BODY), (
+        "le template déclenche sans le couple provider/modelId : c'est le "
+        "vocabulaire qui sépare Mastra de l'API Assistants et des autres "
+        "runtimes d'agents du pack"
+    )
+    assert not mastra_fires(MASTRA_NO_INSTRUCTIONS_BODY), (
+        "le template déclenche sans « instructions » : c'est le champ qui "
+        "fait la sévérité"
+    )
+
+    for body, why in (
+        (MASTRA_UNAUTHORIZED_BODY, "l'instance fermée — même route, l'autre "
+                                   "corps"),
+        (MASTRA_HEALTH_BODY, "la sonde générique relayée sur ce chemin"),
+        (MASTRA_STUDIO_HTML, "la page du Studio servie sur ce chemin"),
+        (MASTRA_COMPOSITE_BODY, "l'inventaire républié au fond du document "
+                                "d'une supervision — l'ancrage d'ouverture dit "
+                                "que l'instance a répondu d'elle-même"),
+        (MASTRA_WRAPPED_BODY, "l'inventaire enveloppé sous une clé étrangère — "
+                              "la première valeur n'ouvre pas sur « id »"),
+        (MASTRA_OPENAI_ASSISTANTS_BODY, "une liste de l'API Assistants d'OpenAI, "
+                                        "qui écrit aussi « instructions »"),
+        (MASTRA_OTHER_AGENT_RECORD_BODY, "un autre framework qui indexe ses "
+                                         "agents par identifiant avec « model »"),
+        (MASTRA_AI_SDK_MODELS_BODY, "des objets de modèle du Vercel AI SDK, qui "
+                                    "portent provider et modelId"),
+        (MASTRA_AI_SDK_WITH_ID_BODY, "les mêmes étoffés d'un « id » et "
+                                     "d'instructions — seul « supportsMemory » "
+                                     "manque, et il doit suffire à retenir"),
+    ):
+        assert not mastra_fires(body), f"le template déclenche sur {why}"
+
+    # Chaque terme seul : aucun ne nomme le produit.
+    for body, why in (
+        ('{"weatherAgent":{"id":"weatherAgent"}}', "l'ancrage seul"),
+        ('{"instructions":"x"}', "les instructions seules"),
+        ('{"provider":"openai","modelId":"gpt-4o"}', "la référence de modèle seule"),
+        ('{"supportsMemory":true}', "le booléen seul"),
+    ):
+        assert not mastra_fires(body), "le template déclenche sur %s" % why
+
+    # Collisions internes au pack : les autres runtimes d'agents et les
+    # listings compatibles OpenAI ne doivent pas être revendiqués.
+    for other_body in (AGNO_CONFIG_BODY, LETTA_AGENTS_BODY,
+                       LANGGRAPH_SEARCH_BODY, OTHER_OPENAI_API_BODY):
+        assert not mastra_fires(other_body), (
+            "le template déclenche sur un runtime d'agents qui n'est pas Mastra"
+        )
+
+
+def test_mastra_conclusion_rests_on_the_body_never_on_the_status():
+    kinds = [m.get("type") for m in mastra_block().get("matchers") or []]
+    assert "status" not in kinds, (
+        "le constat ne doit jamais tenir au statut : la route rend 200 à "
+        "l'anonyme sur l'instance ouverte et 401 sur l'instance fermée, et "
+        "/health rend 200 dans les deux cas"
+    )
+    assert "regex" in kinds
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_mastra_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `body_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei, et l'extracteur gojq n'est pas compilé par `nuclei
+    -validate` : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle de la regex, de l'expression et de la requête — et sur
+    le nombre de lignes remontées, une par extracteur nommé.
+    """
+    def scan(body=MASTRA_AGENTS_BODY, status=200, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == MASTRA_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"error":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MASTRA_TEMPLATE, "-s", "high",
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [MASTRA_ROUTE], seen
+    assert len(results) == 1, results
+    assert results[0].get("template-id") == "mastra-agents-exposed"
+    # Un seul tableau, agent=fournisseur/modèle, par clés triées — gojq
+    # parcourt l'objet ainsi, pas dans l'ordre du handler.
+    assert results[0].get("extracted-results") == [
+        '["supportAgent=anthropic/claude-sonnet-4-5","weatherAgent=openai/gpt-4o-mini"]'
+    ], results[0].get("extracted-results")
+
+    # Le corps réindenté par un intermédiaire : la regex ne suppose pas la
+    # sérialisation compacte.
+    _, results = scan(body=MASTRA_REFORMATTED_BODY)
+    assert len(results) == 1, results
+
+    # L'instance fermée : 401 et l'autre corps.
+    _, results = scan(body=MASTRA_UNAUTHORIZED_BODY, status=401)
+    assert results == [], results
+
+    # L'instance sans agent : non concluant.
+    _, results = scan(body=MASTRA_EMPTY_BODY)
+    assert results == [], results
+
+    # Des objets de modèle du Vercel AI SDK étoffés jusqu'à l'« id » et aux
+    # instructions : « supportsMemory » retient.
+    _, results = scan(body=MASTRA_AI_SDK_WITH_ID_BODY)
+    assert results == [], results
