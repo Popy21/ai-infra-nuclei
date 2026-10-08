@@ -1,0 +1,243 @@
+id: kserve-model-server-exposed
+
+info:
+  name: KServe ModelServer - Unauthenticated Server Metadata and Model Inventory Exposure
+  author: popy21
+  severity: high
+  description: |
+    KServe (kserve/kserve, projet CNCF) est la plate-forme d'inférence de
+    Kubernetes, et kserve.ModelServer en est le serveur Python : c'est le
+    processus qui tourne dans chaque pod predictor d'une InferenceService —
+    les images kserve/sklearnserver, xgbserver, lgbserver, pmmlserver,
+    paddleserver, huggingfaceserver — et dans tout conteneur de modèle
+    personnalisé bâti sur le SDK, qui sous-classe kserve.Model et appelle
+    ModelServer().start([...]). Ce serveur n'a jamais eu de garde à
+    désactiver, parce qu'il n'en construit aucune.
+    python/kserve/kserve/model_server.py instancie « FastAPI(title="KServe
+    ModelServer", version=metadata.version("kserve"), docs_url="/docs" if
+    args.enable_docs_url else None, redoc_url=None,
+    default_response_class=ORJSONResponse) » sans argument dependencies=, et
+    son analyseur d'arguments ne connaît ni clé, ni jeton, ni identifiant :
+    les seules options qui touchent à la sécurité sont --ssl_certfile et
+    --ssl_keyfile, c'est-à-dire le chiffrement du transport, pas l'identité
+    de l'appelant. RESTServer (python/kserve/kserve/protocol/rest/server.py)
+    ne monte que TimingMiddleware, TraceResponseHeaderMiddleware et, si
+    --access_log_format est posé, AccessLoggerMiddleware — trois intergiciels
+    de mesure et de journal, dont aucun ne filtre une requête sur son
+    origine — puis lance uvicorn avec « host="0.0.0.0" » écrit en dur : toutes
+    les interfaces, sans drapeau --host pour en changer, et --http_port à
+    DEFAULT_HTTP_PORT, 8080.
+    GET /v2 porte l'identification. register_v2_endpoints
+    (python/kserve/kserve/protocol/rest/v2_endpoints.py) déclare « r"" » sous
+    le préfixe V2_ROUTE_PREFIX avec methods=["GET"] et
+    response_model=ServerMetadataResponse ; le handler rend
+    « ServerMetadataResponse.model_validate(self.dataplane.metadata()) », et
+    DataPlane.metadata() (python/kserve/kserve/protocol/dataplane.py)
+    construit littéralement « {"name": self._server_name, "version":
+    self._server_version, "extensions": ["model_repository_extension"]} »,
+    avec self._server_name = constants.KSERVE_MODEL_SERVER_NAME — la
+    constante « "kserve" » de constants.py, qu'aucun drapeau ni fichier de
+    configuration ne remplace — et self._server_version lu par
+    importlib.metadata.version("kserve"). ServerMetadataResponse
+    (v2_datamodels.py) déclare name, version puis extensions, tous trois
+    requis : ORJSONResponse les écrit dans cet ordre et compact. Aucun
+    add_api_route du fichier ne passe de dependencies=.
+    C'est la valeur « "name":"kserve" » qui identifie le produit, parce que
+    le protocole, lui, ne le fait pas : MLServer rend « "name":"mlserver" »,
+    OpenVINO Model Server « "name":"OpenVINO Model Server" » et Triton
+    « "name":"triton" » sur exactement la même route, et le pack les couvre
+    déjà chacun. La liste d'extensions est l'autre littérale de la réponse —
+    « model_repository_extension », écrite en dur dans metadata() — et elle
+    sépare l'instance d'un Triton dont --id aurait posé « kserve » comme nom.
+    GET /v1/models corrobore, et nomme. V1Endpoints.models
+    (python/kserve/kserve/protocol/rest/v1_endpoints.py) rend « {"models":
+    list(self.dataplane.model_registry.get_models().keys())} » — les noms
+    sous lesquels le registre tient les modèles chargés, c'est-à-dire,
+    dans une InferenceService, le nom de la ressource elle-même. Ni
+    metadata() ni models() n'ont de branche d'échec : les deux rendent leur
+    objet quoi qu'il arrive, sous un 200. Le statut ne distingue donc rien,
+    pas plus que GET / — « {"status":"alive"} », générique — ni
+    /v2/health/live — « {"live":true} ».
+    Dans un cluster, le pod est joint à travers la passerelle Knative ou
+    Istio en mode Serverless, ou à travers un Service et un Ingress
+    ordinaires en mode RawDeployment ; aucune de ces couches n'ajoute
+    d'authentification d'elle-même. L'exposition survient dès qu'un Service
+    de type LoadBalancer ou NodePort, un Ingress sans AuthorizationPolicy, ou
+    un simple « docker run -p 8080:8080 » d'une image de modèle publie le
+    port.
+  impact: |
+    /v2 date l'instance au correctif près — version est le numéro exact du
+    paquet kserve installé — mais il énonce surtout que le serveur entier
+    répond à l'anonyme, puisque c'est le même routeur nu qui sert tout le
+    reste, et /v1/models dit sous quel nom appeler ce qui est chargé.
+    L'inférence suit sans rien de plus. POST /v1/models/{nom}:predict et
+    :explain (v1_endpoints.py) et POST /v2/models/{nom}/infer
+    (v2_endpoints.py) font tourner le modèle sur le matériel de
+    l'exploitant — CPU ou GPU — pour quiconque connaît son nom, sans compte à
+    débiter ; GET /v2/models/{nom} rend d'abord la forme et le type de ses
+    tenseurs d'entrée. Pour les modèles génératifs, server.py enregistre en
+    plus /openai/v1/completions et /openai/v1/chat/completions dès qu'un
+    modèle du registre implémente l'interface OpenAI : un grand modèle de
+    langage servi par huggingfaceserver sans garde est une facture de calcul
+    ouverte, et le vol de capacité y est le premier usage constaté. Un modèle
+    propriétaire servi ainsi est un modèle qu'on interroge à volonté, donc
+    qu'on distille.
+    L'écriture est sur le même chemin ouvert : POST
+    /v2/repository/models/{nom}/load et /unload appellent
+    model_repository_extension.load() et unload(), qui chargent un modèle du
+    dépôt configuré ou retirent un modèle en production sur simple requête
+    anonyme — un déni de service pour qui en dépend. Et parce qu'aucun compte
+    n'existe, rien de tout cela n'est attribuable : les journaux d'accès ne
+    porteront qu'une adresse, souvent celle de la passerelle.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à activer : l'analyseur
+    d'arguments de model_server.py ne porte aucune option de clé, de jeton ni
+    d'identifiant, aucun add_api_route ne reçoit de Depends(), et FastAPI(...)
+    est construit sans dependencies=. --ssl_certfile et --ssl_keyfile
+    chiffrent le transport, ils ne ferment rien. La fermeture est entièrement
+    réseau, et c'est à la couche qui entoure le pod de la poser.
+    Dans un cluster, ne pas exposer le Service du predictor en LoadBalancer
+    ou NodePort, ni le publier par un Ingress nu : sous Istio, poser une
+    AuthorizationPolicy qui exige un principal ou un JWT sur le préfixe
+    entier — /v1/, /v2/ et /openai/ — et non sur /v2 seul, puisque
+    /v1/models/*:predict, /v2/models/*/infer et
+    /v2/repository/models/*/load|/unload répondent au même routeur ; sans
+    maillage, placer un proxy qui authentifie devant le Service, et vérifier
+    les NetworkPolicy du namespace. Hors cluster, ne pas publier le port du
+    conteneur sur toutes les interfaces : « -p 127.0.0.1:8080:8080 » quand il
+    doit rester local — host="0.0.0.0" est écrit en dur dans le serveur, et
+    aucun drapeau ne le change.
+    Vérifier la prise en compte sur les routes elles-mêmes, depuis
+    l'extérieur du périmètre et sans identifiant : « curl -s
+    http://<hote>:8080/v2 » et « curl -s http://<hote>:8080/v1/models » ne
+    doivent plus rendre leurs documents.
+    Après une exposition, tenir la version et les noms de modèles pour lus,
+    puis vérifier dans les journaux d'accès si /load ou /unload a été appelé
+    et si des requêtes :predict, /infer ou /openai/ sont parties d'une
+    adresse inattendue. Aucune trace ne portera d'identité d'appelant : il
+    n'y en a jamais eu à porter.
+  reference:
+    - https://github.com/kserve/kserve/blob/master/python/kserve/kserve/protocol/dataplane.py
+    - https://github.com/kserve/kserve/blob/master/python/kserve/kserve/protocol/rest/v2_endpoints.py
+    - https://github.com/kserve/kserve/blob/master/python/kserve/kserve/protocol/rest/v1_endpoints.py
+    - https://github.com/kserve/kserve/blob/master/python/kserve/kserve/protocol/rest/server.py
+    - https://github.com/kserve/kserve/blob/master/python/kserve/kserve/model_server.py
+    - https://github.com/kserve/kserve/blob/master/python/kserve/kserve/constants/constants.py
+    - https://github.com/kserve/kserve/blob/master/python/kserve/kserve/protocol/rest/v2_datamodels.py
+    - https://github.com/kserve/kserve/blob/master/docs/predict-api/v2/required_api.md
+    - https://kserve.github.io/website/docs/concepts/architecture/data-plane/v1-protocol
+    - https://kserve.github.io/website/docs/concepts/architecture/data-plane/v2-protocol
+  metadata:
+    max-request: 2
+    vendor: kserve
+    product: kserve
+  tags: ai,ml,kserve,model-server,inference,kubernetes,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit et porte le constat, la
+  # seconde dit que le registre répond au même anonyme et sous quel nom.
+  #
+  # GET /v2 est la route de métadonnées serveur du protocole. Son handler ne
+  # consulte ni la requête, ni le registre, ni le système de fichiers :
+  # metadata() recopie une constante et la version du paquet, et ajoute une
+  # liste écrite en dur. C'est la lecture la moins chère qui identifie
+  # l'instance.
+  #
+  # GET /v1/models est l'inventaire. models() rend les clés du registre, sans
+  # branche d'échec et sans paramètre : une requête nue y reçoit la liste
+  # entière. C'est la route qui dit que le serveur ne se contente pas de se
+  # nommer — il sert quelque chose, et il dit quoi.
+  #
+  # GET, et rien d'autre : les deux routes sont déclarées methods=["GET"] ou
+  # équivalent, et FastAPI rend 405 sur le reste.
+  #
+  # En lecture seule, et strictement : le même routeur nu sert POST
+  # /v1/models/{nom}:predict, :explain et /v2/models/{nom}/infer, qui feraient
+  # tourner le modèle sur le matériel de l'exploitant, /openai/v1/* quand le
+  # modèle est génératif, et POST /v2/repository/models/{nom}/load et
+  # /unload, qui chargeraient ou retireraient un modèle en production.
+  # Signaler une exposition ne demande d'en toucher aucun — et l'inventaire
+  # que le template lit est précisément ce qui dirait quel modèle appeler.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v2"
+      - "{{BaseURL}}/v1/models"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # l'inventaire seul ne nomme aucun produit, et les métadonnées seules
+    # peuvent être republiées par une passerelle.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'identification, et elle tient à deux littérales du handler.
+          # KSERVE_MODEL_SERVER_NAME vaut "kserve" dans constants.py, posé
+          # sans condition par DataPlane.__init__ : ni un drapeau de ligne de
+          # commande ni un fichier de configuration ne le change,
+          # contrairement au nom que Triton rend sur la même route et que
+          # --id remplace. Et « model_repository_extension » est écrit en dur
+          # dans metadata() — c'est lui qui sépare l'instance d'un Triton
+          # dont --id aurait posé « kserve », dont la liste porte
+          # « model_repository » et jamais ce nom-là. La liste n'est pas tenue
+          # pour fermée : une version future peut y ajouter une entrée sans
+          # retirer celle-ci.
+          #
+          # L'adjacence des trois champs suit leur déclaration dans
+          # ServerMetadataResponse — name, version, extensions — et c'est
+          # l'ordre que Pydantic sérialise. L'ancrage sur l'ouverture du corps
+          # écarte la même charge utile retrouvée au fond d'un document
+          # composite qu'une supervision agrégerait sous une clé à elle.
+          #
+          # Le numéro de version est laissé libre : il change à chaque
+          # publication du paquet. Les \s* sont là parce qu'orjson écrit
+          # compact, mais qu'un intermédiaire qui réindente ce qu'il relaie
+          # ne s'y tient pas.
+          - 'regex("^\\{\\s*\"name\"\\s*:\\s*\"kserve\"\\s*,\\s*\"version\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"extensions\"\\s*:\\s*\\[[^\\]]*\"model_repository_extension\"", trim_space(body_1))'
+
+          # Le document est tenu pour plat, et il l'est par construction :
+          # ServerMetadataResponse n'a que deux chaînes et une liste de
+          # chaînes, dont aucune n'ouvre d'accolade. Aucune paire { } ne doit
+          # donc apparaître à l'intérieur du corps.
+          #
+          # C'est ce qui sépare la réponse du serveur du document d'une
+          # passerelle qui citerait les mêmes littérales en les logeant à
+          # côté d'un objet à elle — l'ancrage de la première expression ne
+          # le ferait pas, puisqu'un tel document peut très bien commencer par
+          # les trois mêmes clés.
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_1))'
+
+          # L'inventaire a répondu, et il a répondu comme models() le rend :
+          # un objet d'une seule clé, « models », portant une liste de
+          # chaînes. Le document est tenu pour entier — ouverture, clé, liste,
+          # fermeture, fin — parce que la forme « {"models":[...]} » n'est pas
+          # propre au produit ; ce qui l'est, c'est qu'elle arrive sur /v1 du
+          # même serveur dont /v2 vient de dire le nom. TorchServe, qui sert
+          # aussi « models » sur son port de gestion, y range des objets et
+          # non des chaînes.
+          #
+          # La liste doit nommer au moins un modèle. « {"models":[]} » est un
+          # serveur qui ne sert rien encore — un predictor dont le modèle n'a
+          # pas fini de charger, ou un conteneur personnalisé qui enregistre
+          # tard — et il ne divulgue rien ni n'appelle rien ; le constat est
+          # non concluant, et le prix est assumé : dans une InferenceService,
+          # le registre porte le modèle de la ressource dès qu'il est prêt.
+          - 'regex("^\\{\\s*\"models\"\\s*:\\s*\\[\\s*\"[^\"]+\"[^\\]]*\\]\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # Les noms sous lesquels le registre tient les modèles chargés : c'est
+      # ce qui appartient à l'exploitant dans les deux réponses, et le premier
+      # renseignement qu'un tiers en tire — chacun désigne une route
+      # /v1/models/{nom}:predict appelable.
+      #
+      # Un seul extracteur, et borné à body_2 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second — la
+      # version, que /v2 porte — ferait remonter deux fois la même instance.
+      - type: json
+        part: body_2
+        name: model
+        json:
+          - '.models[]'

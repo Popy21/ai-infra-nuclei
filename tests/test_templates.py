@@ -37347,3 +37347,517 @@ def test_mastra_matcher_compiles_and_fires_against_a_live_server():
     # instructions : « supportsMemory » retient.
     _, results = scan(body=MASTRA_AI_SDK_WITH_ID_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# KServe ModelServer (kserve/kserve, python/kserve) : le serveur Python qui
+# tourne dans chaque pod predictor d'une InferenceService et dans tout
+# conteneur de modèle bâti sur le SDK. GET /v2 — « r"" » sous V2_ROUTE_PREFIX
+# dans protocol/rest/v2_endpoints.py, methods=["GET"],
+# response_model=ServerMetadataResponse — rend
+# « ServerMetadataResponse.model_validate(self.dataplane.metadata()) », et
+# DataPlane.metadata() (protocol/dataplane.py) construit « {"name":
+# self._server_name, "version": self._server_version, "extensions":
+# ["model_repository_extension"]} » avec self._server_name =
+# constants.KSERVE_MODEL_SERVER_NAME, soit "kserve", et self._server_version
+# = importlib.metadata.version("kserve"). GET /v1/models
+# (protocol/rest/v1_endpoints.py) rend « {"models":
+# list(self.dataplane.model_registry.get_models().keys())} ». Ni l'un ni
+# l'autre n'a de branche d'échec : tous deux rendent leur objet sous un 200.
+#
+# L'absence de garde n'a pas à être devinée : model_server.py construit
+# FastAPI(...) sans dependencies=, son analyseur d'arguments ne connaît que
+# --ssl_certfile et --ssl_keyfile côté sécurité, et protocol/rest/server.py ne
+# monte que TimingMiddleware, TraceResponseHeaderMiddleware et, en option,
+# AccessLoggerMiddleware, avant uvicorn sur host="0.0.0.0" écrit en dur.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette
+# section amarre. La littérale d'abord : « name », « version » et
+# « extensions » sont le vocabulaire du protocole KServe V2, que MLServer,
+# OpenVINO Model Server et Triton servent sur la même route et que le pack
+# couvre déjà — seule la valeur "kserve" désigne ce serveur-ci, et
+# « model_repository_extension », écrit en dur, le sépare d'un Triton dont
+# --id aurait posé « kserve ». La sérialisation ensuite : ORJSONResponse écrit
+# compact et dans l'ordre de déclaration du modèle, vérifié sur une pile
+# FastAPI identique — « {"name":"kserve","version":"0.15.2","extensions":
+# ["model_repository_extension"]} » — mais un intermédiaire peut réindenter.
+# L'inventaire enfin : « {"models":[...]} » n'est pas propre au produit, c'est
+# son arrivée sur /v1 du même serveur qui l'est, et une liste vide ne nomme
+# rien — le constat est alors non concluant.
+
+KSERVE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "kserve-model-server-exposed.yaml")
+
+KSERVE_METADATA_ROUTE = "/v2"
+KSERVE_MODELS_ROUTE = "/v1/models"
+
+# La constante de constants.py, et rien d'autre : c'est elle qui identifie le
+# produit, puisque le protocole ne le fait pas.
+KSERVE_SERVER_NAME = "kserve"
+
+# La liste que metadata() écrit en dur.
+KSERVE_EXTENSIONS = ("model_repository_extension",)
+
+
+def kserve_metadata_body(name=KSERVE_SERVER_NAME, version="0.15.2",
+                         extensions=KSERVE_EXTENSIONS, drop=(), first=None,
+                         indent=None):
+    """
+    Ce que rend GET /v2 : le ServerMetadataResponse que le handler valide,
+    sérialisé par ORJSONResponse — donc compact, et dans l'ordre de
+    déclaration du modèle Pydantic : name, version, extensions.
+
+    `drop` retire une clé, `first` en remonte une autre en tête pour défaire
+    l'ancrage, `indent` réécrit le document comme le ferait un intermédiaire
+    qui réindente ce qu'il relaie.
+    """
+    document = {"name": name, "version": version, "extensions": list(extensions)}
+    for key in drop:
+        document.pop(key, None)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def kserve_models_body(*names, indent=None):
+    """Ce que rend GET /v1/models : les clés du registre, sous « models »."""
+    document = {"models": list(names)}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+KSERVE_METADATA_BODY = kserve_metadata_body()
+
+# Le même corps relayé par un intermédiaire qui réindente ce qu'il transporte.
+KSERVE_METADATA_REFORMATTED_BODY = kserve_metadata_body(indent=2)
+
+# Une version future qui déclarerait une extension de plus sans retirer
+# celle-ci : la liste n'est pas tenue pour fermée.
+KSERVE_METADATA_MORE_EXTENSIONS_BODY = kserve_metadata_body(
+    extensions=KSERVE_EXTENSIONS + ("binary_tensor_data",))
+
+# Un Triton dont --id a posé « kserve » comme nom : la littérale du nom y est,
+# la liste d'extensions est celle de Triton — « model_repository », jamais
+# « model_repository_extension ».
+KSERVE_TRITON_RENAMED_BODY = triton_metadata_body(name=KSERVE_SERVER_NAME)
+
+# L'inventaire d'une InferenceService : le registre porte le modèle de la
+# ressource, sous son nom.
+KSERVE_MODELS_BODY = kserve_models_body("sklearn-iris")
+KSERVE_MODELS_SEVERAL_BODY = kserve_models_body("sklearn-iris", "xgboost-iris")
+KSERVE_MODELS_REFORMATTED_BODY = kserve_models_body("sklearn-iris", indent=2)
+
+# Un serveur qui ne sert rien encore : la liste est là, elle ne nomme
+# personne.
+KSERVE_MODELS_EMPTY_BODY = kserve_models_body()
+
+# Ce que FastAPI rend sur /v1/models quand le serveur ne la déclare pas —
+# MLServer, par exemple, dont le /v2 est joignable et pas cette route.
+KSERVE_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# GET / et GET /v2/health/live, génériques : ni l'un ni l'autre ne nomme le
+# produit, et l'un ni l'autre ne doit passer pour l'une des deux routes.
+KSERVE_ROOT_BODY = '{"status":"alive"}'
+KSERVE_LIVE_BODY = '{"live":true}'
+
+# TorchServe sert aussi « models » sur son port de gestion, mais y range des
+# objets — modelName, modelUrl — et non des chaînes.
+KSERVE_TORCHSERVE_MODELS_BODY = (
+    '{"models":[{"modelName":"densenet161","modelUrl":"densenet161.mar"}]}'
+)
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+KSERVE_COMPOSITE_BODY = '{"kserve":%s,"checked_at":0}' % KSERVE_METADATA_BODY
+KSERVE_MODELS_COMPOSITE_BODY = '{"upstream":%s,"checked_at":0}' % KSERVE_MODELS_BODY
+
+# Une passerelle qui republie les métadonnées du serveur qu'elle proxifie : les
+# littérales y sont mot pour mot, en tête, mais logées à côté d'un objet à
+# elle. C'est ce corps qui rend nécessaire de tenir le document pour plat.
+KSERVE_GATEWAY_QUOTING_BODY = json.dumps(
+    {"name": KSERVE_SERVER_NAME, "version": "0.15.2",
+     "extensions": list(KSERVE_EXTENSIONS),
+     "upstream": {"host": "sklearn-iris-predictor.default", "port": 8080}},
+    separators=(",", ":"))
+
+# Une page qui cite le produit sans être lui — inventaire, tableau de bord.
+KSERVE_INVENTORY_BODY = json.dumps(
+    {"service": "inference", "note": "le produit est kserve et sa version "
+     "est 0.15.2, extensions model_repository_extension", "name": "inventaire"},
+    separators=(",", ":"))
+
+
+def kserve_block():
+    doc = load(KSERVE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % KSERVE_METADATA_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /v2 — c'est pourtant la seule route "
+        "dont la réponse porte KSERVE_MODEL_SERVER_NAME, donc la seule qui "
+        "puisse identifier le produit"
+    )
+    return blocks[0]
+
+
+def kserve_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet
+    ordre qui donne son numéro à chaque body_N.
+    """
+    block = kserve_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def kserve_fires(metadata=(200, KSERVE_METADATA_BODY),
+                 models=(200, KSERVE_MODELS_BODY)):
+    scenario = {
+        KSERVE_METADATA_ROUTE: metadata,
+        KSERVE_MODELS_ROUTE: models,
+    }
+    block = kserve_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in kserve_requests():
+        assert route in scenario, (
+            "le template interroge un chemin que le scénario ne sert pas : "
+            f"{route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_kserve_probe_reads_the_two_routes_and_touches_nothing_else():
+    """
+    Les deux routes de lecture, dans l'ordre, et rien de plus. Le même
+    routeur nu sert POST /v1/models/{nom}:predict, :explain,
+    /v2/models/{nom}/infer, /openai/v1/* quand le modèle est génératif, et
+    POST /v2/repository/models/{nom}/load et /unload. Constater une
+    exposition ne demande d'en toucher aucune.
+    """
+    doc = load(KSERVE_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", KSERVE_METADATA_ROUTE),
+        ("GET", KSERVE_MODELS_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 2
+
+    assert kserve_requests() == [
+        ("GET", KSERVE_METADATA_ROUTE),
+        ("GET", KSERVE_MODELS_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {kserve_requests()}"
+    )
+
+    assert kserve_block().get("method") == "GET", (
+        "les deux routes sont déclarées methods=[\"GET\"] : toute autre "
+        "méthode ne mesurerait que le 405 de FastAPI"
+    )
+
+    assert kserve_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et l'inventaire — qui ne nomme aucun "
+        "produit — conclurait de son côté"
+    )
+
+    for block in (doc.get("http") or []):
+        for path in (block.get("path") or []):
+            for route, why in (
+                (":predict", "ferait tourner le modèle sur le matériel de "
+                             "l'exploitant"),
+                (":explain", "ferait tourner l'explainer"),
+                ("/infer", "POST /v2/models/{nom}/infer ferait tourner le "
+                           "modèle"),
+                ("/openai", "ferait produire du texte à un modèle génératif "
+                            "aux frais de l'exploitant"),
+                ("/repository", "chargerait ou retirerait un modèle en "
+                                "production"),
+                ("/health", "{\"live\":true} et {\"ready\":true} ne nomment "
+                            "rien"),
+                ("/metrics", "le registre Prometheus ne nomme pas le produit"),
+                ("/docs", "fermé par défaut, et n'ajouterait rien au constat"),
+            ):
+                assert route not in path, f"le template touche {route} : {why}"
+
+
+def test_kserve_matcher_needs_the_product_literal_not_the_kserve_shape():
+    assert kserve_fires(), (
+        "le template ne reconnaît pas la réponse que DataPlane.metadata() "
+        "construit sur une instance ouverte"
+    )
+
+    assert not kserve_fires(metadata=(200, MLSERVER_METADATA_BODY)), (
+        "le template déclenche sur le /v2 de MLServer, qui répond sur la même "
+        "route avec les mêmes clés : le pack le couvre déjà"
+    )
+    assert not kserve_fires(metadata=(200, TRITON_METADATA_BODY)), (
+        "le template déclenche sur le /v2 de Triton : il a son propre template"
+    )
+    assert not kserve_fires(metadata=(200, OPENVINO_METADATA_BODY)), (
+        "le template déclenche sur le /v2 d'OpenVINO Model Server : il a son "
+        "propre template"
+    )
+    assert not kserve_fires(metadata=(200, KSERVE_TRITON_RENAMED_BODY)), (
+        "le template déclenche sur un Triton dont --id a posé « kserve » : la "
+        "littérale du nom ne suffit pas, c'est « model_repository_extension » "
+        "— écrit en dur dans metadata(), absent de la liste de Triton — qui "
+        "rattache la réponse au SDK"
+    )
+    assert not kserve_fires(
+        metadata=(200, kserve_metadata_body(name="sklearn-iris-predictor"))), (
+        "le template déclenche sur un serveur KServe V2 quelconque : « name », "
+        "« version » et « extensions » sont le vocabulaire du protocole, seule "
+        "la constante KSERVE_MODEL_SERVER_NAME désigne le produit"
+    )
+    assert not kserve_fires(
+        metadata=(200, kserve_metadata_body(extensions=()))), (
+        "le template conclut sans « model_repository_extension » : metadata() "
+        "l'écrit en dur, et c'est ce qui sépare l'instance d'un Triton renommé"
+    )
+
+    assert not kserve_fires(metadata=(200, KSERVE_COMPOSITE_BODY)), (
+        "le template déclenche sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage sur l'ouverture du corps est "
+        "ce qui dit que l'instance a répondu d'elle-même"
+    )
+    assert not kserve_fires(metadata=(200, KSERVE_GATEWAY_QUOTING_BODY)), (
+        "le template déclenche sur une passerelle qui republie les "
+        "métadonnées du serveur qu'elle proxifie : les littérales y sont en "
+        "tête, mais ServerMetadataResponse n'a que deux chaînes et une liste "
+        "de chaînes — aucune paire { } ne peut apparaître à l'intérieur"
+    )
+    assert not kserve_fires(metadata=(200, KSERVE_INVENTORY_BODY)), (
+        "le template déclenche sur une page qui cite le produit sans être lui"
+    )
+    assert not kserve_fires(
+        metadata=(200, kserve_metadata_body(drop=("version",)))), (
+        "le template conclut sans le numéro de version : les trois champs "
+        "sont requis par le modèle, et c'est leur adjacence qui dit que la "
+        "réponse est bien celle du handler"
+    )
+    assert not kserve_fires(
+        metadata=(200, kserve_metadata_body(first="version"))), (
+        "le template admet un ordre de clés que Pydantic n'émet pas : la "
+        "sérialisation suit la déclaration du modèle — name, version, "
+        "extensions"
+    )
+
+    for body, why in (
+        (KSERVE_ROOT_BODY, "GET / relayé sur /v2 — générique"),
+        (KSERVE_LIVE_BODY, "GET /v2/health/live relayé sur /v2 — générique"),
+        (KSERVE_NOT_FOUND_BODY, "le 404 de FastAPI"),
+    ):
+        assert not kserve_fires(metadata=(200, body)), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_kserve_matcher_admits_the_serialisations_the_sdk_and_a_proxy_emit():
+    assert kserve_fires(metadata=(200, KSERVE_METADATA_REFORMATTED_BODY)), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : orjson écrit compact, un proxy ne s'y tient pas"
+    )
+    assert kserve_fires(models=(200, KSERVE_MODELS_REFORMATTED_BODY)), (
+        "le template exige la sérialisation compacte de l'inventaire"
+    )
+    assert kserve_fires(metadata=(200, kserve_metadata_body(version="0.13.1"))), (
+        "le template contraint le numéro de version : il change à chaque "
+        "publication du paquet kserve"
+    )
+    assert kserve_fires(metadata=(200, KSERVE_METADATA_MORE_EXTENSIONS_BODY)), (
+        "le template tient la liste d'extensions pour fermée : une version "
+        "future peut y ajouter une entrée sans retirer "
+        "« model_repository_extension »"
+    )
+
+
+def test_kserve_inventory_arm_requires_a_named_model_not_a_bare_envelope():
+    assert kserve_fires(models=(200, KSERVE_MODELS_SEVERAL_BODY)), (
+        "le template rate un registre à plusieurs modèles"
+    )
+
+    assert not kserve_fires(models=(200, KSERVE_MODELS_EMPTY_BODY)), (
+        "le template déclenche sur « {\"models\":[]} » : un serveur qui ne "
+        "sert rien encore ne nomme rien, et le constat est non concluant"
+    )
+    assert not kserve_fires(models=(200, KSERVE_NOT_FOUND_BODY)), (
+        "le template conclut sans l'inventaire : c'est lui qui dit que le "
+        "registre répond au même anonyme, et un /v2 seul peut être republié"
+    )
+    assert not kserve_fires(models=(200, KSERVE_TORCHSERVE_MODELS_BODY)), (
+        "le template admet l'inventaire de TorchServe, qui range des objets "
+        "sous « models » là où models() n'y met que des chaînes"
+    )
+    assert not kserve_fires(models=(200, KSERVE_MODELS_COMPOSITE_BODY)), (
+        "le template admet l'inventaire enveloppé sous une clé étrangère : le "
+        "document est tenu pour entier"
+    )
+    for body, why in (
+        (KSERVE_ROOT_BODY, "GET / relayé sur /v1/models"),
+        (KSERVE_LIVE_BODY, "GET /v2/health/live relayé sur /v1/models"),
+        (KSERVE_METADATA_BODY, "les métadonnées relayées sur /v1/models — un "
+                               "cache indexé sur l'hôte et non sur le chemin"),
+        ("<html><body>Connexion requise</body></html>", "un portail captif"),
+    ):
+        assert not kserve_fires(models=(200, body)), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_kserve_conclusion_is_carried_by_the_dsl_alone_and_never_by_the_status():
+    """
+    Ni metadata() ni models() n'ont de branche d'échec : les deux rendent leur
+    objet sous un 200, et un statut n'écarterait rien de plus. Le constat
+    tient aux corps, liés par leur numéro.
+    """
+    block = kserve_block()
+    matchers = block.get("matchers") or []
+    kinds = {m.get("type") for m in matchers}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+    for matcher in matchers:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes passer, sinon la littérale du "
+            "produit peut être court-circuitée par la seule forme de "
+            "l'inventaire"
+        )
+        for expr in matcher.get("dsl") or []:
+            assert "status_code" not in expr, (
+                "le constat tient au statut : la route rend 200 quoi qu'il "
+                "arrive, et un intermédiaire qui réécrit le statut ferait "
+                f"manquer l'instance — {expr}"
+            )
+
+    assert kserve_fires(metadata=(503, KSERVE_METADATA_BODY)), (
+        "le verdict change avec le statut alors qu'aucune expression ne le lit"
+    )
+
+
+def test_kserve_extractor_reports_the_model_names():
+    extractors = kserve_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — c'est l'inventaire qui porte "
+        "les noms de modèles, et chacun désigne une route :predict appelable"
+    )
+    assert extractor.get("json") == [".models[]"], (
+        "l'extracteur ne rend pas un nom par modèle — s'arrêter au premier "
+        "tairait les autres, et rendre la liste entière en une chaîne la "
+        "rendrait illisible"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_kserve_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et
+    `dsl_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle des regex, de l'expression et de l'extracteur gojq — et
+    sur le nombre de lignes remontées, une par extracteur nommé.
+    """
+    def scan(metadata_body=KSERVE_METADATA_BODY, models_body=KSERVE_MODELS_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == KSERVE_METADATA_ROUTE:
+                    self.reply(200, metadata_body)
+                elif self.path == KSERVE_MODELS_ROUTE and models_body is not None:
+                    self.reply(200, models_body)
+                else:
+                    self.reply(404, KSERVE_NOT_FOUND_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", KSERVE_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "kserve-model-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert sorted(set(seen)) == [KSERVE_MODELS_ROUTE, KSERVE_METADATA_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["sklearn-iris"], (
+        "le scan ne remonte pas le nom du modèle servi — "
+        f"{results[0].get('extracted-results')}"
+    )
+
+    # Plusieurs modèles : un nom par entrée, et toujours une seule ligne.
+    _, results = scan(models_body=KSERVE_MODELS_SEVERAL_BODY)
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["sklearn-iris", "xgboost-iris"]
+
+    # Les deux corps réindentés par un intermédiaire.
+    _, results = scan(metadata_body=KSERVE_METADATA_REFORMATTED_BODY,
+                      models_body=KSERVE_MODELS_REFORMATTED_BODY)
+    assert len(results) == 1, results
+
+    # Le /v2 de MLServer, sans /v1/models : silence.
+    _, results = scan(metadata_body=MLSERVER_METADATA_BODY, models_body=None)
+    assert results == [], results
+
+    # Un Triton dont --id a posé « kserve », sans /v1/models : silence.
+    _, results = scan(metadata_body=KSERVE_TRITON_RENAMED_BODY, models_body=None)
+    assert results == [], results
+
+    # Un serveur qui ne sert rien encore : non concluant.
+    _, results = scan(models_body=KSERVE_MODELS_EMPTY_BODY)
+    assert results == [], results
