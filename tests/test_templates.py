@@ -37861,3 +37861,551 @@ def test_kserve_matcher_compiles_and_fires_against_a_live_server():
     # Un serveur qui ne sert rien encore : non concluant.
     _, results = scan(models_body=KSERVE_MODELS_EMPTY_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Google ADK API server (google/adk-python, src/google/adk/cli/api_server.py) :
+# le serveur FastAPI que « adk api_server » lance, que « adk web » étend —
+# DevServer (dev_server.py) hérite d'ApiServer — et que « adk deploy cloud_run »
+# et « adk deploy agent_engine » emballent avec --host=0.0.0.0 (cli_deploy.py).
+# La docstring d'ApiServer le dit elle-même : « The served endpoints are
+# unauthenticated. »
+#
+# GET /list-apps?detailed=true — « list_apps(detailed: bool = Query(
+# default=False)) » — rend « ListAppsResponse(apps=[AppInfo(**app) for app in
+# apps_info]) ». AppInfo déclare name, root_agent_name, description, language
+# (Literal["yaml", "python"]), is_computer_use et agents, mais hérite de
+# common.BaseModel (cli/utils/common.py), dont model_config pose
+# alias_generator=to_camel et populate_by_name=True : FastAPI sérialise un
+# modèle de réponse par alias, donc le fil porte rootAgentName et isComputerUse.
+# Mesuré sur un ADK 2.11.0 : « {"apps":[{"name":"hello_agent","rootAgentName":
+# "hello_agent","description":"…","language":"python","isComputerUse":false,
+# "agents":null}]} ». GET /version rend un dict nu — « {"version":"2.11.0",
+# "language":"python","language_version":"3.14.6"} » — en snake_case, puisque
+# aucun modèle ne l'alias.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette
+# section amarre. Les alias d'abord : c'est le couple camelCase — et non les
+# noms déclarés dans le modèle, qu'une transcription de la source aurait
+# écrits — qui désigne le produit, adjacent à « language » contraint à ses deux
+# littérales. L'inventaire ensuite : « {"apps":[]} » ne nomme rien, le constat
+# est alors non concluant. La version enfin : le trio est plat et dans l'ordre
+# du handler, mais sa fin n'est pas exigée tout de suite après lui — une
+# version future peut y ajouter une clé sans retirer celles-ci.
+
+ADK_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "google-adk-api-server-exposed.yaml")
+
+ADK_APPS_ROUTE = "/list-apps?detailed=true"
+ADK_VERSION_ROUTE = "/version"
+
+# Les alias que common.BaseModel génère pour les deux champs composés d'AppInfo.
+ADK_ALIASES = {
+    "root_agent_name": "rootAgentName",
+    "is_computer_use": "isComputerUse",
+}
+
+
+def adk_app(name="hello_agent", root_agent_name=None,
+            description="Agent de laboratoire pour relever la forme du fil.",
+            language="python", is_computer_use=False, agents=None, drop=(),
+            snake=False):
+    """
+    Un élément d'« apps », tel qu'AppInfo se sérialise par alias et dans
+    l'ordre de déclaration : name, rootAgentName, description, language,
+    isComputerUse, agents.
+
+    `snake` écrit les clés comme le modèle les déclare — ce qu'une lecture de
+    la source qui aurait manqué l'alias_generator produirait — et `drop`
+    retire une clé.
+    """
+    def key(declared):
+        return declared if snake else ADK_ALIASES.get(declared, declared)
+
+    document = {
+        "name": name,
+        key("root_agent_name"): name if root_agent_name is None else root_agent_name,
+        "description": description,
+        "language": language,
+        key("is_computer_use"): is_computer_use,
+        "agents": agents,
+    }
+    for declared in drop:
+        document.pop(key(declared), None)
+    return document
+
+
+def adk_apps_body(*apps, indent=None):
+    """Ce que rend GET /list-apps?detailed=true : ListAppsResponse, par alias."""
+    document = {"apps": list(apps)}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+def adk_version_body(version="2.11.0", language="python",
+                     language_version="3.14.6", drop=(), extra=None,
+                     first=None, indent=None):
+    """
+    Ce que rend GET /version : le dict nu du handler, dans son ordre. `extra`
+    ajoute des clés en queue, `first` en remonte une en tête pour défaire
+    l'ancrage, `indent` réécrit le document comme le ferait un intermédiaire.
+    """
+    document = {"version": version, "language": language,
+                "language_version": language_version}
+    for key in drop:
+        document.pop(key, None)
+    if extra:
+        document.update(extra)
+    if first is not None:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+ADK_APPS_BODY = adk_apps_body(adk_app())
+ADK_APPS_SEVERAL_BODY = adk_apps_body(
+    adk_app("hello_agent"),
+    adk_app("weather_agent", description="Donne la météo."))
+ADK_APPS_REFORMATTED_BODY = adk_apps_body(adk_app(), indent=2)
+
+# Les variantes que le modèle admet : un agent déclaré en YAML, un agent
+# outillé pour l'usage d'ordinateur, une description qui porte des guillemets
+# échappés, et le champ agents renseigné plutôt que null.
+ADK_APPS_YAML_BODY = adk_apps_body(adk_app(language="yaml"))
+ADK_APPS_COMPUTER_USE_BODY = adk_apps_body(adk_app(is_computer_use=True))
+ADK_APPS_QUOTED_DESCRIPTION_BODY = adk_apps_body(
+    adk_app(description='Dit "bonjour", puis s\'arrête.'))
+ADK_APPS_WITH_AGENTS_BODY = adk_apps_body(adk_app(agents={
+    "hello_agent": {"name": "hello_agent", "description": "…",
+                    "instruction": "Say hello.", "tools": [],
+                    "sub_agents": []}}))
+
+# L'inventaire tel que le modèle le déclare, et non tel qu'il se sérialise :
+# c'est ce qu'écrirait une transcription de la source qui aurait manqué
+# l'alias_generator de common.BaseModel — et ce que le fil ne porte jamais.
+ADK_APPS_SNAKE_BODY = adk_apps_body(adk_app(snake=True))
+
+# Un serveur dont le répertoire d'agents est vide : la liste est là, elle ne
+# nomme personne.
+ADK_APPS_EMPTY_BODY = adk_apps_body()
+
+# GET /list-apps sans detailed — la liste nue des noms, relayée sur la route
+# détaillée par un cache indexé sur le chemin sans sa requête.
+ADK_APPS_NAMES_ONLY_BODY = '["hello_agent"]'
+
+# Un langage que Literal["yaml", "python"] n'admet pas.
+ADK_APPS_OTHER_LANGUAGE_BODY = adk_apps_body(adk_app(language="go"))
+
+# La charge utile entière au fond d'un document composite qu'une supervision
+# agrégerait sous une clé à elle.
+ADK_APPS_COMPOSITE_BODY = '{"adk":%s,"checked_at":0}' % ADK_APPS_BODY
+
+# Une page qui cite les littérales sans être le serveur.
+ADK_APPS_INVENTORY_BODY = json.dumps(
+    {"service": "agents", "note": "rootAgentName hello_agent isComputerUse "
+     "false language python", "apps": "3"}, separators=(",", ":"))
+
+ADK_VERSION_BODY = adk_version_body()
+ADK_VERSION_REFORMATTED_BODY = adk_version_body(indent=2)
+
+# Une version future qui ajouterait une clé en queue sans retirer le trio.
+ADK_VERSION_EXTRA_KEY_BODY = adk_version_body(extra={"build": "abc123"})
+
+ADK_VERSION_COMPOSITE_BODY = '{"adk":%s,"checked_at":0}' % ADK_VERSION_BODY
+
+# Une passerelle qui republie le document de version du serveur qu'elle
+# proxifie : les littérales y sont mot pour mot, en tête, mais logées à côté
+# d'un objet à elle. C'est ce corps qui rend nécessaire de tenir le document
+# pour plat.
+ADK_VERSION_GATEWAY_QUOTING_BODY = json.dumps(
+    {"version": "2.11.0", "language": "python", "language_version": "3.14.6",
+     "upstream": {"host": "agent.internal", "port": 8000}},
+    separators=(",", ":"))
+
+# Le 404 de FastAPI, et /health, générique.
+ADK_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+ADK_HEALTH_BODY = '{"status":"ok"}'
+
+
+def adk_block():
+    doc = load(ADK_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % ADK_APPS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /list-apps?detailed=true — c'est "
+        "pourtant la seule route dont la réponse porte les alias d'AppInfo, "
+        "donc la seule qui puisse identifier le produit en le nommant"
+    )
+    return blocks[0]
+
+
+def adk_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet
+    ordre qui donne son numéro à chaque body_N.
+    """
+    block = adk_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def adk_fires(apps=(200, ADK_APPS_BODY), version=(200, ADK_VERSION_BODY)):
+    scenario = {
+        ADK_APPS_ROUTE: apps,
+        ADK_VERSION_ROUTE: version,
+    }
+    block = adk_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in adk_requests():
+        assert route in scenario, (
+            "le template interroge un chemin que le scénario ne sert pas : "
+            f"{route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_adk_probe_reads_the_two_routes_and_touches_nothing_else():
+    """
+    Les deux routes de lecture, dans l'ordre, et rien de plus. Le même routeur
+    nu sert POST /run, /run_sse et le WebSocket /run_live, qui feraient
+    tourner un agent aux frais de l'exploitant, et les routes de sessions, de
+    mémoire et d'artefacts, qui s'écrivent. Constater une exposition ne
+    demande d'en toucher aucune.
+    """
+    doc = load(ADK_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", ADK_APPS_ROUTE),
+        ("GET", ADK_VERSION_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 2
+
+    assert adk_requests() == [
+        ("GET", ADK_APPS_ROUTE),
+        ("GET", ADK_VERSION_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {adk_requests()}"
+    )
+
+    assert adk_block().get("method") == "GET", (
+        "les deux routes sont déclarées @app.get : toute autre méthode ne "
+        "mesurerait que le 405 de FastAPI"
+    )
+
+    assert adk_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et le document de version — "
+        "republiable par une passerelle — conclurait de son côté"
+    )
+
+    for block in (doc.get("http") or []):
+        for path in (block.get("path") or []):
+            for route, why in (
+                ("/run", "POST /run, /run_sse et /run_live feraient tourner "
+                         "un agent aux frais de l'exploitant"),
+                ("/apps/", "les routes de sessions, de mémoire, d'artefacts "
+                           "et d'app-info vivent sous ce préfixe, et les "
+                           "premières s'écrivent"),
+                ("/health", "{\"status\":\"ok\"} ne nomme rien"),
+                ("/docs", "le « FastAPI - Swagger UI » générique n'ajouterait "
+                          "rien au constat"),
+                ("/dev-ui", "l'interface de développement n'est servie "
+                            "qu'avec --with_ui et n'ajoute rien au constat"),
+                ("/agent-identity", "la route finalise une poignée de main "
+                                    "OAuth : elle s'écrit"),
+            ):
+                assert route not in path, f"le template touche {route} : {why}"
+
+
+def test_adk_matcher_needs_the_camel_case_aliases_not_a_transcription_of_the_model():
+    assert adk_fires(), (
+        "le template ne reconnaît pas la réponse que list_apps() construit "
+        "sur une instance ouverte, telle qu'un ADK 2.11.0 l'a rendue"
+    )
+
+    assert not adk_fires(apps=(200, ADK_APPS_SNAKE_BODY)), (
+        "le template déclenche sur root_agent_name et is_computer_use : ce "
+        "sont les noms que le modèle déclare, pas ceux que le fil porte — "
+        "common.BaseModel les alias en camelCase, et FastAPI sérialise par "
+        "alias. Un corps en snake_case n'est pas une réponse d'ADK"
+    )
+    assert not adk_fires(
+        apps=(200, adk_apps_body(adk_app(drop=("is_computer_use",))))), (
+        "le template conclut sans isComputerUse : les cinq premiers champs "
+        "sont déclarés sans Optional, et c'est leur adjacence qui dit que la "
+        "réponse est bien celle d'AppInfo"
+    )
+    assert not adk_fires(
+        apps=(200, adk_apps_body(adk_app(drop=("root_agent_name",))))), (
+        "le template conclut sans rootAgentName"
+    )
+    assert not adk_fires(apps=(200, ADK_APPS_OTHER_LANGUAGE_BODY)), (
+        "le template admet un langage que Literal[\"yaml\", \"python\"] "
+        "n'admet pas"
+    )
+
+    assert not adk_fires(apps=(200, ADK_APPS_EMPTY_BODY)), (
+        "le template déclenche sur « {\"apps\":[]} » : un serveur dont le "
+        "répertoire d'agents est vide ne nomme rien, et le constat est non "
+        "concluant"
+    )
+    assert not adk_fires(apps=(200, ADK_APPS_NAMES_ONLY_BODY)), (
+        "le template déclenche sur la liste nue des noms — GET /list-apps "
+        "sans detailed — qui ne porte aucun alias et ne nomme pas le produit"
+    )
+    assert not adk_fires(apps=(200, ADK_APPS_COMPOSITE_BODY)), (
+        "le template déclenche sur la charge utile republiée au fond du "
+        "document d'une supervision : l'ancrage sur l'ouverture du corps est "
+        "ce qui dit que l'instance a répondu d'elle-même"
+    )
+    assert not adk_fires(apps=(200, ADK_APPS_INVENTORY_BODY)), (
+        "le template déclenche sur une page qui cite les littérales sans être "
+        "le serveur"
+    )
+    for body, why in (
+        (ADK_HEALTH_BODY, "GET /health relayé sur l'inventaire — générique"),
+        (ADK_VERSION_BODY, "le document de version relayé sur l'inventaire — "
+                           "un cache indexé sur l'hôte et non sur le chemin"),
+        (ADK_NOT_FOUND_BODY, "le 404 de FastAPI"),
+        ("<html><body>Connexion requise</body></html>", "un portail captif"),
+    ):
+        assert not adk_fires(apps=(200, body)), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_adk_matcher_admits_the_serialisations_the_server_and_a_proxy_emit():
+    assert adk_fires(apps=(200, ADK_APPS_REFORMATTED_BODY)), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : FastAPI écrit compact, un proxy ne s'y tient pas"
+    )
+    assert adk_fires(version=(200, ADK_VERSION_REFORMATTED_BODY)), (
+        "le template exige la sérialisation compacte du document de version"
+    )
+    assert adk_fires(apps=(200, ADK_APPS_SEVERAL_BODY)), (
+        "le template rate un serveur qui sert plusieurs applications"
+    )
+    assert adk_fires(apps=(200, ADK_APPS_YAML_BODY)), (
+        "le template rate un agent déclaré en YAML : Literal[\"yaml\", "
+        "\"python\"] admet les deux"
+    )
+    assert adk_fires(apps=(200, ADK_APPS_COMPUTER_USE_BODY)), (
+        "le template rate un agent outillé pour l'usage d'ordinateur : "
+        "isComputerUse vaut alors true"
+    )
+    assert adk_fires(apps=(200, ADK_APPS_QUOTED_DESCRIPTION_BODY)), (
+        "le template rate une description qui porte des guillemets échappés : "
+        "c'est du texte de l'exploitant, il n'est pas contraint"
+    )
+    assert adk_fires(apps=(200, ADK_APPS_WITH_AGENTS_BODY)), (
+        "le template rate un inventaire dont le champ agents est renseigné "
+        "plutôt que null : il est Optional, pas absent"
+    )
+    assert adk_fires(version=(200, adk_version_body(version="1.4.2",
+                                                    language_version="3.12.3"))), (
+        "le template contraint les numéros de version : ils changent à chaque "
+        "publication du paquet et de l'interpréteur"
+    )
+    assert adk_fires(version=(200, ADK_VERSION_EXTRA_KEY_BODY)), (
+        "le template tient le document de version pour fermé : une version "
+        "future peut y ajouter une clé sans retirer le trio"
+    )
+
+
+def test_adk_version_arm_requires_the_flat_trio_in_the_handler_order():
+    assert not adk_fires(version=(200, adk_version_body(drop=("language_version",)))), (
+        "le template conclut sans language_version : le handler écrit les "
+        "trois clés, et c'est leur adjacence qui dit que la réponse est la "
+        "sienne"
+    )
+    assert not adk_fires(version=(200, adk_version_body(language="go"))), (
+        "le template admet un langage que le handler n'écrit pas : "
+        "« python » y est une littérale"
+    )
+    assert not adk_fires(version=(200, adk_version_body(first="language"))), (
+        "le template admet un ordre de clés que le handler n'émet pas"
+    )
+    assert not adk_fires(version=(200, adk_version_body(language_version="3.12"))), (
+        "le template admet un numéro d'interpréteur à deux nombres : le "
+        "handler en formate trois depuis sys.version_info"
+    )
+    assert not adk_fires(version=(200, ADK_VERSION_COMPOSITE_BODY)), (
+        "le template admet le document de version enveloppé sous une clé "
+        "étrangère"
+    )
+    assert not adk_fires(version=(200, ADK_VERSION_GATEWAY_QUOTING_BODY)), (
+        "le template déclenche sur une passerelle qui republie le document de "
+        "version du serveur qu'elle proxifie : les littérales y sont en tête, "
+        "mais le handler ne rend que trois chaînes — aucune paire { } ne peut "
+        "apparaître à l'intérieur"
+    )
+    for body, why in (
+        (ADK_HEALTH_BODY, "GET /health relayé sur /version"),
+        (ADK_APPS_BODY, "l'inventaire relayé sur /version"),
+        (ADK_NOT_FOUND_BODY, "le 404 de FastAPI : c'est l'inventaire seul, et "
+                             "il peut être le miroir d'une supervision"),
+        (TGI_INFO_BODY, "le /info de TGI, qui porte aussi une version"),
+        ("<html><body>Connexion requise</body></html>", "un portail captif"),
+    ):
+        assert not adk_fires(version=(200, body)), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_adk_conclusion_is_carried_by_the_dsl_alone_and_never_by_the_status():
+    """
+    Ni list_apps() ni version() n'ont de branche d'échec : les deux rendent
+    leur objet sous un 200, et un statut n'écarterait rien de plus. Le constat
+    tient aux corps, liés par leur numéro.
+    """
+    block = adk_block()
+    matchers = block.get("matchers") or []
+    kinds = {m.get("type") for m in matchers}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+    for matcher in matchers:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes passer, sinon les alias du produit "
+            "peuvent être court-circuités par la seule forme du document de "
+            "version"
+        )
+        for expr in matcher.get("dsl") or []:
+            assert "status_code" not in expr, (
+                "le constat tient au statut : la route rend 200 quoi qu'il "
+                "arrive, et un intermédiaire qui réécrit le statut ferait "
+                f"manquer l'instance — {expr}"
+            )
+
+    assert adk_fires(apps=(503, ADK_APPS_BODY)), (
+        "le verdict change avec le statut alors qu'aucune expression ne le lit"
+    )
+
+
+def test_adk_extractor_reports_the_app_names():
+    extractors = adk_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — c'est l'inventaire qui porte "
+        "les noms d'applications, et chacun désigne un corps pour POST /run"
+    )
+    assert extractor.get("json") == [".apps[].name"], (
+        "l'extracteur ne rend pas un nom par application — s'arrêter au "
+        "premier tairait les autres, et rendre la liste entière en une chaîne "
+        "la rendrait illisible"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_adk_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et
+    `dsl_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle des regex, de l'expression et de l'extracteur gojq — et
+    sur le nombre de lignes remontées, une par extracteur nommé.
+    """
+    def scan(apps_body=ADK_APPS_BODY, version_body=ADK_VERSION_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == ADK_APPS_ROUTE:
+                    self.reply(200, apps_body)
+                elif self.path == ADK_VERSION_ROUTE and version_body is not None:
+                    self.reply(200, version_body)
+                else:
+                    self.reply(404, ADK_NOT_FOUND_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", ADK_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "google-adk-api-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert sorted(set(seen)) == sorted([ADK_APPS_ROUTE, ADK_VERSION_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["hello_agent"], (
+        "le scan ne remonte pas le nom de l'application servie — "
+        f"{results[0].get('extracted-results')}"
+    )
+
+    # Plusieurs applications : un nom par entrée, et toujours une seule ligne.
+    _, results = scan(apps_body=ADK_APPS_SEVERAL_BODY)
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["hello_agent", "weather_agent"]
+
+    # Les deux corps réindentés par un intermédiaire.
+    _, results = scan(apps_body=ADK_APPS_REFORMATTED_BODY,
+                      version_body=ADK_VERSION_REFORMATTED_BODY)
+    assert len(results) == 1, results
+
+    # Une transcription du modèle en snake_case : silence.
+    _, results = scan(apps_body=ADK_APPS_SNAKE_BODY)
+    assert results == [], results
+
+    # Un serveur dont le répertoire d'agents est vide : non concluant.
+    _, results = scan(apps_body=ADK_APPS_EMPTY_BODY)
+    assert results == [], results
+
+    # L'inventaire sans la route de version : silence.
+    _, results = scan(version_body=None)
+    assert results == [], results

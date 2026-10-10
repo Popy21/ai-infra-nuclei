@@ -1,0 +1,202 @@
+id: google-adk-api-server-exposed
+
+info:
+  name: Google ADK API Server - Unauthenticated Agent Inventory and Runtime Exposure
+  author: popy21
+  severity: high
+  description: |
+    Google ADK (google/adk-python, « Agent Development Kit ») est la boîte à
+    outils Python de Google pour construire, évaluer et déployer des agents, et
+    « adk api_server » en est le serveur FastAPI : c'est lui que « adk web »
+    étend — DevServer, dans src/google/adk/cli/dev_server.py, hérite d'ApiServer
+    et n'y ajoute que des routes de développement — et c'est lui que « adk
+    deploy cloud_run » et « adk deploy agent_engine » emballent en conteneur :
+    src/google/adk/cli/cli_deploy.py rend le Dockerfile avec
+    command='api_server' et host_option='--host=0.0.0.0', sur le port 8080.
+    Ce serveur n'a pas de garde à activer, et le produit le dit lui-même. La
+    docstring d'ApiServer (src/google/adk/cli/api_server.py) porte une section
+    Security : « The served endpoints are unauthenticated. Any client that can
+    reach the server can read and write sessions, memory, and artifacts and run
+    agents for any user or app. Run it only on a trusted network (for example
+    bound to localhost for local development) and do not expose it directly to
+    untrusted or public networks. Put it behind your own authentication and
+    authorization layer before serving multiple users or exposing it beyond
+    the local machine. » cli_tools_click.py le répète dans l'aide des deux
+    commandes — « This server's endpoints are unauthenticated » — et ses seules
+    options d'authentification, --trigger_oidc_audience et
+    --trigger_oidc_service_accounts, ne couvrent que /apps/{app}/trigger/*.
+    L'application est construite « FastAPI(lifespan=internal_lifespan,
+    root_path=root_path) », sans titre ni dependencies= : /docs affiche le
+    « FastAPI - Swagger UI » générique. Les valeurs par défaut de
+    cli_tools_click.py sont --host 127.0.0.1 et --port 8000 ; l'exposition
+    survient dès que l'opérateur passe --host 0.0.0.0, ce que le produit fait
+    lui-même à chaque déploiement.
+    GET /list-apps?detailed=true porte l'identification et l'inventaire. Le
+    handler « list_apps(detailed: bool = Query(default=False)) » rend
+    « ListAppsResponse(apps=[AppInfo(**app) for app in apps_info]) » quand
+    detailed est posé, et la liste nue des noms sinon. AppInfo déclare name,
+    root_agent_name, description, language (Literal["yaml", "python"]),
+    is_computer_use (bool, False par défaut) et agents (Optional, None) — mais
+    AppInfo hérite de common.BaseModel (src/google/adk/cli/utils/common.py),
+    dont model_config pose alias_generator=to_camel et populate_by_name=True,
+    et FastAPI sérialise un modèle de réponse par alias. Sur le fil, les clés
+    sont donc rootAgentName et isComputerUse, et c'est ce couple en camelCase,
+    adjacent à « language » contraint à python ou yaml, qui désigne le produit :
+    un ADK 2.11.0 mesuré rend « {"apps":[{"name":"hello_agent",
+    "rootAgentName":"hello_agent","description":"…","language":"python",
+    "isComputerUse":false,"agents":null}]} », compact et dans l'ordre de
+    déclaration. apps_info vient d'AgentLoader.list_agents_detailed()
+    (src/google/adk/cli/utils/agent_loader.py) : un élément par sous-dossier
+    du répertoire d'agents qui ressemble à un agent, trié, chargé pour en lire
+    root_agent.name et root_agent.description. Une instance sans agent rend
+    « {"apps":[]} », qui ne nomme rien — le constat est alors non concluant.
+    GET /version corrobore et date. Le handler rend un dict nu — « {"version":
+    __version__, "language": "python", "language_version":
+    "<major.minor.micro>"} » — donc en snake_case cette fois, sans modèle ni
+    alias : le trio version + language + language_version, plat et dans cet
+    ordre, est la seule autre route qui identifie le produit sans énumérer ;
+    /health rend « {"status":"ok"} », générique, et GET / répond 404 hors mode
+    --with_ui.
+  impact: |
+    L'inventaire nomme chaque application d'agents et son agent racine, et
+    chaque nom désigne une cible appelable sur le même routeur nu. POST /run
+    exécute l'agent désigné, outils compris, aux frais des clés de modèle de
+    l'exploitant — Gemini ou Vertex AI — pour quiconque joint le port ; POST
+    /run_sse et le WebSocket /run_live font de même en continu. GET
+    /apps/{app}/app-info livre l'instruction système de l'agent, la liste de
+    ses outils et de ses sous-agents — le prompt et l'outillage que
+    l'organisation a construits. Les sessions, la mémoire et les artefacts de
+    tout utilisateur et de toute application se lisent et s'écrivent sans
+    identifiant, comme la docstring le dit elle-même. /version date l'install
+    au correctif près. Rien de tout cela n'est attribuable : aucun compte
+    n'existe, les journaux ne porteront qu'une adresse.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à activer sur ce serveur : la
+    fermeture est entièrement réseau, et c'est à la couche qui l'entoure de la
+    poser. En local, laisser --host à sa valeur par défaut, 127.0.0.1, et ne
+    pas publier le port d'un conteneur sur toutes les interfaces — « -p
+    127.0.0.1:8000:8000 » quand il doit rester local. Sur Cloud Run, garder le
+    service fermé — « --no-allow-unauthenticated », tel que l'aide d'adk deploy
+    le montre — et joindre l'agent avec un jeton d'identité ; ailleurs, placer
+    un proxy qui authentifie devant le serveur et vérifier qu'il couvre le
+    préfixe entier — /run, /run_sse, /run_live, /apps/ et /list-apps — et non
+    /version seul.
+    Vérifier la prise en compte depuis l'extérieur du périmètre et sans
+    identifiant : « curl -s "http://<hote>:8000/list-apps?detailed=true" » et
+    « curl -s http://<hote>:8000/version » ne doivent plus rendre leurs
+    documents.
+    Après une exposition, tenir les instructions et l'outillage des agents pour
+    lus, puis vérifier dans les journaux d'accès si /run, /run_sse ou /run_live
+    ont été appelés et si des sessions ou des artefacts ont été écrits depuis
+    une adresse inattendue ; faire tourner les clés de modèle si la facture le
+    suggère.
+  reference:
+    - https://github.com/google/adk-python/blob/main/src/google/adk/cli/api_server.py
+    - https://github.com/google/adk-python/blob/main/src/google/adk/cli/utils/common.py
+    - https://github.com/google/adk-python/blob/main/src/google/adk/cli/utils/agent_loader.py
+    - https://github.com/google/adk-python/blob/main/src/google/adk/cli/cli_tools_click.py
+    - https://github.com/google/adk-python/blob/main/src/google/adk/cli/cli_deploy.py
+    - https://github.com/google/adk-python/blob/main/src/google/adk/cli/dev_server.py
+    - https://google.github.io/adk-docs/get-started/testing/
+    - https://google.github.io/adk-docs/deploy/cloud-run/
+    - https://google.github.io/adk-docs/deploy/agent-engine/
+  metadata:
+    max-request: 2
+    vendor: google
+    product: adk-python
+  tags: ai,llm,agents,google,adk,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit et porte l'inventaire, la
+  # seconde dit que le même serveur répond sur sa route de version, et date.
+  #
+  # GET /list-apps?detailed=true est la route d'inventaire. Son handler ne
+  # consulte que le chargeur d'agents : il liste les sous-dossiers du
+  # répertoire d'agents et charge chacun pour lire son nom et sa description.
+  # Il n'ouvre aucune session, n'écrit rien, n'appelle aucun modèle.
+  #
+  # GET /version recopie trois constantes. C'est la lecture la moins chère qui
+  # identifie l'instance, et la seule qui le fasse sans énumérer.
+  #
+  # GET, et rien d'autre : les deux routes sont déclarées @app.get, et FastAPI
+  # rend 405 sur le reste.
+  #
+  # En lecture seule, et strictement : le même routeur nu sert POST /run,
+  # /run_sse et le WebSocket /run_live, qui feraient tourner un agent aux frais
+  # de l'exploitant, et les routes de sessions, de mémoire et d'artefacts, qui
+  # s'écrivent. Signaler une exposition ne demande d'en toucher aucune — et
+  # l'inventaire que le template lit est précisément ce qui dirait quel agent
+  # appeler.
+  - method: GET
+    path:
+      - "{{BaseURL}}/list-apps?detailed=true"
+      - "{{BaseURL}}/version"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, chacune conclurait de son côté — or le
+    # document de version seul peut être republié par une passerelle, et
+    # l'inventaire seul pourrait être le miroir d'une supervision.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'identification, et elle tient à la sérialisation d'AppInfo. Les
+          # clés rootAgentName et isComputerUse sont les alias camelCase que
+          # common.BaseModel génère pour root_agent_name et is_computer_use —
+          # c'est le couple que FastAPI écrit sur le fil, et non les noms
+          # déclarés dans le modèle. Entre les deux, « language » est contraint
+          # à ses deux littérales Literal["yaml", "python"]. L'adjacence des
+          # cinq champs suit leur déclaration — name, root_agent_name,
+          # description, language, is_computer_use — et c'est l'ordre que
+          # Pydantic sérialise.
+          #
+          # La liste doit nommer au moins une application. « {"apps":[]} » est
+          # un serveur dont le répertoire d'agents est vide — rien à appeler,
+          # rien à lire — et il ne divulgue rien ; le constat est non
+          # concluant, et le prix est assumé : un déploiement sert toujours au
+          # moins l'agent qu'il emballe.
+          #
+          # L'ancrage sur l'ouverture du corps écarte la même charge utile
+          # retrouvée au fond d'un document composite qu'une supervision
+          # agrégerait sous une clé à elle. La description est laissée libre,
+          # guillemets échappés compris : c'est du texte de l'exploitant. Les
+          # \s* sont là parce que FastAPI écrit compact, mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          - 'regex("^\\{\\s*\"apps\"\\s*:\\s*\\[\\s*\\{\\s*\"name\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"rootAgentName\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"description\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"language\"\\s*:\\s*\"(python|yaml)\"\\s*,\\s*\"isComputerUse\"\\s*:\\s*(true|false)", trim_space(body_1))'
+
+          # La route de version a répondu, et comme son handler l'écrit : un
+          # dict nu de trois chaînes, version puis language — « python », écrit
+          # en dur — puis language_version, en snake_case cette fois puisque
+          # aucun modèle ne l'alias. Le numéro de version est laissé libre : il
+          # change à chaque publication du paquet. Celui de l'interpréteur est
+          # contraint à trois nombres, parce que le handler les formate
+          # lui-même depuis sys.version_info.
+          - 'regex("^\\{\\s*\"version\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"language\"\\s*:\\s*\"python\"\\s*,\\s*\"language_version\"\\s*:\\s*\"\\d+\\.\\d+\\.\\d+\"", trim_space(body_2))'
+
+          # Le document de version est tenu pour plat, et il l'est par
+          # construction : trois chaînes, dont aucune n'ouvre d'accolade. C'est
+          # ce qui sépare la réponse du serveur du document d'une passerelle
+          # qui citerait les mêmes littérales en tête, à côté d'un objet à
+          # elle. La fin du document n'est pas exigée tout de suite après le
+          # trio : une version future peut y ajouter une clé sans retirer
+          # celles-ci.
+          - 'regex("^\\{[^{}]*\\}$", trim_space(body_2))'
+
+    extractors:
+      # Les noms des applications servies : c'est ce qui appartient à
+      # l'exploitant dans les deux réponses, et le premier renseignement qu'un
+      # tiers en tire — chacun désigne un corps « {"appName": …} » pour
+      # POST /run, et une route /apps/{app}/app-info qui livre l'instruction
+      # système et l'outillage de l'agent.
+      #
+      # Un seul extracteur, et borné à body_1 : sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, donc en ajouter un second — la
+      # version, que body_2 porte — ferait remonter deux fois la même instance.
+      - type: json
+        part: body_1
+        name: app
+        json:
+          - '.apps[].name'
