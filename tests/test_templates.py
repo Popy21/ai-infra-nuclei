@@ -38409,3 +38409,443 @@ def test_adk_matcher_compiles_and_fires_against_a_live_server():
     # L'inventaire sans la route de version : silence.
     _, results = scan(version_body=None)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# GPT-SoVITS api_v2 (RVC-Boss/GPT-SoVITS, api_v2.py) : le serveur d'inférence
+# HTTP du moteur de clonage vocal few-shot, lancé par « python api_v2.py -a
+# 127.0.0.1 -p 9880 ». Il n'a pas d'authentification à activer — « APP =
+# FastAPI() », aucune dépendance de sécurité dans le fichier — et toutes ses
+# routes, /control compris, répondent à qui atteint l'adresse d'écoute.
+#
+# Le constat tient à deux refus. GET /set_gpt_weights sans paramètre sort du
+# handler avant init_t2s_weights — « if weights_path in ["", None]: return
+# JSONResponse(status_code=400, content={"message": "gpt weight path is
+# required"}) » — et GET /set_sovits_weights fait de même avant
+# init_vits_weights, avec « sovits weight path is required ». Les deux chaînes
+# sont des littéraux du fichier, présents depuis le premier commit d'api_v2.py
+# (2024-08-20), et Starlette les sérialise compact.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette
+# section amarre. Le paramètre d'abord : la sonde n'en porte aucun, parce que
+# « ?weights_path=… » ferait charger un fichier au serveur — c'est l'abus que
+# le constat signale. Le statut ensuite : le 400 est exigé, parce qu'un 200
+# sur ces routes signifie « success », c'est-à-dire qu'un chargement a eu
+# lieu, et qu'un template qui l'accepterait rapporterait ce qu'il aurait
+# causé. Les deux messages enfin : chacun est propre à sa route, et c'est leur
+# conjonction qui désigne le produit — /control et /tts rendent des refus
+# génériques, « command is required », « text is required », que le template
+# n'a pas à voir.
+
+GPTSOVITS_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "gpt-sovits-api-exposed.yaml")
+
+GPTSOVITS_GPT_ROUTE = "/set_gpt_weights"
+GPTSOVITS_SOVITS_ROUTE = "/set_sovits_weights"
+
+GPTSOVITS_GPT_MESSAGE = "gpt weight path is required"
+GPTSOVITS_SOVITS_MESSAGE = "sovits weight path is required"
+
+
+def gptsovits_message_body(message, indent=None, extra=None):
+    """
+    Ce que rend un JSONResponse de api_v2.py : un dict à une clé, « message »,
+    que Starlette sérialise compact. `extra` ajoute des clés derrière, comme
+    le fait la branche d'exception du même handler ; `indent` réécrit le
+    document comme le ferait un intermédiaire.
+    """
+    document = {"message": message}
+    if extra:
+        document.update(extra)
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+GPTSOVITS_GPT_REFUSAL_BODY = gptsovits_message_body(GPTSOVITS_GPT_MESSAGE)
+GPTSOVITS_SOVITS_REFUSAL_BODY = gptsovits_message_body(GPTSOVITS_SOVITS_MESSAGE)
+
+GPTSOVITS_GPT_REFUSAL_REFORMATTED_BODY = gptsovits_message_body(
+    GPTSOVITS_GPT_MESSAGE, indent=2)
+GPTSOVITS_SOVITS_REFUSAL_REFORMATTED_BODY = gptsovits_message_body(
+    GPTSOVITS_SOVITS_MESSAGE, indent=2)
+
+# Ce que la même route rend sous un 200 : un fichier de poids vient d'être
+# chargé. Le template ne doit jamais le voir — il n'envoie pas de paramètre, et
+# s'il le voyait, c'est qu'un intermédiaire aurait ajouté le sien.
+GPTSOVITS_SUCCESS_BODY = gptsovits_message_body("success")
+
+# La branche d'exception du handler : un paramètre a été envoyé, le chargement
+# a échoué. Même statut 400, même clé « message », mais ce n'est pas le refus
+# de la requête nue — et la clé « Exception » ferme autrement le document.
+GPTSOVITS_CHANGE_FAILED_BODY = gptsovits_message_body(
+    "change gpt weight failed",
+    extra={"Exception": "[Errno 2] No such file or directory: 'x.ckpt'"})
+
+# Les refus génériques des autres routes du même fichier, relayés sur celles
+# que le template lit : /control sans paramètre, /tts sans texte.
+GPTSOVITS_CONTROL_REFUSAL_BODY = gptsovits_message_body("command is required")
+GPTSOVITS_TTS_REFUSAL_BODY = gptsovits_message_body("text is required")
+
+# Ce qu'une route FastAPI dont le paramètre serait déclaré obligatoire rendrait
+# à la même requête nue : un 422 de validation. api_v2.py déclare
+# « weights_path: str = None », donc jamais ceci.
+GPTSOVITS_VALIDATION_ERROR_BODY = json.dumps(
+    {"detail": [{"type": "missing", "loc": ["query", "weights_path"],
+                 "msg": "Field required", "input": None}]},
+    separators=(",", ":"))
+
+# Le refus au fond d'un document composite qu'une supervision agrégerait sous
+# une clé à elle, et le même recopié en tête par une passerelle qui ajoute une
+# clé derrière.
+GPTSOVITS_COMPOSITE_BODY = '{"gpt_sovits":%s,"checked_at":0}' % GPTSOVITS_GPT_REFUSAL_BODY
+GPTSOVITS_APPENDED_BODY = GPTSOVITS_GPT_REFUSAL_BODY[:-1] + ',"checked_at":0}'
+
+# Une page de documentation qui cite la phrase sans être le serveur.
+GPTSOVITS_DOC_PAGE_BODY = (
+    "<html><body><p>Without a parameter the route answers "
+    '{"message":"gpt weight path is required"} with status 400.</p>'
+    "</body></html>"
+)
+
+# Le 404 de FastAPI, et un intermédiaire qui refuse la route à l'anonyme.
+GPTSOVITS_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+GPTSOVITS_PROXY_DENIED_BODY = '{"detail":"Not authenticated"}'
+
+
+def gptsovits_block():
+    doc = load(GPTSOVITS_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % GPTSOVITS_GPT_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /set_gpt_weights — c'est pourtant, "
+        "avec /set_sovits_weights, la seule route dont le refus nomme le "
+        "produit sans rien lui faire faire"
+    )
+    return blocks[0]
+
+
+def gptsovits_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet
+    ordre qui donne son numéro à chaque body_N et status_code_N.
+    """
+    block = gptsovits_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def gptsovits_fires(gpt=(400, GPTSOVITS_GPT_REFUSAL_BODY),
+                    sovits=(400, GPTSOVITS_SOVITS_REFUSAL_BODY)):
+    scenario = {
+        GPTSOVITS_GPT_ROUTE: gpt,
+        GPTSOVITS_SOVITS_ROUTE: sovits,
+    }
+    block = gptsovits_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in gptsovits_requests():
+        assert route in scenario, (
+            "le template interroge un chemin que le scénario ne sert pas : "
+            f"{route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_gptsovits_probe_reads_the_two_refusals_and_sends_no_parameter():
+    """
+    Les deux routes de poids, nues, dans l'ordre, et rien de plus. Un
+    « ?weights_path=… » ferait charger un fichier au serveur — torch.load
+    sur un chemin choisi par l'appelant — ; /control avec paramètre arrête ou
+    relance le processus ; /tts fait tourner la synthèse sur le GPU de
+    l'exploitant et lève un 500 dès que text_lang est omis ; /set_refer_audio
+    fait lire un fichier de l'hôte. Constater l'exposition ne demande
+    d'en toucher aucune.
+    """
+    doc = load(GPTSOVITS_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", GPTSOVITS_GPT_ROUTE),
+        ("GET", GPTSOVITS_SOVITS_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de poids — "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 2
+
+    assert gptsovits_requests() == [
+        ("GET", GPTSOVITS_GPT_ROUTE),
+        ("GET", GPTSOVITS_SOVITS_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {gptsovits_requests()}"
+    )
+
+    block = gptsovits_block()
+    assert block.get("method") == "GET", (
+        "les deux routes sont déclarées @APP.get : toute autre méthode ne "
+        "mesurerait que le 405 de FastAPI"
+    )
+    assert block.get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, ni body_N "
+        "ni status_code_N n'existent, et un seul message — une chaîne qu'une "
+        "page de documentation peut citer — conclurait de son côté"
+    )
+    assert not block.get("body") and not block.get("raw"), (
+        "le bloc envoie un corps ou une requête brute : rien de ce que le "
+        "template établit ne demande d'envoyer quoi que ce soit au serveur"
+    )
+
+    for block in (doc.get("http") or []):
+        for path in (block.get("path") or []):
+            assert "?" not in path and "weights_path" not in path, (
+                f"le template envoie un paramètre : {path} — avec "
+                "weights_path renseigné, le handler appelle "
+                "init_t2s_weights ou init_vits_weights et charge le fichier "
+                "désigné"
+            )
+            for route, why in (
+                ("/control", "handle_control traite restart et exit : la "
+                             "route arrête ou relance le processus"),
+                ("/tts", "la synthèse tourne sur le GPU de l'exploitant, et "
+                         "le handler lève un 500 dès que text_lang est omis"),
+                ("/set_refer_audio", "set_ref_audio lit le fichier désigné "
+                                     "comme voix de référence"),
+                ("/docs", "le « FastAPI - Swagger UI » générique n'ajouterait "
+                          "rien au constat"),
+            ):
+                assert route not in path, f"le template touche {route} : {why}"
+
+
+def test_gptsovits_matcher_needs_both_product_literals_each_on_its_route():
+    assert gptsovits_fires(), (
+        "le template ne reconnaît pas les deux refus que set_gpt_weights et "
+        "set_sovits_weights rendent à une requête nue"
+    )
+
+    for body, why in (
+        (GPTSOVITS_CONTROL_REFUSAL_BODY, "le refus de /control, « command is "
+                                         "required » — générique"),
+        (GPTSOVITS_TTS_REFUSAL_BODY, "le refus de /tts, « text is required » "
+                                     "— générique"),
+        (GPTSOVITS_CHANGE_FAILED_BODY, "la branche d'exception du handler : "
+                                       "un paramètre a été envoyé, ce n'est "
+                                       "pas le refus de la requête nue"),
+        (GPTSOVITS_VALIDATION_ERROR_BODY, "le 422 d'une route FastAPI dont le "
+                                          "paramètre serait obligatoire — "
+                                          "api_v2.py déclare « = None »"),
+        (GPTSOVITS_COMPOSITE_BODY, "le refus republié au fond du document "
+                                   "d'une supervision : l'ancrage sur "
+                                   "l'ouverture dit que l'instance a répondu "
+                                   "d'elle-même"),
+        (GPTSOVITS_APPENDED_BODY, "un document composite qui ouvre sur le "
+                                  "refus et ajoute une clé derrière : le "
+                                  "handler n'écrit qu'une clé, et l'ancrage "
+                                  "de fermeture doit l'écarter"),
+        (GPTSOVITS_DOC_PAGE_BODY, "une page de documentation qui cite la "
+                                  "phrase sans être le serveur"),
+        (GPTSOVITS_NOT_FOUND_BODY, "le 404 de FastAPI"),
+        (GPTSOVITS_PROXY_DENIED_BODY, "un intermédiaire qui refuse la route à "
+                                      "l'anonyme"),
+        ("<html><body>Connexion requise</body></html>", "un portail captif"),
+        ("", "une réponse vide"),
+    ):
+        assert not gptsovits_fires(gpt=(400, body)), (
+            f"le template déclenche sur {why}"
+        )
+        assert not gptsovits_fires(sovits=(400, body)), (
+            f"le template déclenche sur {why}, relayé sur /set_sovits_weights"
+        )
+
+    # Chaque message est propre à sa route : un cache qui relaierait le
+    # premier document sur la seconde, ou les deux inversés, n'est pas le
+    # serveur.
+    assert not gptsovits_fires(sovits=(400, GPTSOVITS_GPT_REFUSAL_BODY)), (
+        "le template conclut quand /set_sovits_weights rend le message de "
+        "/set_gpt_weights : les deux routes écrivent chacune le sien"
+    )
+    assert not gptsovits_fires(gpt=(400, GPTSOVITS_SOVITS_REFUSAL_BODY),
+                               sovits=(400, GPTSOVITS_GPT_REFUSAL_BODY)), (
+        "le template conclut sur les deux messages inversés"
+    )
+    assert not gptsovits_fires(gpt=(400, gptsovits_message_body(
+        "GPT weight path is required"))), (
+        "le template admet une casse que le littéral n'a pas"
+    )
+
+
+def test_gptsovits_matcher_admits_the_serialisations_the_server_and_a_proxy_emit():
+    assert gptsovits_fires(gpt=(400, GPTSOVITS_GPT_REFUSAL_REFORMATTED_BODY),
+                           sovits=(400, GPTSOVITS_SOVITS_REFUSAL_REFORMATTED_BODY)), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : Starlette écrit compact, un proxy ne s'y tient pas"
+    )
+    assert gptsovits_fires(gpt=(400, GPTSOVITS_GPT_REFUSAL_BODY + "\n"),
+                           sovits=(400, GPTSOVITS_SOVITS_REFUSAL_BODY + "\n")), (
+        "le template ne survit pas à une fin de ligne ajoutée par un "
+        "intermédiaire"
+    )
+
+
+def test_gptsovits_requires_the_refusal_status_and_never_concludes_on_a_200():
+    """
+    Le 400 fait partie du constat. Le littéral ne sort du handler que sous ce
+    statut, et la seule autre réponse de la route — « success », sous un 200 —
+    dit qu'un fichier de poids vient d'être chargé. Un template qui
+    accepterait un 200 rapporterait ce qu'il aurait lui-même causé.
+    """
+    block = gptsovits_block()
+    matchers = block.get("matchers") or []
+    kinds = {m.get("type") for m in matchers}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier chaque statut à son corps par leur numéro"
+    )
+    expressions = [expr for m in matchers for expr in (m.get("dsl") or [])]
+    for matcher in matchers:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes passer : un seul refus n'est "
+            "qu'une chaîne"
+        )
+    assert any("status_code_1 == 400" in expr for expr in expressions), (
+        "le constat ne lit pas le statut du premier refus : un 200 sur "
+        "/set_gpt_weights signifie qu'un chargement a eu lieu"
+    )
+    assert any("status_code_2 == 400" in expr for expr in expressions), (
+        "le constat ne lit pas le statut du second refus"
+    )
+    for expr in expressions:
+        assert "== 200" not in expr, (
+            f"le constat admet un 200 : {expr}"
+        )
+
+    assert not gptsovits_fires(gpt=(200, GPTSOVITS_SUCCESS_BODY)), (
+        "le template conclut sur « success » : un fichier de poids a été "
+        "chargé, et ce n'est pas le refus que le constat décrit"
+    )
+    assert not gptsovits_fires(gpt=(200, GPTSOVITS_GPT_REFUSAL_BODY)), (
+        "le template conclut sur le message de refus servi sous un 200 : le "
+        "handler ne l'émet jamais sous ce statut"
+    )
+    assert not gptsovits_fires(sovits=(200, GPTSOVITS_SOVITS_REFUSAL_BODY)), (
+        "le template conclut sur le second refus servi sous un 200"
+    )
+    assert not gptsovits_fires(gpt=(400, GPTSOVITS_SUCCESS_BODY)), (
+        "le template conclut sur « success » sous un 400 : le corps n'est pas "
+        "le refus, quel que soit le statut"
+    )
+
+
+def test_gptsovits_reports_nothing_of_its_own_because_the_refusals_are_literals():
+    """
+    Les deux corps sont des constantes du fichier source : un extracteur
+    remonterait la même chaîne sur chaque instance, et sous req-condition le
+    moteur émettrait une ligne par extracteur qui rend quelque chose.
+    """
+    assert not gptsovits_block().get("extractors"), (
+        "le template porte un extracteur alors que les deux réponses ne "
+        "contiennent rien qui appartienne à l'exploitant"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_gptsovits_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et
+    `dsl_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle des regex et de l'expression — et sur le fait que la
+    sonde part bien sans paramètre.
+    """
+    def scan(gpt=(400, GPTSOVITS_GPT_REFUSAL_BODY),
+             sovits=(400, GPTSOVITS_SOVITS_REFUSAL_BODY)):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == GPTSOVITS_GPT_ROUTE and gpt is not None:
+                    self.reply(*gpt)
+                elif self.path == GPTSOVITS_SOVITS_ROUTE and sovits is not None:
+                    self.reply(*sovits)
+                else:
+                    self.reply(404, GPTSOVITS_NOT_FOUND_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", GPTSOVITS_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "gpt-sovits-api-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert sorted(set(seen)) == sorted([GPTSOVITS_GPT_ROUTE,
+                                        GPTSOVITS_SOVITS_ROUTE]), (
+        "le scan a touché une route que le template ne déclare pas, ou a "
+        f"envoyé un paramètre — {seen}"
+    )
+    assert len(results) == 1, results
+
+    # Les deux refus réindentés par un intermédiaire.
+    _, results = scan(gpt=(400, GPTSOVITS_GPT_REFUSAL_REFORMATTED_BODY),
+                      sovits=(400, GPTSOVITS_SOVITS_REFUSAL_REFORMATTED_BODY))
+    assert len(results) == 1, results
+
+    # Les refus génériques des autres routes, relayés : silence.
+    _, results = scan(gpt=(400, GPTSOVITS_CONTROL_REFUSAL_BODY),
+                      sovits=(400, GPTSOVITS_TTS_REFUSAL_BODY))
+    assert results == [], results
+
+    # Le message de refus sous un 200 : le handler ne l'émet jamais ainsi.
+    _, results = scan(gpt=(200, GPTSOVITS_GPT_REFUSAL_BODY))
+    assert results == [], results
+
+    # « success » sous un 200 : un chargement a eu lieu, ce n'est pas le constat.
+    _, results = scan(gpt=(200, GPTSOVITS_SUCCESS_BODY))
+    assert results == [], results
+
+    # Le premier document relayé sur la seconde route : silence.
+    _, results = scan(sovits=(400, GPTSOVITS_GPT_REFUSAL_BODY))
+    assert results == [], results
+
+    # Le refus au fond d'un document composite : silence.
+    _, results = scan(gpt=(400, GPTSOVITS_COMPOSITE_BODY))
+    assert results == [], results
+
+    # Une seule des deux routes servie : silence.
+    _, results = scan(sovits=None)
+    assert results == [], results

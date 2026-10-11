@@ -1,0 +1,151 @@
+id: gpt-sovits-api-exposed
+
+info:
+  name: GPT-SoVITS api_v2 - Unauthenticated Voice Cloning TTS Server Exposed
+  author: popy21
+  severity: high
+  description: |
+    GPT-SoVITS (RVC-Boss/GPT-SoVITS, « 1 min voice data can also be used to
+    train a good TTS model! (few shot voice cloning) ») est le moteur de
+    synthèse et de clonage vocal few-shot auto-hébergé le plus répandu —
+    62 646 étoiles au 2026-10-08, dépôt actif sur sa branche main — et
+    api_v2.py est son serveur d'inférence HTTP. L'en-tête du module le lance
+    ainsi : « python api_v2.py -a 127.0.0.1 -p 9880 -c
+    GPT_SoVITS/configs/tts_infer.yaml », et documente ses routes avec leur
+    URL d'exemple : /tts en GET et en POST, /control, /set_gpt_weights et
+    /set_sovits_weights.
+    Le serveur n'a pas d'authentification à activer, parce que le produit n'en
+    a pas : l'application est construite « APP = FastAPI() », sans
+    dependencies=, et le fichier ne contient aucune vérification de clé, de
+    jeton ni de dépendance de sécurité — toutes les routes, /control compris,
+    répondent à tout client qui atteint l'adresse d'écoute. Les valeurs par
+    défaut sont celles de l'analyseur d'arguments du même fichier : « -a,
+    --bind_addr, default="127.0.0.1" », « -p, --port, default="9880" », puis
+    « uvicorn.run(app=APP, host=host, port=port, workers=1) ». L'exposition
+    survient dès que l'opérateur passe -a 0.0.0.0 — et c'est le geste qu'un
+    conteneur impose, puisqu'un serveur lié à 127.0.0.1 à l'intérieur n'est
+    joignable par aucun port publié : le Dockerfile du dépôt écrit « EXPOSE
+    9871 9872 9873 9874 9880 » et son docker-compose.yaml publie « 9880:9880 »
+    sur toutes les interfaces de l'hôte.
+    GET /set_gpt_weights et GET /set_sovits_weights, appelés sans paramètre,
+    portent l'identification. « @APP.get("/set_gpt_weights") / async def
+    set_gpt_weights(weights_path: str = None) » rend « JSONResponse(
+    status_code=400, content={"message": "gpt weight path is required"}) »
+    quand weights_path vaut "" ou None, et n'appelle
+    tts_pipeline.init_t2s_weights(weights_path) — le chargement d'un fichier
+    de poids — que sinon, pour rendre {"message": "success"} sous un 200.
+    set_sovits_weights est symétrique : init_vits_weights, et « sovits weight
+    path is required ». Starlette sérialise un JSONResponse compact, donc le
+    fil porte « {"message":"gpt weight path is required"} » et
+    « {"message":"sovits weight path is required"} » : deux chaînes propres au
+    produit, présentes dans le fichier depuis que api_v2.py existe — le commit
+    qui a fusionné la branche fast_inference_ dans main, le 2024-08-20 — et
+    que toutes les versions rendent.
+    Les autres routes ne nomment rien, ou ne se lisent pas sans conséquence.
+    GET /control sans paramètre rend « {"message":"command is required"} »,
+    générique, et avec un paramètre appelle handle_control, qui traite
+    restart et exit. GET /tts passe par check_params, dont les messages sont
+    génériques — « text is required » — et dont le handler lève une erreur
+    500 (.lower() sur None) dès que text_lang ou prompt_lang est omis. GET
+    /set_refer_audio sans paramètre tente set_ref_audio(None) et rend un
+    « set refer audio failed » accompagné du texte de l'exception.
+  impact: |
+    GET /control?command=exit arrête le processus — os.kill(os.getpid(),
+    SIGTERM) — et ?command=restart le relance par os.execl : quiconque joint
+    le port éteint ou redémarre le service à volonté. GET
+    /set_gpt_weights?weights_path=… fait charger au serveur le fichier que
+    l'appelant désigne, par « torch.load(weights_path, weights_only=False) »
+    dans init_t2s_weights, c'est-à-dire la désérialisation pickle d'un chemin
+    choisi par l'appelant sur l'hôte ; GET /set_sovits_weights?weights_path=…
+    fait de même par load_sovits_new, et chacun remplace le modèle que
+    l'exploitant sert. GET /set_refer_audio?refer_audio_path=… fait lire
+    n'importe quel fichier audio de l'hôte comme voix de référence. /tts, en
+    GET comme en POST, offre la synthèse et le clonage vocal — ref_audio_path
+    n'étant pas contraint, à partir de tout fichier lisible sur l'hôte — sur
+    le GPU et aux frais de l'exploitant, à qui que ce soit. Rien de tout cela
+    n'est attribuable : aucun compte n'existe, les journaux d'uvicorn ne
+    porteront qu'une adresse.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à activer sur ce serveur : la
+    fermeture est entièrement réseau, et c'est à la couche qui l'entoure de
+    la poser. Laisser -a à sa valeur par défaut, 127.0.0.1, quand le serveur
+    tourne sur l'hôte ; dans un conteneur, où -a 0.0.0.0 est inévitable, ne
+    pas publier le port sur toutes les interfaces — « -p 127.0.0.1:9880:9880 »
+    dans la commande ou « "127.0.0.1:9880:9880" » dans docker-compose.yaml —
+    et ne joindre l'API que depuis l'hôte ou un réseau Docker interne.
+    Ailleurs, placer un proxy qui authentifie devant le serveur et vérifier
+    qu'il couvre le préfixe entier — /tts, /control, /set_refer_audio,
+    /set_gpt_weights et /set_sovits_weights — et non /tts seul.
+    Vérifier la prise en compte depuis l'extérieur du périmètre et sans
+    identifiant : « curl -s -o /dev/null -w "%{http_code}"
+    http://<hote>:9880/set_gpt_weights » ne doit plus rendre 400 avec le
+    message du produit.
+    Après une exposition, vérifier dans les journaux d'uvicorn si /control,
+    /set_gpt_weights, /set_sovits_weights ou /set_refer_audio ont été appelés
+    avec un paramètre depuis une adresse inattendue — un chemin de poids
+    étranger désigne un fichier à retrouver sur l'hôte — et si /tts a servi
+    des synthèses que l'exploitant n'a pas demandées.
+  reference:
+    - https://github.com/RVC-Boss/GPT-SoVITS/blob/main/api_v2.py
+    - https://github.com/RVC-Boss/GPT-SoVITS/blob/main/GPT_SoVITS/TTS_infer_pack/TTS.py
+    - https://github.com/RVC-Boss/GPT-SoVITS/blob/main/Dockerfile
+    - https://github.com/RVC-Boss/GPT-SoVITS/blob/main/docker-compose.yaml
+    - https://github.com/RVC-Boss/GPT-SoVITS
+  metadata:
+    max-request: 2
+    vendor: rvc-boss
+    product: gpt-sovits
+  tags: ai,ml,gpt-sovits,tts,voice-cloning,speech,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune est un refus. GET /set_gpt_weights sans
+  # paramètre sort du handler à la première ligne — « if weights_path in ["",
+  # None]: return JSONResponse(status_code=400, …) » — avant
+  # init_t2s_weights : rien n'est chargé, rien n'est écrit, aucun modèle n'est
+  # remplacé. GET /set_sovits_weights fait de même avant init_vits_weights.
+  #
+  # C'est le message du refus qui nomme le produit : « gpt weight path is
+  # required » et « sovits weight path is required » sont des littéraux du
+  # fichier, et aucune autre API ne les écrit. Le 400 est la seule branche qui
+  # les émette — un 200 sur ces routes signifie « success », c'est-à-dire
+  # qu'un fichier de poids vient d'être chargé.
+  #
+  # Pas de paramètre, et c'est la condition du constat : « ?weights_path=… »
+  # ferait charger un fichier au serveur. Pas /control non plus, dont le seul
+  # usage avec paramètre arrête ou relance le processus, ni /tts, dont le
+  # refus — « text is required » — est générique et dont le handler lève un
+  # 500 dès que text_lang est omis.
+  #
+  # GET, et rien d'autre : les deux routes sont déclarées @APP.get, et
+  # FastAPI rend 405 sur le reste.
+  - method: GET
+    path:
+      - "{{BaseURL}}/set_gpt_weights"
+      - "{{BaseURL}}/set_sovits_weights"
+
+    # req-condition accumule body_N et status_code_N pour que la preuve porte
+    # sur les deux refus à la fois. Sans lui, chacun conclurait de son côté —
+    # or un seul message n'est qu'une chaîne, qu'une page de documentation ou
+    # un miroir de supervision peut citer.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le refus de set_gpt_weights, et sous le statut qui l'accompagne.
+          # 400 et surtout pas 200 : sur cette route, un 200 signifie qu'un
+          # chargement de poids a eu lieu, et un template qui l'accepterait
+          # rapporterait ce qu'il aurait lui-même causé. Le corps est le
+          # document entier — une seule clé, une seule chaîne — ancré aux deux
+          # bouts : une page qui citerait la phrase, ou une passerelle qui
+          # l'envelopperait sous une clé à elle, n'est pas le serveur. Les \s*
+          # sont là parce que Starlette écrit compact, mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          - 'status_code_1 == 400 && regex("^\\{\\s*\"message\"\\s*:\\s*\"gpt weight path is required\"\\s*\\}$", trim_space(body_1))'
+
+          # Le refus de set_sovits_weights, symétrique. Les deux routes
+          # répondent chacune avec leur propre message : un cache qui
+          # relaierait le premier document sur la seconde route ne passerait
+          # pas.
+          - 'status_code_2 == 400 && regex("^\\{\\s*\"message\"\\s*:\\s*\"sovits weight path is required\"\\s*\\}$", trim_space(body_2))'
