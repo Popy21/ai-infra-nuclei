@@ -38849,3 +38849,553 @@ def test_gptsovits_matcher_compiles_and_fires_against_a_live_server():
     # Une seule des deux routes servie : silence.
     _, results = scan(sovits=None)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# Hugging Face Chat UI (huggingface/chat-ui) : l'application SvelteKit qui sert
+# HuggingChat, déployée par « docker run -p 3000:3000 -e OPENAI_BASE_URL=… -e
+# OPENAI_API_KEY=hf_*** … ghcr.io/huggingface/chat-ui-db:latest ». Le login
+# n'existe que si un fournisseur OpenID est branché : « export const
+# loginEnabled = !!OIDConfig.CLIENT_ID; » (src/lib/server/auth.ts), et les deux
+# gardes de src/lib/server/hooks/handle.ts commencent par « loginEnabled && ».
+#
+# GET /api/models rend « Response.json(res) », un tableau construit dans
+# l'ordre id, name, websiteUrl, modelUrl, [datasetName, datasetUrl],
+# displayName, description, [logoUrl], promptExamples, preprompt, multimodal,
+# supportsTools, supportsReasoning, supportsArtifacts, unlisted,
+# hasInferenceAPI — les clés entre crochets valent undefined sur un modèle
+# découvert chez le fournisseur, et JSON.stringify les omet. GET
+# /api/v2/feature-flags rend « superjsonResponse({ enableAssistants,
+# loginEnabled, isAdmin, transcriptionEnabled, taskModelId, mlAssistantModels
+# }) », soit « {"json":{…}} » — format relevé avec superjson 2.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette
+# section amarre. La liaison d'abord : le tableau de modèles répond aussi sur
+# une instance fermée — la redirection OAuth exempte /api et le 401 épargne
+# GET — donc il nomme le produit sans conclure, et c'est loginEnabled qui
+# conclut. Le trio ensuite : preprompt, promptExamples et hasInferenceAPI,
+# chacun sous sa forme typée, et sans ordre — hasInferenceAPI suivait tools en
+# 2024, il suit unlisted depuis 2025. La lecture enfin : la preuve directe —
+# créer une conversation — ferait tourner le modèle avec la clé de
+# l'exploitant, et le template ne la tente pas.
+
+CHATUI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "huggingface-chat-ui-models-exposed.yaml")
+
+CHATUI_MODELS_ROUTE = "/api/models"
+CHATUI_FLAGS_ROUTE = "/api/v2/feature-flags"
+
+
+def chatui_model(model_id="meta-llama/Llama-3.3-70B-Instruct", description="",
+                 prompt_examples=None, preprompt="", has_inference_api=False,
+                 drop=(), legacy=False):
+    """
+    Une entrée de GET /api/models, dans l'ordre où le handler la construit,
+    pour un modèle découvert sur le routeur : datasetName, datasetUrl et
+    logoUrl y valent undefined et JSON.stringify les omet.
+
+    `legacy` rend la forme de 2024-11 (v0.9.4) : tokenizer à sa place, tools
+    entre unlisted et hasInferenceAPI, et ni supportsTools, ni
+    supportsReasoning, ni supportsArtifacts. `drop` retire une clé.
+    """
+    document = {
+        "id": model_id,
+        "name": model_id,
+        "websiteUrl": "https://huggingface.co",
+        "modelUrl": "https://huggingface.co",
+    }
+    if legacy:
+        document["tokenizer"] = model_id
+    document.update({
+        "displayName": model_id,
+        "description": description,
+        "promptExamples": prompt_examples or [],
+        "preprompt": preprompt,
+        "multimodal": False,
+    })
+    if legacy:
+        document.update({"unlisted": False, "tools": False})
+    else:
+        document.update({"supportsTools": False, "supportsReasoning": False,
+                         "supportsArtifacts": False, "unlisted": False})
+    document["hasInferenceAPI"] = has_inference_api
+    for key in drop:
+        document.pop(key, None)
+    return document
+
+
+def chatui_models_body(*models, indent=None):
+    """Ce que rend Response.json : JSON.stringify, compact, UTF-8 brut."""
+    if indent is not None:
+        return json.dumps(list(models), ensure_ascii=False, indent=indent)
+    return json.dumps(list(models), ensure_ascii=False, separators=(",", ":"))
+
+
+def chatui_flags_body(login_enabled=False, is_admin=False, legacy=False,
+                      indent=None):
+    """
+    Ce que rend GET /api/v2/feature-flags : FeatureFlags dans l'enveloppe
+    superjson. `legacy` rend la forme de l'API v2 de 2025-06 (Elysia), qui
+    ouvrait sur searchEnabled. `is_admin=None` reproduit locals.isAdmin
+    undefined : superjson écrit null et ajoute « meta » derrière « json ».
+    """
+    if legacy:
+        flags = {"searchEnabled": False, "enableAssistants": False,
+                 "enableAssistantsRAG": False, "enableCommunityTools": False,
+                 "loginEnabled": login_enabled, "loginRequired": False,
+                 "guestMode": False, "isAdmin": is_admin}
+    else:
+        flags = {"enableAssistants": False, "loginEnabled": login_enabled,
+                 "isAdmin": is_admin, "transcriptionEnabled": False,
+                 "taskModelId": None, "mlAssistantModels": []}
+    document = {"json": flags}
+    if is_admin is None:
+        document["meta"] = {"values": {"isAdmin": ["undefined"]}, "v": 1}
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+CHATUI_MODELS_BODY = chatui_models_body(chatui_model())
+
+# Un parc réel : un second modèle dont l'exploitant a écrit l'instruction
+# système — guillemets et accolades compris — et des exemples de requêtes.
+CHATUI_SYSTEM_PROMPT = ('Tu es l\'assistant interne d\'ACME. Réponds en JSON '
+                        '{"answer": "..."} et ne cite jamais "la doc RH".')
+CHATUI_MODELS_SEVERAL_BODY = chatui_models_body(
+    chatui_model(),
+    chatui_model("Qwen/Qwen3-235B-A22B", description="Le modèle maison.",
+                 prompt_examples=[{"title": "Résumer", "prompt": "Résume ce mail."}],
+                 preprompt=CHATUI_SYSTEM_PROMPT, has_inference_api=True))
+CHATUI_MODELS_REFORMATTED_BODY = chatui_models_body(chatui_model(), indent=2)
+CHATUI_MODELS_LEGACY_BODY = chatui_models_body(chatui_model(legacy=True))
+
+# Une instance dont tous les modèles sont unlisted : le tableau est là, il ne
+# nomme rien.
+CHATUI_MODELS_EMPTY_BODY = "[]"
+
+# /api/v2/models, superjson : le même tableau sous « json ». Relayé sur
+# /api/models par une passerelle, il n'est pas la réponse du handler.
+CHATUI_MODELS_V2_BODY = '{"json":%s}' % CHATUI_MODELS_BODY
+
+CHATUI_MODELS_COMPOSITE_BODY = '{"chat_ui":%s,"checked_at":0}' % CHATUI_MODELS_BODY
+
+# Un modèle dont la description cite les trois clés sans que l'entrée les
+# porte : dans le corps, leurs guillemets sont échappés.
+CHATUI_MODELS_QUOTING_BODY = chatui_models_body(chatui_model(
+    description='Expose "preprompt": "", "promptExamples": [] et '
+                '"hasInferenceAPI": false',
+    drop=("preprompt", "promptExamples", "hasInferenceAPI")))
+
+# Une liste de modèles OpenAI-compatible relayée nue, et le /api/models
+# d'Open WebUI, qui l'enveloppe sous « data ».
+CHATUI_OPENAI_LIST_BODY = json.dumps(
+    [{"id": "gpt-4o", "name": "gpt-4o", "object": "model",
+      "owned_by": "openai"}], separators=(",", ":"))
+CHATUI_OPEN_WEBUI_MODELS_BODY = json.dumps(
+    {"data": [{"id": "llama3:latest", "name": "llama3:latest",
+               "object": "model", "owned_by": "ollama"}]},
+    separators=(",", ":"))
+
+CHATUI_FLAGS_OPEN_BODY = chatui_flags_body()
+CHATUI_FLAGS_CLOSED_BODY = chatui_flags_body(login_enabled=True)
+CHATUI_FLAGS_REFORMATTED_BODY = chatui_flags_body(indent=2)
+CHATUI_FLAGS_LEGACY_BODY = chatui_flags_body(legacy=True)
+CHATUI_FLAGS_META_BODY = chatui_flags_body(is_admin=None)
+
+# Les mêmes drapeaux hors de l'enveloppe superjson : ce n'est pas l'écriture
+# de Chat UI.
+CHATUI_FLAGS_BARE_BODY = json.dumps(
+    json.loads(CHATUI_FLAGS_OPEN_BODY)["json"], separators=(",", ":"))
+
+# Les drapeaux logés dans un sous-objet d'un autre document, et le document
+# entier republié sous une clé étrangère.
+CHATUI_FLAGS_NESTED_BODY = json.dumps(
+    {"json": {"service": json.loads(CHATUI_FLAGS_OPEN_BODY)["json"]}},
+    separators=(",", ":"))
+CHATUI_FLAGS_COMPOSITE_BODY = '{"chat_ui":%s,"checked_at":0}' % CHATUI_FLAGS_OPEN_BODY
+
+# Ce que rend une instance sous AUTOMATIC_LOGIN : la redirection vers le
+# fournisseur, sans corps.
+CHATUI_REDIRECT_BODY = ""
+CHATUI_NOT_FOUND_BODY = "Not Found"
+
+
+def chatui_block():
+    doc = load(CHATUI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % CHATUI_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /api/models — c'est pourtant la seule "
+        "route dont la réponse porte le trio preprompt, promptExamples, "
+        "hasInferenceAPI, donc la seule qui nomme le produit"
+    )
+    return blocks[0]
+
+
+def chatui_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet
+    ordre qui donne son numéro à chaque body_N.
+    """
+    block = chatui_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def chatui_fires(models=(200, CHATUI_MODELS_BODY),
+                 flags=(200, CHATUI_FLAGS_OPEN_BODY)):
+    scenario = {
+        CHATUI_MODELS_ROUTE: models,
+        CHATUI_FLAGS_ROUTE: flags,
+    }
+    block = chatui_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in chatui_requests():
+        assert route in scenario, (
+            "le template interroge un chemin que le scénario ne sert pas : "
+            f"{route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_chatui_probe_reads_the_two_routes_and_writes_nothing():
+    """
+    Les deux lectures, dans l'ordre, et rien de plus. POST /conversation puis
+    POST /conversation/{id} établiraient l'absence de login en faisant
+    tourner le modèle avec la clé de l'exploitant ; /login déclenche le flux
+    OAuth et rafraîchit le cookie de session ; /api/v2/debug/config et /admin
+    ne sont pas ce que le constat demande.
+    """
+    doc = load(CHATUI_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", CHATUI_MODELS_ROUTE),
+        ("GET", CHATUI_FLAGS_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert doc["info"]["severity"] == "high", (
+        "loginEnabled à faux est l'inférence gratuite aux frais de "
+        "l'exploitant, constatée et non supposée"
+    )
+    assert doc["info"]["metadata"]["max-request"] == 2
+
+    assert chatui_requests() == [
+        ("GET", CHATUI_MODELS_ROUTE),
+        ("GET", CHATUI_FLAGS_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {chatui_requests()}"
+    )
+
+    block = chatui_block()
+    assert block.get("method") == "GET", (
+        "les deux handlers n'exportent que GET : toute autre méthode "
+        "mesurerait le 405 de SvelteKit — ou, sur /conversation, écrirait"
+    )
+    assert block.get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, body_N "
+        "n'existe pas, et le tableau de modèles — servi aussi par une "
+        "instance fermée — conclurait de son côté"
+    )
+    assert not block.get("body") and not block.get("raw"), (
+        "le bloc envoie un corps ou une requête brute : rien de ce que le "
+        "template établit ne demande d'envoyer quoi que ce soit"
+    )
+
+    for block in (doc.get("http") or []):
+        for path in (block.get("path") or []):
+            for route, why in (
+                ("/conversation", "créer une conversation ou y poster un "
+                                  "message fait tourner le modèle avec la clé "
+                                  "de l'exploitant"),
+                ("/login", "la route déclenche le flux OAuth et rafraîchit le "
+                           "cookie de session"),
+                ("/debug", "/api/v2/debug/config n'est pas ce que le constat "
+                           "demande"),
+                ("/admin", "les routes d'administration n'ajoutent rien au "
+                           "constat"),
+            ):
+                assert route not in path, f"le template touche {route} : {why}"
+
+
+def test_chatui_matcher_needs_the_model_trio_and_the_login_flag():
+    assert chatui_fires(), (
+        "le template ne reconnaît pas une instance ouverte : le tableau que "
+        "GET /api/models construit et « \"loginEnabled\":false »"
+    )
+
+    # Le constat tient à loginEnabled, et à lui seul : la même instance, une
+    # fois OpenID branché, rend le même tableau de modèles.
+    assert not chatui_fires(flags=(200, CHATUI_FLAGS_CLOSED_BODY)), (
+        "le template conclut sur une instance où OpenID est configuré : "
+        "/api/models y répond aussi, c'est loginEnabled qui fait le constat"
+    )
+    assert not chatui_fires(flags=(200, chatui_flags_body(login_enabled=True,
+                                                          legacy=True))), (
+        "le template conclut sur une instance de 2025 où OpenID est configuré"
+    )
+
+    for key in ("preprompt", "promptExamples", "hasInferenceAPI"):
+        assert not chatui_fires(
+            models=(200, chatui_models_body(chatui_model(drop=(key,))))), (
+            f"le template conclut sans {key} : c'est le trio entier qui "
+            "désigne Chat UI"
+        )
+    assert not chatui_fires(models=(200, CHATUI_MODELS_QUOTING_BODY)), (
+        "le template déclenche sur des clés citées dans une description : "
+        "leurs guillemets y sont échappés, ce ne sont pas des clés"
+    )
+    assert not chatui_fires(models=(200, chatui_models_body(
+        chatui_model(drop=("id",))))), (
+        "le template conclut sur une entrée qui n'ouvre pas sur id"
+    )
+    assert not chatui_fires(models=(200, chatui_models_body(
+        {**chatui_model(), "promptExamples": "aucun"}))), (
+        "le template admet un promptExamples qui n'est pas un tableau"
+    )
+    assert not chatui_fires(models=(200, chatui_models_body(
+        {**chatui_model(), "hasInferenceAPI": "false"}))), (
+        "le template admet un hasInferenceAPI qui n'est pas un booléen"
+    )
+
+    assert not chatui_fires(models=(200, CHATUI_MODELS_EMPTY_BODY)), (
+        "le template déclenche sur « [] » : une instance dont tous les modèles "
+        "sont unlisted ne nomme rien, et le constat est non concluant"
+    )
+    assert not chatui_fires(models=(200, CHATUI_MODELS_V2_BODY)), (
+        "le template déclenche sur la variante superjson de /api/v2/models "
+        "relayée sur /api/models : l'ancrage sur l'ouverture du tableau dit "
+        "que le handler a répondu lui-même"
+    )
+    assert not chatui_fires(models=(200, CHATUI_MODELS_COMPOSITE_BODY)), (
+        "le template déclenche sur le tableau republié au fond du document "
+        "d'une supervision"
+    )
+    for body, why in (
+        (CHATUI_OPENAI_LIST_BODY, "une liste de modèles OpenAI-compatible, "
+                                  "nue, sans le trio"),
+        (CHATUI_OPEN_WEBUI_MODELS_BODY, "le /api/models d'Open WebUI"),
+        (NEXTCHAT_OPEN_BODY, "le /api/config de NextChat"),
+        (LIBRECHAT_CONFIG_REGISTRATION_OPEN_BODY, "le /api/config de "
+                                                  "LibreChat"),
+        (CHATUI_FLAGS_OPEN_BODY, "les drapeaux relayés sur /api/models — un "
+                                 "cache indexé sur l'hôte"),
+        (CHATUI_NOT_FOUND_BODY, "le 404 de SvelteKit"),
+        (CHATUI_REDIRECT_BODY, "la redirection OAuth d'AUTOMATIC_LOGIN"),
+        ("<html><body>Connexion requise</body></html>", "un portail captif"),
+    ):
+        assert not chatui_fires(models=(200, body)), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_chatui_login_flag_is_read_inside_the_superjson_envelope_only():
+    for body, why in (
+        (CHATUI_FLAGS_BARE_BODY, "les drapeaux hors de l'enveloppe superjson : "
+                                 "ce n'est pas l'écriture de Chat UI"),
+        (CHATUI_FLAGS_NESTED_BODY, "les drapeaux logés dans un sous-objet : "
+                                   "FeatureFlags les porte au premier niveau"),
+        (CHATUI_FLAGS_COMPOSITE_BODY, "le document republié sous une clé "
+                                      "étrangère"),
+        ('{"json":{"loginEnabled":false}}', "un document sans "
+                                            "enableAssistants, que FeatureFlags "
+                                            "porte depuis 2025-06"),
+        ('{"json":{"enableAssistants":false,"loginEnabled":"false"}}',
+         "loginEnabled écrit en chaîne : la variable est un booléen"),
+        (CHATUI_MODELS_BODY, "le tableau de modèles relayé sur feature-flags"),
+        (CHATUI_NOT_FOUND_BODY, "le 404 d'une instance antérieure à l'API v2 : "
+                                "le tableau seul ne conclut pas"),
+        (CHATUI_REDIRECT_BODY, "la redirection OAuth d'AUTOMATIC_LOGIN"),
+    ):
+        assert not chatui_fires(flags=(200, body)), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_chatui_matcher_admits_the_serialisations_the_versions_and_a_proxy_emit():
+    assert chatui_fires(models=(200, CHATUI_MODELS_SEVERAL_BODY)), (
+        "le template rate un parc de plusieurs modèles dont l'un porte une "
+        "instruction système à guillemets et accolades"
+    )
+    assert chatui_fires(models=(200, chatui_models_body(chatui_model(
+        prompt_examples=[{"title": "Code", "prompt": "Écris un test."}])))), (
+        "le template rate un promptExamples renseigné"
+    )
+    assert chatui_fires(models=(200, chatui_models_body(chatui_model(
+        has_inference_api=True)))), (
+        "le template rate hasInferenceAPI à true"
+    )
+    assert chatui_fires(models=(200, CHATUI_MODELS_LEGACY_BODY)), (
+        "le template rate la forme de 2024 — tokenizer, puis tools entre "
+        "unlisted et hasInferenceAPI : le trio n'y suppose pas d'ordre"
+    )
+    assert chatui_fires(flags=(200, CHATUI_FLAGS_LEGACY_BODY)), (
+        "le template rate les drapeaux de l'API v2 de 2025-06, qui ouvraient "
+        "sur searchEnabled"
+    )
+    assert chatui_fires(flags=(200, CHATUI_FLAGS_META_BODY)), (
+        "le template ancre la fin de l'enveloppe : superjson ajoute « meta » "
+        "derrière « json » dès qu'une valeur est undefined"
+    )
+    assert chatui_fires(models=(200, CHATUI_MODELS_REFORMATTED_BODY),
+                        flags=(200, CHATUI_FLAGS_REFORMATTED_BODY)), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : Response.json et superjson écrivent compact, un proxy ne "
+        "s'y tient pas"
+    )
+    assert chatui_fires(models=(200, CHATUI_MODELS_BODY + "\n"),
+                        flags=(200, CHATUI_FLAGS_OPEN_BODY + "\n")), (
+        "le template ne survit pas à une fin de ligne ajoutée"
+    )
+
+
+def test_chatui_conclusion_is_carried_by_the_bodies_and_never_by_the_status():
+    """
+    Ni le handler de /api/models ni celui de feature-flags n'ont de branche
+    d'échec : le constat tient aux corps, liés par leur numéro.
+    """
+    matchers = chatui_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+    for matcher in matchers:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes passer : le tableau seul répond "
+            "aussi sur une instance fermée"
+        )
+        for expr in matcher.get("dsl") or []:
+            assert "status_code" not in expr, (
+                f"le constat lit le statut — {expr}"
+            )
+    assert chatui_fires(models=(503, CHATUI_MODELS_BODY),
+                        flags=(302, CHATUI_FLAGS_OPEN_BODY)), (
+        "le verdict change avec le statut alors qu'aucune expression ne le lit"
+    )
+
+
+def test_chatui_extractor_reports_the_model_ids():
+    extractors = chatui_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur émet un résultat par extracteur qui rend quelque chose, donc "
+        "la même instance serait signalée plusieurs fois"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json"
+    assert extractor.get("part") == "body_1", (
+        "l'extracteur n'est pas borné à body_1 — c'est le tableau de modèles "
+        "qui porte les identifiants"
+    )
+    assert extractor.get("json") == [".[].id"], (
+        "l'extracteur ne rend pas un identifiant par modèle"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_chatui_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et
+    `dsl_matcher_hits` réévalue les motifs en Python plutôt qu'avec le moteur
+    RE2 de nuclei : seul un scan contre un vrai serveur ferme la boucle sur la
+    compilation réelle des regex et de l'extracteur gojq sur un tableau nu.
+    """
+    def scan(models_body=CHATUI_MODELS_BODY, flags_body=CHATUI_FLAGS_OPEN_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.path == CHATUI_MODELS_ROUTE:
+                    self.reply(200, models_body)
+                elif self.path == CHATUI_FLAGS_ROUTE and flags_body is not None:
+                    self.reply(200, flags_body)
+                else:
+                    self.reply(404, CHATUI_NOT_FOUND_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", CHATUI_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "huggingface-chat-ui-models-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert sorted(set(seen)) == sorted([("GET", CHATUI_MODELS_ROUTE),
+                                        ("GET", CHATUI_FLAGS_ROUTE)]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [
+        "meta-llama/Llama-3.3-70B-Instruct"], results[0].get("extracted-results")
+
+    # Plusieurs modèles : un identifiant par entrée, toujours une seule ligne.
+    # Trié : nuclei dédoublonne les valeurs extraites par une table, et ne
+    # garde pas l'ordre du document.
+    _, results = scan(models_body=CHATUI_MODELS_SEVERAL_BODY)
+    assert len(results) == 1, results
+    assert sorted(results[0].get("extracted-results") or []) == sorted([
+        "meta-llama/Llama-3.3-70B-Instruct", "Qwen/Qwen3-235B-A22B"])
+
+    # Les formes de 2024 et de 2025, et les deux corps réindentés.
+    _, results = scan(models_body=CHATUI_MODELS_LEGACY_BODY,
+                      flags_body=CHATUI_FLAGS_LEGACY_BODY)
+    assert len(results) == 1, results
+    _, results = scan(models_body=CHATUI_MODELS_REFORMATTED_BODY,
+                      flags_body=CHATUI_FLAGS_REFORMATTED_BODY)
+    assert len(results) == 1, results
+    _, results = scan(flags_body=CHATUI_FLAGS_META_BODY)
+    assert len(results) == 1, results
+
+    # OpenID configuré : le même tableau, et silence.
+    _, results = scan(flags_body=CHATUI_FLAGS_CLOSED_BODY)
+    assert results == [], results
+
+    # Aucun modèle listé : non concluant.
+    _, results = scan(models_body=CHATUI_MODELS_EMPTY_BODY)
+    assert results == [], results
+
+    # Une instance antérieure à l'API v2 : le tableau seul, et silence.
+    _, results = scan(flags_body=None)
+    assert results == [], results
+
+    # Les drapeaux hors de l'enveloppe superjson : silence.
+    _, results = scan(flags_body=CHATUI_FLAGS_BARE_BODY)
+    assert results == [], results

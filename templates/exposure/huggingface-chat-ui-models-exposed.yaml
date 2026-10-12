@@ -1,0 +1,173 @@
+id: huggingface-chat-ui-models-exposed
+
+info:
+  name: Hugging Face Chat UI - Open Instance Without Login, Model Prompts Exposed
+  author: popy21
+  severity: high
+  description: |
+    Chat UI (huggingface/chat-ui, « The open source codebase powering
+    HuggingChat ») est l'application SvelteKit qui sert HuggingChat sur
+    hf.co/chat, et l'interface de chat LLM que Hugging Face publie pour être
+    auto-hébergée — 10 978 étoiles au 2026-10-09, dépôt actif sur sa branche
+    main. Le README la déploie ainsi : « docker run -p 3000:3000 -e
+    OPENAI_BASE_URL=https://router.huggingface.co/v1 -e
+    OPENAI_API_KEY=hf_*** -v chat-ui-data:/data
+    ghcr.io/huggingface/chat-ui-db:latest ». La clé du fournisseur reste côté
+    serveur — le .env du dépôt la présente comme « Canonical auth token for
+    any OpenAI-compatible provider », avec « USE_USER_TOKEN=false » — et le
+    port est publié sur toutes les interfaces de l'hôte.
+    L'authentification n'existe que si l'exploitant branche un fournisseur
+    OpenID. src/lib/server/auth.ts pose « export const loginEnabled =
+    !!OIDConfig.CLIENT_ID; », et le .env livre « OPENID_CONFIG= » et
+    « OPENID_CLIENT_ID="" » vides, sous le commentaire « when OPEN_ID is
+    configured, users are required to login after the welcome modal ». Tant
+    que loginEnabled est faux, les deux gardes de
+    src/lib/server/hooks/handle.ts sont muettes : la redirection vers OAuth
+    et le refus « errorResponse(401, ERROR_MESSAGES.authOnly) » commencent
+    tous deux par « loginEnabled && ». Rien n'est alors refusé à l'anonyme,
+    pas même le POST qui crée une conversation : src/routes/conversation/
+    +server.ts la rattache à la session anonyme — « ...(locals.user ? {
+    userId: locals.user._id } : { sessionId: locals.sessionId }) ».
+    Deux lectures en font le constat. GET /api/models nomme le produit : le
+    handler de src/routes/api/models/+server.ts filtre « models.filter((m)
+    => m.unlisted == false) », construit chaque entrée — id, name,
+    websiteUrl, modelUrl, datasetName, datasetUrl, displayName, description,
+    logoUrl, promptExamples, preprompt, multimodal, supportsTools,
+    supportsReasoning, supportsArtifacts, unlisted, hasInferenceAPI — et la
+    rend par « Response.json(res) », sans lire ni cookie, ni session, ni
+    locals.user. Le trio preprompt + promptExamples + hasInferenceAPI dans un
+    tableau de modèles est propre à Chat UI, et c'est lui qui sépare ce
+    document des /api/config de LibreChat et de NextChat que le pack couvre
+    déjà. Mais la route répond aussi sur une instance fermée — la
+    redirection OAuth exempte « ${base}/api » et le 401 épargne GET — : elle
+    identifie, elle ne conclut pas.
+    GET /api/v2/feature-flags conclut. src/routes/api/v2/feature-flags/
+    +server.ts importe loginEnabled de auth.ts et le rend tel quel —
+    « superjsonResponse({ enableAssistants: …, loginEnabled, isAdmin: …, … })
+    » —, donc « "loginEnabled":false » est la variable même qui commande les
+    deux gardes, lue sans rien écrire. Le corps est enveloppé par superjson :
+    « {"json":{"enableAssistants":false,"loginEnabled":false,…}} ».
+  impact: |
+    Le visiteur converse avec le fournisseur configuré, avec la clé de
+    l'exploitant. Sans OpenID, la création de conversation et l'envoi de
+    messages ne réclament qu'une session anonyme que le serveur émet
+    lui-même : l'inférence est gratuite pour n'importe qui, aux frais de
+    l'exploitant, et aucune trace ne portera d'identité.
+    La même lecture livre la configuration des modèles. preprompt est
+    l'instruction système que l'exploitant a écrite pour chaque modèle —
+    « preprompt: model.preprompt ?? "" », résolue au démarrage depuis
+    prepromptUrl quand elle est hébergée ailleurs — et promptExamples ses
+    exemples de requêtes ; id, name et websiteUrl disent quels modèles et
+    quels fournisseurs sont branchés derrière. preprompt reste lisible même
+    sur une instance où OpenID est configuré, tant qu'AUTOMATIC_LOGIN ne vaut
+    pas « true » : la route est en GET sous /api.
+  remediation: |
+    Brancher un fournisseur OpenID : OPENID_CLIENT_ID, OPENID_CLIENT_SECRET
+    et OPENID_PROVIDER_URL, ou le même triplet dans OPENID_CONFIG. C'est
+    CLIENT_ID seul qui allume loginEnabled ; sans lui, aucune garde de
+    handle.ts ne s'applique, et ALLOWED_USER_EMAILS ne restreint rien.
+    Poser ensuite AUTOMATIC_LOGIN=true — « if true authentication is
+    required on all routes » — pour que les GET sous /api, /api/models
+    compris, passent eux aussi par la redirection OAuth : sans lui, les
+    instructions système des modèles restent lisibles à l'anonyme.
+    Restreindre l'écoute, que le README ne restreint pas : « -p
+    127.0.0.1:3000:3000 » plutôt que « -p 3000:3000 », derrière un
+    intermédiaire qui authentifie.
+    Vérifier de l'extérieur et sans identifiant : GET /api/v2/feature-flags
+    doit rendre « "loginEnabled":true », ou une redirection vers le
+    fournisseur sous AUTOMATIC_LOGIN.
+    Après une exposition, relever la consommation chez le fournisseur sur la
+    période et changer OPENAI_API_KEY ; les conversations anonymes sont en
+    base, rattachées à des sessions sans utilisateur.
+  reference:
+    - https://github.com/huggingface/chat-ui/blob/main/src/routes/api/models/+server.ts
+    - https://github.com/huggingface/chat-ui/blob/main/src/routes/api/v2/feature-flags/+server.ts
+    - https://github.com/huggingface/chat-ui/blob/main/src/lib/server/auth.ts
+    - https://github.com/huggingface/chat-ui/blob/main/src/lib/server/hooks/handle.ts
+    - https://github.com/huggingface/chat-ui/blob/main/src/routes/conversation/+server.ts
+    - https://github.com/huggingface/chat-ui/blob/main/.env
+    - https://github.com/huggingface/chat-ui
+  metadata:
+    max-request: 2
+    vendor: huggingface
+    product: chat-ui
+  tags: ai,llm,huggingface,chat-ui,huggingchat,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et rien d'autre. La première nomme le produit, la seconde
+  # dit si le login existe.
+  #
+  # La preuve la plus directe — créer une conversation et y envoyer un message
+  # — ferait tourner le modèle avec la clé de l'exploitant pour établir que
+  # n'importe qui peut le faire : c'est l'abus que le constat signale. Elle
+  # écrirait de surcroît une conversation en base. loginEnabled est la
+  # variable que cette écriture traverserait, et feature-flags la rend en
+  # lecture.
+  #
+  # GET, et rien d'autre : les deux handlers n'exportent que GET.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/models"
+      - "{{BaseURL}}/api/v2/feature-flags"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Le tableau de modèles seul répond aussi sur une
+    # instance fermée ; « "loginEnabled":false » seul ne nomme personne.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Un tableau de modèles qui en liste au moins un, ouvert sur id puis
+          # name, l'ordre que le handler écrit depuis sa création en 2024-01.
+          # « [] » — une
+          # instance dont tous les modèles sont unlisted — ne nomme rien : non
+          # concluant, et c'est assumé. L'ancrage sur l'ouverture écarte la
+          # même charge utile au fond du document d'une supervision, et
+          # « {"json":[…]} », la variante superjson de /api/v2/models.
+          - 'regex("^\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"name\"\\s*:\\s*\"", trim_space(body_1))'
+
+          # Le trio propre à Chat UI, chacun sous sa forme typée : un tableau,
+          # une chaîne, un booléen. Trois expressions plutôt qu'une qui les
+          # enchaînerait : hasInferenceAPI suit unlisted depuis 2025, tools
+          # auparavant, et l'ordre n'est pas ce qui fait la signature. Une clé
+          # citée dans un texte de l'exploitant n'y passe pas : son guillemet
+          # y est échappé.
+          - 'regex("\"promptExamples\"\\s*:\\s*\\[", body_1)'
+          - 'regex("\"preprompt\"\\s*:\\s*\"", body_1)'
+          - 'regex("\"hasInferenceAPI\"\\s*:\\s*(true|false)", body_1)'
+
+          # Le document de feature-flags, dans son enveloppe superjson :
+          # « {"json":{…}} ». enableAssistants et loginEnabled sont dans
+          # FeatureFlags depuis la première version de la route, l'API v2 de
+          # 2025-06 — qui ouvrait sur searchEnabled, d'où des expressions qui
+          # ne supposent pas d'ordre. Le [^{}]* tient chaque clé au premier
+          # niveau de l'objet, pas dans un sous-objet qu'un autre document y
+          # logerait. La fin n'est pas ancrée : superjson ajoute « "meta" »
+          # derrière « "json" » dès qu'une valeur est undefined. Une instance
+          # antérieure à l'API v2 n'a pas cette route et n'est pas reconnue :
+          # c'est le prix d'un constat lu plutôt que provoqué.
+          - 'regex("^\\{\\s*\"json\"\\s*:\\s*\\{[^{}]*\"enableAssistants\"\\s*:\\s*(true|false)", trim_space(body_2))'
+
+          # Le constat. loginEnabled vaut « !!OIDConfig.CLIENT_ID » : faux,
+          # aucun fournisseur OpenID n'est branché et aucune garde de
+          # handle.ts ne s'applique.
+          #
+          # Aucune expression ne lit le statut : les deux handlers n'ont pas
+          # de branche d'échec, et un intermédiaire qui réécrit le statut ne
+          # change rien à ce que les corps disent. Les \s* sont là parce que
+          # Response.json et superjson écrivent compact, mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          - 'regex("^\\{\\s*\"json\"\\s*:\\s*\\{[^{}]*\"loginEnabled\"\\s*:\\s*false", trim_space(body_2))'
+
+    extractors:
+      # Les identifiants des modèles servis : ce qui appartient à l'exploitant
+      # dans les deux réponses, et ce qui dit quel fournisseur la clé paie.
+      # Un seul extracteur, borné à body_1 : sous req-condition le moteur émet
+      # un résultat par extracteur qui rend quelque chose.
+      - type: json
+        part: body_1
+        name: model
+        json:
+          - '.[].id'

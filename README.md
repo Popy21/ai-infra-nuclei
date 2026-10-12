@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-118 templates, 115 produits.
+119 templates, 116 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -44,6 +44,7 @@ amont.
 | bentoml | [`bentoml-yatai-exposed`](templates/exposure/bentoml-yatai-exposed.yaml) | high |
 | bifrost | [`bifrost-gateway-exposed`](templates/exposure/bifrost-gateway-exposed.yaml) | high |
 | chainlit | [`chainlit-project-settings-exposed`](templates/exposure/chainlit-project-settings-exposed.yaml) | medium |
+| chat-ui | [`huggingface-chat-ui-models-exposed`](templates/exposure/huggingface-chat-ui-models-exposed.yaml) | high |
 | chroma | [`chromadb-open-instance`](templates/exposure/chromadb-open-instance.yaml) | high |
 | clearml-server | [`clearml-server-exposed`](templates/exposure/clearml-server-exposed.yaml) | high |
 | cog | [`cog-http-server-exposed`](templates/exposure/cog-http-server-exposed.yaml) | high |
