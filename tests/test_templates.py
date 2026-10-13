@@ -39399,3 +39399,618 @@ def test_chatui_matcher_compiles_and_fires_against_a_live_server():
     # Les drapeaux hors de l'enveloppe superjson : silence.
     _, results = scan(flags_body=CHATUI_FLAGS_BARE_BODY)
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# mcpo (open-webui/mcpo) : le proxy qui sert chaque outil d'un serveur MCP en
+# route HTTP — « app.post(f"/{endpoint_name}", …, dependencies=[Depends(
+# api_dependency)] if api_dependency else []) », dans src/mcpo/main.py. Sans
+# --api-key, api_dependency vaut None et aucune route d'outil n'est gardée.
+#
+# Les documents ci-dessous ont été relevés sur mcpo 0.0.20, avec FastAPI
+# 0.116.1 et mcp 1.17.0 — les versions de son uv.lock —, lancé avec --config
+# sur deux serveurs stdio, echo et other, chacun portant un outil à paramètre
+# et un outil sans : les builders les reproduisent à l'octet près. mcpo 0.0.16
+# rend les mêmes.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette
+# section amarre. Le lieu de la preuve d'abord : le schéma racine, celui qui
+# porte « MCP OpenAPI Proxy », n'a aucun chemin — les montages n'y figurent
+# pas — et il est identique avec ou sans --api-key ; HTTPBearer ne se lit que
+# dans le schéma d'un serveur monté. Le chaînage ensuite : le nom de ce
+# serveur vient du lien que le démarrage ajoute à la description racine, et
+# rien n'est envoyé sans lui. La lecture enfin : chaque chemin du schéma d'un
+# serveur exécute un outil, et le template n'en appelle aucun.
+
+MCPO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure", "mcpo-proxy-exposed.yaml")
+
+MCPO_ROOT_ROUTE = "/openapi.json"
+MCPO_DEFAULT_DESCRIPTION = "Automatically generated API from MCP Tool Schemas"
+
+# Le schéma racine tel que mcpo 0.0.20 l'a servi, avec et sans --api-key.
+MCPO_ROOT_CAPTURED_BODY = (
+    '{"openapi":"3.1.0","info":{"title":"MCP OpenAPI Proxy","description":'
+    '"Automatically generated API from MCP Tool Schemas\\n\\n- **available '
+    'tools**：\\n    - [echo](/echo/docs)\\n    - [other](/other/docs)",'
+    '"version":"1.0"},"paths":{}}'
+)
+
+MCPO_ECHO_TOOLS = (("echo", "Return the text unchanged.", True),
+                   ("ping", "Answer pong.", False))
+
+
+def mcpo_root_body(servers=("echo", "other"), title="MCP OpenAPI Proxy",
+                   description=MCPO_DEFAULT_DESCRIPTION, prefix="/",
+                   indent=None, ascii_only=False):
+    """
+    GET /openapi.json en mode --config : FastAPI(title=name,
+    description=description, version=version), puis, au démarrage, « -
+    **available tools**： » et un lien par serveur joint, sous
+    « urljoin(path_prefix, f"{name}/docs") ». JSONResponse écrit compact et
+    UTF-8 brut ; `ascii_only` et `indent` réécrivent comme le ferait un
+    intermédiaire.
+    """
+    if servers:
+        description += "\n\n- **available tools**："
+        for name in servers:
+            description += "\n    - [%s](%s%s/docs)" % (name, prefix, name)
+    document = {"openapi": "3.1.0",
+                "info": {"title": title, "description": description,
+                         "version": "1.0"},
+                "paths": {}}
+    if indent is not None:
+        return json.dumps(document, ensure_ascii=ascii_only, indent=indent)
+    return json.dumps(document, ensure_ascii=ascii_only, separators=(",", ":"))
+
+
+def mcpo_tool_operation(name, description, takes_input, protected):
+    """
+    L'opération POST que create_dynamic_endpoints déclare pour un outil : le
+    handler s'appelle tool, d'où l'operationId « tool_<outil>_post ». Sous
+    --api-key, la dépendance HTTPBearer ajoute « security » derrière
+    « responses ».
+    """
+    title = name.replace("_", " ").title()
+    operation = {"summary": title, "description": description,
+                 "operationId": "tool_%s_post" % name}
+    if takes_input:
+        operation["requestBody"] = {
+            "content": {"application/json": {"schema": {
+                "$ref": "#/components/schemas/%s_form_model" % name}}},
+            "required": True}
+        operation["responses"] = {
+            "200": {"description": "Successful Response",
+                    "content": {"application/json": {"schema": {
+                        "anyOf": [{"$ref": "#/components/schemas/%s_response_model"
+                                           % name}, {}],
+                        "title": "Response Tool %s Post" % title}}}},
+            "422": {"description": "Validation Error",
+                    "content": {"application/json": {"schema": {
+                        "$ref": "#/components/schemas/HTTPValidationError"}}}}}
+    else:
+        operation["responses"] = {
+            "200": {"description": "Successful Response",
+                    "content": {"application/json": {"schema": {}}}}}
+    if protected:
+        operation["security"] = [{"HTTPBearer": []}]
+    return operation
+
+
+def mcpo_server_body(tools=MCPO_ECHO_TOOLS, protected=False, mount="/echo",
+                     server="lab-echo", version="1.17.0", indent=None):
+    """
+    GET /<serveur>/openapi.json : le sous-schéma d'un montage. Une fois le
+    serveur MCP joint, create_dynamic_endpoints lui donne le nom et la
+    version que le serveur déclare, et la description « <nom> MCP Server » ;
+    FastAPI ajoute le chemin du montage sous « servers ». `mount=None` rend
+    le schéma racine du mode commande unique, qui n'a pas de montage.
+    """
+    schemas = {}
+    if any(takes_input for _, _, takes_input in tools):
+        schemas["HTTPValidationError"] = {
+            "properties": {"detail": {
+                "items": {"$ref": "#/components/schemas/ValidationError"},
+                "type": "array", "title": "Detail"}},
+            "type": "object", "title": "HTTPValidationError"}
+        schemas["ValidationError"] = {
+            "properties": {
+                "loc": {"items": {"anyOf": [{"type": "string"},
+                                            {"type": "integer"}]},
+                        "type": "array", "title": "Location"},
+                "msg": {"type": "string", "title": "Message"},
+                "type": {"type": "string", "title": "Error Type"}},
+            "type": "object", "required": ["loc", "msg", "type"],
+            "title": "ValidationError"}
+    for name, _, takes_input in tools:
+        if takes_input:
+            schemas["%s_form_model" % name] = {
+                "properties": {"text": {"type": "string", "title": "Text",
+                                        "description": ""}},
+                "type": "object", "required": ["text"],
+                "title": "%s_form_model" % name}
+            schemas["%s_response_model" % name] = {
+                "properties": {"result": {"type": "string", "title": "Result",
+                                          "description": ""}},
+                "type": "object", "required": ["result"],
+                "title": "%s_response_model" % name}
+    document = {
+        "openapi": "3.1.0",
+        "info": {"title": server, "description": "%s MCP Server" % server,
+                 "version": version},
+    }
+    if mount is not None:
+        document["servers"] = [{"url": mount}]
+    document["paths"] = {"/%s" % name: {"post": mcpo_tool_operation(
+        name, description, takes_input, protected)}
+        for name, description, takes_input in tools}
+    components = {}
+    if schemas:
+        components["schemas"] = schemas
+    if protected:
+        components["securitySchemes"] = {
+            "HTTPBearer": {"type": "http", "scheme": "bearer"}}
+    if components:
+        document["components"] = components
+    if indent is not None:
+        return json.dumps(document, ensure_ascii=False, indent=indent)
+    return json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+
+
+MCPO_ROOT_BODY = mcpo_root_body()
+MCPO_OPEN_SERVER_BODY = mcpo_server_body()
+MCPO_PROTECTED_SERVER_BODY = mcpo_server_body(protected=True)
+
+# Ce que rend APIKeyMiddleware sous --strict-auth, à toute requête sans
+# en-tête — /openapi.json compris.
+MCPO_STRICT_REFUSAL_BODY = '{"detail":"Missing or invalid Authorization header"}'
+
+# Le schéma racine sans liste : aucun serveur joint, ou une version antérieure
+# à 0.0.10, dont les liens étaient absolus — et 0.0.8 n'en avait aucun.
+MCPO_ROOT_NO_SERVER_BODY = mcpo_root_body(servers=())
+
+# Lancé sur une commande unique, le proxy prend le nom du serveur MCP et
+# devient lui-même le sous-schéma : ni titre ni description par défaut.
+MCPO_SINGLE_SERVER_BODY = mcpo_server_body(mount=None)
+
+# Un montage sans outil, ou dont tous les outils sont désactivés.
+MCPO_SERVER_WITHOUT_TOOL_BODY = mcpo_server_body(tools=())
+
+# Une application FastAPI quelconque : ses operationId ne viennent pas d'un
+# handler nommé tool.
+MCPO_GENERIC_FASTAPI_BODY = json.dumps(
+    {"openapi": "3.1.0", "info": {"title": "FastAPI", "version": "0.1.0"},
+     "paths": {"/items/{item_id}": {"post": {
+         "summary": "Update Item",
+         "operationId": "update_item_items__item_id__post",
+         "responses": {"200": {"description": "Successful Response"}}}}}},
+    separators=(",", ":"))
+
+MCPO_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+
+def mcpo_block():
+    doc = load(MCPO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MCPO_ROOT_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /openapi.json — c'est pourtant le "
+        "seul document qui nomme le proxy et ses montages"
+    )
+    return blocks[0]
+
+
+def mcpo_server_extractor():
+    extractors = [e for e in (mcpo_block().get("extractors") or [])
+                  if e.get("internal")]
+    assert len(extractors) == 1, (
+        "le template ne porte pas exactement un extracteur interne : c'est "
+        "lui qui donne à la seconde requête le nom du serveur monté"
+    )
+    return extractors[0]
+
+
+def mcpo_extracted_server(root_body):
+    """
+    Ce que l'extracteur interne rend sur le schéma racine, comme le moteur :
+    le premier groupe de la première correspondance, ou rien — et sans
+    valeur, la variable reste non résolue et la seconde requête ne part pas.
+    """
+    extractor = mcpo_server_extractor()
+    for pattern in extractor.get("regex") or []:
+        found = re.search(pattern, root_body)
+        if found:
+            return found.group(extractor.get("group", 0))
+    return None
+
+
+def mcpo_dsl_hits(matcher, responses):
+    """
+    dsl_matcher_hits, plus la négation : `!` devant un appel de fonction se
+    lit `not` en Python. Aucun motif du template ne contient de `!`.
+    """
+    translated = dict(matcher)
+    translated["dsl"] = [re.sub(r"!(?=\w+\()", " not ", expr)
+                         for expr in matcher.get("dsl") or []]
+    return dsl_matcher_hits(translated, responses)
+
+
+def mcpo_scan(root=(200, MCPO_ROOT_BODY), servers=None):
+    """
+    Rejoue le bloc : la première requête, l'extracteur interne, puis la
+    seconde sur le chemin qu'il désigne. Rend (requêtes envoyées, verdict).
+    `servers` associe un chemin de sous-schéma à sa réponse ; par défaut,
+    /echo/openapi.json sert le schéma ouvert relevé.
+    """
+    if servers is None:
+        servers = {"/echo/openapi.json": (200, MCPO_OPEN_SERVER_BODY)}
+    block = mcpo_block()
+    paths = block.get("path") or []
+    assert len(paths) == 2, f"le bloc n'envoie pas deux requêtes — {paths}"
+    sent = [MCPO_ROOT_ROUTE]
+    responses = [root]
+    server = mcpo_extracted_server(root[1])
+    if server is None:
+        return sent, False
+    second = paths[1].replace("{{BaseURL}}", "").replace("{{server}}", server)
+    sent.append(second)
+    responses.append(servers.get(second, (404, MCPO_NOT_FOUND_BODY)))
+    matchers = block.get("matchers") or []
+    verdicts = [mcpo_dsl_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux schémas ne sont pas liés"
+    if block.get("matchers-condition") == "or":
+        return sent, any(verdicts)
+    return sent, all(verdicts)
+
+
+def mcpo_fires(root=(200, MCPO_ROOT_BODY), servers=None):
+    return mcpo_scan(root, servers)[1]
+
+
+def test_mcpo_fixtures_are_the_documents_the_proxy_serves():
+    assert MCPO_ROOT_BODY == MCPO_ROOT_CAPTURED_BODY, (
+        "le builder ne rend plus le schéma racine relevé sur mcpo 0.0.20"
+    )
+
+
+def test_mcpo_probe_reads_two_schemas_and_never_calls_a_tool():
+    """
+    Deux lectures de schéma, rien de plus. Un POST sur un chemin du schéma
+    d'un serveur exécute l'outil — système de fichiers, shell, navigateur,
+    selon ce qui est monté — et /docs n'est que le Swagger UI générique de
+    FastAPI.
+    """
+    doc = load(MCPO_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", MCPO_ROOT_ROUTE),
+        ("GET", "/{{server}}/openapi.json"),
+    }, (
+        "le template n'interroge pas exactement le schéma racine et celui "
+        f"d'un serveur monté — {sorted(request_routes(doc))}"
+    )
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 2
+    assert doc["info"]["metadata"]["product"] == "mcpo"
+
+    block = mcpo_block()
+    assert block.get("path") == ["{{BaseURL}}/openapi.json",
+                                 "{{BaseURL}}{{server}}/openapi.json"], (
+        "l'ordre des chemins ne correspond pas à celui que les expressions "
+        f"supposent : body_1 est la racine, body_2 le serveur — {block.get('path')}"
+    )
+    assert block.get("method") == "GET", (
+        "les schémas se lisent en GET ; un POST appellerait un outil"
+    )
+    assert block.get("req-condition") is True, (
+        "le template ne lie pas les deux schémas : sans req-condition, body_N "
+        "n'existe pas, et le schéma racine — identique avec ou sans clé — "
+        "conclurait de son côté"
+    )
+    assert not block.get("body") and not block.get("raw"), (
+        "le bloc envoie un corps ou une requête brute : lire un schéma ne "
+        "demande d'envoyer rien"
+    )
+    for path in block.get("path") or []:
+        assert "/docs" not in path, (
+            "le template lit /docs : le Swagger UI de FastAPI n'est pas "
+            "propre à mcpo"
+        )
+
+    extractor = mcpo_server_extractor()
+    assert extractor.get("name") == "server" and extractor.get("part") == "body_1", (
+        "la variable de la seconde requête n'est pas tirée du schéma racine"
+    )
+    assert mcpo_scan()[0] == [MCPO_ROOT_ROUTE, "/echo/openapi.json"], (
+        "la seconde requête ne vise pas le premier serveur de la liste"
+    )
+
+
+def test_mcpo_matcher_concludes_only_when_the_server_schema_lacks_httpbearer():
+    assert mcpo_fires(), (
+        "le template ne reconnaît pas l'instance ouverte relevée : schéma "
+        "racine par défaut, sous-schéma sans HTTPBearer"
+    )
+
+    # Le constat tient au sous-schéma, et à lui seul : sous --api-key, le
+    # schéma racine est le même à l'octet près.
+    protected = {"/echo/openapi.json": (200, MCPO_PROTECTED_SERVER_BODY)}
+    sent, verdict = mcpo_scan(servers=protected)
+    assert sent == [MCPO_ROOT_ROUTE, "/echo/openapi.json"]
+    assert not verdict, (
+        "le template conclut sur une instance lancée avec --api-key : ses "
+        "outils portent HTTPBearer"
+    )
+
+    # HTTPBearer n'importe où dans le document suffit à se taire : sur les
+    # opérations seules, ou dans components seul.
+    document = json.loads(MCPO_PROTECTED_SERVER_BODY)
+    del document["components"]["securitySchemes"]
+    operations_only = json.dumps(document, separators=(",", ":"))
+    document = json.loads(MCPO_PROTECTED_SERVER_BODY)
+    for item in document["paths"].values():
+        del item["post"]["security"]
+    components_only = json.dumps(document, separators=(",", ":"))
+    for body in (operations_only, components_only):
+        assert not mcpo_fires(servers={"/echo/openapi.json": (200, body)}), (
+            "le template conclut sur un sous-schéma qui porte HTTPBearer"
+        )
+
+    for body, why in (
+        (MCPO_SERVER_WITHOUT_TOOL_BODY, "un montage sans outil : rien à "
+                                        "exécuter"),
+        (MCPO_GENERIC_FASTAPI_BODY, "une application FastAPI quelconque, sans "
+                                    "operationId tool_…_post"),
+        (MCPO_ROOT_BODY, "le schéma racine relayé sur le sous-chemin : il n'a "
+                         "aucun chemin"),
+        (MCPO_STRICT_REFUSAL_BODY, "le 401 d'APIKeyMiddleware"),
+        (MCPO_NOT_FOUND_BODY, "le 404 de FastAPI"),
+        ("<html><body>Connexion requise</body></html>", "un portail captif"),
+        ("", "une réponse vide"),
+    ):
+        assert not mcpo_fires(servers={"/echo/openapi.json": (200, body)}), (
+            f"le template déclenche sur {why}"
+        )
+
+    # Le sous-schéma republié au fond d'un document de supervision.
+    composite = '{"mcpo":%s,"checked_at":0}' % MCPO_OPEN_SERVER_BODY
+    assert not mcpo_fires(servers={"/echo/openapi.json": (200, composite)}), (
+        "le template déclenche sur le sous-schéma au fond d'un autre document"
+    )
+
+
+def test_mcpo_root_schema_names_the_proxy_and_never_concludes_alone():
+    for body, why in (
+        (MCPO_STRICT_REFUSAL_BODY, "le 401 de --strict-auth"),
+        (MCPO_ROOT_NO_SERVER_BODY, "le schéma racine sans serveur joint"),
+        (mcpo_root_body(description="Outils internes"), "une description "
+                                                        "remplacée par "
+                                                        "--description"),
+        (MCPO_SINGLE_SERVER_BODY, "le mode commande unique, qui ne sert ni "
+                                  "titre ni description par défaut"),
+        (MCPO_GENERIC_FASTAPI_BODY, "une application FastAPI quelconque"),
+        (MCPO_NOT_FOUND_BODY, "le 404 de FastAPI"),
+        ("", "une réponse vide"),
+    ):
+        sent, verdict = mcpo_scan(root=(200, body))
+        assert sent == [MCPO_ROOT_ROUTE], (
+            f"le template envoie la seconde requête sur {why} — {sent}"
+        )
+        assert not verdict, f"le template déclenche sur {why}"
+
+    # Le schéma racine republié dans un autre document, et la description
+    # citée par une page qui n'est pas le proxy : l'extracteur trouve un nom,
+    # l'ancrage de la conclusion les écarte.
+    composite = '{"mcpo":%s,"checked_at":0}' % MCPO_ROOT_BODY
+    assert not mcpo_fires(root=(200, composite)), (
+        "le template déclenche sur le schéma racine au fond d'un autre document"
+    )
+    quoting = json.dumps(
+        {"openapi": "3.1.0", "info": {"title": "Notes", "version": "1"},
+         "paths": {}, "x-note": {"description": json.loads(
+             MCPO_ROOT_BODY)["info"]["description"]}},
+        ensure_ascii=False, separators=(",", ":"))
+    assert not mcpo_fires(root=(200, quoting)), (
+        "le template déclenche sur la description citée hors du bloc info"
+    )
+    assert not mcpo_fires(root=(200, mcpo_root_body(
+        description="automatically generated API from MCP Tool Schemas"))), (
+        "le template admet une casse que le littéral n'a pas"
+    )
+
+
+def test_mcpo_server_name_is_read_from_the_first_link_of_the_list():
+    assert mcpo_extracted_server(MCPO_ROOT_BODY) == "/echo"
+    assert mcpo_extracted_server(mcpo_root_body(servers=("time", "memory"))) == "/time"
+    assert mcpo_extracted_server(mcpo_root_body(prefix="/tools/")) == "/tools/echo", (
+        "l'extracteur perd le préfixe de --path-prefix, que le lien porte"
+    )
+    assert mcpo_extracted_server(mcpo_root_body(title="ACME Tools")) == "/echo", (
+        "l'extracteur dépend du titre, que --name remplace"
+    )
+    assert mcpo_extracted_server(mcpo_root_body(ascii_only=True)) == "/echo", (
+        "l'extracteur rate le « ： » réécrit en \\uff1a par un intermédiaire"
+    )
+    assert mcpo_extracted_server(mcpo_root_body(indent=2)) == "/echo"
+    for body in (MCPO_ROOT_NO_SERVER_BODY, MCPO_STRICT_REFUSAL_BODY,
+                 MCPO_SINGLE_SERVER_BODY,
+                 mcpo_root_body(description="Outils internes")):
+        assert mcpo_extracted_server(body) is None, (
+            f"l'extracteur rend un nom sur un document sans liste par défaut — {body[:80]}"
+        )
+
+
+def test_mcpo_matcher_admits_the_options_and_serialisations_a_proxy_emits():
+    assert mcpo_fires(root=(200, mcpo_root_body(title="ACME Tools"))), (
+        "le template exige le titre par défaut : --name le remplace, la "
+        "description reste"
+    )
+    sent, verdict = mcpo_scan(
+        root=(200, mcpo_root_body(prefix="/tools/")),
+        servers={"/tools/echo/openapi.json": (200, mcpo_server_body(
+            mount="/tools/echo"))})
+    assert sent == [MCPO_ROOT_ROUTE, "/tools/echo/openapi.json"] and verdict, (
+        f"le template ne suit pas --path-prefix — {sent}"
+    )
+    assert mcpo_fires(servers={"/echo/openapi.json": (200, mcpo_server_body(
+        tools=(("ping", "Answer pong.", False),)))}), (
+        "le template rate un serveur dont les outils ne prennent aucun "
+        "paramètre"
+    )
+    assert mcpo_fires(root=(200, mcpo_root_body(indent=2)),
+                      servers={"/echo/openapi.json": (
+                          200, mcpo_server_body(indent=2))}), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie"
+    )
+    assert mcpo_fires(root=(200, mcpo_root_body(ascii_only=True, indent=2))), (
+        "le template ne survit pas à un intermédiaire qui réécrit en ASCII"
+    )
+    assert mcpo_fires(root=(200, MCPO_ROOT_BODY + "\n"),
+                      servers={"/echo/openapi.json": (
+                          200, MCPO_OPEN_SERVER_BODY + "\n")}), (
+        "le template ne survit pas à une fin de ligne ajoutée"
+    )
+
+
+def test_mcpo_conclusion_is_carried_by_the_bodies_and_never_by_the_status():
+    matchers = mcpo_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL lie les deux schémas par leur numéro"
+    )
+    expressions = [expr for m in matchers for expr in (m.get("dsl") or [])]
+    for matcher in matchers:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes passer : le schéma racine seul "
+            "répond aussi sous --api-key"
+        )
+    for expr in expressions:
+        assert "status_code" not in expr, f"le constat lit le statut — {expr}"
+    assert any(expr.replace(" ", "") == '!contains(body_2,"HTTPBearer")'
+               for expr in expressions), (
+        "le constat ne lit pas l'absence de HTTPBearer dans le sous-schéma"
+    )
+    assert mcpo_fires(root=(503, MCPO_ROOT_BODY),
+                      servers={"/echo/openapi.json": (
+                          401, MCPO_OPEN_SERVER_BODY)}), (
+        "le verdict change avec le statut alors qu'aucune expression ne le lit"
+    )
+
+
+def test_mcpo_extractor_reports_the_tool_routes():
+    public = [e for e in (mcpo_block().get("extractors") or [])
+              if not e.get("internal")]
+    assert len(public) == 1, (
+        "le template porte plusieurs extracteurs publics sous req-condition : "
+        "le moteur émet un résultat par extracteur qui rend quelque chose"
+    )
+    extractor = public[0]
+    assert extractor.get("type") == "json"
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné au sous-schéma — c'est lui qui porte "
+        "les routes d'outils"
+    )
+    assert extractor.get("json") == [".paths | keys[]"]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_mcpo_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et
+    `dsl_matcher_hits` réévalue les motifs en Python plutôt qu'avec RE2 :
+    seul un scan contre un vrai serveur ferme la boucle sur la compilation
+    réelle des motifs, sur la variable que l'extracteur interne passe à la
+    seconde requête, et sur le silence du moteur quand elle reste non
+    résolue.
+    """
+    def scan(root=(200, MCPO_ROOT_BODY), servers=None):
+        if servers is None:
+            servers = {"/echo/openapi.json": (200, MCPO_OPEN_SERVER_BODY)}
+        routes = {MCPO_ROOT_ROUTE: root, **servers}
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                self.reply(*routes.get(self.path, (404, MCPO_NOT_FOUND_BODY)))
+
+            def do_POST(self):
+                seen.append((self.command, self.path))
+                self.reply(405, '{"detail":"Method Not Allowed"}')
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MCPO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "mcpo-proxy-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", MCPO_ROOT_ROUTE), ("GET", "/echo/openapi.json")], (
+        f"le scan n'a pas lu les deux schémas, et eux seuls — {seen}"
+    )
+    assert len(results) == 1, results
+    assert sorted(results[0].get("extracted-results") or []) == ["/echo", "/ping"], (
+        results[0].get("extracted-results")
+    )
+
+    # --api-key : le même schéma racine, HTTPBearer dans le sous-schéma.
+    seen, results = scan(servers={"/echo/openapi.json": (
+        200, MCPO_PROTECTED_SERVER_BODY)})
+    assert ("GET", "/echo/openapi.json") in seen, seen
+    assert results == [], results
+
+    # --strict-auth : 401 sur la racine, et la seconde requête ne part pas.
+    seen, results = scan(root=(401, MCPO_STRICT_REFUSAL_BODY))
+    assert seen == [("GET", MCPO_ROOT_ROUTE)], seen
+    assert results == [], results
+
+    # --name et --path-prefix : le titre change, le lien porte le préfixe.
+    seen, results = scan(
+        root=(200, mcpo_root_body(title="ACME Tools", prefix="/tools/")),
+        servers={"/tools/echo/openapi.json": (200, mcpo_server_body(
+            mount="/tools/echo"))})
+    assert ("GET", "/tools/echo/openapi.json") in seen, seen
+    assert len(results) == 1, results
+
+    # Un intermédiaire qui réindente et réécrit en ASCII.
+    _, results = scan(root=(200, mcpo_root_body(indent=2, ascii_only=True)),
+                      servers={"/echo/openapi.json": (
+                          200, mcpo_server_body(indent=2))})
+    assert len(results) == 1, results
+
+    # Un montage sans outil : rien à exécuter, silence.
+    _, results = scan(servers={"/echo/openapi.json": (
+        200, MCPO_SERVER_WITHOUT_TOOL_BODY)})
+    assert results == [], results
+
+    # Le mode commande unique : ni titre ni description par défaut, silence.
+    seen, results = scan(root=(200, MCPO_SINGLE_SERVER_BODY))
+    assert seen == [("GET", MCPO_ROOT_ROUTE)], seen
+    assert results == [], results

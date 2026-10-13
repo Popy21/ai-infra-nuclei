@@ -1,0 +1,144 @@
+id: mcpo-proxy-exposed
+
+info:
+  name: mcpo MCP-to-OpenAPI Proxy - Unauthenticated MCP Tool Execution
+  author: popy21
+  severity: high
+  description: |
+    mcpo (open-webui/mcpo, « A simple, secure MCP-to-OpenAPI proxy server »,
+    « Expose any MCP tool as an OpenAPI-compatible HTTP server—instantly. »)
+    est le proxy qu'Open WebUI publie pour servir des serveurs MCP en HTTP —
+    4 399 étoiles au 2026-10-13, v0.0.20, image ghcr.io/open-webui/mcpo:main.
+    Chaque outil du serveur MCP y devient une route : create_dynamic_endpoints
+    (src/mcpo/main.py) déclare « app.post(f"/{endpoint_name}", …,
+    dependencies=[Depends(api_dependency)] if api_dependency else []) », et
+    un POST sur cette route appelle l'outil.
+    La clé est facultative, et absente par défaut. src/mcpo/__init__.py
+    déclare --api-key à None, --strict-auth à False et --host à « 0.0.0.0 » ;
+    run() calcule « api_dependency = get_verify_api_key(api_key) if api_key
+    else None ». Sans --api-key, aucune route d'outil ne porte de dépendance,
+    et le proxy écoute sur toutes les interfaces. Le README ne montre
+    --api-key « top-secret » que dans ses exemples, sans le dire obligatoire.
+    Avec --config, chaque serveur MCP du fichier est monté sous son nom, et
+    GET /openapi.json est le schéma du proxy : titre « MCP OpenAPI Proxy »
+    (que --name remplace), description « Automatically generated API from MCP
+    Tool Schemas », à laquelle le démarrage ajoute « - **available tools**： »
+    puis un lien « [<serveur>](/<serveur>/docs) » par serveur joint. Ce schéma
+    n'a aucun chemin — les montages n'y figurent pas — et il est le même, à
+    l'octet près, avec ou sans --api-key : relevé sur mcpo 0.0.20 et FastAPI
+    0.116.1, les versions de son uv.lock. La clé ne se lit donc que dans le
+    schéma d'un serveur, GET /<serveur>/openapi.json, où chaque outil est une
+    opération POST d'operationId « tool_<outil>_post » — le handler s'appelle
+    tool dans src/mcpo/utils/main.py.
+    get_verify_api_key (src/mcpo/utils/auth.py) passe par « bearer_security
+    = HTTPBearer(auto_error=False) », que FastAPI documente : avec --api-key,
+    chaque opération porte « "security":[{"HTTPBearer":[]}] » et components
+    porte « "securitySchemes":{"HTTPBearer":{"type":"http","scheme":"bearer"}}
+    ». Le même schéma sans la chaîne HTTPBearer est celui d'outils qu'aucune
+    dépendance ne garde. Sous --strict-auth, APIKeyMiddleware répond 401 à
+    tout, /openapi.json compris.
+    Lancé sur une commande unique (« mcpo -- <commande> », l'exemple docker
+    du README), le proxy prend le nom du serveur MCP — « app.title =
+    server_info.name or app.title » — et ne sert ni le titre ni la
+    description par défaut : cette forme n'est pas reconnue ici.
+  impact: |
+    Un appelant anonyme exécute les outils MCP branchés derrière le proxy,
+    avec les droits du processus mcpo : les serveurs stdio sont ses
+    sous-processus, lancés avec son environnement, et les serveurs distants
+    reçoivent les en-têtes que la configuration leur attache. Selon ce que
+    l'exploitant a monté, c'est un système de fichiers, un shell, un
+    navigateur ou une base de données.
+    Le schéma lu en fait l'inventaire : chaque outil, sa description et les
+    paramètres qu'il attend, de quoi l'appeler sans tâtonner.
+  remediation: |
+    Lancer mcpo avec --api-key, et avec --strict-auth pour que la
+    documentation et les schémas soient gardés eux aussi — sans lui, tout
+    appelant lit encore l'inventaire des outils.
+    Restreindre l'écoute, que --host ouvre par défaut : « --host 127.0.0.1 »,
+    ou « -p 127.0.0.1:8000:8000 » plutôt que « -p 8000:8000 » sous docker,
+    derrière un intermédiaire qui authentifie.
+    Vérifier de l'extérieur et sans identifiant : GET /<serveur>/openapi.json
+    doit porter « HTTPBearer » sur chaque opération, ou répondre 401 sous
+    --strict-auth.
+    Après une exposition, faire tourner les secrets que les serveurs MCP
+    tiennent de l'environnement de mcpo ou des en-têtes de sa configuration,
+    et relire ce que leurs outils ont pu écrire.
+  reference:
+    - https://github.com/open-webui/mcpo
+    - https://github.com/open-webui/mcpo/blob/main/src/mcpo/main.py
+    - https://github.com/open-webui/mcpo/blob/main/src/mcpo/__init__.py
+    - https://github.com/open-webui/mcpo/blob/main/src/mcpo/utils/auth.py
+    - https://github.com/open-webui/mcpo/blob/main/src/mcpo/utils/main.py
+  metadata:
+    max-request: 2
+    vendor: open-webui
+    product: mcpo
+  tags: ai,llm,agents,mcp,mcpo,open-webui,openapi,exposure,unauth,misconfig
+
+http:
+  # Deux lectures de schéma, et rien d'autre. La première nomme le proxy et
+  # rend le nom d'un serveur monté ; la seconde lit, dans le schéma de ce
+  # serveur, si ses outils sont gardés.
+  #
+  # Jamais de POST : chaque chemin du schéma exécute un outil, et l'appeler
+  # pour prouver qu'il s'appelle serait l'abus que le constat signale. /docs
+  # non plus : c'est le Swagger UI générique de FastAPI, il ne dit rien que le
+  # schéma ne dise.
+  - method: GET
+    path:
+      - "{{BaseURL}}/openapi.json"
+      - "{{BaseURL}}{{server}}/openapi.json"
+
+    # req-condition accumule body_N : la conclusion lie le schéma du proxy à
+    # celui du serveur. Sans nom de serveur extrait — une instance sous
+    # --strict-auth, un serveur qui n'est pas mcpo —, la variable reste non
+    # résolue et le moteur n'envoie pas la seconde requête.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le schéma du proxy, ouvert sur openapi puis info, comme FastAPI
+          # l'écrit. Le titre est lu sans être exigé : --name le remplace. La
+          # description par défaut l'est, suivie de la liste que le démarrage
+          # lui ajoute — le « ： » pleine chasse est celui du source, rendu
+          # brut par FastAPI ou en \uff1a par un intermédiaire qui réécrit en
+          # ASCII. Une instance lancée avec --description n'est pas reconnue,
+          # et c'est assumé.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3\\.[0-9.]+\"\\s*,\\s*\"info\"\\s*:\\s*\\{\\s*\"title\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"description\"\\s*:\\s*\"Automatically generated API from MCP Tool Schemas\\\\n\\\\n- \\*\\*available tools\\*\\*(?:：|\\\\u[fF]{2}1[aA])\\\\n {4}- \\[", trim_space(body_1))'
+
+          # Le schéma du serveur, et au moins un outil : le handler de chaque
+          # route d'outil s'appelle tool, et FastAPI en tire l'operationId
+          # « tool_<outil>_post ». Un serveur sans outil n'expose rien à
+          # exécuter.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3\\.[0-9.]+\"\\s*,\\s*\"info\"\\s*:\\s*\\{", trim_space(body_2))'
+          - 'regex("\"operationId\"\\s*:\\s*\"tool_[^\"]+_post\"", body_2)'
+
+          # Le constat. --api-key fait porter HTTPBearer à chaque opération et
+          # à components.securitySchemes ; son absence dit qu'aucune
+          # dépendance ne garde les outils. Aucune expression ne lit le
+          # statut : le corps dit ce qui est servi, quoi qu'un intermédiaire
+          # fasse du code.
+          - '!contains(body_2, "HTTPBearer")'
+
+    extractors:
+      # Le premier serveur de la liste, tel que le lien l'écrit — préfixe de
+      # --path-prefix compris. La clé s'applique à tous les montages : un
+      # seul suffit.
+      - type: regex
+        name: server
+        internal: true
+        part: body_1
+        group: 1
+        regex:
+          - '"description"\s*:\s*"Automatically generated API from MCP Tool Schemas\\n\\n- \*\*available tools\*\*(?:：|\\u[fF]{2}1[aA])\\n {4}- \[[^\]"\\]+\]\((/[^()"\\\s]+)/docs\)'
+
+      # Les routes d'outils que l'anonyme peut appeler. Un seul extracteur
+      # public : sous req-condition le moteur émet un résultat par extracteur
+      # qui rend quelque chose.
+      - type: json
+        part: body_2
+        name: tool
+        json:
+          - '.paths | keys[]'
