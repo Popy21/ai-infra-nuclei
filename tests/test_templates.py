@@ -37843,7 +37843,10 @@ def test_kserve_matcher_compiles_and_fires_against_a_live_server():
     # Plusieurs modèles : un nom par entrée, et toujours une seule ligne.
     _, results = scan(models_body=KSERVE_MODELS_SEVERAL_BODY)
     assert len(results) == 1, results
-    assert results[0].get("extracted-results") == ["sklearn-iris", "xgboost-iris"]
+    # nuclei déduplique les valeurs extraites dans une map : l'ordre n'est pas
+    # garanti, seul l'ensemble l'est.
+    assert sorted(results[0].get("extracted-results") or []) == [
+        "sklearn-iris", "xgboost-iris"]
 
     # Les deux corps réindentés par un intermédiaire.
     _, results = scan(metadata_body=KSERVE_METADATA_REFORMATTED_BODY,
@@ -38391,7 +38394,10 @@ def test_adk_matcher_compiles_and_fires_against_a_live_server():
     # Plusieurs applications : un nom par entrée, et toujours une seule ligne.
     _, results = scan(apps_body=ADK_APPS_SEVERAL_BODY)
     assert len(results) == 1, results
-    assert results[0].get("extracted-results") == ["hello_agent", "weather_agent"]
+    # nuclei déduplique les valeurs extraites dans une map : l'ordre n'est pas
+    # garanti, seul l'ensemble l'est.
+    assert sorted(results[0].get("extracted-results") or []) == [
+        "hello_agent", "weather_agent"]
 
     # Les deux corps réindentés par un intermédiaire.
     _, results = scan(apps_body=ADK_APPS_REFORMATTED_BODY,
