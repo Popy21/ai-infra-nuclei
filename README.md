@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-120 templates, 117 produits.
+121 templates, 118 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -76,6 +76,7 @@ amont.
 | koboldcpp | [`koboldcpp-server-exposed`](templates/exposure/koboldcpp-server-exposed.yaml) | high |
 | kokoro-fastapi | [`kokoro-fastapi-exposed`](templates/exposure/kokoro-fastapi-exposed.yaml) | medium |
 | kserve | [`kserve-model-server-exposed`](templates/exposure/kserve-model-server-exposed.yaml) | high |
+| kubeai | [`kubeai-models-exposed`](templates/exposure/kubeai-models-exposed.yaml) | high |
 | kubeflow-pipelines | [`kubeflow-pipelines-exposed`](templates/exposure/kubeflow-pipelines-exposed.yaml) | high |
 | label-studio | [`label-studio-signup-open`](templates/exposure/label-studio-signup-open.yaml) | medium |
 | label-studio-ml-backend | [`label-studio-ml-backend-exposed`](templates/exposure/label-studio-ml-backend-exposed.yaml) | medium |

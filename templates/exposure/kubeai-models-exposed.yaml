@@ -1,0 +1,229 @@
+id: kubeai-models-exposed
+
+info:
+  name: KubeAI - Unauthenticated Cluster Model Inventory and Inference Exposure
+  author: popy21
+  severity: high
+  description: |
+    KubeAI (kubeai-project/kubeai, « AI Inference Operator for Kubernetes. The
+    easiest way to serve ML models in production. Supports VLMs, LLMs,
+    embeddings, and speech-to-text », 1 284 étoiles au 2026-10-16, dépôt actif —
+    dernier push le même jour, non archivé) est l'opérateur Kubernetes qui place
+    un point d'entrée unique compatible OpenAI devant des moteurs vLLM, SGLang,
+    llama.cpp, Ollama, Faster-Whisper et Infinity, et qui les démarre à la
+    demande.
+    GET /openai/v1/models rend l'inventaire des modèles du cluster, et c'est son
+    tableau « features » qui nomme le produit. internal/openaiserver/models.go :
+    getModels encode une structure anonyme aux tags json « object » puis
+    « data », avec le littéral « Object: "list" », et chaque entrée vient de
+    « type Model struct » — tags « id », « created », « object », « owned_by »
+    puis « features,omitempty », dans cet ordre — que constructOpenAIModel
+    remplit par « m.ID = apiutils.MergeModelAdapter(k8sM.Name, adapter) »,
+    « m.Created = k8sM.CreationTimestamp.Unix() », « m.Object = "model" »,
+    « m.OwnedBy = k8sM.Spec.Owner » et « m.Features = k8sM.Spec.Features ».
+    encoding/json écrit les champs d'une structure dans l'ordre de leur
+    déclaration, et sans espace : le corps ouvre sur
+    {"object":"list","data":[{"id":...,"created":...,"object":"model",
+    "owned_by":...,"features":["TextGeneration"]}]}, suivi de la fin de ligne
+    que json.NewEncoder ajoute.
+    « features » n'existe ni dans l'objet Model d'OpenAI, ni chez les runtimes
+    compatibles que le pack couvre déjà — vLLM y met root, parent et
+    max_model_len, llama-swap son status, LMDeploy « "owned_by":"lmdeploy" »,
+    Kokoro-FastAPI et Speaches rien de plus. C'est donc ce tableau, pris dans
+    l'entrée même et derrière owned_by, qui identifie KubeAI, conjoint à
+    l'enveloppe « "object":"list" » : jamais le statut, et jamais le préfixe de
+    chemin seul, puisque KServe monte lui aussi /openai/v1/ et qu'il est déjà
+    couvert ici. Les valeurs sont une énumération fermée, déclarée dans
+    api/k8s/v1/model_types.go : « +kubebuilder:validation:Enum=TextGeneration;
+    TextEmbedding;Reranking;SpeechToText;SystemOne », reprise par les constantes
+    ModelFeatureTextGeneration, ModelFeatureTextEmbedding,
+    ModelFeatureReranking, ModelFeatureSpeechToText et ModelFeatureSystemOne.
+    L'absence d'authentification est une fonctionnalité absente du produit, pas
+    un réglage oublié. internal/openaiserver/handler.go enregistre les routes
+    sur un ServeMux nu, sans le moindre intergiciel :
+    « mux.Handle("/openai/v1/models", http.HandlerFunc(h.getModels)) » et
+    « mux.Handle("/v1/models", http.HandlerFunc(h.getModels)) » pour
+    l'inventaire, « mux.Handle("/openai/v1/chat/completions",
+    http.StripPrefix("/openai", modelProxy)) » et de même pour
+    /openai/v1/completions, /openai/v1/embeddings,
+    /openai/v1/audio/transcriptions, /openai/v1/responses, /v1/rerank,
+    /v1/systemone et /v1/messages. Le seul commentaire de sécurité du fichier
+    dit « NOTE: Proxying all paths to backend engines is a security risk. ». La
+    documentation le confirme : ses exemples passent « api_key="ignored" » et
+    renvoient l'autorisation à la couche d'entrée — « Use the normal inference
+    ingress controls for authentication, TLS, timeouts ».
+    L'adresse d'écoute ne figure dans aucun de ces deux fichiers : c'est
+    internal/manager/run.go qui construit « apiServer = &http.Server{…
+    Addr: ":8000" … } » — toutes les interfaces, port 8000 dans le conteneur,
+    sans drapeau pour en changer. charts/kubeai/templates/deployment.yaml
+    déclare « containerPort: 8000 » sous le nom http, et service.yaml publie la
+    valeur de service.port vers ce port nommé — 80 dans les valeurs du
+    chart ; les exemples de la documentation joignent
+    l'instance par « kubectl port-forward svc/kubeai 8000:80 ». Le template ne
+    fixe donc aucun port : il lit celui de la cible.
+    Aucun en-tête n'est envoyé, et c'est le pire cas pour l'exploitant : le
+    cloisonnement multi-tenant de KubeAI repose sur « X-Label-Selector », que
+    getModels lit dans la requête de l'appelant par r.Header.Values — une
+    requête nue prend la branche par défaut, qui liste tous les Models du
+    cluster.
+  impact: |
+    Tous les chemins ci-dessus sont relayés vers les moteurs d'inférence sans
+    identifiant : POST /openai/v1/chat/completions, /completions, /embeddings,
+    /audio/transcriptions et /responses, plus /v1/rerank, /v1/systemone et
+    /v1/messages, font tourner les modèles de l'exploitant sur son matériel pour
+    quiconque connaît le nom d'un modèle — et l'inventaire que ce template lit
+    est précisément ce qui le donne.
+    KubeAI démarrant les modèles à la demande, la facture ne s'arrête pas au GPU
+    déjà allumé : « If no Pods are running when a request comes in, KubeAI will
+    hold the request, scale up a Pod and forward the request when the Pod is
+    ready » (docs/concepts/autoscaling.md), et MinReplicas vaut 0 par défaut
+    (« Note: 0 is a valid value », model_types.go). Un appelant anonyme fait
+    donc provisionner des nœuds GPU aux frais de l'organisation, par une seule
+    requête, sur un cluster qui ne tournait pas.
+    La réponse cartographie en prime l'inventaire : un identifiant par Model du
+    cluster — plus un par adaptateur LoRA, sous la forme « <modèle>_<adaptateur>
+    » que MergeModelAdapter écrit —, donc les noms de fine-tunings internes, et
+    le tableau « features » dit pour chacun quelle API appeler. Le filtrage par
+    label n'y change rien : il dépend d'un en-tête que l'appelant choisit
+    lui-même, donc une requête sans en-tête voit les modèles de tous les
+    locataires.
+    Et parce qu'aucun compte n'existe, rien n'est attribuable : les journaux ne
+    porteront qu'une adresse, souvent celle de la passerelle.
+  remediation: |
+    Il n'y a pas d'authentification à activer : le ServeMux de handler.go ne
+    porte aucun intergiciel, aucune route ne reçoit de vérification, et la
+    ligne de commande n'a ni option de clé ni option de jeton. La fermeture est
+    entièrement à la charge de la couche qui entoure le pod, comme la
+    documentation le dit elle-même.
+    Ne pas publier le Service de KubeAI en LoadBalancer ni en NodePort — il vaut
+    ClusterIP dans les valeurs du chart, et c'est ce qu'il doit rester —, et ne
+    pas l'exposer par un Ingress nu : poser devant lui une passerelle qui
+    authentifie, ou sous Istio une AuthorizationPolicy qui exige un principal ou
+    un JWT sur les préfixes entiers /openai/v1/ et /v1/, et non sur
+    /openai/v1/models seul, puisque c'est le même routeur qui relaie
+    l'inférence. Vérifier aussi les NetworkPolicy du namespace. Hors cluster,
+    « kubectl port-forward » plutôt qu'un port publié : Addr ":8000" est écrit
+    en dur, aucun drapeau ne le restreint à la boucle locale.
+    Si le cloisonnement par label sert à séparer des locataires, la passerelle
+    doit retirer « X-Label-Selector » de la requête entrante et le poser
+    elle-même d'après l'identité vérifiée : tel quel, l'en-tête est une clause
+    que le client écrit.
+    Vérifier de l'extérieur du périmètre et sans identifiant : « curl -s
+    http://<hote>:8000/openai/v1/models » ne doit plus rendre la liste, et
+    « /v1/models » non plus — le même handler y répond.
+    Après une exposition, tenir l'inventaire et les capacités pour lus, puis
+    relire les journaux de la passerelle et les montées en charge de
+    l'autoscaler sur la période : une création de Pod ou de nœud GPU qu'aucune
+    charge interne n'explique date l'abus, et le budget de calcul de la période
+    est à considérer comme consommé.
+  reference:
+    - https://github.com/kubeai-project/kubeai
+    - https://github.com/kubeai-project/kubeai/blob/main/internal/openaiserver/models.go
+    - https://github.com/kubeai-project/kubeai/blob/main/internal/openaiserver/handler.go
+    - https://github.com/kubeai-project/kubeai/blob/main/api/k8s/v1/model_types.go
+    - https://github.com/kubeai-project/kubeai/blob/main/internal/manager/run.go
+    - https://github.com/kubeai-project/kubeai/blob/main/charts/kubeai/templates/service.yaml
+    - https://github.com/kubeai-project/kubeai/blob/main/charts/kubeai/templates/deployment.yaml
+    - https://www.kubeai.org/reference/openai-api-compatibility/
+    - https://www.kubeai.org/how-to/architect-for-multitenancy/
+    - https://www.kubeai.org/concepts/autoscaling/
+  metadata:
+    max-request: 1
+    vendor: kubeai-project
+    product: kubeai
+  tags: ai,ml,llm,kubeai,kubernetes,inference,model-server,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier : le produit n'a aucune
+  # authentification à opposer, donc l'inventaire rendu à une requête nue est à
+  # la fois la preuve d'identité et la preuve d'ouverture. Une instance placée
+  # derrière une passerelle qui authentifie rend le refus de cette passerelle,
+  # et aucune des expressions ci-dessous n'y tient.
+  #
+  # /openai/v1/models plutôt que /v1/models : le même handler sert les deux,
+  # mais c'est le chemin que la documentation donne, et le seul des deux que les
+  # autres runtimes compatibles OpenAI du pack ne servent pas. En interroger un
+  # suffit.
+  #
+  # En lecture seule, et strictement. Le même routeur relaie POST
+  # /openai/v1/chat/completions, /completions, /embeddings,
+  # /audio/transcriptions, /responses, /v1/rerank, /v1/systemone et
+  # /v1/messages : ce sont les abus que le constat signale, et KubeAI démarrant
+  # les modèles à la demande, en appeler un ferait provisionner un nœud GPU aux
+  # frais de l'exploitant pour établir qu'il est provisionnable.
+  #
+  # Aucun en-tête non plus : « X-Label-Selector » filtrerait l'inventaire sur
+  # des labels devinés, alors que la branche par défaut de getModels liste tous
+  # les Models du cluster.
+  - method: GET
+    path:
+      - "{{BaseURL}}/openai/v1/models"
+
+    matchers-condition: and
+    matchers:
+      # getModels pose « w.Header().Set("Content-Type", "application/json") »
+      # sans condition, avant d'encoder.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          # L'enveloppe, dans l'ordre des champs de la structure anonyme —
+          # « Object string `json:"object"` » puis « Data []Model
+          # `json:"data"` » —, et au moins une entrée, ouverte sur « id » comme
+          # la structure Model la déclare. L'ancrage sur l'ouverture du corps
+          # écarte la même charge utile retrouvée au fond du document d'une
+          # supervision qui l'agrégerait sous une clé à elle.
+          #
+          # Un inventaire vide, « {"object":"list","data":[]} », est un cluster
+          # où aucun Model n'est installé : il ne divulgue rien et ne nomme
+          # aucune cible d'inférence. Le constat est non concluant, et le prix
+          # est assumé.
+          #
+          # Les \s* sont là parce qu'encoding/json écrit compact, mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"data"\s*:\s*\[\s*\{\s*"id"\s*:\s*"'
+
+          # Et le document se ferme sur la liste : la structure anonyme n'a que
+          # ces deux champs, et « data » est le second. L'ancrage d'ouverture
+          # ne suffirait pas seul — une passerelle qui recopierait l'inventaire
+          # en tête d'un document à elle, en ajoutant une clé derrière la
+          # liste, le traverserait.
+          - '\]\s*\}\s*$'
+
+          # Une entrée entière, telle que constructOpenAIModel la remplit et
+          # dans l'ordre de déclaration de « type Model struct » : c'est
+          # l'adjacence owned_by → features qui nomme KubeAI, et non le mot
+          # « features » isolé, que n'importe quel document pourrait porter.
+          # Exiger la séquence écarte aussi une valeur de Spec.Owner — une
+          # chaîne libre — qui citerait la clé : dans le corps, ses guillemets
+          # sont échappés, et ce ne sont alors pas des clés.
+          #
+          # L'expression n'est pas ancrée sur la première entrée, et c'est
+          # voulu : « features,omitempty » disparaît de l'objet d'un Model dont
+          # spec.features est vide, et un tel Model peut très bien ouvrir la
+          # liste. Il suffit qu'une entrée déclare une capacité. Une instance
+          # dont aucun Model n'en déclare n'est pas reconnue — prix assumé, le
+          # champ étant requis par la CRD et posé par tout le catalogue.
+          #
+          # La capacité est lue dans l'énumération fermée de model_types.go, à
+          # n'importe quelle position du tableau : un ajout futur en tête ne
+          # doit pas faire rater le reste. « created » accepte un entier signé
+          # parce que c'est un Unix() : un horodatage de création absent le
+          # rendrait négatif.
+          - '"id"\s*:\s*"[^"]*"\s*,\s*"created"\s*:\s*-?[0-9]+\s*,\s*"object"\s*:\s*"model"\s*,\s*"owned_by"\s*:\s*"[^"]*"\s*,\s*"features"\s*:\s*\[[^\]]*"(?:TextGeneration|TextEmbedding|Reranking|SpeechToText|SystemOne)"'
+
+    extractors:
+      # Les modèles du cluster, sous le nom qu'il faut passer au champ « model »
+      # d'une requête d'inférence — adaptateurs LoRA compris, écrits
+      # « <modèle>_<adaptateur> ». C'est ce qui appartient à l'exploitant dans
+      # la réponse, et le premier renseignement qu'un tiers en tire.
+      - type: json
+        part: body
+        name: model
+        json:
+          - '.data[].id'

@@ -40020,3 +40020,456 @@ def test_mcpo_matcher_compiles_and_fires_against_a_live_server():
     seen, results = scan(root=(200, MCPO_SINGLE_SERVER_BODY))
     assert seen == [("GET", MCPO_ROOT_ROUTE)], seen
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# KubeAI (kubeai-project/kubeai) : l'opérateur Kubernetes qui place un point
+# d'entrée compatible OpenAI devant vLLM, Faster-Whisper et Infinity, et qui
+# démarre les modèles à la demande. GET /openai/v1/models rend l'inventaire du
+# cluster, et internal/openaiserver/handler.go enregistre la route sur un
+# ServeMux nu — « mux.Handle("/openai/v1/models", http.HandlerFunc(
+# h.getModels)) » —, sans aucun intergiciel : il n'y a pas d'authentification à
+# désactiver.
+#
+# Trois points commandent la forme du template, et ce sont eux que cette
+# section amarre. Le discriminant d'abord : /openai/v1/models rend l'enveloppe
+# {"object":"list","data":[…]} que tout l'écosystème sert, et le pack en couvre
+# déjà une demi-douzaine de producteurs ; ce qui nomme KubeAI est le tableau
+# « features » de l'entrée, pris derrière « owned_by », dont les valeurs sont
+# l'énumération fermée de api/k8s/v1/model_types.go. Le champ facultatif
+# ensuite : « features,omitempty » disparaît de l'objet d'un Model dont
+# spec.features est vide — le cas « unlabelled » du propre test du projet —,
+# donc l'expression ne peut pas s'ancrer sur la première entrée. La lecture
+# enfin : le même routeur relaie l'inférence, et KubeAI démarrant les modèles à
+# la demande, un POST de preuve ferait provisionner un nœud GPU.
+
+KUBEAI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "kubeai-models-exposed.yaml")
+
+KUBEAI_MODELS_ROUTE = "/openai/v1/models"
+
+# metadata.creationTimestamp du Model, telle que l'API Kubernetes la pose, lue
+# par « m.Created = k8sM.CreationTimestamp.Unix() ».
+KUBEAI_CREATED = 1792000000
+
+
+def kubeai_model(name="llama-3.1-8b-instruct-fp8-l4",
+                 features=("TextGeneration",), created=KUBEAI_CREATED,
+                 owner="", adapter=None, drop=()):
+    """
+    Une entrée de `data`, dans l'ordre de déclaration de « type Model struct »
+    — id, created, object, owned_by, features — que constructOpenAIModel
+    remplit. `features` vide reproduit « features,omitempty » sur un Model dont
+    spec.features ne porte rien ; `adapter` reproduit
+    MergeModelAdapter(nom, adaptateur), qui joint les deux par un « _ ».
+    """
+    document = {"id": name if adapter is None else "%s_%s" % (name, adapter),
+                "created": created, "object": "model", "owned_by": owner}
+    if features:
+        document["features"] = list(features)
+    for key in drop:
+        document.pop(key, None)
+    return document
+
+
+def kubeai_models_body(*models, indent=None):
+    """
+    Ce que rend « json.NewEncoder(w).Encode(response) » : la structure anonyme
+    dans l'ordre de ses champs — object puis data —, compacte, suivie de la fin
+    de ligne que l'encodeur ajoute. `indent` réécrit comme le ferait un
+    intermédiaire qui réindente ce qu'il relaie.
+    """
+    document = {"object": "list", "data": list(models)}
+    if indent is not None:
+        return json.dumps(document, indent=indent) + "\n"
+    return json.dumps(document, separators=(",", ":")) + "\n"
+
+
+KUBEAI_MODELS_BODY = kubeai_models_body(kubeai_model())
+
+# Un parc réel, pris au catalogue du chart (charts/models/values.yaml) : la
+# génération de texte, l'embedding, la transcription, et un adaptateur LoRA du
+# premier modèle — qui hérite des features de son parent.
+KUBEAI_CATALOGUE_BODY = kubeai_models_body(
+    kubeai_model(),
+    kubeai_model(adapter="support-tuned"),
+    kubeai_model("nomic-embed-text-cpu", features=("TextEmbedding",)),
+    kubeai_model("faster-whisper-medium-en-cpu", features=("SpeechToText",)))
+
+# Un Model qui déclare plusieurs capacités, et un Model dont l'exploitant a
+# renseigné spec.owner — le champ déprécié que /v1/models recopie.
+KUBEAI_MULTI_FEATURE_BODY = kubeai_models_body(
+    kubeai_model(features=("TextGeneration", "SystemOne")),
+    kubeai_model("bge-reranker-base-cpu", features=("Reranking",),
+                 owner="plateforme-ia"))
+
+# Le cas « unlabelled » du test du projet : un Model sans spec.features ouvre
+# la liste, et omitempty retire la clé de son objet. Le template doit toujours
+# déclencher sur l'entrée suivante.
+KUBEAI_FEATURELESS_FIRST_BODY = kubeai_models_body(
+    kubeai_model("unlabelled", features=()),
+    kubeai_model("unlabelled", features=(), adapter="tuned"),
+    kubeai_model())
+
+# Le même corps réindenté par un intermédiaire.
+KUBEAI_REFORMATTED_BODY = kubeai_models_body(kubeai_model(), indent=2)
+
+# Une capacité qu'une version future ajouterait à l'énumération, posée devant
+# celles d'aujourd'hui : le tableau est lu à n'importe quelle position.
+KUBEAI_FUTURE_FEATURE_BODY = kubeai_models_body(
+    kubeai_model(features=("ImageGeneration", "TextGeneration")))
+
+# Aucun Model du cluster ne déclare de capacité : le template ne déclenche pas,
+# et c'est le prix assumé d'ancrer le constat sur « features » — la CRD exige
+# pourtant le champ, et tout le catalogue le pose.
+KUBEAI_NO_FEATURE_BODY = kubeai_models_body(kubeai_model(features=()))
+
+# Une capacité hors de l'énumération, et seule : non reconnue, même prix.
+KUBEAI_UNKNOWN_FEATURE_BODY = kubeai_models_body(
+    kubeai_model(features=("ImageGeneration",)))
+
+# Un cluster où aucun Model n'est installé. getModels construit « models :=
+# make([]Model, 0) », donc « [] » et jamais « null » — le test du projet
+# l'exige : « empty discovery must return [] rather than null ». Rien n'est
+# divulgué, aucune cible d'inférence n'est nommée, le constat est non
+# concluant.
+KUBEAI_EMPTY_BODY = kubeai_models_body()
+
+# spec.owner est une chaîne libre : un exploitant facétieux peut y écrire les
+# clés de la signature. Dans le corps, leurs guillemets sont échappés, et ce ne
+# sont alors pas des clés.
+KUBEAI_OWNER_QUOTING_BODY = kubeai_models_body(kubeai_model(
+    owner='acme","features":["TextGeneration"]', features=()))
+
+# La charge utile entière retrouvée au fond du document d'une supervision qui
+# l'agrégerait sous une clé à elle, et la même recopiée en tête par une
+# passerelle qui ajoute une clé derrière la liste.
+KUBEAI_COMPOSITE_BODY = ('{"kubeai":%s,"checked_at":0}'
+                         % KUBEAI_MODELS_BODY.strip())
+KUBEAI_APPENDED_BODY = KUBEAI_MODELS_BODY.strip()[:-1] + ',"checked_at":0}'
+
+# Les deux refus que KubeAI écrit lui-même, par sendErrorResponse : le 400 d'un
+# sélecteur de labels illisible et le 500 d'un appel à l'API Kubernetes qui
+# échoue, dont le message est remplacé par le texte du statut.
+KUBEAI_BAD_SELECTOR_BODY = ('{"error":"failed to parse label selector: '
+                            'unable to parse requirement"}\n')
+KUBEAI_SERVER_ERROR_BODY = '{"error":"Internal Server Error"}\n'
+
+# Ce que rend une passerelle qui authentifie devant le pod : la fermeture
+# attendue, puisque le produit n'a rien à opposer lui-même.
+KUBEAI_GATEWAY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+
+def kubeai_block():
+    doc = load(KUBEAI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % KUBEAI_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /openai/v1/models — c'est pourtant la "
+        "seule lecture qui nomme le produit sans rien lui faire exécuter"
+    )
+    return blocks[0]
+
+
+def kubeai_fires(status=200, body=None, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and` par défaut."""
+    block = kubeai_block()
+    if body is None:
+        body = KUBEAI_MODELS_BODY
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            blob = " ".join(headers.values())
+            words = matcher.get("words") or []
+            verdicts.append(all(w in blob for w in words)
+                            if matcher.get("condition") == "and"
+                            else any(w in blob for w in words))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_kubeai_probe_is_a_single_read_only_get_that_never_triggers_a_scale_up():
+    """
+    Le point qui borne ce template. Le ServeMux de handler.go relaie POST
+    /openai/v1/chat/completions, /completions, /embeddings,
+    /audio/transcriptions, /responses, /v1/rerank, /v1/systemone et
+    /v1/messages vers les moteurs d'inférence, et KubeAI tient la requête puis
+    démarre un Pod quand aucun ne tourne : appeler l'une de ces routes ferait
+    provisionner un nœud GPU aux frais de l'exploitant pour établir qu'il est
+    provisionnable. getModels, lui, ne fait qu'un List sur l'API Kubernetes.
+    """
+    doc = load(KUBEAI_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", KUBEAI_MODELS_ROUTE)}, (
+        "le template n'interroge pas exactement la route d'inventaire — "
+        f"{sorted(request_routes(doc))}"
+    )
+    assert doc["info"]["severity"] == "high", (
+        "l'inventaire anonyme ouvre l'inférence et le provisionnement de GPU "
+        "sur le même routeur"
+    )
+    assert doc["info"]["metadata"]["max-request"] == 1
+    assert doc["info"]["metadata"]["product"] == "kubeai"
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "l'inventaire se lit en GET : le handler ne consulte pas la "
+            "méthode, et tout autre verbe sur ce routeur touche une route de "
+            "proxy"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande de faire tourner un modèle sur l'instance auditée"
+        )
+        assert not block.get("raw"), (
+            "une requête brute porterait sa propre méthode et ses propres "
+            "en-têtes : les contrôles ci-dessous ne les verraient pas"
+        )
+        assert not block.get("headers"), (
+            "le bloc pose un en-tête : « X-Label-Selector » filtrerait "
+            "l'inventaire sur des labels devinés, alors que la branche par "
+            "défaut de getModels liste tous les Models du cluster"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/chat/completions", "la route de conversation fait tourner "
+                                      "le moteur, et démarre un Pod GPU quand "
+                                      "aucun ne tourne"),
+                ("/completions", "même routeur, même effet"),
+                ("/embeddings", "la route d'embedding démarre le moteur "
+                                "Infinity"),
+                ("/audio/transcriptions", "la route de transcription démarre "
+                                          "Faster-Whisper"),
+                ("/responses", "la route Responses relaie vers le moteur"),
+                ("/rerank", "la route de reclassement relaie vers le moteur"),
+                ("/systemone", "la route SystemOne relaie vers le moteur"),
+                ("/messages", "la route Anthropic Messages relaie vers le "
+                              "moteur"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+
+
+def test_kubeai_matcher_rests_on_the_features_array_not_on_the_openai_envelope():
+    """
+    /openai/v1/models rend l'enveloppe la plus partagée de l'écosystème. Ce qui
+    nomme KubeAI est « features » pris derrière « owned_by », dans la même
+    entrée, avec une valeur de l'énumération de model_types.go.
+    """
+    assert kubeai_fires(), (
+        "le template ne reconnaît pas l'inventaire que getModels rend"
+    )
+    assert kubeai_fires(body=KUBEAI_CATALOGUE_BODY), (
+        "le template rate un parc du catalogue officiel — génération, "
+        "embedding, transcription et un adaptateur LoRA"
+    )
+    assert kubeai_fires(body=KUBEAI_MULTI_FEATURE_BODY), (
+        "le template rate un Model à plusieurs capacités, ou un spec.owner "
+        "renseigné"
+    )
+    assert kubeai_fires(body=KUBEAI_FUTURE_FEATURE_BODY), (
+        "le template lit la première valeur du tableau plutôt que n'importe "
+        "laquelle : un ajout futur en tête ferait rater le reste"
+    )
+    assert kubeai_fires(body=KUBEAI_REFORMATTED_BODY), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : encoding/json écrit compact, un proxy ne s'y tient pas"
+    )
+
+    for other, why in (
+        (VLLM_MODELS_BODY, "vLLM, déjà couvert par son propre template — son "
+                           "entrée porte root, parent et max_model_len, pas "
+                           "de features"),
+        (OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy, déjà couvert"),
+        (LLAMASWAP_MODELS_BODY, "llama-swap, déjà couvert — son entrée porte "
+                                "un status derrière owned_by"),
+        (KOKORO_MODELS_BODY, "Kokoro-FastAPI, déjà couvert"),
+        (SPEACHES_MODELS_BODY, "Speaches, déjà couvert"),
+        (LMSTUDIO_MODELS_BODY, "LM Studio, déjà couvert"),
+        (KSERVE_MODELS_BODY, "KServe, déjà couvert, et qui monte lui aussi "
+                             "/openai/v1/ : le préfixe de chemin ne distingue "
+                             "rien"),
+        (KUBEAI_NO_FEATURE_BODY, "un cluster dont aucun Model ne déclare de "
+                                 "capacité : prix assumé du discriminant"),
+        (KUBEAI_UNKNOWN_FEATURE_BODY, "une capacité hors de l'énumération, et "
+                                      "seule"),
+        (KUBEAI_EMPTY_BODY, "un cluster sans Model installé — rien n'est "
+                            "divulgué, aucune inférence n'est nommée"),
+        (KUBEAI_OWNER_QUOTING_BODY, "les clés citées dans spec.owner : dans le "
+                                    "corps, leurs guillemets sont échappés"),
+        (KUBEAI_COMPOSITE_BODY, "la charge utile republiée au fond du document "
+                                "d'une supervision"),
+        (KUBEAI_APPENDED_BODY, "la même, recopiée en tête par une passerelle "
+                               "qui ajoute une clé derrière la liste"),
+        (KUBEAI_BAD_SELECTOR_BODY, "le 400 que sendErrorResponse écrit sur un "
+                                   "sélecteur illisible"),
+        (KUBEAI_SERVER_ERROR_BODY, "le 500 d'un appel à l'API Kubernetes qui "
+                                   "échoue"),
+        (KUBEAI_GATEWAY_DENIED_BODY, "le refus d'une passerelle qui "
+                                     "authentifie — c'est la fermeture "
+                                     "attendue"),
+    ):
+        assert not kubeai_fires(body=other), (
+            f"le template déclenche sur {why}"
+        )
+
+
+def test_kubeai_matcher_admits_a_model_whose_features_are_omitted():
+    """
+    « Features []kubeaiv1.ModelFeature `json:"features,omitempty"` » : un Model
+    dont spec.features est vide n'a pas la clé, et il peut très bien ouvrir la
+    liste — c'est le cas « unlabelled » du propre test du projet, adaptateur
+    compris. L'expression ne doit donc pas s'ancrer sur la première entrée.
+    """
+    assert kubeai_fires(body=KUBEAI_FEATURELESS_FIRST_BODY), (
+        "le template ne lit que la première entrée : un Model sans capacité "
+        "déclarée en tête de liste masquerait tout le reste de l'inventaire"
+    )
+    assert "features" not in json.loads(
+        KUBEAI_FEATURELESS_FIRST_BODY)["data"][0], (
+        "le cas de test ne dit pas ce qu'il croit dire"
+    )
+
+
+def test_kubeai_conclusion_is_carried_by_the_body_and_never_by_the_status():
+    """
+    getModels rend 200 et l'inventaire, ou un corps d'erreur entièrement
+    différent ; une passerelle qui authentifie répond son propre refus. Le
+    corps dit donc ce qui est servi, quoi qu'un intermédiaire fasse du code.
+    """
+    block = kubeai_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la signature produit "
+        "peut être court-circuitée par l'enveloppe générique"
+    )
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}, (
+        "le bloc lit le statut : le constat tient au corps"
+    )
+    assert kubeai_fires(status=503), (
+        "le verdict change avec le statut alors qu'aucun matcher ne le lit"
+    )
+    assert not kubeai_fires(headers={"Content-Type": "text/html"}), (
+        "le template admet un corps servi en text/html : getModels pose "
+        "« Content-Type: application/json » sans condition"
+    )
+
+
+def test_kubeai_extractor_reports_the_cluster_model_names():
+    extractors = kubeai_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        f"un seul extracteur suffit à dire ce que le cluster sert — {extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", extractor
+    assert extractor.get("json") == [".data[].id"], (
+        "l'extracteur ne rend pas un identifiant par entrée — c'est le nom à "
+        "passer au champ « model » d'une requête d'inférence"
+    )
+    assert json.loads(KUBEAI_CATALOGUE_BODY)["data"][1]["id"] == (
+        "llama-3.1-8b-instruct-fp8-l4_support-tuned"), (
+        "le cas de test ne dit pas ce qu'il croit dire : MergeModelAdapter "
+        "joint le modèle et l'adaptateur par un « _ »"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_kubeai_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher, et
+    `body_matcher_hits` réévalue les motifs avec le moteur de Python plutôt
+    qu'avec RE2 : seul un scan contre un vrai serveur ferme la boucle, sur la
+    compilation des regex comme sur l'extracteur gojq.
+    """
+    def scan(status=200, body=KUBEAI_MODELS_BODY,
+             content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.path == KUBEAI_MODELS_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, "404 page not found\n", "text/plain")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", KUBEAI_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "kubeai-models-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", KUBEAI_MODELS_ROUTE)], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [
+        "llama-3.1-8b-instruct-fp8-l4"], results[0].get("extracted-results")
+
+    # Le parc du catalogue : un identifiant par entrée, adaptateur compris, et
+    # toujours une seule ligne. Trié, parce que nuclei dédoublonne les valeurs
+    # extraites par une table et ne garde pas l'ordre du document.
+    _, results = scan(body=KUBEAI_CATALOGUE_BODY)
+    assert len(results) == 1, results
+    assert sorted(results[0].get("extracted-results") or []) == sorted([
+        "llama-3.1-8b-instruct-fp8-l4",
+        "llama-3.1-8b-instruct-fp8-l4_support-tuned",
+        "nomic-embed-text-cpu", "faster-whisper-medium-en-cpu"])
+
+    # Un Model sans capacité déclarée en tête de liste, un corps réindenté, une
+    # capacité future posée devant les autres : le constat tient.
+    for body in (KUBEAI_FEATURELESS_FIRST_BODY, KUBEAI_REFORMATTED_BODY,
+                 KUBEAI_FUTURE_FEATURE_BODY, KUBEAI_MULTI_FEATURE_BODY):
+        _, results = scan(body=body)
+        assert len(results) == 1, (body, results)
+
+    # Les voisins du même endpoint, les refus, et les corps non concluants.
+    for body in (VLLM_MODELS_BODY, LLAMASWAP_MODELS_BODY, KOKORO_MODELS_BODY,
+                 LMDEPLOY_OPEN_BODY, KSERVE_MODELS_BODY, KUBEAI_EMPTY_BODY,
+                 KUBEAI_NO_FEATURE_BODY, KUBEAI_OWNER_QUOTING_BODY,
+                 KUBEAI_COMPOSITE_BODY, KUBEAI_APPENDED_BODY,
+                 KUBEAI_SERVER_ERROR_BODY):
+        _, results = scan(body=body)
+        assert results == [], (body, results)
+
+    # Le même inventaire servi en text/html : silence.
+    _, results = scan(content_type="text/html; charset=utf-8")
+    assert results == [], results
