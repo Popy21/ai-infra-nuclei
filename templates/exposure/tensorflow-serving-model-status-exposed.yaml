@@ -1,0 +1,144 @@
+id: tensorflow-serving-model-status-exposed
+
+info:
+  name: TensorFlow Serving - Unauthenticated REST API (Model Status Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    TensorFlow Serving (tensorflow/serving) est le serveur de modèles de
+    référence de l'écosystème TensorFlow, distribué par l'image
+    tensorflow/serving. Son API REST n'a pas de garde à désactiver, parce
+    qu'elle n'en construit aucune : ni
+    tensorflow_serving/model_servers/http_server.cc ni
+    http_rest_api_handler.cc ne contiennent de vérification d'identifiant, et
+    le seul contrôle lié à l'origine de la requête est le test CORS
+    facultatif « if (core_->enable_cors_support()) ». HttpRestApiHandler
+    s'enregistre sous kPathRegex, qui vaut kHTTPRestApiHandlerPathRegex,
+    « (?i)/v1/.* » (http_rest_api_util.h) : tout le préfixe /v1/ arrive au
+    handler.
+    Le Dockerfile de l'image (tensorflow_serving/tools/docker/Dockerfile)
+    pose « ENV MODEL_NAME=model », « EXPOSE 8501 » — le REST, 8500 portant le
+    gRPC — et lance « tensorflow_model_server --port=8500
+    --rest_api_port=8501 --model_name=${MODEL_NAME}
+    --model_base_path=${MODEL_BASE_PATH}/${MODEL_NAME} ». Sur une instance
+    déployée depuis l'image sans surcharge, le modèle servi s'appelle donc
+    littéralement « model ».
+    GET /v1/models/model porte le constat. ProcessModelStatusRequest rend la
+    GetModelStatusResponse du modèle, sérialisée par MessageToJsonString avec
+    add_whitespace : un objet dont l'unique clé est « model_version_status »,
+    une entrée par version avec son « state » — « AVAILABLE » pour une version
+    qui sert — et son « status » (« error_code »: « OK »).
+    GET /v1/models, sans nom, est le second oracle, et il ne dépend pas du
+    nom du modèle. kModelStatusApiRegex (http_rest_api_util.cc) rend le nom
+    facultatif, et ProcessModelStatusRequest refuse alors par
+    « errors::InvalidArgument("Missing model name in request.") » ; la fin de
+    ProcessRequest passe ce statut à MakeJsonFromStatus
+    (tensorflow_serving/util/json_tensor.cc), qui écrit un objet à la seule
+    clé « error » par un rapidjson::PrettyWriter, et ToHTTPStatusCode
+    (http_server.cc) traduit kInvalidArgument en 400. Le message est propre
+    au produit ; le statut et la route, eux, ne le sont pas — /v1/models est
+    aussi l'inventaire des runtimes compatibles OpenAI et de KServe, que le
+    pack couvre déjà.
+  impact: |
+    Le même serveur sans garde exécute les modèles qu'il annonce. POST
+    /v1/models/{nom}:predict, :classify et :regress — les trois verbes de
+    kPredictionApiGegex, dans http_rest_api_util.cc — font tourner le modèle
+    sur le matériel de l'exploitant, CPU ou GPU, pour quiconque connaît son
+    nom : une inférence gratuite à ses frais, et un modèle propriétaire qu'on
+    interroge à volonté, donc qu'on distille. GET /v1/models/{nom}/metadata
+    rend la GetModelMetadataResponse, c'est-à-dire le signature_def du
+    modèle : les noms, types et formes exacts de ses tenseurs d'entrée et de
+    sortie — exactement ce qu'il faut pour construire une requête de
+    prédiction valide du premier coup. Aucun compte n'existe : rien de tout
+    cela n'est attribuable, les journaux ne porteront qu'une adresse.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à activer : le serveur n'en
+    connaît aucun. La fermeture est réseau. Ne pas publier le port REST sur
+    toutes les interfaces — « -p 127.0.0.1:8501:8501 » quand il doit rester
+    local — ni le port gRPC 8500, qui sert les mêmes méthodes ; dans un
+    cluster, ne pas exposer le Service en LoadBalancer ou NodePort, et placer
+    devant le conteneur un proxy ou une passerelle qui authentifie sur le
+    préfixe /v1/ entier, et non sur la seule route d'état, puisque :predict,
+    :classify, :regress et /metadata répondent au même handler.
+    Vérifier depuis l'extérieur et sans identifiant : « curl -s
+    http://<hote>:8501/v1/models/model » et « curl -s
+    http://<hote>:8501/v1/models » ne doivent plus rendre le document du
+    serveur. Changer MODEL_NAME ne ferme rien : le nom n'est pas un secret, et
+    /v1/models répond sans lui.
+  reference:
+    - https://github.com/tensorflow/serving/blob/master/tensorflow_serving/g3doc/api_rest.md
+    - https://github.com/tensorflow/serving/blob/master/tensorflow_serving/tools/docker/Dockerfile
+    - https://github.com/tensorflow/serving/blob/master/tensorflow_serving/model_servers/http_rest_api_handler.cc
+    - https://github.com/tensorflow/serving/blob/master/tensorflow_serving/model_servers/http_rest_api_util.cc
+    - https://github.com/tensorflow/serving/blob/master/tensorflow_serving/model_servers/http_rest_api_util.h
+    - https://github.com/tensorflow/serving/blob/master/tensorflow_serving/model_servers/http_server.cc
+    - https://github.com/tensorflow/serving/blob/master/tensorflow_serving/util/json_tensor.cc
+  metadata:
+    max-request: 2
+    vendor: tensorflow
+    product: tensorflow-serving
+  tags: ai,ml,tensorflow,tensorflow-serving,model-server,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures au plus, une seule en pratique sur une image sans surcharge.
+  #
+  # GET /v1/models/model d'abord : le nom par défaut de l'image, et la route
+  # qui dit que le serveur sert quelque chose, et quoi. GET /v1/models ensuite,
+  # seulement si la première n'a pas conclu — un MODEL_NAME surchargé, ou un
+  # --model_config_file : le refus que le handler écrit faute de nom nomme le
+  # produit sans qu'il faille deviner celui du modèle.
+  #
+  # GET, et en lecture seule strictement : le même handler sert POST
+  # /v1/models/{nom}:predict, :classify et :regress, qui feraient tourner le
+  # modèle sur le matériel de l'exploitant. /metadata n'est pas joint non plus :
+  # le signature_def n'ajoute rien au constat.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models/model"
+      - "{{BaseURL}}/v1/models"
+
+    # req-condition accumule body_N pour que chaque branche lise la réponse
+    # qui la concerne ; stop-at-first-match ferme la marche dès que la
+    # première a conclu — sans lui, le moteur réévaluerait après la seconde
+    # requête et la seconde partirait pour rien.
+    stop-at-first-match: true
+    req-condition: true
+
+    matchers:
+      # Deux expressions, une par oracle, et la condition vaut « or ».
+      #
+      # La première est le document entier de GET /v1/models/model, ancré aux
+      # deux bouts : « model_version_status » est son unique clé, et une
+      # version au moins doit être « AVAILABLE ». Pas sur la première entrée :
+      # la réponse liste chaque version suivie, et une version en LOADING,
+      # UNLOADING ou END peut précéder celle qui sert. L'ancrage écarte la
+      # charge utile republiée au fond du document d'une supervision. Les \s*
+      # sont nécessaires et non une prudence : MessageToJsonString est appelé
+      # avec add_whitespace, et l'instance écrit « "state": "AVAILABLE" » avec
+      # une espace — l'exemple compact de api_rest.md n'est pas ce que le
+      # serveur rend.
+      #
+      # La seconde est le refus de GET /v1/models, ancré lui aussi : un objet à
+      # la seule clé « error », portant le littéral que
+      # ProcessModelStatusRequest écrit. Le PrettyWriter de rapidjson indente
+      # de quatre espaces ; l'espacement n'est pas exigé.
+      #
+      # Le code HTTP n'entre dans aucune des deux : 200 et 400 sont ceux de
+      # tout serveur, et le second est aussi celui d'un runtime compatible
+      # OpenAI qui refuserait une requête — seul le corps sépare.
+      - type: dsl
+        dsl:
+          - 'regex("(?s)^\\{\\s*\"model_version_status\"\\s*:\\s*\\[.*\\]\\s*\\}$", trim_space(body_1)) && regex("\"state\"\\s*:\\s*\"AVAILABLE\"", body_1)'
+          - 'regex("^\\{\\s*\"error\"\\s*:\\s*\"Missing model name in request\\.\"\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # Les versions qui servent : chacune désigne une route
+      # /v1/models/model/versions/{n}:predict appelable. Borné à body_1, qui
+      # n'existe que sous la première branche ; sous la seconde, le corps de
+      # body_1 est un refus sans « model_version_status » et l'extracteur ne
+      # rend rien.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.model_version_status[] | select(.state == "AVAILABLE") | .version'

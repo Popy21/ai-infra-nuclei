@@ -40473,3 +40473,306 @@ def test_kubeai_matcher_compiles_and_fires_against_a_live_server():
     # Le même inventaire servi en text/html : silence.
     _, results = scan(content_type="text/html; charset=utf-8")
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# TensorFlow Serving (tensorflow/serving) : le serveur de modèles de référence
+# de TensorFlow, distribué par l'image tensorflow/serving. HttpRestApiHandler
+# s'enregistre sous « (?i)/v1/.* » (kHTTPRestApiHandlerPathRegex,
+# http_rest_api_util.h), et ni http_server.cc ni http_rest_api_handler.cc ne
+# vérifient d'identifiant : il n'y a pas d'authentification à désactiver.
+#
+# Deux oracles, et cette section les amarre aux corps relevés sur une instance
+# réelle — tensorflow/serving:latest, linux/amd64, image du 2026-09-29, le
+# modèle saved_model_half_plus_two_cpu du dépôt monté sous /models/model. GET
+# /v1/models/model d'abord, parce que le Dockerfile pose « ENV
+# MODEL_NAME=model » : la GetModelStatusResponse, que MessageToJsonString
+# écrit avec add_whitespace — l'exemple compact de api_rest.md n'est pas ce que
+# le serveur rend. GET /v1/models ensuite, qui ne dépend pas du nom : le refus
+# « Missing model name in request. » de ProcessModelStatusRequest, écrit par le
+# PrettyWriter de rapidjson. La route /v1/models est aussi celle des runtimes
+# compatibles OpenAI et de KServe : seul le corps sépare.
+
+TFSERVING_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "tensorflow-serving-model-status-exposed.yaml")
+
+TFSERVING_STATUS_ROUTE = "/v1/models/model"
+TFSERVING_MODELS_ROUTE = "/v1/models"
+
+# Relevés verbatim sur l'instance : une espace d'indentation pour le JSON de
+# protobuf, quatre pour rapidjson, et pas de fin de ligne derrière le refus.
+TFSERVING_STATUS_BODY = (
+    '{\n "model_version_status": [\n  {\n   "version": "123",\n'
+    '   "state": "AVAILABLE",\n   "status": {\n    "error_code": "OK",\n'
+    '    "error_message": ""\n   }\n  }\n ]\n}\n'
+)
+TFSERVING_MISSING_NAME_BODY = (
+    '{\n    "error": "Missing model name in request."\n}'
+)
+# GET /v1/models/model quand MODEL_NAME a été surchargé : relevé lui aussi,
+# sous un 404. Le produit répond, mais ce corps-là ne le nomme pas.
+TFSERVING_UNKNOWN_MODEL_BODY = (
+    '{\n    "error": "Could not find any versions of model model"\n}'
+)
+# GET /v1/models/ — la barre finale ne laisse pas le nom vide, elle rend la
+# requête illisible pour kModelStatusApiRegex : autre message, relevé aussi.
+TFSERVING_MALFORMED_BODY = (
+    '{\n    "error": "Malformed request: GET /v1/models/"\n}'
+)
+
+# L'exemple de api_rest.md, compact : ce qu'un intermédiaire qui réécrit le
+# JSON rendrait.
+TFSERVING_COMPACT_STATUS_BODY = (
+    '{"model_version_status":[{"version":"123","state":"AVAILABLE",'
+    '"status":{"error_code":"OK","error_message":""}}]}'
+)
+
+
+def tfserving_status_body(*versions):
+    """
+    Une GetModelStatusResponse à plusieurs versions, dans l'écriture de
+    MessageToJsonString avec add_whitespace — indentation d'une espace.
+    """
+    document = {"model_version_status": [
+        {"version": str(version), "state": state,
+         "status": {"error_code": "OK", "error_message": ""}}
+        for version, state in versions]}
+    return json.dumps(document, indent=1) + "\n"
+
+
+# La version qui charge précède celle qui sert : la réponse liste chaque
+# version suivie, dans l'ordre que GetModelStatus rend.
+TFSERVING_TWO_VERSIONS_BODY = tfserving_status_body(
+    (1, "END"), (2, "AVAILABLE"), (3, "LOADING"))
+# Aucune version ne sert : rien d'exécutable n'est nommé, silence.
+TFSERVING_LOADING_ONLY_BODY = tfserving_status_body((1, "LOADING"))
+TFSERVING_ENDED_BODY = tfserving_status_body((1, "END"))
+
+# La charge utile republiée au fond d'une supervision, et la même suivie d'une
+# clé qu'une passerelle ajouterait.
+TFSERVING_COMPOSITE_BODY = '{"tfserving":%s,"checked_at":0}' % (
+    TFSERVING_STATUS_BODY.strip())
+TFSERVING_APPENDED_BODY = (TFSERVING_STATUS_BODY.strip()[:-1]
+                           + ',"checked_at":0}')
+TFSERVING_MISSING_NAME_COMPOSITE_BODY = (
+    '{"error": "Missing model name in request.", "upstream": "tfserving"}')
+
+# Le refus d'une passerelle qui authentifie : la fermeture attendue.
+TFSERVING_GATEWAY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+TFSERVING_DEFAULT = ((200, TFSERVING_STATUS_BODY),
+                     (400, TFSERVING_MISSING_NAME_BODY))
+TFSERVING_RENAMED = ((404, TFSERVING_UNKNOWN_MODEL_BODY),
+                     (400, TFSERVING_MISSING_NAME_BODY))
+
+
+def tfserving_block():
+    doc = load(TFSERVING_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % TFSERVING_STATUS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /v1/models/model — le nom de modèle "
+        "par défaut de l'image officielle"
+    )
+    return blocks[0]
+
+
+def tfserving_scan(responses):
+    """
+    Sémantique nuclei du bloc sous req-condition et stop-at-first-match : le
+    matcher est évalué après chaque réponse, contre celles déjà reçues, et la
+    marche s'arrête au premier verdict positif. Rend le nombre de requêtes
+    parties et le verdict.
+    """
+    block = tfserving_block()
+    matcher, = block.get("matchers")
+    received = []
+    for response in responses:
+        received.append(response)
+        try:
+            hit = dsl_matcher_hits(matcher, received)
+        except NameError:
+            # body_2 n'existe pas encore : nuclei évalue l'expression à faux.
+            hit = any(
+                dsl_matcher_hits({"dsl": [e]}, received)
+                for e in matcher["dsl"] if "body_2" not in e)
+        if hit:
+            return len(received), True
+    return len(received), False
+
+
+def tfserving_fires(status=TFSERVING_DEFAULT[0], models=TFSERVING_DEFAULT[1]):
+    return tfserving_scan((status, models))[1]
+
+
+def test_tfserving_probe_reads_the_status_routes_and_never_runs_the_model():
+    """
+    Le même handler sert POST /v1/models/{nom}:predict, :classify et :regress
+    — kPredictionApiGegex — qui feraient tourner le modèle sur le matériel de
+    l'exploitant. Le constat tient à deux GET qui ne lisent que l'état.
+    """
+    doc = load(TFSERVING_TEMPLATE)
+    assert request_routes(doc) == {("GET", TFSERVING_STATUS_ROUTE),
+                                   ("GET", TFSERVING_MODELS_ROUTE)}, (
+        sorted(request_routes(doc)))
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 2
+    assert doc["info"]["metadata"]["product"] == "tensorflow-serving"
+
+    block = tfserving_block()
+    assert block.get("path") == ["{{BaseURL}}%s" % TFSERVING_STATUS_ROUTE,
+                                 "{{BaseURL}}%s" % TFSERVING_MODELS_ROUTE], (
+        "l'ordre compte : la route du modèle par défaut conclut seule sur une "
+        "image sans surcharge, et /v1/models ne doit partir qu'à défaut"
+    )
+    for b in doc.get("http") or []:
+        assert b.get("method", "GET") == "GET"
+        assert not b.get("body") and not b.get("raw") and not b.get("headers")
+        for path in b.get("path") or []:
+            for verb in (":predict", ":classify", ":regress", "/metadata"):
+                assert verb not in path, f"{path} : le constat n'en a pas besoin"
+
+
+def test_tfserving_matcher_reads_either_oracle_and_nothing_generic():
+    # L'image sans surcharge : la première requête conclut, la seconde ne part
+    # pas.
+    assert tfserving_scan(TFSERVING_DEFAULT) == (1, True)
+    # MODEL_NAME surchargé : /v1/models/model rend 404, le refus sans nom
+    # prend le relais.
+    assert tfserving_scan(TFSERVING_RENAMED) == (2, True)
+
+    for status in ((200, TFSERVING_COMPACT_STATUS_BODY),
+                   (200, TFSERVING_TWO_VERSIONS_BODY)):
+        assert tfserving_fires(status=status, models=(404, "")), status
+
+    for status, models, why in (
+        ((200, TFSERVING_LOADING_ONLY_BODY), (404, ""),
+         "un modèle dont aucune version ne sert encore"),
+        ((200, TFSERVING_ENDED_BODY), (404, ""),
+         "un modèle déchargé"),
+        ((404, TFSERVING_UNKNOWN_MODEL_BODY), (400, TFSERVING_MALFORMED_BODY),
+         "un autre refus du handler, qui ne dit pas « Missing model name »"),
+        ((200, TFSERVING_COMPOSITE_BODY), (404, ""),
+         "la charge utile au fond d'une supervision"),
+        ((200, TFSERVING_APPENDED_BODY), (404, ""),
+         "la même suivie d'une clé ajoutée"),
+        ((404, ""), (400, TFSERVING_MISSING_NAME_COMPOSITE_BODY),
+         "le message recopié dans un document plus large"),
+        ((404, ""), (200, KSERVE_MODELS_BODY), "KServe, déjà couvert"),
+        ((404, ""), (200, VLLM_MODELS_BODY), "vLLM, déjà couvert"),
+        ((404, ""), (200, OTHER_OPENAI_API_BODY),
+         "une API compatible OpenAI quelconque"),
+        ((401, TFSERVING_GATEWAY_DENIED_BODY),
+         (401, TFSERVING_GATEWAY_DENIED_BODY),
+         "une passerelle qui authentifie — la fermeture attendue"),
+    ):
+        assert not tfserving_fires(status=status, models=models), why
+
+
+def test_tfserving_conclusion_is_carried_by_the_bodies_and_never_by_the_status():
+    block = tfserving_block()
+    assert block.get("req-condition") is True
+    assert block.get("stop-at-first-match") is True, (
+        "sans stop-at-first-match, /v1/models partirait après un constat déjà "
+        "établi, et l'instance remonterait deux fois"
+    )
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("type") == "dsl", matcher
+        for expression in matcher.get("dsl") or []:
+            assert "status_code" not in expression, (
+                "200 et 400 sont ceux de tout serveur : le constat tient au corps"
+            )
+    assert tfserving_fires(status=(203, TFSERVING_STATUS_BODY))
+    assert tfserving_fires(status=(404, ""),
+                           models=(200, TFSERVING_MISSING_NAME_BODY))
+
+
+def test_tfserving_extractor_reports_the_available_versions():
+    extractors = tfserving_block().get("extractors") or []
+    assert len(extractors) == 1, extractors
+    extractor, = extractors
+    assert extractor.get("type") == "json"
+    assert extractor.get("part") == "body_1"
+    assert extractor.get("json") == [
+        '.model_version_status[] | select(.state == "AVAILABLE") | .version']
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_tfserving_matcher_compiles_and_fires_against_a_live_server():
+    """
+    Seul un scan contre un vrai serveur ferme la boucle sur RE2, sur gojq et sur
+    ce que stop-at-first-match fait de la seconde requête.
+    """
+    def scan(status=(200, TFSERVING_STATUS_BODY),
+             models=(400, TFSERVING_MISSING_NAME_BODY)):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.path == TFSERVING_STATUS_ROUTE:
+                    self.reply(*status)
+                elif self.path == TFSERVING_MODELS_ROUTE:
+                    self.reply(*models)
+                else:
+                    self.reply(404, "<HTML><BODY>Not Found</BODY></HTML>\n")
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", TFSERVING_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "tensorflow-serving-model-status-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", TFSERVING_STATUS_ROUTE)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["123"], results[0]
+
+    _, results = scan(status=(200, TFSERVING_TWO_VERSIONS_BODY))
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["2"], results[0]
+
+    seen, results = scan(status=(404, TFSERVING_UNKNOWN_MODEL_BODY))
+    assert seen == [("GET", TFSERVING_STATUS_ROUTE),
+                    ("GET", TFSERVING_MODELS_ROUTE)], seen
+    assert len(results) == 1, results
+    assert not results[0].get("extracted-results"), results[0]
+
+    for status, models in (
+        ((200, TFSERVING_LOADING_ONLY_BODY), (404, "")),
+        ((200, TFSERVING_COMPOSITE_BODY), (404, "")),
+        ((404, TFSERVING_UNKNOWN_MODEL_BODY), (400, TFSERVING_MALFORMED_BODY)),
+        ((404, ""), (200, KSERVE_MODELS_BODY)),
+        ((404, ""), (200, VLLM_MODELS_BODY)),
+        ((404, ""), (400, TFSERVING_MISSING_NAME_COMPOSITE_BODY)),
+    ):
+        _, results = scan(status=status, models=models)
+        assert results == [], (status, models, results)

@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-121 templates, 118 produits.
+122 templates, 119 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -138,6 +138,7 @@ amont.
 | swarmui | [`swarmui-new-session-exposed`](templates/exposure/swarmui-new-session-exposed.yaml) | high |
 | tabby | [`tabby-health-exposed`](templates/exposure/tabby-health-exposed.yaml) | medium |
 | tensorboard | [`tensorboard-exposed`](templates/exposure/tensorboard-exposed.yaml) | medium |
+| tensorflow-serving | [`tensorflow-serving-model-status-exposed`](templates/exposure/tensorflow-serving-model-status-exposed.yaml) | high |
 | text-embeddings-inference | [`text-embeddings-inference-exposed`](templates/exposure/text-embeddings-inference-exposed.yaml) | medium |
 | text-generation-inference | [`text-generation-inference-exposed`](templates/exposure/text-generation-inference-exposed.yaml) | high |
 | text-generation-webui | [`text-generation-webui-internal-api-exposed`](templates/exposure/text-generation-webui-internal-api-exposed.yaml) | high |
