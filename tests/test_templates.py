@@ -40776,3 +40776,254 @@ def test_tfserving_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(status=status, models=models)
         assert results == [], (status, models, results)
+
+
+# --------------------------------------------------------------------------
+# Lemonade Server (lemonade-sdk/lemonade, démon lemond) : un serveur
+# d'inférence local derrière des API compatibles OpenAI, Ollama et Anthropic.
+# Server::authenticate_request (src/cpp/server/server.cpp) ne refuse les
+# préfixes /api/, /v0/ et /v1/ que si LEMONADE_API_KEY est posée, et /v1/health
+# n'en est pas exempté.
+#
+# Cette section amarre le template aux corps relevés sur une instance réelle —
+# lemond 2026.42.1, archive lemonade-embeddable macOS arm64 de la release,
+# lancé sur 127.0.0.1 sans clé puis avec LEMONADE_API_KEY. Deux faits que la
+# documentation ne donne pas commandent sa forme. L'ordre d'abord :
+# handle_health construit un nlohmann::json, dont les clés sont triées, et le
+# rend par dump(), compact — l'exemple réindenté et non trié de
+# docs/api/lemonade.md n'est pas ce que le serveur écrit. La garde ensuite :
+# avec une clé, /v1/health et /api/v1/health rendent le même 401, et seule
+# /live répond encore ; le document de santé servi à une requête nue suffit
+# donc à dire qu'aucune clé n'est posée.
+
+LEMONADE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "lemonade-server-exposed.yaml")
+
+LEMONADE_HEALTH_ROUTE = "/v1/health"
+
+# Relevé verbatim : instance neuve, aucun modèle chargé, 488 octets.
+LEMONADE_IDLE_HEALTH_BODY = (
+    '{"all_models_loaded":[],"max_models":{"classification":1,"embedding":1,'
+    '"image":1,"llm":1,"reranking":1,"transcription":1,"tts":1},'
+    '"model_loaded":null,"pinned_helper_models":{"classification":0,'
+    '"embedding":0,"image":0,"llm":0,"reranking":0,"transcription":0,"tts":0},'
+    '"pinned_models":{"classification":0,"embedding":0,"image":0,"llm":0,'
+    '"reranking":0,"transcription":0,"tts":0},"status":"ok",'
+    '"telemetry":{"enabled":false},"update_check_done":true,'
+    '"version":"2026.42.1","websocket_port":9002}'
+)
+
+# Relevés eux aussi : le refus de authenticate_request quand LEMONADE_API_KEY
+# est posée, et la sonde de vivacité, hors des préfixes gardés.
+LEMONADE_UNAUTHORIZED_BODY = '{"error": "Invalid or missing API key"}'
+LEMONADE_LIVE_BODY = '{"status":"ok"}'
+
+
+def lemonade_health_body(*models, indent=None, drop=(), **overrides):
+    """
+    Le document de handle_health tel que dump() l'écrit : clés triées, compact.
+    Chaque entrée de `models` est complétée des champs que
+    Router::get_all_loaded_models pose (router.cpp). `indent` réécrit comme le
+    ferait un intermédiaire qui réindente ce qu'il relaie, sans réordonner.
+    """
+    document = json.loads(LEMONADE_IDLE_HEALTH_BODY)
+    document["all_models_loaded"] = list(models)
+    if models:
+        document["model_loaded"] = models[0]["model_name"]
+    document.update(overrides)
+    for key in drop:
+        document.pop(key, None)
+    if indent is not None:
+        return json.dumps(document, indent=indent, sort_keys=True) + "\n"
+    return json.dumps(document, separators=(",", ":"), sort_keys=True)
+
+
+def lemonade_loaded_model(name="Qwen3-4B-Instruct-2507-GGUF",
+                          checkpoint="unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M",
+                          port=8001, pid=48213):
+    return {
+        "backend_alive": True, "backend_health": "ok",
+        "backend_url": "http://127.0.0.1:%d/v1" % port,
+        "checkpoint": checkpoint, "device": "gpu", "is_busy": False,
+        "is_streaming": False, "loaded": True, "model_name": name,
+        "pid": pid, "pinned": False, "recipe": "llamacpp",
+        "recipe_options": {"ctx_size": 4096, "llamacpp_backend": "vulkan"},
+        "residency_class": "standard", "slot_pool": "llm", "status": "ready",
+        "type": "llm", "watchdog_reset": False,
+    }
+
+
+LEMONADE_LOADED_HEALTH_BODY = lemonade_health_body(
+    lemonade_loaded_model(),
+    lemonade_loaded_model("nomic-embed-text-v1-GGUF",
+                          "nomic-ai/nomic-embed-text-v1-GGUF:Q4_K_S",
+                          port=8002, pid=48240))
+LEMONADE_REFORMATTED_BODY = lemonade_health_body(
+    lemonade_loaded_model(), indent=2)
+LEMONADE_TELEMETRY_BODY = lemonade_health_body(
+    telemetry={"captures": ["inputs", "outputs", "thinking"], "enabled": True})
+
+# Le serveur WebSocket n'a pas pu démarrer : handle_health ne pose pas la clé.
+# Non reconnu — prix assumé, le trio nomme le produit.
+LEMONADE_NO_WEBSOCKET_BODY = lemonade_health_body(drop=("websocket_port",))
+
+# La charge utile au fond d'une supervision, et la même suivie d'une clé
+# qu'une passerelle ajouterait.
+LEMONADE_COMPOSITE_BODY = ('{"lemonade":%s,"checked_at":0}'
+                           % LEMONADE_IDLE_HEALTH_BODY)
+LEMONADE_APPENDED_BODY = LEMONADE_IDLE_HEALTH_BODY[:-1] + ',"checked_at":0}'
+
+# Un serveur quelconque dont la santé dit « ok » et sa version.
+LEMONADE_GENERIC_HEALTH_BODY = '{"status":"ok","version":"2026.42.1"}'
+
+
+def lemonade_block():
+    doc = load(LEMONADE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LEMONADE_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /v1/health"
+    return blocks[0]
+
+
+def lemonade_fires(status=200, body=LEMONADE_IDLE_HEALTH_BODY, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and`."""
+    block = lemonade_block()
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            blob = " ".join(headers.values())
+            verdicts.append(all(w in blob for w in matcher.get("words") or []))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    assert block.get("matchers-condition") == "and"
+    return all(verdicts)
+
+
+def test_lemonade_probe_reads_the_health_route_only():
+    """
+    Les routes d'inférence et de gestion des modèles sont les abus que le
+    constat signale : une seule lecture, en GET, sans corps ni en-tête.
+    """
+    doc = load(LEMONADE_TEMPLATE)
+    assert request_routes(doc) == {("GET", LEMONADE_HEALTH_ROUTE)}, (
+        sorted(request_routes(doc)))
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 1
+    assert doc["info"]["metadata"]["product"] == "lemonade"
+    for block in doc.get("http") or []:
+        assert block.get("method", "GET") == "GET"
+        assert not block.get("body") and not block.get("raw")
+        assert not block.get("headers"), (
+            "aucun Authorization : le constat est justement qu'il n'en faut pas"
+        )
+
+
+def test_lemonade_matcher_reads_the_product_trio_and_nothing_generic():
+    for body in (LEMONADE_IDLE_HEALTH_BODY, LEMONADE_LOADED_HEALTH_BODY,
+                 LEMONADE_REFORMATTED_BODY, LEMONADE_TELEMETRY_BODY):
+        assert lemonade_fires(body=body), body
+
+    for body, why in (
+        (LEMONADE_UNAUTHORIZED_BODY, "une clé est posée — la fermeture attendue"),
+        (LEMONADE_LIVE_BODY, "la sonde de vivacité, que la clé ne garde pas"),
+        (LEMONADE_GENERIC_HEALTH_BODY, "« status: ok » seul"),
+        (LEMONADE_NO_WEBSOCKET_BODY, "le trio incomplet"),
+        (LEMONADE_COMPOSITE_BODY, "la charge utile au fond d'une supervision"),
+        (LEMONADE_APPENDED_BODY, "la même suivie d'une clé ajoutée"),
+        (LETTA_HEALTH_BODY, "Letta, sur la même route"),
+        (TABBY_HEALTH_BODY, "Tabby, sur la même route"),
+    ):
+        assert not lemonade_fires(body=body), why
+
+
+def test_lemonade_conclusion_is_carried_by_the_body_and_never_by_the_status():
+    block = lemonade_block()
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}
+    assert lemonade_fires(status=203)
+    assert not lemonade_fires(headers={"Content-Type": "text/html"})
+
+
+def test_lemonade_extractor_reports_the_server_version():
+    extractors = lemonade_block().get("extractors") or []
+    assert len(extractors) == 1, extractors
+    extractor, = extractors
+    assert extractor.get("type") == "json"
+    assert extractor.get("json") == [".version"]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_lemonade_matcher_compiles_and_fires_against_a_live_server():
+    """Seul un scan contre un vrai serveur ferme la boucle sur RE2 et gojq."""
+    def scan(status=200, body=LEMONADE_IDLE_HEALTH_BODY,
+             content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.path == LEMONADE_HEALTH_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, '{"error": "Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LEMONADE_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "lemonade-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", LEMONADE_HEALTH_ROUTE)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["2026.42.1"], results[0]
+
+    for body in (LEMONADE_LOADED_HEALTH_BODY, LEMONADE_REFORMATTED_BODY):
+        _, results = scan(body=body)
+        assert len(results) == 1, (body, results)
+
+    for status, body in (
+        (401, LEMONADE_UNAUTHORIZED_BODY),
+        (200, LEMONADE_GENERIC_HEALTH_BODY),
+        (200, LEMONADE_NO_WEBSOCKET_BODY),
+        (200, LEMONADE_COMPOSITE_BODY),
+        (200, LEMONADE_APPENDED_BODY),
+        (200, LETTA_HEALTH_BODY),
+        (200, TABBY_HEALTH_BODY),
+    ):
+        _, results = scan(status=status, body=body)
+        assert results == [], (body, results)
+
+    _, results = scan(content_type="text/html; charset=utf-8")
+    assert results == [], results

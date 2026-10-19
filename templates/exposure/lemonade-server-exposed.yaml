@@ -1,0 +1,124 @@
+id: lemonade-server-exposed
+
+info:
+  name: Lemonade Server - Unauthenticated API (Health and Loaded Models Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    Lemonade Server (lemonade-sdk/lemonade, démon lemond) est un serveur
+    d'inférence local qui sert des modèles sur CPU, GPU AMD ou NVIDIA et NPU
+    AMD, par des back-ends dont llama.cpp, derrière des API compatibles
+    OpenAI, Ollama et Anthropic. La page de configuration officielle pose
+    « host » à localhost et « port » à 13305 par défaut, et LEMONADE_API_KEY
+    comme seule garde des préfixes /api/, /v0/ et /v1/ : « When it is unset,
+    those endpoints are reachable without authentication ». L'exposition
+    survient dès que l'hôte est réglé sur une interface publique sans clé.
+    Server::authenticate_request (src/cpp/server/server.cpp) range toute
+    requête dont le chemin commence par /api/, /v0/ ou /v1/ parmi les routes
+    d'API et ne la refuse — 401, « {"error": "Invalid or missing API key"} »
+    — que si api_key_ n'est pas vide. /v1/health n'en est pas exempté : relevé
+    sur lemond 2026.42.1 (macOS arm64) lancé avec LEMONADE_API_KEY, la route
+    rend ce 401, et seule /live, hors de ces préfixes, répond encore. Le
+    document de santé servi à une requête nue est donc à lui seul la preuve
+    qu'aucune clé n'est posée.
+    GET /v1/health porte le constat. Server::handle_health construit un
+    nlohmann::json — un objet à clés triées — et le rend par dump(), compact :
+    « all_models_loaded » l'ouvre, « websocket_port » le ferme, et entre les
+    deux se trouvent « max_models », « model_loaded », « pinned_models »,
+    « status » (toujours « ok »), « telemetry », « update_check_done » et
+    « version ». register_get enregistre le même handler sous /api/v0/,
+    /api/v1/, /v0/ et /v1/ : en interroger un suffit.
+  impact: |
+    L'absence de clé ouvre toutes les routes /v1/* à la fois, et pas seulement
+    la santé : POST /v1/chat/completions, /v1/completions, /v1/embeddings et
+    les autres routes d'inférence font tourner les modèles sur le CPU, le GPU
+    ou le NPU de l'exploitant, à ses frais et sans compte qui les attribue ;
+    /v1/pull, /v1/load, /v1/unload et /v1/delete gèrent les modèles —
+    télécharger, charger, décharger, effacer. /v1/system-info décrit la
+    machine — « OS Version », « Processor », « Physical Memory » — et chacun
+    de ses accélérateurs. Le document de santé lui-même livre, pour chaque
+    modèle chargé dans « all_models_loaded », le checkpoint, la recette et
+    ses options, le PID du processus back-end et son « backend_url » — l'URL
+    interne du llama-server ou de l'équivalent que lemond pilote.
+  remediation: |
+    Poser LEMONADE_API_KEY : les routes /api/*, /v0/* et /v1/* exigent alors
+    « Authorization: Bearer <clé> », /v1/health comprise. Poser aussi
+    LEMONADE_ADMIN_API_KEY à une valeur distincte pour que la clé d'usage
+    n'ouvre pas /internal/*. Laisser « host » à localhost quand le serveur n'a
+    pas à être joint d'ailleurs, et ne pas publier le port 13305 sur toutes
+    les interfaces.
+    Vérifier depuis l'extérieur et sans identifiant : « curl -s
+    http://<hote>:13305/v1/health » doit rendre le refus
+    « {"error": "Invalid or missing API key"} » et non le document de santé.
+  reference:
+    - https://lemonade-server.ai/docs/guide/configuration/
+    - https://github.com/lemonade-sdk/lemonade/blob/main/docs/api/lemonade.md
+    - https://github.com/lemonade-sdk/lemonade/blob/main/src/cpp/server/server.cpp
+    - https://github.com/lemonade-sdk/lemonade/blob/main/src/cpp/server/router.cpp
+  metadata:
+    max-request: 1
+    vendor: lemonade-sdk
+    product: lemonade
+  tags: ai,llm,lemonade,inference,openai,ollama,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier : la route est gardée
+  # par LEMONADE_API_KEY comme le reste de /v1/, donc le document de santé
+  # rendu à une requête nue est à la fois la preuve d'identité et la preuve
+  # d'ouverture.
+  #
+  # /v1/health plutôt que /api/v1/health, que les exemples clients prennent
+  # pour base : register_get pose le même handler sous les quatre préfixes, et
+  # l'instance relevée rend le même corps aux deux.
+  #
+  # En lecture seule, et strictement : les routes d'inférence et de gestion
+  # des modèles sont les abus que le constat signale, et /v1/system-info n'est
+  # pas joint — l'inventaire de la machine n'ajoute rien à la preuve.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/health"
+
+    matchers-condition: and
+    matchers:
+      # res.set_content(response.dump(), "application/json"), sans condition.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          # L'ouverture et la fermeture du document, dans l'ordre que l'objet
+          # nlohmann::json trié impose : « all_models_loaded » est la première
+          # clé, « websocket_port » la dernière. Les deux ancres écartent la
+          # charge utile republiée au fond du document d'une supervision, et la
+          # même suivie d'une clé qu'une passerelle ajouterait.
+          #
+          # websocket_port n'est posé que si le serveur WebSocket tourne ; il
+          # est démarré avec le serveur HTTP, sur le port « auto » par défaut.
+          # Une instance dont le WebSocket n'a pas pu démarrer n'est pas
+          # reconnue — prix assumé : le trio websocket_port, all_models_loaded,
+          # update_check_done est ce qui nomme le produit.
+          #
+          # Les \s* sont là parce que dump() écrit compact, mais qu'un
+          # intermédiaire qui réindente ce qu'il relaie ne s'y tient pas.
+          - '^\s*\{\s*"all_models_loaded"\s*:\s*\['
+          - '"websocket_port"\s*:\s*[0-9]+\s*\}\s*$'
+
+          # Le reste de la signature : le booléen que la tâche de vérification
+          # des mises à jour pose au démarrage, et le statut, toujours « ok ».
+          # « "status":"ok" » seul est celui de tout serveur ; il ne compte ici
+          # qu'en compagnie des deux autres clés.
+          - '"update_check_done"\s*:\s*(?:true|false)\s*,'
+          - '"status"\s*:\s*"ok"\s*,'
+
+    extractors:
+      # La version du serveur : LEMON_VERSION_STRING, « 2026.42.1 » sur
+      # l'instance relevée.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
