@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-123 templates, 120 produits.
+124 templates, 121 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -117,6 +117,7 @@ amont.
 | onyx | [`onyx-versions-exposed`](templates/exposure/onyx-versions-exposed.yaml) | low |
 | open-notebook | [`open-notebook-auth-disabled`](templates/exposure/open-notebook-auth-disabled.yaml) | high |
 | open-webui | [`open-webui-signup-enabled`](templates/exposure/open-webui-signup-enabled.yaml) | medium |
+| opencode | [`opencode-server-exposed`](templates/exposure/opencode-server-exposed.yaml) | critical |
 | openhands-agent-server | [`openhands-agent-server-exposed`](templates/exposure/openhands-agent-server-exposed.yaml) | critical |
 | openvino-model-server | [`openvino-model-server-exposed`](templates/exposure/openvino-model-server-exposed.yaml) | high |
 | opik | [`opik-projects-exposed`](templates/exposure/opik-projects-exposed.yaml) | high |

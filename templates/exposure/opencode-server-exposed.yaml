@@ -1,0 +1,125 @@
+id: opencode-server-exposed
+
+info:
+  name: opencode Server - Unauthenticated Headless Agent API (Shell Execution)
+  author: popy21
+  severity: critical
+  description: |
+    opencode (anomalyco/opencode, ex-sst/opencode) est un agent de code open
+    source. « opencode serve » lance son serveur HTTP headless, celui qui
+    pilote les sessions, les outils et le shell de l'agent ; la documentation
+    officielle pose --port à 4096 et --hostname à 127.0.0.1 par défaut, et
+    « Set OPENCODE_SERVER_PASSWORD to protect the server with HTTP basic auth »,
+    nom d'utilisateur « opencode » par défaut. Sans mot de passe, rien ne
+    garde le serveur : ServerAuth.required (packages/server/src/auth.ts) ne
+    déclare l'authentification requise que si « Option.isSome(config.password)
+    && config.password.value !== "" », la couche par défaut posant
+    « password: Option.none() », et le middleware d'autorisation
+    (packages/server/src/middleware/authorization.ts) rend alors un
+    autorisateur no-op — « if (!ServerAuth.required(config)) return
+    Authorization.of((effect) => effect) » — sans contrôle de loopback ni
+    d'hôte. Le serveur le dit lui-même au démarrage : « Warning:
+    OPENCODE_SERVER_PASSWORD is not set; server is unsecured. » Lancé avec
+    --hostname 0.0.0.0 sans mot de passe, il répond à tous, sans identifiant.
+    Relevé sur opencode 1.19.3 (binaire darwin-arm64 du paquet npm) :
+    GET /global/health rend « {"healthy":true,"version":"1.19.3"} », et GET
+    /doc la spécification OpenAPI 3.1 du serveur, compacte, qui s'ouvre sur
+    « {"openapi":"3.1.0","info":{"title":"opencode","version":"1.0.0",
+    "description":"opencode api"} » et décrit 162 chemins, dont
+    /session/{sessionID}/shell. Avec OPENCODE_SERVER_PASSWORD, les deux routes
+    rendent un 401 au corps vide et « www-authenticate: Basic realm="Secure
+    Area" ».
+  impact: |
+    Le serveur ouvert est l'agent entier, à la disposition de qui le joint.
+    POST /session/{sessionID}/shell — « Run shell command » — exécute une
+    commande shell arbitraire sur la machine de l'opérateur, dans le
+    répertoire du projet et avec ses droits ; POST /session et POST
+    /session/{sessionID}/command créent la session et y lancent les commandes
+    de l'agent, /pty ouvre un terminal. GET /config et PATCH /config lisent et
+    modifient la configuration de l'agent — fournisseurs de modèles, outils,
+    serveurs MCP — et PUT /auth/{providerID} y pose des identifiants ; GET
+    /file/content et /find lisent le code et les fichiers du projet. Aucun
+    compte n'existe : rien de tout cela n'est attribuable.
+  remediation: |
+    Poser OPENCODE_SERVER_PASSWORD (et au besoin OPENCODE_SERVER_USERNAME) :
+    toutes les routes exigent alors l'authentification HTTP basic,
+    /global/health et /doc comprises. Laisser --hostname à 127.0.0.1 quand le
+    serveur n'a pas à être joint d'ailleurs, et ne pas publier le port 4096
+    sur une interface publique ; un accès distant passe par un tunnel SSH ou
+    un proxy qui authentifie.
+    Vérifier depuis l'extérieur et sans identifiant : « curl -si
+    http://<hote>:4096/global/health » doit rendre « 401 Unauthorized » et non
+    « {"healthy":true,"version":…} ».
+  reference:
+    - https://opencode.ai/docs/server/
+    - https://github.com/anomalyco/opencode
+    - https://github.com/anomalyco/opencode/blob/dev/packages/server/src/auth.ts
+    - https://github.com/anomalyco/opencode/blob/dev/packages/server/src/middleware/authorization.ts
+  metadata:
+    max-request: 2
+    vendor: anomalyco
+    product: opencode
+  tags: ai,llm,agent,coding-agent,opencode,rce,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et toutes deux doivent conclure.
+  #
+  # GET /global/health d'abord : la route de santé que la documentation
+  # publie, et dont le corps porte la version. Seule, elle ne nomme pas le
+  # produit — « healthy » et « version » sont deux mots que n'importe quel
+  # serveur peut écrire. GET /doc ensuite : la spécification OpenAPI que le
+  # serveur sert, intitulée « opencode », et qui déclare à la fois la route de
+  # santé et celle du shell. Les deux routes sont gardées par le même
+  # middleware ; sur une instance protégée l'une et l'autre rendent 401.
+  #
+  # En lecture seule, et strictement : /session/{sessionID}/shell, /config et
+  # /pty sont les abus que le constat signale, et aucun n'est appelé.
+  - method: GET
+    path:
+      - "{{BaseURL}}/global/health"
+      - "{{BaseURL}}/doc"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document de santé entier, ancré aux deux bouts : deux clés,
+          # healthy à true puis version, comme le schéma de /doc les déclare
+          # (« required: [healthy, version] », « additionalProperties: false »)
+          # et comme l'instance les écrit. L'ancrage écarte la charge utile
+          # republiée au fond d'une supervision et la même suivie d'une clé
+          # ajoutée. « {"healthy":true} » seul est la santé de /api/health, la
+          # surface expérimentale, et n'est pas reconnu ici.
+          - 'regex("^\\{\\s*\"healthy\"\\s*:\\s*true\\s*,\\s*\"version\"\\s*:\\s*\"[^\"]+\"\\s*\\}$", trim_space(body_1))'
+
+          # L'ouverture de /doc, ancrée elle aussi : une spécification OpenAPI
+          # 3.x dont le titre est « opencode » et la description « opencode
+          # api », dans l'ordre que le serveur écrit. Le catch-all de
+          # l'interface web, qui rend sa page HTML en 200 sur un chemin
+          # inconnu, n'y répond pas.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3\\.[0-9.]+\"\\s*,\\s*\"info\"\\s*:\\s*\\{\\s*\"title\"\\s*:\\s*\"opencode\"\\s*,\\s*\"version\"\\s*:\\s*\"[^\"]*\"\\s*,\\s*\"description\"\\s*:\\s*\"opencode api\"", trim_space(body_2))'
+
+          # Deux chemins de la spécification : celui de la santé qu'on vient de
+          # lire, et celui du shell, qui est le constat. Le nom du paramètre
+          # n'est pas exigé — sessionID sur l'instance relevée, :id dans la
+          # documentation.
+          - 'regex("\"/global/health\"\\s*:\\s*\\{", body_2)'
+          - 'regex("\"/session/\\{[A-Za-z]+\\}/shell\"\\s*:\\s*\\{", body_2)'
+
+          # Pas de matcher de statut : 200 est celui de tout serveur, et seul
+          # le corps sépare.
+
+    extractors:
+      # La version du serveur, « 1.19.3 » sur l'instance relevée — celle de
+      # /doc, « 1.0.0 », est celle de la spécification, pas du produit. Un
+      # seul extracteur, borné à body_1 : sous req-condition le moteur évalue
+      # les extracteurs contre chaque réponse.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.version'

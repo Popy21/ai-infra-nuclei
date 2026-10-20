@@ -41027,3 +41027,280 @@ def test_lemonade_matcher_compiles_and_fires_against_a_live_server():
 
     _, results = scan(content_type="text/html; charset=utf-8")
     assert results == [], results
+
+
+# --------------------------------------------------------------------------
+# opencode (anomalyco/opencode, ex-sst/opencode) : « opencode serve » lance le
+# serveur HTTP headless de l'agent de code. ServerAuth.required
+# (packages/server/src/auth.ts) ne déclare l'authentification requise que si
+# OPENCODE_SERVER_PASSWORD est posé et non vide ; sinon le middleware
+# d'autorisation est un no-op, sans contrôle de loopback ni d'hôte.
+#
+# Cette section amarre le template aux corps relevés sur une instance réelle —
+# opencode 1.19.3, binaire darwin-arm64 du paquet npm, lancé sur 127.0.0.1
+# sans mot de passe puis avec OPENCODE_SERVER_PASSWORD. La documentation ne
+# donnait ni l'ordre des clés de la santé ni le titre de /doc : l'instance
+# écrit « {"healthy":true,"version":"1.19.3"} », compact, et une
+# spécification OpenAPI 3.1.0 intitulée « opencode », description « opencode
+# api ». Avec un mot de passe, /global/health et /doc rendent toutes deux un
+# 401 au corps vide.
+
+OPENCODE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "opencode-server-exposed.yaml")
+
+OPENCODE_HEALTH_ROUTE = "/global/health"
+OPENCODE_DOC_ROUTE = "/doc"
+
+# Relevés verbatim.
+OPENCODE_HEALTH_BODY = '{"healthy":true,"version":"1.19.3"}'
+# La santé de la surface expérimentale, /api/health : sans version.
+OPENCODE_API_HEALTH_BODY = '{"healthy":true}'
+
+
+def opencode_doc_body(title="opencode", description="opencode api",
+                      shell_path="/session/{sessionID}/shell", indent=None):
+    """
+    L'ouverture de /doc telle que le serveur l'écrit — compacte, dans cet
+    ordre —, réduite à deux de ses 162 chemins. L'entrée de /global/health est
+    verbatim ; celle du shell est abrégée à ses champs descriptifs.
+    """
+    paths = {
+        "/global/health": {"get": {
+            "tags": ["global"], "operationId": "global.health",
+            "parameters": [],
+            "responses": {"200": {
+                "description": "Health information",
+                "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "properties": {
+                        "healthy": {"type": "boolean", "enum": [True]},
+                        "version": {"type": "string"}},
+                    "required": ["healthy", "version"],
+                    "additionalProperties": False,
+                    "description": "Health information"}}}},
+                "400": {"description": "Bad request", "content": {
+                    "application/json": {"schema": {
+                        "$ref": "#/components/schemas/BadRequestError"}}}}},
+            "description": "Get health information about the OpenCode server.",
+            "summary": "Get health"}},
+    }
+    if shell_path:
+        paths[shell_path] = {"post": {
+            "tags": ["session"], "operationId": "session.shell",
+            "description": "Execute a shell command within the session "
+                           "context and return the AI's response.",
+            "summary": "Run shell command"}}
+    document = {
+        "openapi": "3.1.0",
+        "info": {"title": title, "version": "1.0.0",
+                 "description": description},
+        "paths": paths,
+        "components": {"schemas": {}}, "security": [], "tags": [],
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent) + "\n"
+    return json.dumps(document, separators=(",", ":"))
+
+
+OPENCODE_DOC_BODY = opencode_doc_body()
+OPENCODE_REFORMATTED_DOC_BODY = opencode_doc_body(indent=2)
+OPENCODE_REFORMATTED_HEALTH_BODY = json.dumps(
+    json.loads(OPENCODE_HEALTH_BODY), indent=2) + "\n"
+# Le paramètre tel que la documentation l'écrit.
+OPENCODE_ID_PARAM_DOC_BODY = opencode_doc_body(shell_path="/session/{id}/shell")
+
+# Ce qui ne doit pas conclure.
+OPENCODE_NO_SHELL_DOC_BODY = opencode_doc_body(shell_path=None)
+OPENCODE_OTHER_TITLE_DOC_BODY = opencode_doc_body(title="FastAPI",
+                                                  description="")
+OPENCODE_COMPOSITE_HEALTH_BODY = ('{"opencode":%s,"checked_at":0}'
+                                  % OPENCODE_HEALTH_BODY)
+OPENCODE_APPENDED_HEALTH_BODY = OPENCODE_HEALTH_BODY[:-1] + ',"checked_at":0}'
+OPENCODE_UNHEALTHY_BODY = '{"healthy":false,"version":"1.19.3"}'
+# Le catch-all de l'interface web : sa page HTML, en 200, sur tout chemin
+# inconnu.
+OPENCODE_SPA_BODY = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                     '<title>OpenCode</title></head><body><div id="root"></div>'
+                     '</body></html>')
+
+OPENCODE_OPEN = ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_DOC_BODY))
+# Une instance protégée : 401, corps vide, sur les deux routes.
+OPENCODE_PROTECTED = ((401, ""), (401, ""))
+
+
+def opencode_block():
+    doc = load(OPENCODE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % OPENCODE_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /global/health"
+    return blocks[0]
+
+
+def opencode_fires(health=OPENCODE_OPEN[0], doc=OPENCODE_OPEN[1]):
+    """
+    Sémantique nuclei du bloc sous req-condition, sans stop-at-first-match :
+    les deux requêtes partent et le matcher est évalué contre les deux.
+    """
+    block = opencode_block()
+    assert block.get("req-condition") is True
+    assert not block.get("stop-at-first-match")
+    matcher, = block.get("matchers")
+    assert matcher.get("type") == "dsl" and matcher.get("condition") == "and"
+    return dsl_matcher_hits(matcher, [health, doc])
+
+
+def test_opencode_probe_reads_health_and_doc_and_never_reaches_the_shell():
+    """
+    /session/{sessionID}/shell, /config et /pty sont les abus que le constat
+    signale : deux GET de lecture, dans cet ordre, sans corps ni en-tête.
+    """
+    doc = load(OPENCODE_TEMPLATE)
+    assert request_routes(doc) == {("GET", OPENCODE_HEALTH_ROUTE),
+                                   ("GET", OPENCODE_DOC_ROUTE)}, (
+        sorted(request_routes(doc)))
+    assert doc["info"]["severity"] == "critical"
+    assert doc["info"]["metadata"]["max-request"] == 2
+    assert doc["info"]["metadata"]["product"] == "opencode"
+
+    block = opencode_block()
+    assert block.get("path") == ["{{BaseURL}}%s" % OPENCODE_HEALTH_ROUTE,
+                                 "{{BaseURL}}%s" % OPENCODE_DOC_ROUTE]
+    for b in doc.get("http") or []:
+        assert b.get("method", "GET") == "GET"
+        assert not b.get("body") and not b.get("raw")
+        assert not b.get("headers"), (
+            "aucun Authorization : le constat est justement qu'il n'en faut pas"
+        )
+        for path in b.get("path") or []:
+            for abuse in ("/shell", "/config", "/pty", "/session"):
+                assert abuse not in path, path
+
+
+def test_opencode_matcher_needs_both_the_health_and_the_doc():
+    assert opencode_fires()
+    for health, doc in (
+        ((200, OPENCODE_REFORMATTED_HEALTH_BODY),
+         (200, OPENCODE_REFORMATTED_DOC_BODY)),
+        ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_ID_PARAM_DOC_BODY)),
+        # Le statut n'entre pas dans la conclusion.
+        ((203, OPENCODE_HEALTH_BODY), (203, OPENCODE_DOC_BODY)),
+    ):
+        assert opencode_fires(health, doc), (health, doc)
+
+    for health, doc, why in (
+        (OPENCODE_PROTECTED[0], OPENCODE_PROTECTED[1],
+         "un mot de passe est posé — la fermeture attendue"),
+        ((200, OPENCODE_HEALTH_BODY), (401, ""),
+         "la santé seule, /doc refusée"),
+        ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_SPA_BODY),
+         "la santé seule, /doc tombée dans le catch-all de l'interface web"),
+        ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_OTHER_TITLE_DOC_BODY),
+         "la santé et la spécification d'un autre service"),
+        ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_NO_SHELL_DOC_BODY),
+         "une spécification sans la route du shell"),
+        ((200, OPENCODE_API_HEALTH_BODY), (200, OPENCODE_DOC_BODY),
+         "la santé de /api/health, sans version"),
+        ((200, OPENCODE_UNHEALTHY_BODY), (200, OPENCODE_DOC_BODY),
+         "healthy à false"),
+        ((200, OPENCODE_COMPOSITE_HEALTH_BODY), (200, OPENCODE_DOC_BODY),
+         "la charge utile au fond d'une supervision"),
+        ((200, OPENCODE_APPENDED_HEALTH_BODY), (200, OPENCODE_DOC_BODY),
+         "la même suivie d'une clé ajoutée"),
+        ((200, LEMONADE_GENERIC_HEALTH_BODY), (200, OPENCODE_DOC_BODY),
+         "une santé quelconque"),
+    ):
+        assert not opencode_fires(health, doc), why
+
+
+def test_opencode_conclusion_is_carried_by_the_bodies_and_never_by_the_status():
+    matcher, = opencode_block().get("matchers")
+    assert matcher.get("type") == "dsl"
+    for expr in matcher.get("dsl") or []:
+        assert "status_code" not in expr, expr
+
+
+def test_opencode_extractor_reports_the_server_version():
+    extractors = opencode_block().get("extractors") or []
+    assert len(extractors) == 1, extractors
+    extractor, = extractors
+    assert extractor.get("type") == "json"
+    assert extractor.get("part") == "body_1"
+    assert extractor.get("json") == [".version"]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_opencode_matcher_compiles_and_fires_against_a_live_server():
+    """Seul un scan contre un vrai serveur ferme la boucle sur RE2 et gojq."""
+    def scan(health=OPENCODE_OPEN[0], doc=OPENCODE_OPEN[1]):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.path == OPENCODE_HEALTH_ROUTE:
+                    self.reply(*health)
+                elif self.path == OPENCODE_DOC_ROUTE:
+                    self.reply(*doc)
+                else:
+                    self.reply(200, OPENCODE_SPA_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                if code == 401:
+                    self.send_header("www-authenticate",
+                                     'Basic realm="Secure Area"')
+                elif payload.startswith("<"):
+                    self.send_header("Content-Type", "text/html")
+                else:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", OPENCODE_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "opencode-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert sorted(seen) == [("GET", OPENCODE_DOC_ROUTE),
+                            ("GET", OPENCODE_HEALTH_ROUTE)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == ["1.19.3"], results[0]
+
+    _, results = scan((200, OPENCODE_REFORMATTED_HEALTH_BODY),
+                      (200, OPENCODE_REFORMATTED_DOC_BODY))
+    assert len(results) == 1, results
+
+    for health, doc in (
+        OPENCODE_PROTECTED,
+        ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_SPA_BODY)),
+        ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_OTHER_TITLE_DOC_BODY)),
+        ((200, OPENCODE_HEALTH_BODY), (200, OPENCODE_NO_SHELL_DOC_BODY)),
+        ((200, OPENCODE_API_HEALTH_BODY), (200, OPENCODE_DOC_BODY)),
+        ((200, OPENCODE_APPENDED_HEALTH_BODY), (200, OPENCODE_DOC_BODY)),
+    ):
+        _, results = scan(health, doc)
+        assert results == [], (health, doc, results)
