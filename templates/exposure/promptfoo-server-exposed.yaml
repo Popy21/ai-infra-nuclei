@@ -1,0 +1,110 @@
+id: promptfoo-server-exposed
+
+info:
+  name: Promptfoo Server - Unauthenticated Eval and Red Team Results Exposure
+  author: popy21
+  severity: high
+  description: |
+    Promptfoo (promptfoo/promptfoo) teste les prompts, les agents et les RAG,
+    et fait du red teaming de LLM. « promptfoo view » lance son serveur
+    Express, celui que l'image officielle ghcr.io/promptfoo/promptfoo:latest
+    sert en auto-hébergement ; il écoute sur toutes les interfaces —
+    httpServer.listen(port) sans hôte —, port API_PORT, 15500 par défaut et
+    3000 dans l'image. Le produit n'a pas d'authentification : server.ts ne
+    monte que cors() sans option, csrfProtection et compression, et
+    csrfProtection exempte GET, HEAD et OPTIONS ; la documentation
+    d'auto-hébergement le range parmi les limites, « No built-in
+    authentication or SSO capabilities ». GET /api/results rend la liste des
+    évaluations, « {"data":[{"evalId":…,"createdAt":…,"description":…,
+    "numTests":…,"datasetId":…,"isRedteam":…,"passRate":…,"label":…,
+    "providers":[…]}]} », dans l'ordre où getEvalSummaries (src/models/eval.ts)
+    l'écrit. Une instance sans évaluation y rend « {"data":[]} » ; GET
+    /api/version, le routeur de version, rend alors « {"currentVersion":…,
+    "latestVersion":…,"updateAvailable":…,"selfHosted":…,"isNpx":…,
+    "updateCommands":{…},"commandType":…} », relevé sur promptfoo 0.124.1.
+  impact: |
+    Quiconque joint le port lit tout ce que l'organisation a évalué. GET
+    /api/results/:id livre le détail de chaque évaluation — prompts,
+    configuration, réponses des modèles et, pour les runs isRedteam, les
+    attaques qui ont réussi contre ses propres agents et applications LLM :
+    la carte des faiblesses, déjà testée. GET /api/prompts et GET
+    /api/datasets livrent les prompts et les jeux de test. Les routeurs
+    /api/eval, /api/redteam, /api/providers et /api/configs sont montés sur
+    le même serveur, sans plus de garde. Aucun compte n'existe : rien de tout
+    cela n'est attribuable.
+  remediation: |
+    Ne pas publier le port de « promptfoo view » (15500, ou 3000 pour l'image
+    Docker) sur une interface publique : le serveur n'a aucune
+    authentification à activer. Le placer derrière un reverse proxy qui
+    authentifie (SSO, basic auth, VPN), ou le joindre par un tunnel SSH.
+    Vérifier depuis l'extérieur et sans identifiant : « curl -s
+    http://<hote>:3000/api/results » ne doit pas rendre « {"data":[…]} ».
+  reference:
+    - https://www.promptfoo.dev/docs/usage/self-hosting/
+    - https://github.com/promptfoo/promptfoo
+    - https://github.com/promptfoo/promptfoo/blob/main/src/server/server.ts
+    - https://github.com/promptfoo/promptfoo/blob/main/src/server/routes/version.ts
+    - https://github.com/promptfoo/promptfoo/blob/main/src/server/middleware/csrfProtection.ts
+  metadata:
+    max-request: 2
+    vendor: promptfoo
+    product: promptfoo
+  tags: ai,llm,promptfoo,redteam,eval,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et la conclusion vient de l'une ou des deux.
+  #
+  # GET /api/results d'abord : la liste des évaluations, qui est le constat.
+  # Une seule évaluation suffit à nommer le produit — ses clés evalId,
+  # createdAt, numTests, datasetId, isRedteam et passRate, dans l'ordre où
+  # getEvalSummaries les écrit. attackSuccessRate n'y entre pas : il n'est
+  # sérialisé que pour les listes filtrées sur le red teaming.
+  #
+  # Une instance sans évaluation rend « {"data":[]} », que n'importe quelle
+  # API peut écrire. GET /api/version tranche alors : le document du routeur
+  # de version, selfHosted et isNpx compris, n'appartient qu'au produit.
+  #
+  # En lecture seule : /api/results/:id, /api/eval et /api/redteam sont les
+  # abus que le constat signale, et aucun n'est appelé.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/results"
+      - "{{BaseURL}}/api/version"
+
+    # req-condition accumule body_N pour que la preuve puisse porter sur les
+    # deux réponses à la fois ; stop-at-first-match ferme la marche dès que la
+    # première branche conclut — sans lui, le moteur réévalue le matcher après
+    # la seconde requête et remonte deux fois la même instance. Une instance
+    # qui a des évaluations s'arrête ainsi à GET /api/results.
+    stop-at-first-match: true
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'enveloppe de ListResultsResponseSchema, ancrée au début.
+          - 'regex("^\\{\\s*\"data\"\\s*:\\s*\\[", trim_space(body_1))'
+
+          # Soit une évaluation au moins, lue à ses clés propres : evalId puis
+          # createdAt, numérique ; numTests, datasetId — null ou un hachage —,
+          # isRedteam booléen, puis passRate.
+          # Soit la liste vide, ancrée aux deux bouts, et le document de
+          # /api/version, ancré lui aussi, dans l'ordre de
+          # VersionResponseSchema.
+          - '(regex("\"evalId\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"createdAt\"\\s*:\\s*[0-9]+\\s*,", body_1) && regex("\"numTests\"\\s*:\\s*[0-9]+\\s*,\\s*(\"datasetId\"\\s*:\\s*(null|\"[^\"]*\")\\s*,\\s*)?\"isRedteam\"\\s*:\\s*(true|false)\\s*,\\s*\"passRate\"\\s*:\\s*-?[0-9]", body_1)) || (regex("^\\{\\s*\"data\"\\s*:\\s*\\[\\s*\\]\\s*\\}$", trim_space(body_1)) && regex("^\\{\\s*\"currentVersion\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"latestVersion\"\\s*:\\s*\"[^\"]*\"\\s*,\\s*\"updateAvailable\"\\s*:\\s*(true|false)\\s*,\\s*\"selfHosted\"\\s*:\\s*(true|false)\\s*,\\s*\"isNpx\"\\s*:\\s*(true|false)\\s*,\\s*\"updateCommands\"\\s*:\\s*\\{", trim_space(body_2)) && regex("\"commandType\"\\s*:\\s*\"(docker|npx|npm)\"\\s*\\}$", trim_space(body_2)))'
+
+          # Pas de matcher de statut : 200 est celui de tout serveur, et seul
+          # le corps sépare. GET /health, « {"status":"OK","version":…} », est
+          # générique et n'est pas lu.
+
+    extractors:
+      # La version du serveur, « 0.124.1 » sur l'instance relevée. Bornée à
+      # body_2 : sous req-condition le moteur évalue les extracteurs contre
+      # chaque réponse. Elle ne remonte que lorsque /api/version a été lu,
+      # c'est-à-dire sur une instance sans évaluation.
+      - type: json
+        part: body_2
+        name: version
+        json:
+          - '.currentVersion'

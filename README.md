@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-124 templates, 121 produits.
+125 templates, 122 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -127,6 +127,7 @@ amont.
 | prefect | [`prefect-server-admin-exposed`](templates/exposure/prefect-server-admin-exposed.yaml) | high |
 | presidio | [`presidio-analyzer-exposed`](templates/exposure/presidio-analyzer-exposed.yaml) | medium |
 | privategpt | [`privategpt-artifacts-exposed`](templates/exposure/privategpt-artifacts-exposed.yaml) | high |
+| promptfoo | [`promptfoo-server-exposed`](templates/exposure/promptfoo-server-exposed.yaml) | high |
 | qdrant | [`qdrant-no-api-key`](templates/exposure/qdrant-no-api-key.yaml) | high |
 | ragflow | [`ragflow-config-exposed`](templates/exposure/ragflow-config-exposed.yaml) | medium |
 | rasa | [`rasa-server-status-exposed`](templates/exposure/rasa-server-status-exposed.yaml) | high |

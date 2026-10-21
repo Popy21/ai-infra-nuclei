@@ -41304,3 +41304,282 @@ def test_opencode_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(health, doc)
         assert results == [], (health, doc, results)
+
+
+# --------------------------------------------------------------------------
+# Promptfoo (promptfoo/promptfoo) : « promptfoo view » lance le serveur
+# Express de l'outil d'évaluation et de red teaming, celui que l'image
+# ghcr.io/promptfoo/promptfoo:latest sert en auto-hébergement. Aucune
+# authentification n'existe dans le produit : cors(), csrfProtection — qui
+# exempte GET, HEAD et OPTIONS — et compression, rien d'autre.
+#
+# Cette section amarre le template aux corps relevés sur une instance réelle —
+# promptfoo 0.124.1, « promptfoo view », une évaluation au fournisseur echo.
+# attackSuccessRate n'est sérialisé que pour les listes filtrées sur le red
+# teaming et n'entre pas dans la conclusion ; une instance vide rend
+# « {"data":[]} », que seul le routeur de version départage.
+
+PROMPTFOO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "promptfoo-server-exposed.yaml")
+
+PROMPTFOO_RESULTS_ROUTE = "/api/results"
+PROMPTFOO_VERSION_ROUTE = "/api/version"
+
+# Relevés verbatim (le hachage datasetId est complété à sa longueur sha256).
+PROMPTFOO_RESULTS_BODY = (
+    '{"data":[{"evalId":"eval-WMG-2026-10-14T10:17:20",'
+    '"createdAt":1791973040027,"description":"probe eval","numTests":1,'
+    '"datasetId":"294a' + "0" * 60 + '","isRedteam":false,"passRate":100,'
+    '"label":"probe eval (eval-WMG-2026-10-14T10:17:20)","providers":[]}]}')
+PROMPTFOO_EMPTY_BODY = '{"data":[]}'
+PROMPTFOO_VERSION_BODY = (
+    '{"currentVersion":"0.124.1","latestVersion":"0.124.1",'
+    '"updateAvailable":false,"selfHosted":false,"isNpx":false,'
+    '"updateCommands":{"primary":"npm install -g promptfoo@latest",'
+    '"alternative":"npx promptfoo@latest","commandType":"npm"},'
+    '"commandType":"npm"}')
+PROMPTFOO_GENERIC_HEALTH_BODY = '{"status":"OK","version":"0.124.1"}'
+
+# Ce qui doit conclure aussi.
+# Une évaluation red team, sans description ni jeu de données, à taux
+# fractionnaire, et la même liste filtrée qui porte attackSuccessRate.
+PROMPTFOO_REDTEAM_RESULTS_BODY = (
+    '{"data":[{"evalId":"eval-abc-2026-10-14T11:00:00",'
+    '"createdAt":1791975600000,"description":null,"numTests":42,'
+    '"datasetId":null,"isRedteam":true,"passRate":66.66666666666667,'
+    '"label":"eval-abc-2026-10-14T11:00:00","providers":[{"id":"openai:gpt"}],'
+    '"attackSuccessRate":33.33}]}')
+PROMPTFOO_REFORMATTED_RESULTS_BODY = json.dumps(
+    json.loads(PROMPTFOO_RESULTS_BODY), indent=2) + "\n"
+PROMPTFOO_REFORMATTED_EMPTY_BODY = '{\n  "data": []\n}\n'
+PROMPTFOO_REFORMATTED_VERSION_BODY = json.dumps(
+    json.loads(PROMPTFOO_VERSION_BODY), indent=2) + "\n"
+# L'image Docker officielle.
+PROMPTFOO_DOCKER_VERSION_BODY = json.dumps({
+    "currentVersion": "0.124.1", "latestVersion": "0.125.0",
+    "updateAvailable": True, "selfHosted": True, "isNpx": False,
+    "updateCommands": {"primary": "docker pull ghcr.io/promptfoo/promptfoo:latest",
+                       "alternative": None, "commandType": "docker"},
+    "commandType": "docker"}, separators=(",", ":"))
+
+# Ce qui ne doit pas conclure.
+# Une liste d'évaluations quelconque, sans les clés du produit.
+PROMPTFOO_FOREIGN_RESULTS_BODY = ('{"data":[{"id":"run-1","createdAt":1,'
+                                  '"status":"done","score":0.9}]}')
+# evalId seul, sans les compteurs.
+PROMPTFOO_PARTIAL_RESULTS_BODY = ('{"data":[{"evalId":"eval-1",'
+                                  '"createdAt":1791973040027}]}')
+# Les clés au fond d'un autre document que la liste.
+PROMPTFOO_WRAPPED_RESULTS_BODY = '{"mirror":%s}' % PROMPTFOO_RESULTS_BODY
+PROMPTFOO_NON_EMPTY_FOREIGN_BODY = '{"data":[{"id":1}]}'
+# Un document de version qui n'est pas celui du routeur.
+PROMPTFOO_FOREIGN_VERSION_BODY = '{"version":"1.2.3","build":"abc"}'
+PROMPTFOO_VERSION_WITHOUT_ISNPX_BODY = json.dumps({
+    k: v for k, v in json.loads(PROMPTFOO_VERSION_BODY).items()
+    if k != "isNpx"}, separators=(",", ":"))
+PROMPTFOO_APPENDED_VERSION_BODY = (PROMPTFOO_VERSION_BODY[:-1]
+                                   + ',"checked_at":0}')
+# Le catch-all de l'interface web : index.html en 200 sur tout chemin
+# inconnu.
+PROMPTFOO_SPA_BODY = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                      '<title>promptfoo</title></head><body><div id="root">'
+                      '</div></body></html>')
+
+PROMPTFOO_OPEN = ((200, PROMPTFOO_RESULTS_BODY), (200, PROMPTFOO_VERSION_BODY))
+PROMPTFOO_EMPTY = ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_VERSION_BODY))
+
+
+def promptfoo_block():
+    doc = load(PROMPTFOO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % PROMPTFOO_RESULTS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/results"
+    return blocks[0]
+
+
+def promptfoo_fires(results=PROMPTFOO_OPEN[0], version=PROMPTFOO_OPEN[1]):
+    """
+    Sémantique nuclei du bloc sous req-condition : le matcher est évalué
+    contre les réponses reçues. stop-at-first-match n'arrête la marche qu'une
+    fois la première branche conclue, ce qui ne change pas la conclusion.
+    """
+    block = promptfoo_block()
+    assert block.get("req-condition") is True
+    assert block.get("stop-at-first-match") is True
+    matcher, = block.get("matchers")
+    assert matcher.get("type") == "dsl" and matcher.get("condition") == "and"
+    return dsl_matcher_hits(matcher, [results, version])
+
+
+def test_promptfoo_probe_reads_the_eval_list_and_version_and_nothing_else():
+    """
+    /api/results/:id, /api/eval et /api/redteam sont les abus que le constat
+    signale : deux GET de lecture, dans cet ordre, sans corps ni en-tête.
+    """
+    doc = load(PROMPTFOO_TEMPLATE)
+    assert request_routes(doc) == {("GET", PROMPTFOO_RESULTS_ROUTE),
+                                   ("GET", PROMPTFOO_VERSION_ROUTE)}, (
+        sorted(request_routes(doc)))
+    assert doc["info"]["severity"] == "high"
+    assert doc["info"]["metadata"]["max-request"] == 2
+    assert doc["info"]["metadata"]["product"] == "promptfoo"
+
+    block = promptfoo_block()
+    assert block.get("path") == ["{{BaseURL}}%s" % PROMPTFOO_RESULTS_ROUTE,
+                                 "{{BaseURL}}%s" % PROMPTFOO_VERSION_ROUTE]
+    for b in doc.get("http") or []:
+        assert b.get("method", "GET") == "GET"
+        assert not b.get("body") and not b.get("raw")
+        assert not b.get("headers")
+        for path in b.get("path") or []:
+            for abuse in ("/api/eval", "/api/redteam", "/api/results/",
+                          "/api/configs", "/api/providers"):
+                assert abuse not in path, path
+
+
+def test_promptfoo_matcher_concludes_on_an_eval_or_on_an_empty_list_and_version():
+    assert promptfoo_fires()
+    for results, version in (
+        PROMPTFOO_EMPTY,
+        # Une évaluation suffit, quelle que soit la route de version.
+        ((200, PROMPTFOO_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY)),
+        ((200, PROMPTFOO_REDTEAM_RESULTS_BODY), (404, "")),
+        ((200, PROMPTFOO_REFORMATTED_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY)),
+        ((200, PROMPTFOO_REFORMATTED_EMPTY_BODY),
+         (200, PROMPTFOO_REFORMATTED_VERSION_BODY)),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_DOCKER_VERSION_BODY)),
+        # Le statut n'entre pas dans la conclusion.
+        ((203, PROMPTFOO_RESULTS_BODY), (203, PROMPTFOO_VERSION_BODY)),
+    ):
+        assert promptfoo_fires(results, version), (results, version)
+
+    for results, version, why in (
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_SPA_BODY),
+         "la liste vide seule, que n'importe quelle API peut écrire"),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_GENERIC_HEALTH_BODY),
+         "la liste vide et une version générique"),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_FOREIGN_VERSION_BODY),
+         "la liste vide et le document de version d'un autre service"),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_VERSION_WITHOUT_ISNPX_BODY),
+         "un document de version sans isNpx"),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_APPENDED_VERSION_BODY),
+         "le document de version suivi d'une clé ajoutée"),
+        ((200, PROMPTFOO_NON_EMPTY_FOREIGN_BODY), (200, PROMPTFOO_VERSION_BODY),
+         "la version seule, la liste d'un autre service"),
+        ((200, PROMPTFOO_FOREIGN_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY),
+         "une liste d'évaluations sans les clés du produit"),
+        ((200, PROMPTFOO_PARTIAL_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY),
+         "evalId sans numTests, isRedteam ni passRate"),
+        ((200, PROMPTFOO_WRAPPED_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY),
+         "la liste republiée au fond d'un autre document"),
+        ((200, PROMPTFOO_SPA_BODY), (200, PROMPTFOO_SPA_BODY),
+         "le catch-all de l'interface web"),
+        ((401, ""), (401, ""), "un proxy qui authentifie"),
+    ):
+        assert not promptfoo_fires(results, version), why
+
+
+def test_promptfoo_conclusion_never_rests_on_status_nor_attack_success_rate():
+    matcher, = promptfoo_block().get("matchers")
+    assert matcher.get("type") == "dsl"
+    for expr in matcher.get("dsl") or []:
+        assert "status_code" not in expr, expr
+        assert "attackSuccessRate" not in expr, expr
+
+
+def test_promptfoo_extractor_reports_the_server_version():
+    extractors = promptfoo_block().get("extractors") or []
+    assert len(extractors) == 1, extractors
+    extractor, = extractors
+    assert extractor.get("type") == "json"
+    assert extractor.get("part") == "body_2"
+    assert extractor.get("json") == [".currentVersion"]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_promptfoo_matcher_compiles_and_fires_against_a_live_server():
+    """Seul un scan contre un vrai serveur ferme la boucle sur RE2 et gojq."""
+    def scan(results=PROMPTFOO_OPEN[0], version=PROMPTFOO_OPEN[1]):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.path == PROMPTFOO_RESULTS_ROUTE:
+                    self.reply(*results)
+                elif self.path == PROMPTFOO_VERSION_ROUTE:
+                    self.reply(*version)
+                else:
+                    self.reply(200, PROMPTFOO_SPA_BODY)
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                if payload.startswith("<"):
+                    self.send_header("Content-Type", "text/html")
+                else:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", PROMPTFOO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=120,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        found = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in found} <= {
+            "promptfoo-server-exposed"}, r.stdout + r.stderr
+        return seen, found
+
+    # Une évaluation conclut à la première requête : la seconde ne part pas,
+    # et l'instance ne remonte qu'une fois.
+    seen, found = scan()
+    assert seen == [("GET", PROMPTFOO_RESULTS_ROUTE)], seen
+    assert len(found) == 1, found
+
+    # La liste vide ne conclut qu'avec le routeur de version, dont la version
+    # est extraite.
+    seen, found = scan(*PROMPTFOO_EMPTY)
+    assert seen == [("GET", PROMPTFOO_RESULTS_ROUTE),
+                    ("GET", PROMPTFOO_VERSION_ROUTE)], seen
+    assert len(found) == 1, found
+    assert found[0].get("extracted-results") == ["0.124.1"], found[0]
+
+    for results, version in (
+        ((200, PROMPTFOO_REDTEAM_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY)),
+        ((200, PROMPTFOO_REFORMATTED_EMPTY_BODY),
+         (200, PROMPTFOO_REFORMATTED_VERSION_BODY)),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_DOCKER_VERSION_BODY)),
+    ):
+        _, found = scan(results, version)
+        assert len(found) == 1, (results, version, found)
+
+    for results, version in (
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_SPA_BODY)),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_FOREIGN_VERSION_BODY)),
+        ((200, PROMPTFOO_EMPTY_BODY), (200, PROMPTFOO_APPENDED_VERSION_BODY)),
+        ((200, PROMPTFOO_NON_EMPTY_FOREIGN_BODY), (200, PROMPTFOO_VERSION_BODY)),
+        ((200, PROMPTFOO_FOREIGN_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY)),
+        ((200, PROMPTFOO_WRAPPED_RESULTS_BODY), (200, PROMPTFOO_SPA_BODY)),
+        ((401, ""), (401, "")),
+    ):
+        _, found = scan(results, version)
+        assert found == [], (results, version, found)
