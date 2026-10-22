@@ -41583,3 +41583,255 @@ def test_promptfoo_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, found = scan(results, version)
         assert found == [], (results, version, found)
+
+
+# --------------------------------------------------------------------------
+# nvidia_gpu_exporter : l'exportateur Prometheus de télémétrie GPU adossé à
+# nvidia-smi, celui qu'on pose hors Kubernetes. Produit distinct de DCGM
+# Exporter, et c'est la première chose que cette section amarre : ses séries
+# portent le préfixe « nvidia_smi_ », jamais « DCGM_FI_DEV_ », et les deux
+# templates ne doivent pas se répondre l'un l'autre.
+#
+# Le constat repose sur la série d'identité nvidia_smi_gpu_info, conjointe à
+# driver_version — l'étiquette n'existe que sur elle (docs/METRICS.md). Le
+# point non évident est l'ordre des étiquettes : METRICS.md imprime uuid en
+# premier, alors que le rendu réel de client_golang les trie par nom — les
+# sorties que l'amont enregistre pour ses tests d'intégration ouvrent sur
+# compute_cap. Les deux doivent être lues. Comme le tri ne distingue plus
+# l'instance de sa copie, c'est le jeu d'étiquettes qui le fait : celui de
+# gpu_info est fixe et ne contient ni job ni instance, qu'une fédération
+# ajoute.
+
+NGE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "nvidia-gpu-exporter-metrics-exposed.yaml")
+
+NGE_ROUTE = "/metrics"
+
+NGE_HELP = ("# HELP nvidia_smi_gpu_info A metric with a constant '1' value "
+            "labeled by gpu uuid, name, driver_model_current, "
+            "driver_model_pending, vbios_version, driver_version, pci_bus_id, "
+            "serial, compute_cap, pci_sub_device_id, index, cuda_version.\n"
+            "# TYPE nvidia_smi_gpu_info gauge\n")
+
+# Verbatim : internal/integration/testdata/
+# linux-x86_64__nvidia-h100-80gb-hbm3__590.48.01__idle.metrics.
+NGE_H100_INFO = (
+    'nvidia_smi_gpu_info{compute_cap="9.0",cuda_version="13.1",'
+    'driver_model_current="[N/A]",driver_model_pending="[N/A]",'
+    'driver_version="590.48.01",index="0",name="NVIDIA H100 80GB HBM3",'
+    'pci_bus_id="00000000:00:09.0",pci_sub_device_id="0x16C110DE",'
+    'serial="0000000000000",uuid="00000000-0000-0000-0000-000000000000",'
+    'vbios_version="96.00.A5.00.01"} 1')
+
+# Verbatim : windows-x86_64__nvidia-geforce-rtx-2080-super__610.62__load.metrics.
+NGE_WINDOWS_INFO = (
+    'nvidia_smi_gpu_info{compute_cap="7.5",cuda_version="13.3",'
+    'driver_model_current="WDDM",driver_model_pending="WDDM",'
+    'driver_version="610.62",index="0",name="NVIDIA GeForce RTX 2080 SUPER",'
+    'pci_bus_id="00000000:0C:00.0",pci_sub_device_id="0x40051458",'
+    'serial="[N/A]",uuid="00000000-0000-0000-0000-000000000000",'
+    'vbios_version="90.04.7a.40.73"} 1')
+
+# L'exemple que docs/METRICS.md imprime, uuid en tête.
+NGE_DOC_INFO = (
+    'nvidia_smi_gpu_info{uuid="df6e7a7c-7314-46f8-abc4-b88b36dcf3aa",'
+    'name="NVIDIA GeForce RTX 2080 SUPER",driver_version="471.11",'
+    'cuda_version="11.4",pci_bus_id="00000000:71:00.0",index="0",...} 1')
+
+NGE_MEASURES = (
+    "# HELP nvidia_smi_memory_used_bytes memory.used [MiB]\n"
+    "# TYPE nvidia_smi_memory_used_bytes gauge\n"
+    'nvidia_smi_memory_used_bytes{uuid="00000000-0000-0000-0000-000000000000"} 0\n'
+    "# HELP nvidia_smi_temperature_gpu temperature.gpu\n"
+    "# TYPE nvidia_smi_temperature_gpu gauge\n"
+    'nvidia_smi_temperature_gpu{uuid="00000000-0000-0000-0000-000000000000"} 41\n'
+)
+
+# Sous --collect.compute-apps : verbatim de la sortie Windows enregistrée.
+NGE_COMPUTE_APPS = (
+    "# TYPE nvidia_smi_compute_app_info gauge\n"
+    'nvidia_smi_compute_app_info{pid="2140",'
+    'process_name="C:\\\\Windows\\\\System32\\\\dwm.exe",'
+    'uuid="00000000-0000-0000-0000-000000000000"} 1\n'
+)
+
+
+def nge_body(info=NGE_H100_INFO, metadata=True, compute_apps=False):
+    body = NGE_HELP if metadata else ""
+    body += info + "\n" + NGE_MEASURES
+    if compute_apps:
+        body += NGE_COMPUTE_APPS
+    return body
+
+
+NGE_BODY = nge_body()
+
+# La même série relayée par une fédération Prometheus : job et instance
+# ajoutés, puis tri par nom.
+NGE_FEDERATED_BODY = nge_body(info=NGE_H100_INFO.replace(
+    'index="0",',
+    'index="0",instance="10.0.0.4:9835",job="nvidia_gpu_exporter",'))
+
+# Les mesures seules, sans la série d'identité — et donc sans pilote derrière.
+NGE_MEASURES_ONLY_BODY = NGE_MEASURES
+
+# Une règle d'alerte qui cite la série.
+NGE_PROMQL_BODY = (
+    "groups:\n  - name: gpu\n    rules:\n      - alert: OldDriver\n"
+    '        expr: nvidia_smi_gpu_info{driver_version="471.11"} == 1\n'
+)
+
+# La page de documentation servie telle quelle : la ligne est dans une phrase.
+NGE_DOC_PAGE_BODY = ("<html><body><p>A scrape looks like %s</p></body></html>"
+                     % NGE_DOC_INFO)
+
+
+def nge_block():
+    doc = load(NGE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % NGE_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /metrics"
+    return blocks[0]
+
+
+def nge_fires(body=None, status=200):
+    if body is None:
+        body = NGE_BODY
+    block = nge_block()
+    verdicts = [mcpo_dsl_hits(m, [(status, body)])
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def nge_extracted(body):
+    found = set()
+    for extractor in nge_block().get("extractors") or []:
+        group = extractor.get("group", 0)
+        for pattern in extractor.get("regex") or []:
+            for m in re.finditer(pattern, body):
+                found.add(m.group(group))
+    return sorted(found)
+
+
+def test_nge_probe_reads_only_the_telemetry_route():
+    doc = load(NGE_TEMPLATE)
+    assert request_routes(doc) == {("GET", NGE_ROUTE)}, sorted(request_routes(doc))
+    for block in doc.get("http") or []:
+        assert not block.get("body") and not block.get("raw")
+        for path in block.get("path") or []:
+            assert "/debug/pprof" not in path
+
+
+def test_nge_matcher_rests_on_gpu_info_joined_to_driver_version():
+    for body, why in (
+        (NGE_BODY, "la sortie réelle enregistrée par l'amont (Linux, H100)"),
+        (nge_body(info=NGE_WINDOWS_INFO), "la sortie réelle sous Windows"),
+        (nge_body(info=NGE_DOC_INFO),
+         "l'exemple de METRICS.md, uuid en tête plutôt que trié"),
+        (nge_body(compute_apps=True), "une instance sous --collect.compute-apps"),
+        (NGE_BODY.replace("\n", "\r\n"), "un relais qui sert le corps en CRLF"),
+    ):
+        assert nge_fires(body), "le template perd %s" % why
+    assert nge_fires(status=203), "le constat dépend du statut HTTP"
+
+    for body, why in (
+        (dcgm_body(), "DCGM Exporter, produit distinct déjà couvert"),
+        (DCGM_NODE_EXPORTER_BODY, "un exportateur Prometheus quelconque"),
+        (NGE_MEASURES_ONLY_BODY, "les mesures sans la série d'identité"),
+        (nge_body(info=NGE_H100_INFO.replace("driver_version", "drv")),
+         "une série gpu_info sans driver_version"),
+        (nge_body(info=NGE_H100_INFO.replace('driver_version="590.48.01"',
+                                             'driver_version=""')),
+         "un driver_version vide"),
+        (nge_body(info=NGE_H100_INFO.replace(
+            'driver_version="590.48.01"', 'xdriver_version="590.48.01"')),
+         "une étiquette qui finit seulement par driver_version"),
+        (nge_body(metadata=False), "la ligne sans # TYPE de famille"),
+        (NGE_FEDERATED_BODY, "une copie republiée par une fédération"),
+        (NGE_PROMQL_BODY, "une règle d'alerte qui cite la série"),
+        (NGE_DOC_PAGE_BODY, "la page de documentation"),
+        ("Unauthorized\n", "le refus d'exporter-toolkit sous --web.config.file"),
+        ("404 page not found\n", "un 404"),
+        ("", "une réponse vide"),
+    ):
+        assert not nge_fires(body), "le template conclut sur %s" % why
+
+    for block in (load(DCGM_TEMPLATE).get("http") or []):
+        for m in block.get("matchers") or []:
+            if m.get("type") == "dsl":
+                assert not dsl_matcher_hits(m, [(200, NGE_BODY)]), (
+                    "le template DCGM conclut sur nvidia_gpu_exporter")
+
+
+def test_nge_extraction_reports_the_inventory_without_process_names():
+    extractors = nge_block().get("extractors") or []
+    assert len(extractors) == 1, "une ligne de résultat par instance"
+    assert nge_extracted(NGE_BODY) == sorted([
+        'name="NVIDIA H100 80GB HBM3"',
+        'driver_version="590.48.01"',
+        'cuda_version="13.1"',
+    ]), nge_extracted(NGE_BODY)
+    assert not any("process_name" in v or "dwm.exe" in v
+                   for v in nge_extracted(nge_body(compute_apps=True))), (
+        "l'extracteur recopie les noms de processus dans le rapport")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_nge_matcher_compiles_and_fires_against_a_live_server():
+    def scan(body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == NGE_ROUTE:
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "text/plain; version=0.0.4; charset=utf-8")
+                else:
+                    payload = b"404 page not found\n"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", NGE_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(nge_body(compute_apps=True))
+    assert seen == [NGE_ROUTE], seen
+    assert hits == 1, hits
+    assert extracted == sorted(['name="NVIDIA H100 80GB HBM3"',
+                                'driver_version="590.48.01"',
+                                'cuda_version="13.1"']), extracted
+
+    for body in (NGE_FEDERATED_BODY, dcgm_body(), NGE_DOC_PAGE_BODY):
+        _, hits, _ = scan(body)
+        assert hits == 0, body

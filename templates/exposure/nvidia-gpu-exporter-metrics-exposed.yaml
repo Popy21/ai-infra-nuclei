@@ -1,0 +1,129 @@
+id: nvidia-gpu-exporter-metrics-exposed
+
+info:
+  name: nvidia_gpu_exporter - Unauthenticated GPU Inventory Exposure
+  author: popy21
+  severity: medium
+  description: |
+    nvidia_gpu_exporter (utkuozdemir/nvidia_gpu_exporter) est l'exportateur
+    Prometheus de télémétrie GPU adossé à nvidia-smi — ou à NVML sous le
+    moteur expérimental. C'est celui qu'on pose hors Kubernetes : sur les
+    machines d'inférence, les postes de travail GPU, les hôtes Windows. C'est
+    un produit distinct de DCGM Exporter, et ses séries ne se confondent pas
+    avec les siennes : elles portent toutes le préfixe « nvidia_smi_ ».
+    GET /metrics est la route d'exposition — CONFIGURE.md donne
+    « --web.telemetry-path="/metrics" » —, sur une écoute dont le défaut est
+    « --web.listen-address=:9835 », donc toutes les interfaces. Le README
+    publie la commande de conteneur qui la met sur l'hôte, « -p 9835:9835 »,
+    puis « curl http://localhost:9835/metrics ».
+    L'absence d'authentification est le défaut documenté, et le projet l'écrit
+    en propre dans docs/SECURITY_MODEL.md : « The metrics endpoint is plain
+    HTTP by default, like other Prometheus exporters. TLS, client certificates
+    and basic auth can be enabled with `--web.config.file` ». Ce drapeau a
+    pour défaut la chaîne vide (« --web.config.file="" ») ; sans lui,
+    exporter-toolkit sert la route à tout appelant.
+    Le constat repose sur la série d'identité du produit, nvidia_smi_gpu_info,
+    que docs/METRICS.md décrit comme « A metric with a constant '1' value
+    labeled by gpu uuid, name, driver_model_current, driver_model_pending,
+    vbios_version, driver_version, pci_bus_id, serial, compute_cap,
+    pci_sub_device_id, index, cuda_version » et dont il donne l'exemple
+    « nvidia_smi_gpu_info{uuid="df6e7a7c-…",name="NVIDIA GeForce RTX 2080
+    SUPER",driver_version="471.11",cuda_version="11.4",pci_bus_id="00000000:71:00.0",index="0",...} 1 ».
+    Les mesures — nvidia_smi_utilization_gpu_ratio, nvidia_smi_memory_used_bytes,
+    nvidia_smi_temperature_gpu — ne portent que l'étiquette uuid et se joignent
+    à elle ; driver_version n'existe que sur cette série-là.
+  impact: |
+    La lecture livre l'inventaire des accélérateurs de la machine, et
+    SECURITY_MODEL.md le dit sans détour : « Anyone who can reach the port sees
+    everything the exporter exports. That includes the GPU inventory (UUIDs,
+    serials, PCI addresses, driver and VBIOS versions) ». La version du pilote
+    NVIDIA et la version CUDA qu'il porte donnent le niveau de correctif de
+    l'hôte, en une requête et sans compte.
+    Avec « --collect.compute-apps », la même route publie
+    nvidia_smi_compute_app_info{pid=…,process_name=…} : les noms complets et
+    les PID des processus qui tiennent un contexte de calcul sur chaque GPU —
+    les chemins d'exécutables, donc les noms d'utilisateurs et les outils
+    installés, et sous « --pid=host » ceux de toutes les charges de l'hôte.
+    Les mesures jointes disent enfin quand les cartes travaillent et combien
+    de mémoire elles tiennent : le rythme des travaux d'inférence ou
+    d'entraînement de la machine. Rien de tout cela n'est attribuable, la
+    route ne réclamant aucune identité.
+  remediation: |
+    Le produit porte le mécanisme, éteint par défaut : poser
+    « --web.config.file=web-config.yml » au format d'exporter-toolkit
+    (« basic_auth_users », « tls_server_config »). SECURITY_MODEL.md le
+    désigne comme la seule garde : « Keep the port on a trusted network, or
+    enable TLS and auth ».
+    Fermer aussi le réseau. L'écoute par défaut « :9835 » vaut toutes les
+    interfaces : passer « --web.listen-address=127.0.0.1:9835 » quand la
+    scrutation est locale, publier le conteneur en « -p 127.0.0.1:9835:9835 »
+    plutôt qu'en « -p 9835:9835 », et sous Windows restreindre la règle de
+    pare-feu au collecteur Prometheus.
+    Laisser « --collect.compute-apps » et « --web.enable-pprof » éteints tant
+    que la route n'est pas gardée : le premier publie les noms et PID des
+    processus, le second « exposes runtime internals including the full
+    process command line ».
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<hote>:9835/metrics » ne doit plus rendre de ligne
+    « nvidia_smi_gpu_info{ ».
+  reference:
+    - https://github.com/utkuozdemir/nvidia_gpu_exporter
+    - https://github.com/utkuozdemir/nvidia_gpu_exporter/blob/main/docs/METRICS.md
+    - https://github.com/utkuozdemir/nvidia_gpu_exporter/blob/main/docs/CONFIGURE.md
+    - https://github.com/utkuozdemir/nvidia_gpu_exporter/blob/main/docs/SECURITY_MODEL.md
+    - https://github.com/utkuozdemir/nvidia_gpu_exporter/tree/main/internal/integration/testdata
+  metadata:
+    max-request: 1
+    vendor: utkuozdemir
+    product: nvidia_gpu_exporter
+  tags: ai,ml,gpu,nvidia,nvidia-smi,nvidia-gpu-exporter,telemetry,prometheus,exposure,unauth,misconfig
+
+http:
+  # Une lecture, celle de la route d'exposition. GET seulement : l'exportateur
+  # ne fait que lire (« It only reads. It never changes GPU settings »), et
+  # /debug/pprof/ n'est pas interrogée — elle n'existe que sous
+  # « --web.enable-pprof » et rend la ligne de commande du processus.
+  - method: GET
+    path:
+      - "{{BaseURL}}/metrics"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # La série d'identité en début de ligne, portant driver_version. Le
+          # préfixe « nvidia_smi_ » n'est publié par aucun autre exportateur, et
+          # driver_version n'existe que sur nvidia_smi_gpu_info (METRICS.md).
+          #
+          # L'étiquette n'est pas cherchée à une position fixe : le rendu de
+          # client_golang trie les étiquettes par nom — les sorties enregistrées
+          # de l'amont ouvrent sur compute_cap, cuda_version, driver_model_* —
+          # alors que METRICS.md imprime uuid en premier. [{,] devant le nom
+          # écarte une étiquette qui finirait par « driver_version ».
+          #
+          # L'ancrage (?m)^ écarte une citation au milieu d'une phrase, d'une
+          # requête PromQL ou d'une page de documentation ; la valeur non vide
+          # écarte un sélecteur qui ne porte aucun pilote derrière lui.
+          - 'regex("(?m)^nvidia_smi_gpu_info\\{(?:[^}\\n]*,)?driver_version=\"[^\"]+\"", body)'
+
+          # Les métadonnées de famille que le format d'exposition impose : le
+          # corps est une scrutation rendue, pas un extrait recopié.
+          - 'regex("(?m)^# TYPE nvidia_smi_gpu_info gauge", body)'
+
+          # Pas une copie republiée. Le jeu d'étiquettes de nvidia_smi_gpu_info
+          # est fixe et ne contient ni job ni instance ; une fédération
+          # Prometheus ou un collecteur OpenTelemetry les ajoute. La série
+          # republiée n'est pas l'exportateur qui répond.
+          - '!regex("(?m)^nvidia_smi_gpu_info\\{(?:[^}\\n]*,)?(?:job|instance)=\"", body)'
+
+    extractors:
+      # Un seul extracteur, donc une seule ligne de résultat par instance. Le
+      # groupe 1 garde la paire entière — « driver_version="590.48.01" » — sans
+      # le séparateur qui la précède. [{,] avant « name » écarte
+      # « process_name » des séries par processus, qu'il n'y a pas lieu de
+      # recopier dans le rapport.
+      - type: regex
+        name: inventory
+        group: 1
+        regex:
+          - '[{,]((?:name|driver_version|cuda_version)="[^"]+")'
