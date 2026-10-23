@@ -1,0 +1,165 @@
+id: tensorrt-llm-serve-exposed
+
+info:
+  name: TensorRT-LLM trtllm-serve - Unauthenticated OpenAI-Compatible API Exposure
+  author: popy21
+  severity: high
+  description: |
+    TensorRT-LLM (NVIDIA/TensorRT-LLM) est le moteur d'inférence LLM de NVIDIA,
+    et `trtllm-serve` son serveur compatible OpenAI — « The trtllm-serve command
+    starts an OpenAI compatible server that supports the following endpoints:
+    /v1/models, /v1/completions, /v1/chat/completions », puis « /health,
+    /metrics, /version, /start_profile (prototype), /stop_profile (prototype) ».
+    C'est un produit distinct des trois NVIDIA déjà couverts par le pack :
+    Triton est le serveur multi-framework qui peut embarquer un backend
+    TensorRT-LLM, Dynamo la couche d'orchestration qui se place au-dessus des
+    moteurs, et un NIM l'image qui emballe un modèle avec sa propre API.
+    GET /v1/models nomme le produit sans ambiguïté. tensorrt_llm/serve/
+    openai_server.py enregistre « self.app.add_api_route("/v1/models",
+    self.get_model, methods=["GET"]) » — dans register_routes comme dans
+    register_mm_encoder_routes, register_embedding_routes et
+    register_visual_gen_routes, donc quel que soit le rôle du serveur — et
+    get_model() rend « ModelList(data=[ModelCard(id=self.model)]) » en
+    JSONResponse. tensorrt_llm/serve/openai_protocol.py fixe le reste en dur :
+    « class ModelCard(OpenAIBaseModel): id: str; object: str = "model";
+    created: int = Field(default_factory=lambda: int(time.time())); owned_by:
+    str = "tensorrt_llm" » et « class ModelList(OpenAIBaseModel): object: str =
+    "list"; data: List[ModelCard] ». OpenAIBaseModel porte « extra="forbid" »,
+    donc la carte n'a que ces quatre champs, dans cet ordre, et Starlette
+    sérialise compact : le document ouvre sur « {"object":"list","data":[{"id":
+    ...,"object":"model","created":...,"owned_by":"tensorrt_llm"}]} ». La
+    valeur « tensorrt_llm » n'est exposée par aucun paramètre de `trtllm-serve`
+    — l'exploitant passe le chemin ou l'identifiant du modèle, jamais ce champ.
+    C'est une constante du produit, et elle le sépare de tous les autres
+    serveurs du même protocole : vLLM écrit « vllm », LMDeploy « lmdeploy », le
+    frontend Dynamo « nvidia » (lib/llm/src/http/service/openai.rs).
+    L'absence d'authentification est une fonctionnalité absente du produit, pas
+    un réglage oublié. Dans openai_server.py, les seuls intergiciels montés sont
+    « PerfMetricsMiddleware » — sous condition, pour horodater les requêtes — et
+    « ServerArrivalTimeMiddleware » : aucun ne lit d'identifiant. Aucune des
+    routes d'inférence, de santé, de version ou de métriques ne porte de
+    « Depends(...) ». Les seules dépendances d'autorisation du fichier,
+    « _require_runtime_control_auth » et « _require_rl_control_auth », gardent
+    des routes opt-in — /release_memory, /resume_memory, /memory_status sous
+    --enable_sleep_mode, qui exige « TRTLLM_RUNTIME_CONTROL_API_KEY », et
+    /update_weights côté RL — et ne touchent pas /v1/models ni les routes
+    OpenAI. tensorrt_llm/commands/serve.py n'offre aucune option de clé d'API :
+    ses défauts sont « --host, default="localhost" » et « --port,
+    default=8000 », et c'est en conteneur que l'exposition survient — les
+    guides de déploiement de NVIDIA écrivent tous « --host 0.0.0.0 --port
+    8000 » (blog09_Deploying_GPT_OSS_on_TRTLLM.md, features/embeddings.md),
+    réglage obligé pour que le port du conteneur soit joignable.
+    Le matcher exige l'ouverture du document — « object » puis « data », puis
+    la carte dans l'ordre id, object, created, owned_by — jusqu'au littéral
+    « "owned_by":"tensorrt_llm" ». Jamais sur le statut HTTP, qui vaut 200 sur
+    tout serveur vivant ; jamais sur /health, qui rend « Response(status_code=
+    200) » à corps vide, ni sur /version, qui rend « {"version": VERSION} » —
+    deux formes que n'importe quel service sert.
+  impact: |
+    Le corps de /v1/models est la preuve, pas le butin. Le même routeur, sans
+    la moindre garde devant lui, sert POST /v1/chat/completions, POST
+    /v1/completions, POST /v1/responses et — hors mode harmony — POST
+    /v1/messages, l'adaptateur Anthropic Messages : un tiers lance de
+    l'inférence sur les GPU de l'exploitant, pour son propre compte et à ses
+    frais, sans quota, sans utilisateur et sans trace qui lui attribue
+    l'appel. Une instance GPU louée à l'heure se paie en continu pendant que
+    l'inférence d'autrui tourne, et le service légitime perd la capacité de
+    lot et la mémoire vidéo qu'elle occupe.
+    Les routes d'exploitation sont servies par le même routeur : GET
+    /server_info rend les paramètres désagrégés, max_batch_size, l'algorithme
+    de hachage et la taille de bloc du cache KV et les métriques de démarrage
+    — la forme du déploiement, en une requête —, POST /start_profile et
+    POST /stop_profile déclenchent le profilage du moteur sur le GPU — une
+    charge supplémentaire et des traces écrites sur le disque de l'hôte —,
+    GET /metrics livre les statistiques d'itération, dont chaque relevé n'est
+    rendu qu'à un seul appelant (« Each statistic is returned to only one
+    caller ») : un tiers qui le lit les retire à la supervision. POST
+    /kv_cache_events et POST /steady_clock_offset, prévus pour le serveur
+    désagrégé, acceptent eux aussi l'anonyme.
+    L'identifiant rendu par /v1/models dit ce qui tourne : l'identifiant
+    Hugging Face du modèle, ou — pour un chemin local — le nom du dossier de
+    poids, où un fine-tuning interne se lit en clair.
+  remediation: |
+    Il n'y a aucun réglage à activer : `trtllm-serve` n'a pas d'option de clé
+    d'API, et « TRTLLM_RUNTIME_CONTROL_API_KEY » ne garde que les routes de
+    contrôle de la mémoire sous --enable_sleep_mode, jamais /v1/models ni les
+    routes d'inférence. La fermeture est réseau — garder le « --host
+    localhost » par défaut quand le client est local, publier le conteneur en
+    « -p 127.0.0.1:8000:8000 » plutôt qu'en « -p 8000:8000 » quand il faut
+    « --host 0.0.0.0 », et router tout accès distant par un mandataire qui
+    authentifie avant de relayer. Dans un déploiement Kubernetes ou Dynamo, le
+    port 8000 des workers n'a pas à sortir du réseau du cluster.
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<hote>:8000/v1/models » ne doit plus rendre « "owned_by":
+    "tensorrt_llm" ».
+    Après une exposition, tenir pour consommé le budget GPU sur la période —
+    il n'y a ni utilisateur ni journal d'appelant — et relire les journaux
+    d'uvicorn pour les POST sur /v1/chat/completions, /v1/completions,
+    /v1/messages, /v1/responses, /start_profile et /stop_profile servis à un
+    tiers pendant la fenêtre.
+  reference:
+    - https://github.com/NVIDIA/TensorRT-LLM
+    - https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/openai_protocol.py
+    - https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/openai_server.py
+    - https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/commands/serve.py
+    - https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve/trtllm-serve.html
+    - https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.md
+  metadata:
+    max-request: 1
+    vendor: nvidia
+    product: tensorrt_llm
+  tags: ai,llm,tensorrt-llm,trtllm,nvidia,inference,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier : GET /v1/models nomme
+  # le produit par le littéral « tensorrt_llm » que ModelCard fixe en dur, et
+  # il n'y a aucune version gardée à distinguer — le produit n'a pas de clé
+  # d'API. /health et /version ne sont pas interrogés : corps vide et
+  # {"version": ...}, génériques.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions, /v1/completions,
+  # /v1/messages et /v1/responses lanceraient de l'inférence sur les GPU de
+  # l'hôte, POST /start_profile un profilage du moteur, et GET /metrics
+  # retirerait à la supervision les statistiques qu'il rend à un seul appelant :
+  # ce sont les abus que le template signale, pas ce qu'un scanner a le droit
+  # de faire pour les établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture, tenu sur l'ordre de déclaration des deux modèles
+      # pydantic. ModelList déclare object puis data ; ModelCard déclare id,
+      # object, created puis owned_by, et OpenAIBaseModel interdit tout champ
+      # supplémentaire — c'est cette séquence, pas un mot isolé, qui écarte
+      # tout document qui republierait "owned_by":"tensorrt_llm" au fond d'un
+      # objet composite ou sous une clé étrangère. Les \s* laissent passer
+      # l'intermédiaire qui réindente ce que Starlette sérialise compact.
+      #
+      # Le littéral « tensorrt_llm » est le discriminant : la forme
+      # {"object":"list","data":[...]} est celle de tout serveur compatible
+      # OpenAI, et le pack en couvre une dizaine sur cette même route.
+      #
+      # Pas de matcher de statut : /v1/models répond 200 sur tout serveur
+      # vivant, et c'est le corps seul qui dit lequel.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"data"\s*:\s*\[\s*\{\s*"id"\s*:\s*"[^"]*"\s*,\s*"object"\s*:\s*"model"\s*,\s*"created"\s*:\s*\d+\s*,\s*"owned_by"\s*:\s*"tensorrt_llm"'
+        condition: and
+
+    extractors:
+      # Le modèle servi : l'identifiant Hugging Face passé à `trtllm-serve`, ou
+      # le nom du dossier quand c'est un chemin local — get_model() rend
+      # ModelCard(id=self.model), et self.model vaut model_dir.name dans ce cas.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'

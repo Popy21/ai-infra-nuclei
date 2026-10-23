@@ -41835,3 +41835,361 @@ def test_nge_matcher_compiles_and_fires_against_a_live_server():
     for body in (NGE_FEDERATED_BODY, dcgm_body(), NGE_DOC_PAGE_BODY):
         _, hits, _ = scan(body)
         assert hits == 0, body
+
+
+# --------------------------------------------------------------------------
+# TensorRT-LLM `trtllm-serve` — NVIDIA/TensorRT-LLM, le serveur compatible
+# OpenAI du moteur d'inférence de NVIDIA, produit distinct de Triton, de
+# Dynamo et de NIM. Une seule route porte le constat : GET /v1/models rend
+# « ModelList(data=[ModelCard(id=self.model)]) », et openai_protocol.py fixe
+# en dur « owned_by: str = "tensorrt_llm" » sur une carte que OpenAIBaseModel
+# (extra="forbid") limite à id, object, created, owned_by. Aucun paramètre de
+# `trtllm-serve` n'expose ce champ, aucune option de clé d'API n'existe, et
+# openai_server.py ne monte que PerfMetricsMiddleware et
+# ServerArrivalTimeMiddleware — les seuls Depends(...) du fichier gardent les
+# routes opt-in /release_memory, /resume_memory, /memory_status et
+# /update_weights. Cette section vérifie que le constat tient sur le littéral
+# « tensorrt_llm » à sa place dans l'ordre de déclaration, jamais sur la forme
+# OpenAI générique que vLLM, LMDeploy et le frontend Dynamo servent sur la
+# même route, et jamais sur le statut, /health ou /version.
+
+TRTLLM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "tensorrt-llm-serve-exposed.yaml")
+
+TRTLLM_MODELS_ROUTE = "/v1/models"
+
+
+def trtllm_models_body(model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                       owned_by="tensorrt_llm", created=1761200000,
+                       indent=None):
+    """
+    Ce que rend GET /v1/models : ModelList(data=[ModelCard(id=self.model)]),
+    sérialisé par JSONResponse avec `separators=(",", ":")` dans l'ordre de
+    déclaration des deux modèles — ModelList : object, data ; ModelCard : id,
+    object, created, owned_by — et rien d'autre, extra="forbid" oblige.
+    """
+    payload = {
+        "object": "list",
+        "data": [{
+            "id": model_id,
+            "object": "model",
+            "created": created,
+            "owned_by": owned_by,
+        }],
+    }
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# L'instance ouverte, lancée sur un identifiant Hugging Face.
+TRTLLM_OPEN_BODY = trtllm_models_body()
+
+# Lancée sur un chemin local : self.model vaut model_dir.name, le nom du
+# dossier de poids, sans le reste du chemin.
+TRTLLM_LOCAL_DIR_BODY = trtllm_models_body(model_id="Llama-3.1-8B-Instruct")
+
+# Le frontend Dynamo, qui orchestre des workers TensorRT-LLM, sert la même
+# route avec « owned_by: "nvidia".to_string() » (lib/llm/src/http/service/
+# openai.rs) : ce n'est pas le moteur qui répond, et le template ne doit pas
+# le dire.
+TRTLLM_DYNAMO_LOOKALIKE_BODY = trtllm_models_body(
+    model_id="Qwen/Qwen3-0.6B", owned_by="nvidia")
+
+# La charge utile republiée au fond du document d'une supervision qui
+# agrégerait plusieurs sondes sous ses propres clés.
+TRTLLM_COMPOSITE_BODY = ('{"probe":"trtllm","upstream":%s}' % TRTLLM_OPEN_BODY)
+
+# Un tableau vide : get_model() rend toujours exactement une carte, donc cette
+# forme n'existe pas, mais le matcher ne doit pas la confondre avec une
+# instance réelle.
+TRTLLM_EMPTY_BODY = '{"object":"list","data":[]}'
+
+# Les deux routes génériques que le template refuse de lire : /version rend
+# « {"version": VERSION} », /health un 200 à corps vide.
+TRTLLM_VERSION_BODY = '{"version":"1.3.0"}'
+TRTLLM_HEALTH_BODY = ""
+
+# Une page de documentation qui cite la réponse.
+TRTLLM_DOC_PAGE_BODY = ("<html><body><pre>%s</pre></body></html>"
+                        % TRTLLM_OPEN_BODY)
+
+
+def trtllm_block():
+    doc = load(TRTLLM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % TRTLLM_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant la seule route "
+        "du produit dont le corps le nomme" % TRTLLM_MODELS_ROUTE
+    )
+    return blocks[0]
+
+
+def trtllm_fires(status=200, body=None, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and` par défaut."""
+    block = trtllm_block()
+    if body is None:
+        body = TRTLLM_OPEN_BODY
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            header_blob = " ".join(headers.values())
+            words = matcher.get("words") or []
+            hit = (all(w in header_blob for w in words)
+                   if matcher.get("condition") == "and"
+                   else any(w in header_blob for w in words))
+            verdicts.append(hit)
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_trtllm_probe_is_a_single_read_only_get_on_v1_models():
+    """
+    Le même routeur sans garde sert POST /v1/chat/completions, /v1/completions,
+    /v1/messages et /v1/responses, qui lanceraient de l'inférence sur les GPU
+    de l'hôte, POST /start_profile et /stop_profile, qui profilent le moteur
+    et écrivent des traces sur son disque, et GET /metrics, dont chaque relevé
+    n'est rendu qu'à un seul appelant : les toucher est l'abus que le template
+    signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+    """
+    doc = load(TRTLLM_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", TRTLLM_MODELS_ROUTE)}, (
+        "le template interroge autre chose que /v1/models — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste des modèles se lit en GET : tout ce qui agit sur le "
+            "moteur est en POST"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le bloc enverrait un corps ou une requête brute : rien de ce que "
+            "le template établit ne demande d'écrire sur l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/v1/chat/completions", "lancerait de l'inférence sur les GPU "
+                                        "de l'hôte, aux frais de l'exploitant"),
+                ("/v1/completions", "lancerait de l'inférence sur les GPU"),
+                ("/v1/messages", "lancerait de l'inférence par l'adaptateur "
+                                 "Anthropic Messages"),
+                ("/v1/responses", "lancerait de l'inférence par l'API Responses"),
+                ("/start_profile", "déclencherait le profilage du moteur sur "
+                                   "le GPU et écrirait une trace sur l'hôte"),
+                ("/stop_profile", "agirait sur le profilage du moteur"),
+                ("/metrics", "retirerait à la supervision des statistiques "
+                             "rendues à un seul appelant"),
+                ("/release_memory", "agirait sur la mémoire du moteur"),
+                ("/resume_memory", "agirait sur la mémoire du moteur"),
+                ("/update_weights", "réécrirait les poids du modèle chargé"),
+                ("/kv_cache_events", "consommerait les événements du cache KV "
+                                     "destinés au routeur désagrégé"),
+                ("/steady_clock_offset", "écrirait l'horloge de référence du "
+                                         "worker"),
+                ("/health", "ne nomme pas le produit : un 200 à corps vide"),
+                ("/version", "ne nomme pas le produit : {\"version\": ...}"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+
+
+def test_trtllm_matcher_needs_the_owned_by_literal_not_the_generic_shape():
+    """
+    Le cœur du constat. {"object":"list","data":[...]} est la forme de tout
+    serveur compatible OpenAI ; "owned_by":"tensorrt_llm", à sa place dans
+    l'ordre de déclaration de ModelCard, est ce que seul ce produit rend.
+    """
+    assert trtllm_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance ouverte"
+    )
+    assert trtllm_fires(status=203), (
+        "le constat dépend du statut HTTP, qui vaut 200 sur tout serveur vivant"
+    )
+
+    for body, why in (
+        (VLLM_MODELS_BODY, "vLLM, qui fixe owned_by='vllm' sur la même route"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy, qui fixe owned_by='lmdeploy'"),
+        (OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (TRTLLM_DYNAMO_LOOKALIKE_BODY,
+         "le frontend Dynamo, qui écrit owned_by='nvidia' devant des workers "
+         "TensorRT-LLM — ce n'est pas le moteur qui répond"),
+        (TRTLLM_EMPTY_BODY, "un tableau data vide, que get_model() ne rend "
+                            "jamais"),
+        (TRTLLM_COMPOSITE_BODY, "la charge utile republiée au fond du document "
+                                "d'une supervision : l'ancrage d'ouverture doit "
+                                "dire que l'instance a répondu en tête"),
+        (TRTLLM_VERSION_BODY, "le corps de /version, générique"),
+        (TRTLLM_HEALTH_BODY, "le corps vide de /health"),
+        (TRTLLM_DOC_PAGE_BODY, "une page de documentation qui cite la réponse"),
+        (trtllm_models_body(owned_by="tensorrt_llm_x"),
+         "un owned_by qui ne fait que commencer par le littéral"),
+        ('{"detail":"Not Found"}', "le 404 de FastAPI"),
+    ):
+        assert not trtllm_fires(body=body), "le template conclut sur %s" % why
+
+    assert not trtllm_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+
+def test_trtllm_matcher_holds_on_variations_that_do_not_change_the_fact():
+    for body, why in (
+        (TRTLLM_LOCAL_DIR_BODY,
+         "une instance lancée sur un chemin local : l'identifiant est le nom "
+         "du dossier"),
+        (trtllm_models_body(model_id="nvidia/Llama-3.1-Nemotron-Nano-8B-v1"),
+         "un identifiant de modèle qui porte lui-même une barre oblique"),
+        (trtllm_models_body(indent=2),
+         "un intermédiaire qui réindente ce que Starlette sérialise compact"),
+        (TRTLLM_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne au corps relayé"),
+        (trtllm_models_body(indent=2).replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+        (trtllm_models_body(created=1700000000),
+         "une instance démarrée à une autre date"),
+    ):
+        assert trtllm_fires(body=body), "le template perd %s" % why
+
+
+def test_trtllm_and_its_siblings_on_v1_models_do_not_answer_for_one_another():
+    """
+    vLLM et LMDeploy lisent la même route : chacun des trois templates doit
+    se taire sur la réponse des deux autres, sans quoi un serveur exposé
+    remonterait sous trois noms.
+    """
+    vllm_block = [b for b in (load(VLLM_TEMPLATE).get("http") or [])
+                  if "{{BaseURL}}/v1/models" in (b.get("path") or [])][0]
+    vllm_body_matchers = [m for m in (vllm_block.get("matchers") or [])
+                          if m.get("type") == "word" and m.get("part") == "body"]
+    assert vllm_body_matchers
+    assert not all(word_matcher_hits(m, TRTLLM_OPEN_BODY)
+                   for m in vllm_body_matchers), (
+        "le template vLLM conclut sur une instance TensorRT-LLM"
+    )
+    assert not lmdeploy_fires(body=TRTLLM_OPEN_BODY), (
+        "le template LMDeploy conclut sur une instance TensorRT-LLM"
+    )
+
+
+def test_trtllm_matchers_condition_requires_every_clause():
+    block = trtllm_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la forme générique "
+        "{\"object\":\"list\",\"data\":[...]} suffirait seule à faire "
+        "remonter n'importe quel serveur compatible OpenAI"
+    )
+    kinds = {m.get("type") for m in block.get("matchers") or []}
+    assert "status" not in kinds, (
+        "un matcher de statut n'ajoute rien : /v1/models répond 200 sur tout "
+        "serveur vivant, et c'est le corps seul qui nomme le produit"
+    )
+
+
+def test_trtllm_extractor_reports_the_model_served():
+    extractors = trtllm_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        f"un seul extracteur suffit à nommer ce que sert l'instance — "
+        f"{extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json" and extractor.get("json") == [".data[].id"], (
+        "l'extracteur ne relève pas l'identifiant du modèle servi — %s"
+        % extractor
+    )
+    assert json.loads(TRTLLM_LOCAL_DIR_BODY)["data"][0]["id"] == "Llama-3.1-8B-Instruct", (
+        "le cas de test ne dit pas ce qu'il croit dire"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_trtllm_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher : seul un scan
+    contre un vrai serveur ferme la boucle, y compris face au frontend Dynamo
+    qui sert la même route devant des workers TensorRT-LLM.
+    """
+    def scan(status=200, body=TRTLLM_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == TRTLLM_MODELS_ROUTE:
+                    self.reply(status, body, content_type)
+                elif self.path == "/health":
+                    self.reply(200, TRTLLM_HEALTH_BODY, "application/json")
+                elif self.path == "/version":
+                    self.reply(200, TRTLLM_VERSION_BODY, "application/json")
+                else:
+                    self.reply(404, '{"detail":"Not Found"}', "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", TRTLLM_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "tensorrt-llm-serve-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [TRTLLM_MODELS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        f"le scan ne reconnaît pas la réponse d'une instance ouverte — {results}"
+    )
+    assert results[0].get("extracted-results") == [
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0"], (
+        "l'extracteur ne rend pas l'identifiant du modèle servi — %s"
+        % results[0].get("extracted-results")
+    )
+
+    _, results = scan(body=TRTLLM_LOCAL_DIR_BODY)
+    assert len(results) == 1 and results[0].get("extracted-results") == [
+        "Llama-3.1-8B-Instruct"], results
+
+    for body, why in (
+        (VLLM_MODELS_BODY, "vLLM"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy"),
+        (TRTLLM_DYNAMO_LOOKALIKE_BODY, "le frontend Dynamo"),
+        (TRTLLM_COMPOSITE_BODY, "une supervision qui republie la réponse"),
+    ):
+        _, results = scan(body=body)
+        assert results == [], f"le scan confond {why} avec TensorRT-LLM — {results}"
