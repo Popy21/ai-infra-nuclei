@@ -1,0 +1,192 @@
+id: mistralrs-server-exposed
+
+info:
+  name: mistral.rs Server - Unauthenticated OpenAI-Compatible API Exposure
+  author: popy21
+  severity: high
+  description: |
+    mistral.rs (EricLBuehler/mistral.rs) est un moteur d'inférence LLM et
+    multimodal écrit en Rust, et `mistralrs serve` son serveur HTTP, qui expose
+    sur le même port l'API compatible OpenAI (/v1/chat/completions,
+    /v1/completions, /v1/responses, /v1/models, /v1/files), l'API Anthropic
+    Messages (/v1/messages) et ses propres routes d'exploitation
+    (/v1/models/unload, /v1/models/reload, /v1/models/status, /v1/models/tune,
+    /v1/system/info, /v1/system/doctor, /re_isq, /calibration/*,
+    /v1/sessions/{session_id}) — mistralrs-server-core/src/route_registry.rs
+    les déclare toutes, et mistralrs_server_router_builder.rs les monte toutes
+    sur un seul routeur axum.
+    GET /v1/models nomme le produit sans ambiguïté. Dans
+    mistralrs-server-core/src/handlers.rs, models() ouvre la liste par une
+    entrée synthétique fixée en dur — « id: "default".to_string(), object:
+    "model", created: state.get_creation_time(), owned_by: "local", root:
+    Some("default".to_string()) », tous les autres champs à None — poussée dès
+    qu'au moins un modèle est enregistré, puis une entrée par modèle avec « id:
+    model_id, object: "model", owned_by: "local", root: Some(model_id), status:
+    Some(status.to_string()) », et rend « Json(ModelObjects { object: "list",
+    data: model_objects }) ». mistralrs-server-core/src/openai.rs déclare
+    ModelObject dans l'ordre id, object, created, owned_by, puis root, parent,
+    adapter_generation, status, tools_available, mcp_tools_count et
+    mcp_servers_connected, tous en « skip_serializing_if = "Option::is_none" »
+    ; serde sérialise dans l'ordre de déclaration et axum compact, donc le
+    document ouvre toujours sur « {"object":"list","data":[{"id":"default",
+    "object":"model","created":...,"owned_by":"local","root":"default"}, ».
+    Les valeurs de status viennent du Display de mistralrs_core::ModelStatus
+    (mistralrs-core/src/lib.rs) : « loaded », « unloaded » ou « reloading ».
+    Aucun paramètre de `mistralrs serve` ne touche « default » ni « local » :
+    l'exploitant choisit le modèle, jamais ces deux littéraux. Ils séparent
+    mistral.rs de tous les autres serveurs du même protocole — vLLM écrit
+    « vllm », LMDeploy « lmdeploy », TensorRT-LLM « tensorrt_llm », llama-swap
+    « llama-swap », et aucun ne place une entrée « default » en tête.
+    L'absence d'authentification est une fonctionnalité absente du produit, pas
+    un réglage oublié. La documentation officielle (Authentication) l'écrit :
+    « There is none. The server accepts and ignores Authorization: Bearer ...
+    (OpenAI clients) and x-api-key plus anthropic-version headers (Anthropic
+    clients) [...] For real authentication and TLS, put a reverse proxy in
+    front. » Le code le confirme : init_router() dans
+    mistralrs_server_router_builder.rs ne monte qu'un CorsLayer —
+    « AllowOrigin::any() » quand aucune origine n'est passée —, un
+    DefaultBodyLimit et des Extension, et le constructeur n'y ajoute que le
+    middleware d'observabilité observe_http ; aucune couche ne lit
+    d'identifiant. mistralrs-cli/src/args/server.rs déclare « #[arg(long,
+    default_value = "0.0.0.0")] pub host » et « #[arg(short = 'p', long,
+    default_value_t = 1234)] pub port », sans aucun argument de clé : le
+    serveur écoute sur toutes les interfaces sans qu'aucun drapeau ne soit
+    passé, et le README fait ouvrir http://localhost:1234/ui juste après
+    « mistralrs serve -m Qwen/Qwen3-4B --quant 4 ».
+    Le matcher exige l'ouverture du document — « object » puis « data », puis
+    l'entrée synthétique entière dans l'ordre id, object, created, owned_by,
+    root — jusqu'à l'accolade qui la ferme. Jamais sur le statut HTTP, qui
+    vaut 200 sur tout serveur vivant ; jamais sur /health ni sur /, qui rendent
+    le texte brut « OK » (« pub async fn health() -> &'static str { "OK" } »),
+    générique.
+  impact: |
+    Le corps de /v1/models est la preuve, pas le butin. Le même routeur, sans
+    la moindre garde devant lui, sert POST /v1/chat/completions, POST
+    /v1/completions, POST /v1/responses, POST /v1/messages, POST /v1/embeddings,
+    POST /v1/images/generations et POST /v1/audio/speech : un tiers lance de
+    l'inférence sur les GPU de l'exploitant, pour son propre compte et à ses
+    frais, sans quota, sans utilisateur et sans trace qui lui attribue
+    l'appel — le journal d'accès enregistre une route et un statut, pas un
+    appelant. Une instance GPU louée à l'heure se paie en continu pendant que
+    l'inférence d'autrui tourne, et le service légitime perd la capacité de lot
+    et la mémoire vidéo qu'elle occupe.
+    Les routes d'exploitation sont servies par le même routeur. POST
+    /v1/models/unload décharge un modèle et POST /v1/models/reload le recharge
+    : un anonyme interrompt le service, ou impose à l'hôte le coût d'un
+    rechargement complet. POST /re_isq requantifie à chaud le modèle chargé et
+    POST /calibration/start, /calibration/apply font de même avec des
+    statistiques collectées sur le trafic réel : la qualité des réponses
+    servies aux utilisateurs légitimes change sans que personne ne l'ait
+    décidé. POST /v1/models/tune et POST /v1/system/doctor font tourner des
+    diagnostics sur la machine. GET /v1/system/info rend
+    mistralrs_core::SystemInfo — os, kernel, cpu, memory, devices (type, nom,
+    mémoire totale et disponible, capacité de calcul de chaque GPU), build
+    (version, révision git, drapeaux cuda / metal / flash_attn, version du
+    toolkit CUDA) et hf_cache_path — la forme de l'hôte, en une requête.
+    Les données des utilisateurs sont lisibles et supprimables : GET /v1/files
+    liste les fichiers envoyés avec les requêtes, GET /v1/files/{id}/content
+    les lit, DELETE /v1/files/{id} les efface ; GET, PUT et DELETE
+    /v1/sessions/{session_id} lisent, remplacent et effacent les sessions de
+    conversation ; GET et DELETE /v1/responses/{response_id} font de même avec
+    les réponses stockées. Quand le serveur est lancé avec des outils MCP,
+    /v1/models le dit (tools_available, mcp_tools_count,
+    mcp_servers_connected) et chaque appel d'inférence anonyme peut les
+    déclencher.
+    L'identifiant rendu par /v1/models dit ce qui tourne — l'identifiant
+    Hugging Face, ou le chemin local d'un fine-tuning interne — et son status
+    dit s'il est chargé.
+  remediation: |
+    Il n'y a aucun réglage à activer : `mistralrs serve` n'a pas d'option de
+    clé d'API, et la documentation officielle renvoie à un mandataire inverse
+    pour l'authentification et le TLS. La fermeture est réseau — passer
+    « --host 127.0.0.1 » quand le client est local, publier le conteneur en
+    « -p 127.0.0.1:1234:1234 » plutôt qu'en « -p 1234:1234 », et router tout
+    accès distant par un mandataire qui authentifie avant de relayer.
+    Restreindre aussi les origines autorisées (le CorsLayer accepte toute
+    origine par défaut) si un navigateur doit atteindre l'API.
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<hote>:1234/v1/models » ne doit plus rendre « "id":"default" » suivi
+    de « "owned_by":"local" ».
+    Après une exposition, tenir pour consommé le budget GPU sur la période —
+    il n'y a ni utilisateur ni journal d'appelant — et relire le journal
+    d'accès pour les POST sur /v1/chat/completions, /v1/completions,
+    /v1/messages, /v1/responses, /v1/models/unload, /v1/models/reload,
+    /re_isq et /calibration/apply, et les GET, PUT et DELETE sur /v1/files et
+    /v1/sessions servis à un tiers pendant la fenêtre ; tenir les fichiers et
+    sessions stockés pour lus.
+  reference:
+    - https://github.com/EricLBuehler/mistral.rs
+    - https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-server-core/src/handlers.rs
+    - https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-server-core/src/openai.rs
+    - https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-server-core/src/route_registry.rs
+    - https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-server-core/src/mistralrs_server_router_builder.rs
+    - https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-cli/src/args/server.rs
+    - https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-core/src/lib.rs
+    - https://docs.mistralrs.dev/reference/http-api/
+  metadata:
+    max-request: 1
+    vendor: ericlbuehler
+    product: mistralrs
+  tags: ai,llm,mistralrs,mistral-rs,inference,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier : GET /v1/models nomme
+  # le produit par l'entrée synthétique « default » / « local » que models()
+  # fixe en dur, et il n'y a aucune version gardée à distinguer — le produit
+  # n'a pas de clé d'API. /health et / ne sont pas interrogés : « OK » en texte
+  # brut, générique. /v1/system/info non plus : son corps décrit l'hôte, pas le
+  # produit, et c'est un butin, pas une preuve.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions,
+  # /v1/completions, /v1/messages et /v1/responses lanceraient de l'inférence
+  # sur les GPU de l'hôte, POST /v1/models/unload et /v1/models/reload
+  # interrompraient le service, POST /re_isq et /calibration/* changeraient la
+  # quantification du modèle servi, et /v1/files comme /v1/sessions/{id}
+  # ouvriraient les données des utilisateurs : ce sont les abus que le template
+  # signale, pas ce qu'un scanner a le droit de faire pour les établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture, tenu sur l'ordre de déclaration des deux
+      # structs. ModelObjects déclare object puis data ; models() pousse en
+      # tête l'entrée synthétique, et ModelObject déclare id, object, created,
+      # owned_by puis root — ses autres champs sont None sur cette entrée et
+      # serde les omet, donc l'accolade se ferme juste après "root":"default".
+      # C'est cette séquence, pas un mot isolé, qui écarte tout document qui
+      # republierait l'entrée au fond d'un objet composite ou sous une clé
+      # étrangère. Les \s* laissent passer l'intermédiaire qui réindente ce
+      # qu'axum sérialise compact.
+      #
+      # Le couple « "id":"default" » + « "owned_by":"local" », renforcé par
+      # « "root":"default" », est le discriminant : la forme
+      # {"object":"list","data":[...]} est celle de tout serveur compatible
+      # OpenAI, et le pack en couvre une dizaine sur cette même route. Un vLLM
+      # lancé avec --served-model-name default écrit « "owned_by":"vllm » ; un
+      # serveur qui écrirait « local » sans l'entrée « default » en tête n'est
+      # pas celui-ci.
+      #
+      # Pas de matcher de statut : /v1/models répond 200 sur tout serveur
+      # vivant, et c'est le corps seul qui dit lequel.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"data"\s*:\s*\[\s*\{\s*"id"\s*:\s*"default"\s*,\s*"object"\s*:\s*"model"\s*,\s*"created"\s*:\s*\d+\s*,\s*"owned_by"\s*:\s*"local"\s*,\s*"root"\s*:\s*"default"\s*\}'
+        condition: and
+
+    extractors:
+      # Les modèles servis, sans l'entrée synthétique « default » qui ne nomme
+      # rien : l'identifiant Hugging Face ou le chemin local passé à
+      # `mistralrs serve`, et les alias d'adaptateurs LoRA quand il y en a.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[] | select(.id != "default") | .id'

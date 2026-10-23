@@ -42193,3 +42193,514 @@ def test_trtllm_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body)
         assert results == [], f"le scan confond {why} avec TensorRT-LLM — {results}"
+
+
+# --------------------------------------------------------------------------
+# mistral.rs — EricLBuehler/mistral.rs, moteur d'inférence LLM et multimodal en
+# Rust, dont `mistralrs serve` expose sur un seul routeur axum l'API OpenAI,
+# l'API Anthropic Messages et ses routes d'exploitation. Une seule route porte
+# le constat : GET /v1/models, dont models() (handlers.rs) ouvre la liste par
+# une entrée synthétique fixée en dur — id "default", object "model", created,
+# owned_by "local", root Some("default"), tout le reste à None — puis une
+# entrée par modèle avec owned_by "local", root Some(model_id) et status
+# Some(status.to_string()), où le Display de mistralrs_core::ModelStatus rend
+# « loaded », « unloaded » ou « reloading ». ModelObject (openai.rs) déclare
+# id, object, created, owned_by, puis root, parent, adapter_generation, status,
+# tools_available, mcp_tools_count, mcp_servers_connected en
+# skip_serializing_if = "Option::is_none", et axum sérialise compact dans
+# l'ordre de déclaration. Aucune couche d'authentification n'existe
+# (init_router ne monte que CorsLayer, DefaultBodyLimit et des Extension ; la
+# documentation écrit « Authentication: There is none »), et server.rs écoute
+# sur 0.0.0.0:1234 par défaut. Cette section vérifie que le constat tient sur
+# l'entrée synthétique entière à sa place en tête du document, jamais sur la
+# forme OpenAI générique que vLLM, LMDeploy, TensorRT-LLM et llama-swap servent
+# sur la même route, et jamais sur le statut, /health ou /.
+
+MISTRALRS_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "mistralrs-server-exposed.yaml")
+
+MISTRALRS_MODELS_ROUTE = "/v1/models"
+
+
+def mistralrs_model_entry(model_id, status="loaded", created=1761200000,
+                          parent=None, adapter_generation=None,
+                          tools_available=None, mcp_tools_count=None,
+                          mcp_servers_connected=None):
+    """
+    Une entrée de modèle telle que serde sérialise ModelObject : les champs
+    dans l'ordre de déclaration, et seuls ceux qui ne sont pas None.
+    """
+    entry = {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "local",
+        "root": model_id,
+    }
+    for key, value in (
+        ("parent", parent),
+        ("adapter_generation", adapter_generation),
+        ("status", status),
+        ("tools_available", tools_available),
+        ("mcp_tools_count", mcp_tools_count),
+        ("mcp_servers_connected", mcp_servers_connected),
+    ):
+        if value is not None:
+            entry[key] = value
+    return entry
+
+
+def mistralrs_models_body(entries=None, created=1761200000, indent=None,
+                          default_entry=True, owned_by="local",
+                          default_id="default"):
+    """
+    Ce que rend GET /v1/models : ModelObjects { object: "list", data } avec,
+    en tête, l'entrée synthétique « default » — id, object, created, owned_by,
+    root, et rien d'autre puisque tous ses Option sont None — puis une entrée
+    par modèle enregistré, puis une par adaptateur LoRA. axum sérialise
+    compact ; `indent` dit ce qu'un intermédiaire qui réindente en ferait.
+    """
+    if entries is None:
+        entries = [mistralrs_model_entry("Qwen/Qwen3-4B", created=created)]
+    data = []
+    if default_entry:
+        data.append({
+            "id": default_id,
+            "object": "model",
+            "created": created,
+            "owned_by": owned_by,
+            "root": default_id,
+        })
+    data.extend(entries)
+    payload = {"object": "list", "data": data}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# L'instance ouverte : un modèle, chargé.
+MISTRALRS_OPEN_BODY = mistralrs_models_body()
+
+# Le modèle déchargé par POST /v1/models/unload : l'entrée reste, status change.
+MISTRALRS_UNLOADED_BODY = mistralrs_models_body(
+    [mistralrs_model_entry("Qwen/Qwen3-4B", status="unloaded")])
+
+# En cours de rechargement.
+MISTRALRS_RELOADING_BODY = mistralrs_models_body(
+    [mistralrs_model_entry("Qwen/Qwen3-4B", status="reloading")])
+
+# Lancée sur un chemin local : l'identifiant est le chemin tel quel.
+MISTRALRS_LOCAL_PATH_BODY = mistralrs_models_body(
+    [mistralrs_model_entry("/models/llama-3.1-8b-finetune")])
+
+# Avec des outils MCP branchés : models() renseigne les trois champs quand
+# has_mcp || tools_count > 0.
+MISTRALRS_MCP_BODY = mistralrs_models_body(
+    [mistralrs_model_entry("Qwen/Qwen3-4B", tools_available=True,
+                           mcp_tools_count=3, mcp_servers_connected=1)])
+
+# Plusieurs modèles (multi-model serve) et un adaptateur LoRA : l'entrée de
+# l'adaptateur porte parent et adapter_generation, et root vaut son alias.
+MISTRALRS_MULTI_BODY = mistralrs_models_body([
+    mistralrs_model_entry("Qwen/Qwen3-4B"),
+    mistralrs_model_entry("mistralai/Mistral-7B-Instruct-v0.3",
+                          status="unloaded"),
+    mistralrs_model_entry("Qwen/Qwen3-4B:coder", parent="Qwen/Qwen3-4B",
+                          adapter_generation="2"),
+])
+
+# Aucun modèle enregistré : models() ne pousse pas l'entrée « default », et
+# le corps ne nomme plus rien. Le template ne doit pas déclencher — c'est le
+# prix assumé d'ancrer le constat sur l'entrée synthétique, et une instance
+# sans modèle n'a rien à servir.
+MISTRALRS_EMPTY_BODY = '{"object":"list","data":[]}'
+
+# Un vLLM lancé avec --served-model-name default : l'identifiant est le même,
+# le propriétaire non — c'est « vllm », et la carte continue sur root, parent,
+# max_model_len.
+MISTRALRS_VLLM_DEFAULT_NAME_BODY = (
+    '{"object":"list","data":[{"id":"default","object":"model",'
+    '"created":1761200000,"owned_by":"vllm","root":"/models/qwen3",'
+    '"parent":null,"max_model_len":32768,"permission":[]}]}'
+)
+
+# Un serveur qui écrirait « local » sans l'entrée synthétique en tête : ce
+# n'est pas models() qui a répondu.
+MISTRALRS_LOCAL_WITHOUT_DEFAULT_BODY = mistralrs_models_body(
+    default_entry=False)
+
+# L'entrée synthétique sous un autre propriétaire, ou sous un autre nom.
+MISTRALRS_OTHER_OWNER_BODY = mistralrs_models_body(owned_by="localhost")
+MISTRALRS_OTHER_DEFAULT_BODY = mistralrs_models_body(default_id="default-model")
+
+# L'entrée « default » en deuxième position : models() la pousse toujours en
+# premier, donc ce document vient d'ailleurs.
+MISTRALRS_DEFAULT_NOT_FIRST_BODY = json.dumps({
+    "object": "list",
+    "data": [
+        mistralrs_model_entry("Qwen/Qwen3-4B"),
+        json.loads(MISTRALRS_OPEN_BODY)["data"][0],
+    ],
+}, separators=(",", ":"))
+
+# La charge utile republiée au fond du document d'une supervision qui
+# agrégerait plusieurs sondes sous ses propres clés.
+MISTRALRS_COMPOSITE_BODY = ('{"probe":"mistralrs","upstream":%s}'
+                            % MISTRALRS_OPEN_BODY)
+
+# Les routes génériques que le template refuse de lire : / et /health rendent
+# « OK » en texte brut ; une route /v1 inconnue rend l'erreur OpenAI de
+# api_route_not_found.
+MISTRALRS_HEALTH_BODY = "OK"
+MISTRALRS_NOT_FOUND_BODY = (
+    '{"error":{"message":"The requested API route was not found.",'
+    '"type":"not_found","param":null,"code":"not_found"}}'
+)
+
+# Une page de documentation qui cite la réponse.
+MISTRALRS_DOC_PAGE_BODY = ("<html><body><pre>%s</pre></body></html>"
+                           % MISTRALRS_OPEN_BODY)
+
+
+def mistralrs_block():
+    doc = load(MISTRALRS_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MISTRALRS_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant la seule route "
+        "du produit dont le corps le nomme" % MISTRALRS_MODELS_ROUTE
+    )
+    return blocks[0]
+
+
+def mistralrs_fires(status=200, body=None, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and` par défaut."""
+    block = mistralrs_block()
+    if body is None:
+        body = MISTRALRS_OPEN_BODY
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            header_blob = " ".join(headers.values())
+            words = matcher.get("words") or []
+            hit = (all(w in header_blob for w in words)
+                   if matcher.get("condition") == "and"
+                   else any(w in header_blob for w in words))
+            verdicts.append(hit)
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_mistralrs_probe_is_a_single_read_only_get_on_v1_models():
+    """
+    Le même routeur sans garde sert POST /v1/chat/completions, /v1/completions,
+    /v1/messages et /v1/responses, qui lanceraient de l'inférence sur les GPU
+    de l'hôte, POST /v1/models/unload et /v1/models/reload, qui interrompraient
+    le service, POST /re_isq et /calibration/*, qui changeraient la
+    quantification du modèle servi, et /v1/files comme /v1/sessions/{id}, qui
+    ouvriraient les données des utilisateurs : les toucher est l'abus que le
+    template signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+    """
+    doc = load(MISTRALRS_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", MISTRALRS_MODELS_ROUTE)}, (
+        "le template interroge autre chose que /v1/models — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste des modèles se lit en GET : tout ce qui agit sur le "
+            "moteur est en POST"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le bloc enverrait un corps ou une requête brute : rien de ce que "
+            "le template établit ne demande d'écrire sur l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/v1/chat/completions", "lancerait de l'inférence sur les GPU "
+                                        "de l'hôte, aux frais de l'exploitant"),
+                ("/v1/completions", "lancerait de l'inférence sur les GPU"),
+                ("/v1/messages", "lancerait de l'inférence par l'API Anthropic "
+                                 "Messages"),
+                ("/v1/responses", "lancerait de l'inférence par l'API Responses"),
+                ("/v1/embeddings", "lancerait un calcul sur les GPU"),
+                ("/v1/images/generations", "lancerait une génération d'image"),
+                ("/v1/audio/speech", "lancerait une synthèse vocale"),
+                ("/v1/models/unload", "déchargerait le modèle servi"),
+                ("/v1/models/reload", "rechargerait le modèle servi"),
+                ("/v1/models/status", "est un POST, sans rien apporter de plus "
+                                      "que la liste"),
+                ("/v1/models/tune", "ferait tourner un diagnostic sur l'hôte"),
+                ("/re_isq", "requantifierait le modèle à chaud"),
+                ("/calibration", "collecterait des statistiques sur le trafic "
+                                 "réel ou requantifierait le modèle"),
+                ("/v1/system/info", "décrit l'hôte, pas le produit : c'est un "
+                                    "butin, pas une preuve"),
+                ("/v1/system/doctor", "ferait tourner un diagnostic sur l'hôte"),
+                ("/v1/files", "lirait les fichiers des utilisateurs"),
+                ("/v1/sessions", "lirait les sessions des utilisateurs"),
+                ("/v1/containers", "lirait les fichiers des conteneurs"),
+                ("/v1/skills", "lirait ou écrirait les skills de l'agent"),
+                ("/v1/load_lora_adapter", "chargerait un adaptateur sur l'hôte"),
+                ("/v1/unload_lora_adapter", "déchargerait un adaptateur"),
+                ("/metrics", "ne nomme pas le produit"),
+                ("/health", "ne nomme pas le produit : « OK » en texte brut"),
+                ("/ui", "est l'interface web, pas l'API"),
+                ("/docs", "ne nomme pas le produit"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+            assert path.rstrip("/") != "{{BaseURL}}", (
+                "GET / rend « OK » en texte brut, générique"
+            )
+
+
+def test_mistralrs_matcher_needs_the_default_local_entry_not_the_generic_shape():
+    """
+    Le cœur du constat. {"object":"list","data":[...]} est la forme de tout
+    serveur compatible OpenAI ; l'entrée synthétique « "id":"default" ...
+    "owned_by":"local","root":"default" » en tête de liste est ce que seul
+    models() rend.
+    """
+    assert mistralrs_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance ouverte"
+    )
+    assert mistralrs_fires(status=203), (
+        "le constat dépend du statut HTTP, qui vaut 200 sur tout serveur vivant"
+    )
+
+    for body, why in (
+        (VLLM_MODELS_BODY, "vLLM, qui fixe owned_by='vllm' sur la même route"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy, qui fixe owned_by='lmdeploy'"),
+        (TRTLLM_OPEN_BODY, "TensorRT-LLM, qui fixe owned_by='tensorrt_llm'"),
+        (LLAMASWAP_MODELS_BODY, "llama-swap, qui fixe owned_by='llama-swap'"),
+        (OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (MISTRALRS_VLLM_DEFAULT_NAME_BODY,
+         "un vLLM lancé avec --served-model-name default : même identifiant, "
+         "autre propriétaire"),
+        (MISTRALRS_LOCAL_WITHOUT_DEFAULT_BODY,
+         "un serveur qui écrit owned_by='local' sans l'entrée synthétique en "
+         "tête — ce n'est pas models() qui a répondu"),
+        (MISTRALRS_OTHER_OWNER_BODY,
+         "l'entrée « default » sous un propriétaire qui ne fait que commencer "
+         "par le littéral"),
+        (MISTRALRS_OTHER_DEFAULT_BODY,
+         "une entrée dont l'identifiant ne fait que commencer par « default »"),
+        (MISTRALRS_DEFAULT_NOT_FIRST_BODY,
+         "l'entrée « default » en deuxième position, que models() ne rend "
+         "jamais"),
+        (MISTRALRS_EMPTY_BODY, "un tableau data vide : aucun modèle enregistré, "
+                               "donc pas d'entrée synthétique et rien à nommer"),
+        (MISTRALRS_COMPOSITE_BODY, "la charge utile republiée au fond du "
+                                   "document d'une supervision : l'ancrage "
+                                   "d'ouverture doit dire que l'instance a "
+                                   "répondu en tête"),
+        (MISTRALRS_HEALTH_BODY, "le « OK » de /health et de /"),
+        (MISTRALRS_NOT_FOUND_BODY, "l'erreur OpenAI d'une route /v1 inconnue"),
+        (MISTRALRS_DOC_PAGE_BODY, "une page de documentation qui cite la "
+                                  "réponse"),
+        ('{"detail":"Not Found"}', "le 404 de FastAPI"),
+    ):
+        assert not mistralrs_fires(body=body), "le template conclut sur %s" % why
+
+    assert not mistralrs_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+
+def test_mistralrs_matcher_holds_on_variations_that_do_not_change_the_fact():
+    for body, why in (
+        (MISTRALRS_UNLOADED_BODY,
+         "un modèle déchargé par /v1/models/unload : le constat porte sur "
+         "l'exposition de l'API, pas sur ce qui occupe le GPU"),
+        (MISTRALRS_RELOADING_BODY, "un modèle en cours de rechargement"),
+        (MISTRALRS_LOCAL_PATH_BODY,
+         "une instance lancée sur un chemin local : l'identifiant est le chemin"),
+        (MISTRALRS_MCP_BODY,
+         "une instance avec des outils MCP : trois champs de plus sur l'entrée "
+         "du modèle, aucun sur l'entrée synthétique"),
+        (MISTRALRS_MULTI_BODY,
+         "plusieurs modèles et un adaptateur LoRA"),
+        (mistralrs_models_body(indent=2),
+         "un intermédiaire qui réindente ce qu'axum sérialise compact"),
+        (MISTRALRS_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne au corps relayé"),
+        (mistralrs_models_body(indent=2).replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+        (mistralrs_models_body(created=1700000000),
+         "une instance démarrée à une autre date"),
+    ):
+        assert mistralrs_fires(body=body), "le template perd %s" % why
+
+
+def test_mistralrs_and_its_siblings_on_v1_models_do_not_answer_for_one_another():
+    """
+    vLLM, LMDeploy, TensorRT-LLM, llama-swap, Kokoro et Speaches lisent la
+    même route : chacun des templates doit se taire sur la réponse des autres,
+    sans quoi un serveur exposé remonterait sous plusieurs noms.
+    """
+    vllm_block = [b for b in (load(VLLM_TEMPLATE).get("http") or [])
+                  if "{{BaseURL}}/v1/models" in (b.get("path") or [])][0]
+    vllm_body_matchers = [m for m in (vllm_block.get("matchers") or [])
+                          if m.get("type") == "word" and m.get("part") == "body"]
+    assert vllm_body_matchers
+    for body in (MISTRALRS_OPEN_BODY, MISTRALRS_MULTI_BODY):
+        assert not all(word_matcher_hits(m, body) for m in vllm_body_matchers), (
+            "le template vLLM conclut sur une instance mistral.rs"
+        )
+        assert not lmdeploy_fires(body=body), (
+            "le template LMDeploy conclut sur une instance mistral.rs"
+        )
+        assert not trtllm_fires(body=body), (
+            "le template TensorRT-LLM conclut sur une instance mistral.rs"
+        )
+        assert not llamaswap_fires(body), (
+            "le template llama-swap conclut sur une instance mistral.rs"
+        )
+        assert not kokoro_fires(body=body), (
+            "le template Kokoro conclut sur une instance mistral.rs"
+        )
+        assert not speaches_fires(body=body), (
+            "le template Speaches conclut sur une instance mistral.rs"
+        )
+
+
+def test_mistralrs_matchers_condition_requires_every_clause():
+    block = mistralrs_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la forme générique "
+        "{\"object\":\"list\",\"data\":[...]} suffirait seule à faire "
+        "remonter n'importe quel serveur compatible OpenAI"
+    )
+    kinds = {m.get("type") for m in block.get("matchers") or []}
+    assert "status" not in kinds, (
+        "un matcher de statut n'ajoute rien : /v1/models répond 200 sur tout "
+        "serveur vivant, et c'est le corps seul qui nomme le produit"
+    )
+
+
+def test_mistralrs_extractor_reports_the_models_served_without_the_synthetic_entry():
+    """
+    L'entrée « default » ne nomme rien : models() la fabrique. Ce qu'un
+    lecteur veut, ce sont les identifiants réels — Hugging Face, chemin local,
+    alias d'adaptateur.
+    """
+    extractors = mistralrs_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        f"un seul extracteur suffit à nommer ce que sert l'instance — "
+        f"{extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", extractor
+    expressions = extractor.get("json") or []
+    assert len(expressions) == 1 and '"default"' in expressions[0], (
+        "l'extracteur ne retire pas l'entrée synthétique « default » — %s"
+        % extractor
+    )
+    data = json.loads(MISTRALRS_MULTI_BODY)["data"]
+    assert [entry["id"] for entry in data] == [
+        "default", "Qwen/Qwen3-4B", "mistralai/Mistral-7B-Instruct-v0.3",
+        "Qwen/Qwen3-4B:coder"], "le cas de test ne dit pas ce qu'il croit dire"
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_mistralrs_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher ni celle de
+    l'extracteur : seul un scan contre un vrai serveur ferme la boucle, y
+    compris face aux produits qui servent la même route.
+    """
+    def scan(status=200, body=MISTRALRS_OPEN_BODY,
+             content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == MISTRALRS_MODELS_ROUTE:
+                    self.reply(status, body, content_type)
+                elif self.path in ("/", "/health"):
+                    self.reply(200, MISTRALRS_HEALTH_BODY, "text/plain; charset=utf-8")
+                elif self.path.startswith("/v1/"):
+                    self.reply(404, MISTRALRS_NOT_FOUND_BODY, "application/json")
+                else:
+                    self.reply(404, "", "text/plain; charset=utf-8")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MISTRALRS_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "mistralrs-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [MISTRALRS_MODELS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        f"le scan ne reconnaît pas la réponse d'une instance ouverte — {results}"
+    )
+    assert results[0].get("extracted-results") == ["Qwen/Qwen3-4B"], (
+        "l'extracteur ne rend pas le seul identifiant réel, sans l'entrée "
+        "synthétique — %s" % results[0].get("extracted-results")
+    )
+
+    _, results = scan(body=MISTRALRS_MULTI_BODY)
+    assert len(results) == 1 and sorted(results[0].get("extracted-results") or []) == sorted([
+        "Qwen/Qwen3-4B", "mistralai/Mistral-7B-Instruct-v0.3",
+        "Qwen/Qwen3-4B:coder"]), results
+
+    _, results = scan(body=MISTRALRS_UNLOADED_BODY)
+    assert len(results) == 1, results
+
+    for body, why in (
+        (VLLM_MODELS_BODY, "vLLM"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy"),
+        (TRTLLM_OPEN_BODY, "TensorRT-LLM"),
+        (LLAMASWAP_MODELS_BODY, "llama-swap"),
+        (MISTRALRS_VLLM_DEFAULT_NAME_BODY,
+         "un vLLM lancé avec --served-model-name default"),
+        (MISTRALRS_LOCAL_WITHOUT_DEFAULT_BODY,
+         "un serveur qui écrit owned_by='local' sans l'entrée synthétique"),
+        (MISTRALRS_EMPTY_BODY, "une instance sans modèle enregistré"),
+        (MISTRALRS_COMPOSITE_BODY, "une supervision qui republie la réponse"),
+    ):
+        _, results = scan(body=body)
+        assert results == [], f"le scan confond {why} avec mistral.rs — {results}"
