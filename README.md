@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-128 templates, 125 produits.
+129 templates, 126 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -107,6 +107,7 @@ amont.
 | milvus | [`milvus-exposed`](templates/exposure/milvus-exposed.yaml) | high |
 | mineru | [`mineru-api-exposed`](templates/exposure/mineru-api-exposed.yaml) | medium |
 | mistralrs | [`mistralrs-server-exposed`](templates/exposure/mistralrs-server-exposed.yaml) | high |
+| mlc-llm | [`mlc-llm-serve-exposed`](templates/exposure/mlc-llm-serve-exposed.yaml) | high |
 | mlflow | [`mlflow-tracking-server-unauth`](templates/exposure/mlflow-tracking-server-unauth.yaml) | critical |
 | mlrun | [`mlrun-client-spec-exposed`](templates/exposure/mlrun-client-spec-exposed.yaml) | high |
 | mlserver | [`mlserver-metadata-exposed`](templates/exposure/mlserver-metadata-exposed.yaml) | high |

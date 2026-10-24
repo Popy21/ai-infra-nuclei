@@ -42704,3 +42704,456 @@ def test_mistralrs_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body)
         assert results == [], f"le scan confond {why} avec mistral.rs — {results}"
+
+
+# --------------------------------------------------------------------------
+# MLC LLM — mlc-ai/mlc-llm, « Universal LLM Deployment Engine with ML
+# Compilation », dont `mlc_llm serve <modèle>` expose un serveur FastAPI
+# compatible OpenAI. Une seule route porte le constat : GET /v1/models, dont
+# request_models() (openai_entrypoints.py) rend « ListResponse(data=[
+# ModelResponse(id=model) for model in server_context.get_model_list()]) »,
+# et openai_api_protocol.py fixe en dur « class ModelResponse(BaseModel): id:
+# str; created: int = Field(default_factory=lambda: int(time.time()));
+# object: str = "model"; owned_by: str = "MLC-LLM" » — created avant object,
+# à l'inverse de l'objet Model d'OpenAI. Le routeur porte « dependencies=[
+# fastapi.Depends(verify_api_key)] », mais verify_api_key() ne compare rien
+# tant que server_context.api_key vaut None, et cli/serve.py déclare
+# « --api-key, default=None » (« If not provided, authentication is
+# disabled. »), « --host, default="127.0.0.1" », « --port, default=8000 » :
+# l'exposition survient dès « --host 0.0.0.0 ». Cette section vérifie que le
+# constat tient sur le littéral « MLC-LLM » à sa place dans l'ordre de
+# déclaration, jamais sur la forme OpenAI générique que vLLM, LMDeploy,
+# TensorRT-LLM, llama-swap et mistral.rs servent sur la même route, jamais sur
+# le statut, et qu'il se tait devant le 401 « {"detail":"Invalid API Key"} »
+# d'une instance gardée.
+
+MLC_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "mlc-llm-serve-exposed.yaml")
+
+MLC_MODELS_ROUTE = "/v1/models"
+
+MLC_HF_MODEL = "HF://mlc-ai/Llama-3-8B-Instruct-q4f16_1-MLC"
+
+
+def mlc_model_entry(model_id, created=1761200000, owned_by="MLC-LLM",
+                    openai_order=False):
+    """
+    Une entrée telle que pydantic sérialise ModelResponse(id=model) : les
+    quatre champs dans l'ordre de déclaration — id, created, object, owned_by
+    — et rien d'autre, puisque le constructeur ne reçoit que l'identifiant.
+    `openai_order` écrit l'ordre de l'objet Model d'OpenAI (id, object,
+    created, owned_by), que ModelResponse ne rend jamais.
+    """
+    if openai_order:
+        return {"id": model_id, "object": "model", "created": created,
+                "owned_by": owned_by}
+    return {"id": model_id, "created": created, "object": "model",
+            "owned_by": owned_by}
+
+
+def mlc_models_body(entries=None, indent=None):
+    """
+    Ce que rend GET /v1/models : ListResponse(data=[...]) — object puis data
+    —, sérialisé compact par Starlette. `indent` dit ce qu'un intermédiaire
+    qui réindente en ferait.
+    """
+    if entries is None:
+        entries = [mlc_model_entry(MLC_HF_MODEL)]
+    payload = {"object": "list", "data": list(entries)}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+# L'instance ouverte, lancée sur un identifiant « HF://… » du dépôt mlc-ai.
+MLC_OPEN_BODY = mlc_models_body()
+
+# Lancée sur le dossier compilé local de la documentation : l'identifiant est
+# le chemin tel quel, barre finale comprise.
+MLC_LOCAL_DIR_BODY = mlc_models_body(
+    [mlc_model_entry("./dist/Llama-2-7b-chat-hf-q4f16_1-MLC/")])
+
+# Sous Windows : les barres obliques inverses sont échappées dans le JSON.
+MLC_WINDOWS_PATH_BODY = mlc_models_body(
+    [mlc_model_entry("C:\\dist\\Qwen2.5-7B-Instruct-q4f16_1-MLC")])
+
+# Avec --embedding-model : get_model_list() concatène le registre des moteurs
+# de génération puis celui des moteurs d'embedding.
+MLC_WITH_EMBEDDING_BODY = mlc_models_body([
+    mlc_model_entry(MLC_HF_MODEL),
+    mlc_model_entry("HF://mlc-ai/snowflake-arctic-embed-m-q0f32-MLC"),
+])
+
+# L'instance gardée par --api-key : verify_api_key() lève HTTPException(401,
+# "Invalid API Key") avant que request_models() ne s'exécute, et FastAPI rend
+# ce corps. Le template doit se taire — c'est précisément la fermeture que la
+# remédiation demande.
+MLC_UNAUTHORIZED_BODY = '{"detail":"Invalid API Key"}'
+
+# Un document qui écrit les champs dans l'ordre de l'objet Model d'OpenAI :
+# ModelResponse déclare created avant object, donc ce n'est pas
+# request_models() qui a répondu.
+MLC_OPENAI_ORDER_BODY = mlc_models_body(
+    [mlc_model_entry(MLC_HF_MODEL, openai_order=True)])
+
+# Un propriétaire qui ne fait que commencer par le littéral, et le littéral
+# en minuscules : ni l'un ni l'autre n'est la constante du produit.
+MLC_OTHER_OWNER_BODY = mlc_models_body(
+    [mlc_model_entry(MLC_HF_MODEL, owned_by="MLC-LLM-Gateway")])
+MLC_LOWERCASE_OWNER_BODY = mlc_models_body(
+    [mlc_model_entry(MLC_HF_MODEL, owned_by="mlc-llm")])
+
+# Le littéral en deuxième position derrière une entrée d'un autre serveur :
+# request_models() rend des ModelResponse et rien d'autre, donc ce document
+# vient d'un agrégateur.
+MLC_NOT_FIRST_BODY = mlc_models_body([
+    json.loads(OTHER_OPENAI_API_BODY)["data"][0],
+    mlc_model_entry(MLC_HF_MODEL),
+])
+
+# Un tableau vide : le modèle principal est toujours enregistré avant que
+# uvicorn ne démarre, donc cette forme n'existe pas, mais le matcher ne doit
+# pas la confondre avec une instance réelle.
+MLC_EMPTY_BODY = '{"object":"list","data":[]}'
+
+# La charge utile republiée au fond du document d'une supervision qui
+# agrégerait plusieurs sondes sous ses propres clés.
+MLC_COMPOSITE_BODY = '{"probe":"mlc","upstream":%s}' % MLC_OPEN_BODY
+
+# Les routes génériques que le template refuse de lire : /metrics rend le
+# texte Prometheus du moteur, /docs la page Swagger de FastAPI, et une route
+# /v1 inconnue le 404 de FastAPI.
+MLC_METRICS_BODY = (
+    "# HELP engine_prefill_time_sum Prefill time in seconds\n"
+    "# TYPE engine_prefill_time_sum counter\n"
+    "engine_prefill_time_sum 12.5\n"
+)
+MLC_DOCS_BODY = "<!DOCTYPE html><html><head><title>FastAPI - Swagger UI</title></head></html>"
+MLC_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Une page de documentation qui cite la réponse.
+MLC_DOC_PAGE_BODY = "<html><body><pre>%s</pre></body></html>" % MLC_OPEN_BODY
+
+
+def mlc_block():
+    doc = load(MLC_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MLC_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est pourtant la seule route "
+        "du produit dont le corps le nomme" % MLC_MODELS_ROUTE
+    )
+    return blocks[0]
+
+
+def mlc_fires(status=200, body=None, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête, condition `and` par défaut."""
+    block = mlc_block()
+    if body is None:
+        body = MLC_OPEN_BODY
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif kind == "word" and matcher.get("part") == "header":
+            header_blob = " ".join(headers.values())
+            words = matcher.get("words") or []
+            hit = (all(w in header_blob for w in words)
+                   if matcher.get("condition") == "and"
+                   else any(w in header_blob for w in words))
+            verdicts.append(hit)
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_mlc_probe_is_a_single_read_only_get_on_v1_models():
+    """
+    Le même routeur à dépendance inerte sert POST /v1/chat/completions,
+    /v1/completions et /v1/embeddings, qui lanceraient de l'inférence sur les
+    GPU de l'hôte ; les routeurs sans dépendance servent POST /microserving/*,
+    qui réserve du cache KV et génère, et — sous --enable-debug — POST
+    /debug/reset_engine, qui réinitialise le moteur : les toucher est l'abus
+    que le template signale, pas ce qu'un scanner a le droit de faire pour
+    l'établir.
+    """
+    doc = load(MLC_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", MLC_MODELS_ROUTE)}, (
+        "le template interroge autre chose que /v1/models — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "la liste des modèles se lit en GET : tout ce qui agit sur le "
+            "moteur est en POST"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le bloc enverrait un corps ou une requête brute : rien de ce que "
+            "le template établit ne demande d'écrire sur l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/v1/chat/completions", "lancerait de l'inférence sur les GPU "
+                                        "de l'hôte, aux frais de l'exploitant"),
+                ("/v1/completions", "lancerait de l'inférence sur les GPU"),
+                ("/v1/embeddings", "lancerait un calcul sur les GPU"),
+                ("/microserving", "réserverait du cache KV ou générerait"),
+                ("/debug", "réinitialiserait le moteur ou piloterait le "
+                           "profileur CUDA"),
+                ("/metrics", "ne nomme pas le produit : texte Prometheus"),
+                ("/docs", "ne nomme pas le produit : Swagger de FastAPI"),
+                ("/openapi.json", "ne nomme pas le produit"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+            assert path.rstrip("/") != "{{BaseURL}}", (
+                "GET / rend le 404 de FastAPI, générique"
+            )
+
+
+def test_mlc_matcher_needs_the_mlc_llm_literal_not_the_generic_shape():
+    """
+    Le cœur du constat. {"object":"list","data":[...]} est la forme de tout
+    serveur compatible OpenAI ; « "created":...,"object":"model","owned_by":
+    "MLC-LLM" » dans cet ordre est ce que seul ModelResponse rend.
+    """
+    assert mlc_fires(), (
+        "le template ne reconnaît pas la réponse d'une instance ouverte"
+    )
+    assert mlc_fires(status=203), (
+        "le constat dépend du statut HTTP, qui vaut 200 sur tout serveur vivant"
+    )
+
+    for body, why in (
+        (VLLM_MODELS_BODY, "vLLM, qui fixe owned_by='vllm' sur la même route"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy, qui fixe owned_by='lmdeploy'"),
+        (TRTLLM_OPEN_BODY, "TensorRT-LLM, qui fixe owned_by='tensorrt_llm'"),
+        (LLAMASWAP_MODELS_BODY, "llama-swap, qui fixe owned_by='llama-swap'"),
+        (MISTRALRS_OPEN_BODY, "mistral.rs, qui fixe owned_by='local'"),
+        (KOKORO_MODELS_BODY, "Kokoro-FastAPI, qui fixe owned_by='kokoro'"),
+        (SPEACHES_MODELS_BODY, "Speaches, dont owned_by est l'organisation "
+                               "Hugging Face"),
+        (KSERVE_MODELS_BODY, "KServe, dont /v1/models rend {\"models\":[...]}"),
+        (OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (MLC_UNAUTHORIZED_BODY,
+         "une instance gardée par --api-key : le 401 de verify_api_key() est "
+         "la fermeture que la remédiation demande"),
+        (MLC_OPENAI_ORDER_BODY,
+         "un document qui écrit object avant created : ModelResponse déclare "
+         "created d'abord, donc ce n'est pas request_models() qui a répondu"),
+        (MLC_OTHER_OWNER_BODY,
+         "un propriétaire qui ne fait que commencer par le littéral"),
+        (MLC_LOWERCASE_OWNER_BODY, "le littéral en minuscules"),
+        (MLC_NOT_FIRST_BODY,
+         "le littéral en deuxième position derrière l'entrée d'un autre "
+         "serveur : un agrégateur, pas request_models()"),
+        (MLC_EMPTY_BODY, "un tableau data vide, que le serveur ne rend jamais"),
+        (MLC_COMPOSITE_BODY, "la charge utile republiée au fond du document "
+                             "d'une supervision : l'ancrage d'ouverture doit "
+                             "dire que l'instance a répondu en tête"),
+        (MLC_METRICS_BODY, "le texte Prometheus de /metrics"),
+        (MLC_DOCS_BODY, "la page Swagger de /docs"),
+        (MLC_NOT_FOUND_BODY, "le 404 de FastAPI"),
+        (MLC_DOC_PAGE_BODY, "une page de documentation qui cite la réponse"),
+    ):
+        assert not mlc_fires(body=body), "le template conclut sur %s" % why
+
+    assert not mlc_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+
+def test_mlc_matcher_holds_on_variations_that_do_not_change_the_fact():
+    for body, why in (
+        (MLC_LOCAL_DIR_BODY,
+         "une instance lancée sur le dossier compilé local : l'identifiant "
+         "est le chemin, barre finale comprise"),
+        (MLC_WINDOWS_PATH_BODY,
+         "un chemin Windows, dont les barres obliques inverses sont échappées"),
+        (MLC_WITH_EMBEDDING_BODY,
+         "une instance qui sert aussi un modèle d'embedding : deux entrées"),
+        (mlc_models_body(indent=2),
+         "un intermédiaire qui réindente ce que Starlette sérialise compact"),
+        (MLC_OPEN_BODY + "\n",
+         "un intermédiaire qui ajoute un saut de ligne au corps relayé"),
+        (mlc_models_body(indent=2).replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+        (mlc_models_body([mlc_model_entry(MLC_HF_MODEL, created=1700000000)]),
+         "une instance démarrée à une autre date"),
+    ):
+        assert mlc_fires(body=body), "le template perd %s" % why
+
+
+def test_mlc_and_its_siblings_on_v1_models_do_not_answer_for_one_another():
+    """
+    vLLM, LMDeploy, TensorRT-LLM, llama-swap, mistral.rs, Kokoro et Speaches
+    lisent la même route : chacun des templates doit se taire sur la réponse
+    des autres, sans quoi un serveur exposé remonterait sous plusieurs noms.
+    """
+    vllm_block = [b for b in (load(VLLM_TEMPLATE).get("http") or [])
+                  if "{{BaseURL}}/v1/models" in (b.get("path") or [])][0]
+    vllm_body_matchers = [m for m in (vllm_block.get("matchers") or [])
+                          if m.get("type") == "word" and m.get("part") == "body"]
+    assert vllm_body_matchers
+    for body in (MLC_OPEN_BODY, MLC_WITH_EMBEDDING_BODY):
+        assert not all(word_matcher_hits(m, body) for m in vllm_body_matchers), (
+            "le template vLLM conclut sur une instance MLC LLM"
+        )
+        assert not lmdeploy_fires(body=body), (
+            "le template LMDeploy conclut sur une instance MLC LLM"
+        )
+        assert not trtllm_fires(body=body), (
+            "le template TensorRT-LLM conclut sur une instance MLC LLM"
+        )
+        assert not llamaswap_fires(body), (
+            "le template llama-swap conclut sur une instance MLC LLM"
+        )
+        assert not mistralrs_fires(body=body), (
+            "le template mistral.rs conclut sur une instance MLC LLM"
+        )
+        assert not kokoro_fires(body=body), (
+            "le template Kokoro conclut sur une instance MLC LLM"
+        )
+        assert not speaches_fires(body=body), (
+            "le template Speaches conclut sur une instance MLC LLM"
+        )
+
+
+def test_mlc_matchers_condition_requires_every_clause():
+    block = mlc_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer, sinon la forme générique "
+        "{\"object\":\"list\",\"data\":[...]} suffirait seule à faire "
+        "remonter n'importe quel serveur compatible OpenAI"
+    )
+    kinds = {m.get("type") for m in block.get("matchers") or []}
+    assert "status" not in kinds, (
+        "un matcher de statut n'ajoute rien : /v1/models répond 200 sur tout "
+        "serveur vivant, et c'est le corps seul qui nomme le produit"
+    )
+
+
+def test_mlc_extractor_reports_the_models_served():
+    """
+    Ce qu'un lecteur veut, ce sont les identifiants réels — le dossier
+    compilé ou le dépôt « HF://… », et le modèle d'embedding s'il y en a un.
+    """
+    extractors = mlc_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        f"un seul extracteur suffit à nommer ce que sert l'instance — "
+        f"{extractors}"
+    )
+    extractor = extractors[0]
+    assert extractor.get("type") == "json" and extractor.get("json") == [".data[].id"], (
+        "l'extracteur ne relève pas les identifiants des modèles servis — %s"
+        % extractor
+    )
+    assert [e["id"] for e in json.loads(MLC_WITH_EMBEDDING_BODY)["data"]] == [
+        MLC_HF_MODEL, "HF://mlc-ai/snowflake-arctic-embed-m-q0f32-MLC",
+    ], "le cas de test ne dit pas ce qu'il croit dire"
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_mlc_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions du matcher ni celle de
+    l'extracteur : seul un scan contre un vrai serveur ferme la boucle, y
+    compris face aux produits qui servent la même route et face à l'instance
+    gardée qui répond 401.
+    """
+    def scan(status=200, body=MLC_OPEN_BODY,
+             content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == MLC_MODELS_ROUTE:
+                    self.reply(status, body, content_type)
+                elif self.path == "/metrics":
+                    self.reply(200, MLC_METRICS_BODY, "text/plain; charset=utf-8")
+                elif self.path == "/docs":
+                    self.reply(200, MLC_DOCS_BODY, "text/html; charset=utf-8")
+                else:
+                    self.reply(404, MLC_NOT_FOUND_BODY, "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MLC_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "mlc-llm-serve-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [MLC_MODELS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, (
+        f"le scan ne reconnaît pas la réponse d'une instance ouverte — {results}"
+    )
+    assert results[0].get("extracted-results") == [MLC_HF_MODEL], (
+        "l'extracteur ne rend pas l'identifiant du modèle servi — %s"
+        % results[0].get("extracted-results")
+    )
+
+    _, results = scan(body=MLC_WITH_EMBEDDING_BODY)
+    assert len(results) == 1 and sorted(results[0].get("extracted-results") or []) == sorted([
+        MLC_HF_MODEL, "HF://mlc-ai/snowflake-arctic-embed-m-q0f32-MLC"]), results
+
+    _, results = scan(body=MLC_LOCAL_DIR_BODY)
+    assert len(results) == 1 and results[0].get("extracted-results") == [
+        "./dist/Llama-2-7b-chat-hf-q4f16_1-MLC/"], results
+
+    # L'instance gardée : verify_api_key() répond 401 avant request_models().
+    _, results = scan(status=401, body=MLC_UNAUTHORIZED_BODY)
+    assert results == [], (
+        f"le scan conclut sur une instance gardée par --api-key — {results}"
+    )
+
+    for body, why in (
+        (VLLM_MODELS_BODY, "vLLM"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy"),
+        (TRTLLM_OPEN_BODY, "TensorRT-LLM"),
+        (LLAMASWAP_MODELS_BODY, "llama-swap"),
+        (MISTRALRS_OPEN_BODY, "mistral.rs"),
+        (MLC_OPENAI_ORDER_BODY, "un document écrit dans l'ordre d'OpenAI"),
+        (MLC_OTHER_OWNER_BODY, "un propriétaire qui commence par le littéral"),
+        (MLC_EMPTY_BODY, "un tableau data vide"),
+        (MLC_COMPOSITE_BODY, "une supervision qui republie la réponse"),
+    ):
+        _, results = scan(body=body)
+        assert results == [], f"le scan confond {why} avec MLC LLM — {results}"

@@ -1,0 +1,178 @@
+id: mlc-llm-serve-exposed
+
+info:
+  name: MLC LLM Serve - Unauthenticated OpenAI-Compatible API Exposure
+  author: popy21
+  severity: high
+  description: |
+    MLC LLM (mlc-ai/mlc-llm, « Universal LLM Deployment Engine with ML
+    Compilation ») compile des modèles de langage pour les GPU NVIDIA, AMD,
+    Apple et les navigateurs, et `mlc_llm serve <modèle>` lance son serveur
+    HTTP compatible OpenAI. python/mlc_llm/interface/serve.py monte sur une
+    application FastAPI le routeur OpenAI (/v1/models, /v1/chat/completions,
+    /v1/completions, /v1/embeddings), le routeur /metrics, le routeur
+    MicroServing (/microserving/prep_recv, /microserving/remote_send,
+    /microserving/start_generate) et, sous --enable-debug seulement, le
+    routeur de débogage (/debug/dump_event_trace, /debug/cuda_profiler_start,
+    /debug/cuda_profiler_stop, /debug/dump_engine_metrics,
+    /debug/reset_engine).
+    GET /v1/models nomme le produit sans ambiguïté. Dans python/mlc_llm/serve/
+    entrypoints/openai_entrypoints.py, request_models() rend « ListResponse(
+    data=[ModelResponse(id=model) for model in server_context.get_model_list()
+    ]) », et python/mlc_llm/protocol/openai_api_protocol.py fixe le reste en
+    dur : « class ModelResponse(BaseModel): id: str; created: int = Field(
+    default_factory=lambda: int(time.time())); object: str = "model";
+    owned_by: str = "MLC-LLM" » et « class ListResponse(BaseModel): object:
+    str = "list"; data: List[Any] ». Le constructeur ne passe que
+    l'identifiant, donc chaque entrée n'a que ces quatre champs, dans cet
+    ordre — created avant object, à l'inverse de l'objet Model d'OpenAI et des
+    autres serveurs du protocole —, et Starlette sérialise compact : le
+    document ouvre sur « {"object":"list","data":[{"id":...,"created":...,
+    "object":"model","owned_by":"MLC-LLM"} ». get_model_list() rend le modèle
+    principal — le dossier compilé ou l'identifiant « HF://… » passé en
+    argument — puis le modèle d'embedding quand --embedding-model est donné.
+    La valeur « MLC-LLM » n'est exposée par aucun paramètre de `mlc_llm serve`
+    : l'exploitant choisit le modèle, jamais ce champ. C'est une constante du
+    produit, et elle le sépare de tous les autres serveurs du même protocole :
+    vLLM écrit « vllm », LMDeploy « lmdeploy », TensorRT-LLM « tensorrt_llm »,
+    llama-swap « llama-swap », mistral.rs « local ».
+    L'absence d'authentification est le défaut du produit. Le routeur OpenAI
+    est déclaré « app = fastapi.APIRouter(dependencies=[fastapi.Depends(
+    verify_api_key)]) », mais verify_api_key() ne compare la clé — et ne lève
+    « HTTPException(status_code=401, detail="Invalid API Key") » — que sous la
+    condition « if server_context is not None and server_context.api_key is
+    not None: ». python/mlc_llm/cli/serve.py déclare « --api-key » avec
+    « default=None » et l'aide littérale « API key for authentication. If not
+    provided, authentication is disabled. » ; l'option n'existe que depuis le
+    2026-03-01 (PR #3297, « Add API Key Authentication For openai_entrypoints
+    »), et aucune version antérieure n'a de garde du tout. Les autres défauts
+    du même fichier sont « --host, default="127.0.0.1" », « --port,
+    default=8000 » et « --allow-origins, default=["*"] » — CORSMiddleware
+    avec origines, méthodes et en-têtes à « * » : l'exposition survient dès
+    que l'exploitant passe « --host 0.0.0.0 » ou publie le port du conteneur,
+    ce que tout déploiement hors du poste local impose. Les routeurs /metrics
+    et /microserving/* sont des « fastapi.APIRouter() » sans dépendance : eux
+    restent ouverts même quand une clé est configurée.
+    Le matcher exige l'ouverture du document — « object » puis « data », puis
+    l'entrée dans l'ordre id, created, object, owned_by — jusqu'au littéral
+    « "owned_by":"MLC-LLM" ». Jamais sur le statut HTTP, qui vaut 200 sur tout
+    serveur vivant ; jamais sur /docs ni sur /metrics, génériques. Une
+    instance lancée avec --api-key répond 401 « {"detail":"Invalid API Key"} »
+    sur la même route : le corps dit à la fois le produit et l'absence de clé.
+  impact: |
+    Le corps de /v1/models est la preuve, pas le butin. Le même routeur, à
+    dépendance inerte, sert POST /v1/chat/completions, POST /v1/completions
+    et — quand --embedding-model est passé — POST /v1/embeddings : un tiers
+    lance de l'inférence sur les GPU de l'exploitant, pour son propre compte
+    et à ses frais, sans quota, sans utilisateur et sans trace qui lui attribue
+    l'appel — le journal d'uvicorn enregistre une route et un statut, pas un
+    appelant. Une instance GPU louée à l'heure se paie en continu pendant que
+    l'inférence d'autrui tourne, et le service légitime perd la capacité de
+    lot — quatre séquences en mode local, une seule en mode interactive — et
+    la mémoire vidéo qu'elle occupe.
+    Les routes d'exploitation sont servies à côté, sans aucune garde, clé ou
+    pas. GET /metrics rend les métriques Prometheus du moteur. POST
+    /microserving/prep_recv, /microserving/remote_send et
+    /microserving/start_generate, prévus pour désagréger prefill et decode
+    entre plusieurs moteurs, acceptent l'anonyme : prep_recv réserve des
+    entrées du cache KV pour un prompt, start_generate génère. Sous
+    --enable-debug, POST /debug/reset_engine réinitialise le moteur et perd
+    toutes les requêtes en cours, POST /debug/cuda_profiler_start et
+    /debug/cuda_profiler_stop pilotent le profileur CUDA sur tous les workers,
+    POST /debug/dump_event_trace livre la trace des événements du moteur et
+    POST /debug/dump_engine_metrics ses métriques détaillées.
+    L'identifiant rendu par /v1/models dit ce qui tourne : l'identifiant
+    « HF://… » d'un dépôt mlc-ai, ou le chemin local du dossier compilé — où
+    un fine-tuning interne se lit en clair — et, s'il y en a un, le modèle
+    d'embedding servi.
+  remediation: |
+    Passer « --api-key <clé> » à `mlc_llm serve` : verify_api_key() exige
+    alors « Authorization: Bearer <clé> » sur /v1/models, /v1/chat/completions,
+    /v1/completions et /v1/embeddings, et répond 401 sinon. Mettre à jour une
+    installation antérieure au 2026-03-01 (PR #3297), qui n'a pas l'option.
+    La clé ne couvre ni /metrics, ni /microserving/*, ni /debug/* : garder le
+    « --host 127.0.0.1 » par défaut quand le client est local, publier le
+    conteneur en « -p 127.0.0.1:8000:8000 » plutôt qu'en « -p 8000:8000 »
+    quand il faut « --host 0.0.0.0 », router tout accès distant par un
+    mandataire qui authentifie avant de relayer, et ne pas passer
+    --enable-debug en production. Restreindre « --allow-origins » si un
+    navigateur doit atteindre l'API.
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<hote>:8000/v1/models » doit rendre « {"detail":"Invalid API Key"}
+    », et plus « "owned_by":"MLC-LLM" ».
+    Après une exposition, tenir pour consommé le budget GPU sur la période —
+    il n'y a ni utilisateur ni journal d'appelant — et relire les journaux
+    d'uvicorn pour les POST sur /v1/chat/completions, /v1/completions,
+    /v1/embeddings, /microserving/* et /debug/* servis à un tiers pendant la
+    fenêtre.
+  reference:
+    - https://github.com/mlc-ai/mlc-llm
+    - https://github.com/mlc-ai/mlc-llm/blob/main/python/mlc_llm/protocol/openai_api_protocol.py
+    - https://github.com/mlc-ai/mlc-llm/blob/main/python/mlc_llm/serve/entrypoints/openai_entrypoints.py
+    - https://github.com/mlc-ai/mlc-llm/blob/main/python/mlc_llm/cli/serve.py
+    - https://github.com/mlc-ai/mlc-llm/blob/main/python/mlc_llm/interface/serve.py
+    - https://github.com/mlc-ai/mlc-llm/pull/3297
+    - https://llm.mlc.ai/docs/deploy/rest.html
+  metadata:
+    max-request: 1
+    vendor: mlc-ai
+    product: mlc-llm
+  tags: ai,llm,mlc-llm,mlc,inference,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, et elle porte le constat entier : GET /v1/models nomme
+  # le produit par le littéral « MLC-LLM » que ModelResponse fixe en dur, et
+  # une instance gardée par --api-key répond 401 sur cette même route — le
+  # corps dit donc à la fois le produit et l'absence de clé. /docs et /metrics
+  # ne sont pas interrogés : Swagger et texte Prometheus, génériques.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions,
+  # /v1/completions et /v1/embeddings lanceraient de l'inférence sur les GPU
+  # de l'hôte, POST /microserving/* réserverait du cache KV et générerait,
+  # POST /debug/reset_engine réinitialiserait le moteur : ce sont les abus
+  # que le template signale, pas ce qu'un scanner a le droit de faire pour
+  # les établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture, tenu sur l'ordre de déclaration des deux modèles
+      # pydantic. ListResponse déclare object puis data ; ModelResponse déclare
+      # id, created, object puis owned_by — created avant object, ce qu'aucun
+      # autre serveur du protocole n'écrit —, et request_models() ne passe que
+      # l'identifiant, donc rien d'autre ne précède owned_by. C'est cette
+      # séquence, pas un mot isolé, qui écarte tout document qui republierait
+      # "owned_by":"MLC-LLM" au fond d'un objet composite ou sous une clé
+      # étrangère. Les \s* laissent passer l'intermédiaire qui réindente ce
+      # que Starlette sérialise compact.
+      #
+      # Le littéral « MLC-LLM » est le discriminant : la forme
+      # {"object":"list","data":[...]} est celle de tout serveur compatible
+      # OpenAI, et le pack en couvre une dizaine sur cette même route.
+      #
+      # Pas de matcher de statut : /v1/models répond 200 sur tout serveur
+      # vivant, et c'est le corps seul qui dit lequel — le 401 d'une instance
+      # gardée rend {"detail":"Invalid API Key"}, que le corps écarte de
+      # lui-même.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"data"\s*:\s*\[\s*\{\s*"id"\s*:\s*"[^"]*"\s*,\s*"created"\s*:\s*\d+\s*,\s*"object"\s*:\s*"model"\s*,\s*"owned_by"\s*:\s*"MLC-LLM"'
+        condition: and
+
+    extractors:
+      # Les modèles servis : le dossier compilé ou l'identifiant « HF://… »
+      # passé à `mlc_llm serve`, puis le modèle d'embedding quand il y en a
+      # un — get_model_list() concatène les deux registres dans cet ordre.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'
