@@ -1,0 +1,200 @@
+id: whispercpp-server-exposed
+
+info:
+  name: whisper.cpp Server - Unauthenticated Inference Endpoint Exposed
+  author: popy21
+  severity: medium
+  description: |
+    whisper-server est le serveur HTTP de whisper.cpp (ggml-org/whisper.cpp,
+    « Port of OpenAI's Whisper model in C/C++ »), bâti depuis examples/server :
+    un binaire C++ posé sur cpp-httplib, produit distinct du wrapper Python
+    whisper-asr-webservice que le pack couvre déjà. Il publie deux routes de
+    calcul, POST /inference et POST /load, une page d'accueil et GET /health,
+    et aucune d'elles ne demande d'identité.
+    L'absence d'authentification est une fonctionnalité absente du produit.
+    examples/server/server.cpp ne porte ni clé, ni jeton, ni lecture d'un
+    en-tête d'autorisation : le seul endroit où le mot apparaît est
+    « svr->set_default_headers({{"Server", "whisper.cpp"},
+    {"Access-Control-Allow-Origin", "*"}, {"Access-Control-Allow-Headers",
+    "content-type, authorization"}}) », qui autorise toute origine à appeler
+    l'API depuis un navigateur. Il n'y a donc rien à activer, et rien à mal
+    configurer : ce qui sépare l'instance du réseau est la liaison — « std::string
+    hostname = "127.0.0.1"; » et « int32_t port = 8080; » par défaut —, que
+    « --host 0.0.0.0 » ou la publication du port d'un conteneur suffisent à
+    ouvrir.
+    La sonde est POST /inference sans champ de formulaire « file ». Le handler
+    enregistré par « svr->Post(sparams.request_path + sparams.inference_path,
+    ...) » — request_path vaut "" et inference_path "/inference" par défaut —
+    commence par « std::lock_guard<std::mutex> lock(whisper_mutex); » puis
+    « if (!req.has_file("file")) », et c'est la première chose qu'il fait : il
+    pose « res.status = 400 » et rend la main avant toute lecture d'audio et
+    avant toute inférence. Rien n'est déposé, rien n'est calculé, aucun modèle
+    n'est chargé.
+    Ce qui arrive sur le fil n'est pas le JSON que le handler écrit. Le code pose
+    « {"error":"no 'file' field in the request"} », mais le serveur installe
+    aussi « svr->set_error_handler(...) », que cpp-httplib appelle sur toute
+    réponse de statut 400 ou plus, et dont la première branche est « if
+    (res.status == 400) { res.set_content("Invalid request", "text/plain"); } » :
+    le corps JSON est remplacé par les quinze octets « Invalid request » avant
+    d'être écrit. Ce remplacement est présent depuis la première publication du
+    serveur (v1.5.1, novembre 2023), le JSON n'a donc jamais atteint un client,
+    et c'est le corps réécrit, mesuré sur un build local, que le template exige
+    — le JSON du handler est admis en second, pour le jour où le gestionnaire
+    d'erreur cesserait de le couvrir. L'autre branche du même gestionnaire
+    éclaire la lecture : tout chemin qui n'atteint aucun handler rend « File Not
+    Found (<chemin>) » en 404, donc un 400 sur /inference dit que la route
+    existe et que son handler a parlé.
+    Ce qui nomme le produit est l'en-tête « Server: whisper.cpp », posé par
+    set_default_headers sur toutes les réponses depuis la v1.5.2 — « Invalid
+    request » seul est le texte que n'importe quel serveur cpp-httplib peut
+    rendre sur un 400. Le constat est la conjonction des trois, sur POST
+    /inference : le statut 400, cet en-tête, et ce corps.
+  impact: |
+    POST /inference reçoit un fichier audio arbitraire dans le champ « file » et
+    le fait traverser le modèle chargé, avec tout ce que get_req_parameters()
+    lit du même formulaire : « response_format » parmi json, verbose_json, text,
+    srt et vtt, « language », « translate », « prompt », « temperature »,
+    « beam_size », « diarize », les seuils de VAD — soit de la transcription et
+    de la traduction gratuites sur le matériel de l'exploitant, GPU compris
+    quand le build en a un (« --no-gpu » vaut false), sans compte à débiter et
+    sans limite de débit. Toutes les requêtes se succèdent derrière
+    « whisper_mutex » : les fichiers d'un tiers font attendre les usagers
+    légitimes. Avec « --convert », chaque dépôt fait en plus tourner un
+    sous-processus ffmpeg sur le serveur — convert_to_wav() passe par
+    system() —, et le README du projet avertit lui-même : « Do not run the
+    server example with administrative privileges and ensure it's operated in a
+    sandbox environment, especially since it involves risky operations like
+    accepting user file uploads and using ffmpeg for format conversions. »
+    POST /load est servi au même anonyme, et il fait pire que calculer. Son
+    handler lit « model » dans le formulaire, vérifie seulement que le chemin
+    existe sur le disque du serveur — « is_file_exist(model.c_str()) » —, libère
+    le contexte courant par « whisper_free(ctx) » et charge le fichier désigné
+    par « whisper_init_from_file_with_params(model.c_str(), cparams) » : un
+    appelant choisit donc quels poids l'instance sert, parmi tout ce que le
+    processus peut lire. Et si l'initialisation échoue — le fichier existe mais
+    n'est pas un modèle ggml —, le code écrit « error: model init  failed, no
+    model loaded must exit » puis « exit(1) » : le processus meurt. Un seul POST
+    /load portant un chemin lisible quelconque arrête le service.
+    Rien de tout cela ne sera attribué : le serveur n'a jamais réclamé
+    d'identité, donc aucune trace n'en portera.
+  remediation: |
+    Il n'y a rien à activer dans le produit : server.cpp ne porte aucune
+    vérification de clé, de jeton ni d'en-tête d'autorisation, donc aucune
+    option ne ferme /inference ni /load. Le contrôle d'accès se pose à
+    l'extérieur — un intermédiaire qui authentifie devant le port
+    (authentification HTTP, mTLS, oauth2-proxy), ou l'isolement réseau.
+    Restreindre l'écoute d'abord : laisser « --host » à son défaut 127.0.0.1
+    quand l'instance n'a pas à être atteinte depuis l'extérieur de la machine,
+    et publier le port d'un conteneur sur l'interface locale seulement — « -p
+    127.0.0.1:8080:8080 », là où « -p 8080:8080 » l'ouvre à toutes. Si le
+    serveur doit rester joignable, refuser POST /load au niveau du mandataire :
+    rien dans l'usage courant ne demande qu'un client change les poids servis,
+    et c'est la route qui arrête le processus.
+    Ne pas confondre le symptôme et la brèche. Changer « --request-path » ou
+    « --inference-path » déplace la route et fait rendre « File Not Found » à
+    ce template, mais ne retire rien à qui lit la page d'accueil, où les deux
+    chemins sont imprimés dans l'exemple curl. Une instance qui rend 404 sur
+    /inference n'est pas une instance fermée.
+    Vérifier la prise en compte depuis l'extérieur du périmètre : « curl -s -o
+    /dev/null -D - -X POST -d '' http://<hote>:8080/inference » doit cesser de
+    rendre « HTTP/1.1 400 » avec « Server: whisper.cpp » — le « -d '' » n'est
+    pas décoratif, il fait envoyer « Content-Length: 0 », sans quoi cpp-httplib
+    attend un corps jusqu'au délai de lecture, 600 secondes par défaut. Après
+    une exposition, relire la sortie standard du processus — chaque dépôt y
+    écrit « Received request: <nom de fichier> » — et considérer qu'un POST
+    /load inexpliqué a pu changer le modèle servi.
+  reference:
+    - https://github.com/ggml-org/whisper.cpp/blob/master/examples/server/server.cpp
+    - https://github.com/ggml-org/whisper.cpp/blob/master/examples/server/README.md
+    - https://github.com/ggml-org/whisper.cpp
+  metadata:
+    max-request: 1
+    vendor: ggml-org
+    product: whisper.cpp
+  tags: ai,ml,whisper,whisper-cpp,ggml,asr,stt,speech,transcription,exposure,unauth,misconfig
+
+http:
+  # Une seule requête, sur la route de calcul elle-même, et sans rien y
+  # déposer. POST /inference sans champ « file » : le handler prend le mutex,
+  # teste « req.has_file("file") » en premier et rend la main sur 400 avant
+  # toute lecture d'audio, toute inférence et tout chargement. Le corps est
+  # vide, et c'est voulu — le client Go de nuclei envoie « Content-Length: 0 »
+  # sur un POST sans corps, ce que cpp-httplib exige pour ne pas attendre un
+  # corps jusqu'au délai de lecture (600 s par défaut).
+  #
+  # Pourquoi pas les autres routes. GET /health rend « {"status":"ok"} », qui
+  # n'appartient à personne, et ne dit rien de la route de calcul qu'un
+  # mandataire pourrait garder seule. GET / rend une page dont le titre est
+  # « Whisper.cpp Server », mais seulement « if no index.html is found in the
+  # public --path » — c'est le défaut, pas une constante. POST /load, surtout,
+  # est hors lecture seule : son handler exécute « state.store(
+  # SERVER_STATE_LOADING_MODEL) » AVANT de tester « req.has_file("model") »,
+  # donc une sonde sans champ laisserait l'instance répondre 503 « loading
+  # model » sur /health ; et avec un champ, il libère le modèle courant et
+  # charge le fichier désigné, ou tue le processus si ce n'en est pas un.
+  #
+  # Délai d'attente. La sonde prend « whisper_mutex » et se met donc en file
+  # derrière une transcription en cours : sur une instance occupée, le 400
+  # arrive quand le fichier précédent est fini. Le template n'a pas de champ
+  # pour le dire — c'est « -timeout » de nuclei qu'il faut allonger (60 s est
+  # confortable) pour ne pas perdre les instances qui travaillent, celles-là
+  # mêmes qui sont le plus sûrement exposées.
+  - method: POST
+    path:
+      - "{{BaseURL}}/inference"
+
+    matchers-condition: and
+    matchers:
+      # Le statut d'abord, et ici il porte du sens, contrairement aux routes
+      # de schéma du pack qui rendent 200 à tout le monde. set_error_handler
+      # distribue les réponses d'erreur du serveur en deux classes : 400 pour
+      # ce qu'un handler a refusé, 404 « File Not Found (<chemin>) » pour tout
+      # chemin qui n'atteint aucun handler — une instance lancée avec
+      # « --request-path » ou « --inference-path » rend celui-là sur
+      # /inference. Exiger 400 dit que la route existe et que c'est bien
+      # « if (!req.has_file("file")) » qui a parlé ; 200 serait la page
+      # d'accueil servie à tout chemin par un intermédiaire, 503 une instance
+      # en cours de chargement, 401/403 un mandataire qui garde la porte.
+      - type: status
+        status:
+          - 400
+
+      # Ce qui nomme le produit. « set_default_headers({{"Server",
+      # "whisper.cpp"}, ...}) » est posé sur toutes les réponses depuis la
+      # v1.5.2 (décembre 2023), erreurs comprises — cpp-httplib copie les
+      # en-têtes par défaut dans la réponse avant même de lire la requête
+      # (« res.headers = default_headers_; » ouvre process_request), et le
+      # gestionnaire d'erreur ne touche que le corps et le Content-Type. Épinglé
+      # à l'en-tête Server et à la ligne entière, parce que « whisper.cpp »
+      # pourrait se lire ailleurs — dans un Via ou un X-Powered-By de
+      # mandataire qui nomme son amont. Insensible à la casse pour l'en-tête,
+      # que le client Go canonise de toute façon. La seule instance que cette
+      # condition perd est la v1.5.1, qui ne posait pas encore l'en-tête : sans
+      # lui, « 400 Invalid request » est le texte de n'importe quel serveur
+      # cpp-httplib, et le constat ne nommerait plus rien.
+      - type: regex
+        part: header
+        regex:
+          - '(?mi)^Server:\s*whisper\.cpp\s*$'
+
+      # Le corps, et c'est le point non évident de ce template : ce n'est pas
+      # celui que le handler écrit. Il pose « {"error":"no 'file' field in the
+      # request"} » en application/json, puis « svr->set_error_handler » —
+      # appelé par cpp-httplib sur toute réponse de statut 400 ou plus — le
+      # remplace par « res.set_content("Invalid request", "text/plain") ».
+      # Mesuré sur un build local : quinze octets, Content-Type text/plain,
+      # et ce depuis la première publication du serveur (v1.5.1). C'est donc
+      # ce texte, entier et seul dans le corps, qui est exigé en premier.
+      # Le JSON du handler est admis en second, non ancré : il n'a jamais
+      # atteint un client dans aucune version publiée, mais il est écrit dans
+      # le code, et le jour où le gestionnaire d'erreur cesserait de couvrir
+      # les 400 — un correctif amont qui laisserait passer les erreurs JSON —
+      # c'est lui qui arriverait, sous le même statut et le même en-tête
+      # Server. L'exiger en alternative ne coûte aucune fausse alerte : l'un
+      # comme l'autre ne vaut qu'avec l'en-tête qui nomme le produit.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*Invalid request\s*$'
+          - '"error"\s*:\s*"no ''file'' field in the request"'
+        condition: or

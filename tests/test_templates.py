@@ -43157,3 +43157,464 @@ def test_mlc_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body)
         assert results == [], f"le scan confond {why} avec MLC LLM — {results}"
+
+
+# --------------------------------------------------------------------------
+# whisper.cpp server — ggml-org/whisper.cpp, le binaire whisper-server bâti
+# depuis examples/server : un serveur cpp-httplib en C++, produit distinct du
+# wrapper Python whisper-asr-webservice couvert plus haut. Ce que cette section
+# amarre tient en trois points.
+#
+# La sonde d'abord. POST /inference sans champ « file » : le handler prend
+# whisper_mutex, teste « req.has_file("file") » en premier et rend 400 avant
+# toute lecture d'audio, toute inférence et tout chargement. Les autres routes
+# ne conviennent pas — GET /health rend « {"status":"ok"} », qui n'appartient à
+# personne ; GET / n'a son titre « Whisper.cpp Server » que faute d'index.html
+# dans le dossier public ; et POST /load pose « state.store(
+# SERVER_STATE_LOADING_MODEL) » AVANT de vérifier le champ « model », donc une
+# sonde le laisserait répondre 503 sur /health.
+#
+# Le fil ensuite, et c'est le point non évident. Le handler écrit
+# « {"error":"no 'file' field in the request"} » en application/json, mais
+# « svr->set_error_handler » — appelé par cpp-httplib sur tout statut ≥ 400 —
+# le remplace par « res.set_content("Invalid request", "text/plain") », et ce
+# depuis la première publication du serveur (v1.5.1). Le JSON n'a jamais
+# atteint un client ; le template exige le corps réécrit, et admet le JSON en
+# alternative pour le jour où le gestionnaire cesserait de le couvrir.
+#
+# Le nom enfin. « Invalid request » seul est le texte de n'importe quel serveur
+# cpp-httplib sur un 400 ; c'est l'en-tête « Server: whisper.cpp », posé par
+# set_default_headers sur toutes les réponses depuis la v1.5.2, qui nomme le
+# produit. Le constat est la conjonction : 400, cet en-tête, ce corps.
+
+WHISPERCPP_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "whispercpp-server-exposed.yaml")
+
+WHISPERCPP_ROUTE = "/inference"
+
+# Ce que le handler pose, et que set_error_handler remplace avant écriture.
+WHISPERCPP_HANDLER_JSON = '{"error":"no \'file\' field in the request"}'
+
+# Ce qui arrive sur le fil : quinze octets, text/plain.
+WHISPERCPP_WIRE_BODY = "Invalid request"
+
+# Le message du handler de /load — même forme, autre champ. Le template ne
+# sonde jamais cette route, et son message ne doit pas être pris pour celui de
+# /inference.
+WHISPERCPP_LOAD_JSON = '{"error":"no \'model\' field in the request"}'
+
+# La seconde branche du gestionnaire d'erreur : tout chemin qui n'atteint aucun
+# handler, donc /inference sur une instance lancée avec --request-path ou
+# --inference-path.
+WHISPERCPP_NOT_FOUND_BODY = "File Not Found (/inference)"
+
+WHISPERCPP_HEALTH_OK_BODY = '{"status":"ok"}'
+WHISPERCPP_HEALTH_LOADING_BODY = '{"status":"loading model"}'
+
+# La page d'accueil par défaut, qu'un intermédiaire pourrait servir à tout
+# chemin : elle porte le nom du produit, et le template ne doit pas s'y
+# raccrocher.
+WHISPERCPP_INDEX_BODY = ("<html><head><title>Whisper.cpp Server</title></head>"
+                         "<body><h1>Whisper.cpp Server</h1><h2>/inference</h2>"
+                         "</body></html>")
+
+
+def whispercpp_headers(server="whisper.cpp", content_type="text/plain",
+                       body=WHISPERCPP_WIRE_BODY, extra=(), crlf=False,
+                       server_name="Server"):
+    """
+    Les en-têtes que cpp-httplib écrit sur ce 400, dans la forme où nuclei les
+    donne à un matcher de part « header » : une ligne « Nom: valeur » par
+    en-tête. `server=None` est une instance qui ne pose pas l'en-tête — la
+    v1.5.1, ou n'importe quel autre serveur cpp-httplib.
+    """
+    lines = []
+    if server is not None:
+        lines.append("%s: %s" % (server_name, server))
+    lines += ["Access-Control-Allow-Origin: *",
+              "Access-Control-Allow-Headers: content-type, authorization",
+              "Content-Type: %s" % content_type,
+              "Content-Length: %d" % len(body.encode())]
+    lines += list(extra)
+    end = "\r\n" if crlf else "\n"
+    return "".join(line + end for line in lines)
+
+
+def whispercpp_block():
+    doc = load(WHISPERCPP_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % WHISPERCPP_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas POST /inference — c'est pourtant la seule "
+        "route qui dise, sans rien déposer, que le handler de calcul répond à "
+        "l'anonyme"
+    )
+    return blocks[0]
+
+
+def whispercpp_fires(status=400, headers=None, body=WHISPERCPP_WIRE_BODY):
+    """
+    Sémantique nuclei d'un bloc à une seule requête : chaque matcher est évalué
+    contre la part qu'il déclare — statut, en-têtes ou corps — et
+    matchers-condition les joint.
+    """
+    block = whispercpp_block()
+    if headers is None:
+        headers = whispercpp_headers(body=body)
+
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, headers))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_whispercpp_probe_posts_nothing_to_inference_and_never_touches_load():
+    """
+    Le handler de /inference teste « req.has_file("file") » en premier et rend
+    la main sur 400 : une requête sans champ ne dépose rien, ne fait rien
+    calculer et ne charge rien. POST /load, lui, pose
+    « state.store(SERVER_STATE_LOADING_MODEL) » AVANT de vérifier son champ —
+    une sonde sans « model » laisserait l'instance répondre 503 « loading
+    model » sur /health, et une sonde avec un champ libérerait le modèle
+    courant pour charger le fichier désigné, ou tuerait le processus par
+    exit(1) si ce n'en est pas un. C'est l'abus que le constat signale, pas ce
+    qu'un scanner a le droit de faire pour l'établir.
+    """
+    doc = load(WHISPERCPP_TEMPLATE)
+
+    assert request_routes(doc) == {("POST", WHISPERCPP_ROUTE)}, (
+        "le template interroge autre chose que POST /inference — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "POST", (
+            "la route est enregistrée par svr->Post : un GET n'atteint aucun "
+            "handler et rend « File Not Found (/inference) » en 404"
+        )
+        assert not block.get("body"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande de déposer un octet sur l'instance auditée, et un corps "
+            "vide avec Content-Length: 0 est ce que le handler refuse le plus "
+            "vite"
+        )
+        assert not block.get("raw"), (
+            "une requête brute écrirait elle-même ses en-têtes, et perdrait le "
+            "Content-Length: 0 que le client Go pose sur un POST sans corps — "
+            "sans lui, cpp-httplib attend un corps jusqu'au délai de lecture"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/load", "le handler passe l'instance en « loading model » "
+                          "avant de valider la requête, puis libère et "
+                          "recharge le modèle — ou tue le processus"),
+                ("/health", "« {\"status\":\"ok\"} » n'appartient à personne, et "
+                            "la route ne dit rien de /inference qu'un mandataire "
+                            "pourrait garder seule"),
+            ):
+                assert forbidden not in path, f"{path} : {why}"
+            assert path.replace("{{BaseURL}}", "") not in ("", "/"), (
+                "la page d'accueil n'a son titre « Whisper.cpp Server » que "
+                "faute d'index.html dans le dossier public : ce n'est pas une "
+                "constante du produit"
+            )
+
+    for matcher in whispercpp_block().get("matchers") or []:
+        for expression in (matcher.get("regex") or []) + (matcher.get("words") or []):
+            assert '"status"' not in expression, (
+                "une expression s'appuie sur le corps de /health — "
+                f"{expression}"
+            )
+            assert "Whisper.cpp Server" not in expression, (
+                "une expression épingle le titre de la page d'accueil, qui "
+                f"n'est servi que faute d'index.html — {expression}"
+            )
+
+
+def test_whispercpp_matcher_needs_the_status_the_header_and_the_body_together():
+    """
+    Le point qui fait ce template. « Invalid request » est le texte que
+    n'importe quel serveur cpp-httplib rend sur un 400 ; l'en-tête
+    « Server: whisper.cpp » se lit sur toutes les réponses du produit, 404 et
+    page d'accueil comprises ; et le statut 400 est celui que
+    « if (!req.has_file("file")) » pose, là où 404 dit qu'aucun handler n'a
+    été atteint. Aucun des trois ne nomme l'instance exposée à lui seul.
+    """
+    assert whispercpp_fires(), (
+        "le template ne reconnaît pas la réponse que l'instance émet "
+        "réellement : 400, Server: whisper.cpp, « Invalid request »"
+    )
+
+    for headers, why in (
+        (whispercpp_headers(server=None),
+         "un 400 « Invalid request » sans en-tête Server — la v1.5.1, qui ne le "
+         "posait pas encore, ou n'importe quel autre serveur cpp-httplib : "
+         "c'est la limite assumée du constat"),
+        (whispercpp_headers(server="nginx/1.27.0"),
+         "le même texte servi par un autre serveur"),
+        (whispercpp_headers(server="nginx/1.27.0",
+                            extra=["Via: 1.1 whisper.cpp"]),
+         "« whisper.cpp » lu dans un Via de mandataire qui nomme son amont : "
+         "ce n'est pas l'en-tête Server, et ce n'est pas l'instance qui "
+         "répond"),
+        (whispercpp_headers(server="nginx/1.27.0",
+                            extra=["X-Powered-By: whisper.cpp"]),
+         "« whisper.cpp » dans un X-Powered-By"),
+        (whispercpp_headers(server="whisper.cpp-proxy"),
+         "un en-tête Server qui commence par le littéral sans s'y arrêter"),
+    ):
+        assert not whispercpp_fires(headers=headers), (
+            "le template conclut sur %s" % why
+        )
+
+    for body, why in (
+        (WHISPERCPP_NOT_FOUND_BODY,
+         "« File Not Found (/inference) » — la seconde branche du gestionnaire "
+         "d'erreur, servie sous le même en-tête Server, et le statut est 404"),
+        (WHISPERCPP_LOAD_JSON,
+         "le message du handler de /load, même forme et autre champ : ce "
+         "n'est pas la route sondée"),
+        (WHISPERCPP_HEALTH_OK_BODY,
+         "le corps de /health, qui n'appartient à personne"),
+        (WHISPERCPP_HEALTH_LOADING_BODY,
+         "le corps de /health d'une instance en chargement"),
+        (WHISPERCPP_INDEX_BODY,
+         "la page d'accueil, qui porte le nom du produit sans que son handler "
+         "de calcul ait parlé"),
+        ("Invalid request body",
+         "un texte qui contient le littéral sans être lui : le corps réécrit "
+         "est entier et seul"),
+        ("invalid request", "une casse que set_content n'écrit pas"),
+        ('{"error":"Invalid request"}',
+         "le littéral enveloppé dans un JSON d'un autre serveur"),
+        ("", "une réponse vide"),
+    ):
+        assert not whispercpp_fires(body=body), (
+            "le template conclut sur %s" % why
+        )
+
+    for status, body, why in (
+        (404, WHISPERCPP_NOT_FOUND_BODY,
+         "le 404 d'une instance lancée avec --inference-path : la route "
+         "existe ailleurs, le template ne la voit pas et ne doit rien dire"),
+        (200, WHISPERCPP_INDEX_BODY,
+         "la page d'accueil servie à tout chemin par un intermédiaire"),
+        (503, WHISPERCPP_HEALTH_LOADING_BODY,
+         "une instance en cours de chargement"),
+        (401, "Unauthorized",
+         "un mandataire qui garde la porte — c'est la fermeture attendue"),
+        (403, "Forbidden", "un mandataire qui refuse la méthode"),
+        (200, WHISPERCPP_WIRE_BODY,
+         "le texte du 400 sous un 200 : ce n'est pas le handler qui a refusé"),
+    ):
+        assert not whispercpp_fires(status=status, body=body), (
+            "le template conclut sur %s" % why
+        )
+
+
+def test_whispercpp_matcher_holds_across_the_shapes_the_wire_carries():
+    """
+    Ce qui bouge d'une capture à l'autre sans que l'instance change : la casse
+    du nom d'en-tête, les fins de ligne, l'espace après les deux-points, les
+    en-têtes de connexion que cpp-httplib ajoute selon la version, une fin de
+    ligne collée au corps par un relais. Et le JSON du handler lui-même, admis
+    en alternative : il est écrit dans le code, et c'est lui qui arriverait si
+    le gestionnaire d'erreur cessait de couvrir les 400.
+    """
+    for headers, why in (
+        (whispercpp_headers(server_name="server"),
+         "le nom d'en-tête en minuscules, tel qu'un relais HTTP/2 le réécrit"),
+        (whispercpp_headers(crlf=True),
+         "des fins de ligne CRLF conservées dans la part d'en-têtes"),
+        ("Server:whisper.cpp\n" + whispercpp_headers(server=None),
+         "aucun espace après les deux-points"),
+        (whispercpp_headers(extra=["Keep-Alive: timeout=5, max=100",
+                                   "Connection: Keep-Alive"]),
+         "les en-têtes de connexion que cpp-httplib ajoute en HTTP/1.1"),
+        (whispercpp_headers(server="whisper.cpp") + "\n",
+         "une ligne vide finale"),
+    ):
+        assert whispercpp_fires(headers=headers), "le template perd %s" % why
+
+    for body, why in (
+        (WHISPERCPP_WIRE_BODY, "le corps réécrit tel que set_content l'écrit"),
+        (WHISPERCPP_WIRE_BODY + "\n", "une fin de ligne ajoutée par un relais"),
+        ("  " + WHISPERCPP_WIRE_BODY + "\r\n", "des blancs autour du texte"),
+        (WHISPERCPP_HANDLER_JSON,
+         "le JSON du handler, si le gestionnaire d'erreur cessait de le "
+         "remplacer"),
+        ('{"error": "no \'file\' field in the request"}',
+         "le même JSON réindenté par un relais"),
+    ):
+        assert whispercpp_fires(body=body), "le template perd %s" % why
+
+
+def test_whispercpp_conclusion_requires_the_400_the_handler_sets():
+    """
+    Le statut porte ici du sens, contrairement aux routes de schéma du pack qui
+    rendent 200 à tout le monde : set_error_handler distribue les erreurs en
+    deux classes, 400 pour ce qu'un handler a refusé et 404 pour tout chemin
+    qui n'en atteint aucun. Le 400 est donc la preuve que la route existe et
+    que c'est « if (!req.has_file("file")) » qui a parlé. Les trois conditions
+    sont exigées ensemble ; le corps admet deux écritures, et deux seulement.
+    """
+    block = whispercpp_block()
+    assert block.get("matchers-condition") == "and", (
+        "les matchers doivent tous devoir passer : aucun des trois ne nomme "
+        "l'instance exposée à lui seul"
+    )
+
+    by_kind = {}
+    for matcher in block.get("matchers") or []:
+        by_kind.setdefault(matcher.get("type"), []).append(matcher)
+
+    assert [m.get("status") for m in by_kind.get("status", [])] == [[400]], (
+        "le bloc n'exige pas le seul statut que le handler pose sur une requête "
+        f"sans champ « file » — {by_kind.get('status')}"
+    )
+
+    header = [m for m in by_kind.get("regex", []) if m.get("part") == "header"]
+    assert len(header) == 1, (
+        "le bloc ne porte pas exactement un matcher d'en-tête : c'est lui qui "
+        f"nomme le produit — {header}"
+    )
+    assert all("Server" in expression for expression in header[0].get("regex")), (
+        "le matcher d'en-tête n'épingle pas la ligne Server : « whisper.cpp » "
+        "pourrait se lire dans un Via ou un X-Powered-By de mandataire"
+    )
+
+    body = [m for m in by_kind.get("regex", []) if m.get("part") == "body"]
+    assert len(body) == 1 and body[0].get("condition") == "or", (
+        "le corps doit admettre l'une ou l'autre de ses deux écritures — "
+        f"{body}"
+    )
+    assert len(body[0].get("regex") or []) == 2, (
+        "deux écritures du corps, et deux seulement : celle que le gestionnaire "
+        "d'erreur met sur le fil, et celle que le handler écrit — "
+        f"{body[0].get('regex')}"
+    )
+    assert any("Invalid request" in expression for expression in body[0]["regex"]), (
+        "le corps réécrit par set_error_handler — le seul qu'une version "
+        "publiée ait jamais envoyé — n'est pas exigé"
+    )
+    assert any("no ''file'' field in the request" in expression
+               or "no 'file' field in the request" in expression
+               for expression in body[0]["regex"]), (
+        "le JSON du handler n'est pas admis en alternative"
+    )
+
+    assert not whispercpp_fires(status=200), (
+        "le template conclut sans le 400 : un 200 portant ce texte n'est pas "
+        "le refus du handler"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_whispercpp_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions des matchers, et
+    `body_matcher_hits` réévalue les motifs avec le module `re` de Python plutôt
+    qu'avec RE2 : seul un scan contre un vrai serveur ferme la boucle. Deux
+    enjeux propres ici. Les drapeaux « (?mi) » du matcher d'en-tête, sur la
+    forme exacte que nuclei donne aux en-têtes. Et le Content-Length que le
+    client envoie sur un POST sans corps : cpp-httplib lit un corps jusqu'à
+    cette longueur, et sans l'en-tête il attend jusqu'au délai de lecture —
+    600 s par défaut — avant de répondre. Le serveur factice le relève, pour
+    que la sonde qui marche ici marche aussi contre whisper-server.
+    """
+    def scan(status=400, server_header="whisper.cpp", content_type="text/plain",
+             body=WHISPERCPP_WIRE_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                length = self.headers.get("Content-Length")
+                received = self.rfile.read(int(length or 0)).decode()
+                seen.append(("POST", self.path, length, received))
+                self.reply(status, body)
+
+            def do_GET(self):
+                seen.append(("GET", self.path, None, ""))
+                self.reply(404, "File Not Found (%s)" % self.path)
+
+            def reply(self, code, payload):
+                # send_response() ajouterait « Server: BaseHTTP/… » et
+                # « Date » ; send_response_only() laisse écrire l'en-tête Server
+                # du produit, ou aucun.
+                encoded = payload.encode()
+                self.send_response_only(code)
+                if server_header is not None:
+                    self.send_header("Server", server_header)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers",
+                                 "content-type, authorization")
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", WHISPERCPP_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % httpd.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+            )
+        finally:
+            httpd.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "whispercpp-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("POST", WHISPERCPP_ROUTE, "0", "")], (
+        "la requête émise n'est pas un POST /inference sans corps portant "
+        f"Content-Length: 0 — {seen}. Sans cet en-tête, cpp-httplib attend un "
+        "corps jusqu'au délai de lecture et la sonde ne rend rien"
+    )
+    assert len(results) == 1, (
+        "le scan ne reconnaît pas la réponse que whisper-server émet sur un "
+        f"POST /inference sans champ « file » — {results}"
+    )
+
+    _, results = scan(body=WHISPERCPP_HANDLER_JSON, content_type="application/json")
+    assert len(results) == 1, (
+        "le scan ne reconnaît pas le JSON du handler, admis en alternative "
+        f"pour le jour où le gestionnaire d'erreur cesserait de le remplacer — "
+        f"{results}"
+    )
+
+    for kwargs, why in (
+        (dict(server_header=None),
+         "un 400 « Invalid request » sans en-tête Server — la limite assumée"),
+        (dict(server_header="nginx/1.27.0"),
+         "le même texte sous un autre serveur"),
+        (dict(status=404, body=WHISPERCPP_NOT_FOUND_BODY),
+         "le 404 d'une instance lancée avec --inference-path"),
+        (dict(status=200, content_type="application/json",
+              body=WHISPERCPP_HEALTH_OK_BODY),
+         "un 200 dont le corps est celui de /health"),
+    ):
+        _, results = scan(**kwargs)
+        assert results == [], f"le scan conclut sur {why} — {results}"
