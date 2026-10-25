@@ -43618,3 +43618,804 @@ def test_whispercpp_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(**kwargs)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# Chatterbox TTS Server — devnen/Chatterbox-TTS-Server, le serveur FastAPI
+# auto-hébergé posé devant le modèle Chatterbox de Resemble AI. Ce que cette
+# section amarre tient en trois points.
+#
+# La route d'abord. « @app.get("/api/ui/initial-data", tags=["UI Helpers"]) »
+# rend un littéral de dictionnaire — « config », « reference_files »,
+# « predefined_voices », « presets », « initial_gen_result », puis
+# « model_info », ajoutée après le premier commit — et « config » vaut
+# « get_full_config_for_template() », la configuration complète de l'instance,
+# DEFAULT_CONFIG fusionné avec config.yaml. server.py ne porte ni « Security »,
+# ni clé, ni intergiciel autre que CORSMiddleware ; « use_auth » et ses deux
+# voisins de DEFAULT_CONFIG sont des « Placeholder » que personne ne lit.
+#
+# La famille ensuite. Kitten TTS Server, du même auteur, sert la même route et
+# le même /openapi.json — « description="Text-to-Speech server with advanced UI
+# and API capabilities." » mot pour mot — avec « config », « presets »,
+# « initial_gen_result » et « model_info », mais sans « reference_files » ni
+# « predefined_voices », et sans « exaggeration » ni « cfg_weight », les deux
+# réglages du modèle Chatterbox que DEFAULT_CONFIG garantit dans la copie que
+# « get_all() » rend. Dia TTS Server porte une autre phrase et rend son
+# interface côté serveur, sans route JSON.
+#
+# Le lien enfin. Le schéma nomme la famille mais ne prouve rien — il est
+# partagé, et une passerelle peut le recopier ; c'est la réponse de la route,
+# ouverte sur « config », qui dit que l'instance a parlé d'elle-même. Les deux
+# réponses sont donc liées par req-condition, le titre n'entre nulle part
+# (« ui.title » le change d'une ligne), et le statut non plus.
+
+CHATTERBOX_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "chatterbox-tts-server-exposed.yaml")
+
+CHATTERBOX_OPENAPI_ROUTE = "/openapi.json"
+CHATTERBOX_INITIAL_DATA_ROUTE = "/api/ui/initial-data"
+
+CHATTERBOX_DESCRIPTION = "Text-to-Speech server with advanced UI and API capabilities."
+DIA_DESCRIPTION = "Text-to-Speech server using the Dia model, providing API and Web UI."
+
+# Les routes que server.py déclare dans le schéma — « / », /styles.css et
+# /script.js portent include_in_schema=False et n'y figurent pas.
+CHATTERBOX_SCHEMA_ROUTES = (
+    ("/api/model-info", "get", "Model Information", "Get Model Info Endpoint"),
+    ("/api/ui/initial-data", "get", "UI Helpers", "Get Ui Initial Data"),
+    ("/save_settings", "post", "Configuration", "Save Settings Endpoint"),
+    ("/reset_settings", "post", "Configuration", "Reset Settings Endpoint"),
+    ("/restart_server", "post", "Configuration", "Restart Server Endpoint"),
+    ("/api/unload", "post", "Configuration", "Unload Model Endpoint"),
+    ("/get_reference_files", "get", "UI Helpers", "Get Reference Files"),
+    ("/get_predefined_voices", "get", "UI Helpers", "Get Predefined Voices Api"),
+    ("/upload_reference", "post", "File Management", "Upload Reference Audio"),
+    ("/upload_predefined_voice", "post", "File Management", "Upload Predefined Voice"),
+    ("/tts", "post", "TTS Generation", "Generate speech with custom parameters"),
+    ("/v1/audio/voices", "get", "llama-swap Compatible", "List Voices"),
+    ("/v1/audio/speech", "post", "OpenAI Compatible", "Openai Speech Endpoint"),
+)
+
+# Kitten TTS Server : pas de clonage, donc ni dépôt de référence ni liste de
+# voix prédéfinies, mais la même route de démarrage et la même phrase.
+KITTEN_SCHEMA_ROUTES = (
+    ("/api/model-info", "get", "Model Information", "Get Model Info Endpoint"),
+    ("/api/ui/initial-data", "get", "UI Helpers", "Get Ui Initial Data"),
+    ("/save_settings", "post", "Configuration", "Save Settings Endpoint"),
+    ("/reset_settings", "post", "Configuration", "Reset Settings Endpoint"),
+    ("/restart_server", "post", "Configuration", "Restart Server Endpoint"),
+    ("/tts", "post", "TTS Generation", "Generate speech with custom parameters"),
+    ("/v1/audio/speech", "post", "OpenAI Compatible", "Openai Speech Endpoint"),
+)
+
+# Dia TTS Server : l'interface est rendue par Jinja sur GET /, la route JSON de
+# démarrage n'existe pas.
+DIA_SCHEMA_ROUTES = (
+    ("/save_settings", "post", "Configuration", "Save Settings Endpoint"),
+    ("/reset_settings", "post", "Configuration", "Reset Settings Endpoint"),
+    ("/restart_server", "post", "Configuration", "Restart Server Endpoint"),
+    ("/upload_reference", "post", "File Management", "Upload Reference Audio"),
+    ("/tts", "post", "TTS Generation", "Generate speech with custom parameters"),
+    ("/v1/audio/speech", "post", "OpenAI Compatible", "Openai Speech Endpoint"),
+)
+
+
+def chatterbox_openapi_body(title="Chatterbox TTS Server",
+                            description=CHATTERBOX_DESCRIPTION, version="2.0.2",
+                            routes=CHATTERBOX_SCHEMA_ROUTES, openapi="3.1.0",
+                            indent=None):
+    """
+    Ce que get_openapi() rend pour « FastAPI(title=get_ui_title(),
+    description="…", version="2.0.2") » : « openapi » en tête, puis « info »
+    avec les trois champs passés au constructeur, puis les routes. Sérialisé
+    compact par Starlette ; `indent` dit ce qu'un intermédiaire qui réindente
+    en ferait.
+    """
+    paths = {}
+    for route, method, tag, summary in routes:
+        operation_id = (summary.lower().replace(" ", "_") + "_"
+                        + route.strip("/").replace("/", "_").replace("-", "_")
+                        + "_" + method)
+        paths[route] = {method: {
+            "tags": [tag], "summary": summary, "operationId": operation_id,
+            "responses": {"200": {"description": "Successful Response",
+                                  "content": {"application/json": {"schema": {}}}}},
+        }}
+    doc = {"openapi": openapi,
+           "info": {"title": title, "description": description, "version": version},
+           "paths": paths}
+    if indent is not None:
+        return json.dumps(doc, indent=indent, ensure_ascii=False)
+    return json.dumps(doc, separators=(",", ":"), ensure_ascii=False)
+
+
+def chatterbox_config(repo_id="chatterbox-turbo", title="Chatterbox TTS Server",
+                      generation_defaults=None, with_model_section=True,
+                      last_text="Bonjour, ceci est un test de la voix de Gianna."):
+    """
+    La copie que « get_all() » rend : DEFAULT_CONFIG fusionné avec le
+    config.yaml livré, chemins convertis en chaînes par
+    _prepare_config_for_saving(). `with_model_section=False` est une instance
+    du premier commit, avant que la section « model » n'existe.
+    """
+    if generation_defaults is None:
+        generation_defaults = {"temperature": 0.8, "exaggeration": 1.3,
+                               "cfg_weight": 0.5, "seed": 0, "speed_factor": 1.0,
+                               "language": "en"}
+    config = {
+        "server": {"host": "0.0.0.0", "port": 8004, "use_ngrok": False,
+                   "use_auth": False, "auth_username": "user",
+                   "auth_password": "password",
+                   "log_file_path": "logs/tts_server.log",
+                   "log_file_max_size_mb": 10, "log_file_backup_count": 5,
+                   "ssl_certfile": None, "ssl_keyfile": None},
+    }
+    if with_model_section:
+        config["model"] = {"repo_id": repo_id}
+    config.update({
+        "tts_engine": {"device": "auto", "predefined_voices_path": "voices",
+                       "reference_audio_path": "reference_audio",
+                       "default_voice_id": "Emily.wav"},
+        "paths": {"model_cache": "model_cache", "output": "outputs"},
+        "generation_defaults": generation_defaults,
+        "audio_output": {"format": "wav", "sample_rate": 24000,
+                         "max_reference_duration_sec": 30, "save_to_disk": False},
+        "ui_state": {"last_text": last_text, "last_voice_mode": "clone",
+                     "last_predefined_voice": "Emily.wav",
+                     "last_reference_file": "Gianna.wav", "last_seed": 3000,
+                     "last_chunk_size": 240, "last_split_text_enabled": True,
+                     "hide_chunk_warning": False, "hide_generation_warning": False,
+                     "theme": "light",
+                     "last_preset_name": "⚡ Turbo: Escape Room Panic"},
+        "ui": {"title": title, "show_language_select": True,
+               "max_predefined_voices_in_dropdown": 50},
+        "debug": {"save_intermediate_audio": False},
+    })
+    return config
+
+
+CHATTERBOX_MODEL_INFO = {
+    "loaded": True, "type": "turbo", "class_name": "ChatterboxTurboTTS",
+    "device": "cuda", "sample_rate": 24000, "supports_paralinguistic_tags": True,
+    "available_paralinguistic_tags": ["[laugh]", "[chuckle]", "[sigh]", "[gasp]",
+                                      "[cough]", "[clear throat]", "[sniff]",
+                                      "[groan]", "[shush]"],
+    "turbo_available_in_package": True, "multilingual_available_in_package": True,
+    "supports_multilingual": False, "supported_languages": {"en": "English"},
+}
+
+# engine.get_model_info() avant load_model(), ou après POST /api/unload.
+CHATTERBOX_MODEL_INFO_UNLOADED = dict(CHATTERBOX_MODEL_INFO, loaded=False,
+                                      type=None, class_name=None, device=None,
+                                      sample_rate=None,
+                                      supports_paralinguistic_tags=False,
+                                      available_paralinguistic_tags=[])
+
+CHATTERBOX_PRESETS = [
+    {"name": "⚡ Turbo: Tech Support Meltdown",
+     "text": "[sigh] Thank you for calling technical support.",
+     "params": {"temperature": 0.85, "exaggeration": 1.2, "cfg_weight": 0.55,
+                "seed": 0, "speed_factor": 1.0, "language": "en"}},
+]
+
+CHATTERBOX_INITIAL_GEN_RESULT = {
+    "outputUrl": None, "filename": None, "genTime": None,
+    "submittedVoiceMode": None, "submittedPredefinedVoice": None,
+    "submittedCloneFile": None,
+}
+
+
+def chatterbox_initial_data_body(config=None, reference_files=("Gianna.wav", "papa_message_vocal.mp3"),
+                                 predefined_voices=({"display_name": "Emily", "filename": "Emily.wav"},
+                                                    {"display_name": "Marcus", "filename": "Marcus.wav"}),
+                                 presets=CHATTERBOX_PRESETS,
+                                 model_info=CHATTERBOX_MODEL_INFO, indent=None):
+    """
+    Ce que le handler de /api/ui/initial-data rend, dans l'ordre du littéral de
+    dictionnaire — « config » ouvre le corps. `model_info=None` est une instance
+    antérieure à l'ajout de la clé.
+    """
+    payload = {"config": config if config is not None else chatterbox_config(),
+               "reference_files": list(reference_files),
+               "predefined_voices": list(predefined_voices),
+               "presets": list(presets),
+               "initial_gen_result": CHATTERBOX_INITIAL_GEN_RESULT}
+    if model_info is not None:
+        payload["model_info"] = model_info
+    if indent is not None:
+        return json.dumps(payload, indent=indent, ensure_ascii=False)
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+
+def kitten_config():
+    """DEFAULT_CONFIG de Kitten TTS Server : ni exaggeration ni cfg_weight."""
+    return {
+        "server": {"host": "0.0.0.0", "port": 8005, "use_ngrok": False,
+                   "use_auth": False, "auth_username": "user",
+                   "auth_password": "password",
+                   "log_file_path": "logs/tts_server.log",
+                   "log_file_max_size_mb": 10, "log_file_backup_count": 5},
+        "model": {"repo_id": "KittenML/kitten-tts-nano-0.1"},
+        "tts_engine": {"device": "auto"},
+        "paths": {"model_cache": "model_cache", "output": "outputs"},
+        "generation_defaults": {"speed": 1.0, "language": "en"},
+        "audio_output": {"format": "wav", "sample_rate": 24000},
+        "ui_state": {"last_text": "", "last_voice": "expr-voice-5-m",
+                     "last_speed": 1.0, "theme": "dark"},
+        "ui": {"title": "Kitten TTS Server", "show_language_select": True},
+        "debug": {"save_intermediate_audio": False},
+    }
+
+
+KITTEN_INITIAL_DATA_BODY = json.dumps({
+    "config": kitten_config(),
+    "presets": [{"name": "Narration", "text": "Once upon a time.", "params": {"speed": 1.0}}],
+    "initial_gen_result": {"outputUrl": None, "filename": None, "genTime": None,
+                           "submittedVoice": None},
+    "model_info": {"loaded": True, "selector": "nano-0.1",
+                   "repo_id": "KittenML/kitten-tts-nano-0.1",
+                   "display_name": "Kitten TTS Nano 0.1",
+                   "voices": ["expr-voice-2-m", "expr-voice-5-m"],
+                   "default_voice": "expr-voice-5-m", "params": "15M",
+                   "size": "25MB", "version": "0.1", "device": "cpu"},
+    "model_registry": {"nano-0.1": {"display_name": "Kitten TTS Nano 0.1"}},
+    "available_voices": ["expr-voice-2-m", "expr-voice-5-m"],
+}, separators=(",", ":"))
+
+CHATTERBOX_OPENAPI_BODY = chatterbox_openapi_body()
+CHATTERBOX_INITIAL_DATA_BODY = chatterbox_initial_data_body()
+
+KITTEN_OPENAPI_BODY = chatterbox_openapi_body(title="Kitten TTS Server", version="3.0.0",
+                                              routes=KITTEN_SCHEMA_ROUTES)
+DIA_OPENAPI_BODY = chatterbox_openapi_body(title="Dia TTS Server",
+                                           description=DIA_DESCRIPTION,
+                                           version="2.0.0", routes=DIA_SCHEMA_ROUTES)
+
+# La route sur une instance dont le handler a échoué : HTTPException(500).
+CHATTERBOX_FAILED_BODY = '{"detail":"Failed to load initial data for UI."}'
+FASTAPI_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# La charge utile de la route republiée au fond du document d'une supervision.
+CHATTERBOX_COMPOSITE_BODY = '{"probe":"chatterbox","upstream":%s}' % CHATTERBOX_INITIAL_DATA_BODY
+
+# Le schéma cité dans une page de documentation : la phrase y est, le JSON non.
+CHATTERBOX_DOC_PAGE_BODY = "<html><body><pre>%s</pre></body></html>" % CHATTERBOX_OPENAPI_BODY
+
+
+def chatterbox_scenario(openapi, initial_data):
+    return {CHATTERBOX_OPENAPI_ROUTE: openapi,
+            CHATTERBOX_INITIAL_DATA_ROUTE: initial_data}
+
+
+# L'instance ouverte, telle que le dépôt la livre : config.yaml sur 8004, le
+# modèle Turbo chargé, deux voix de référence déposées.
+CHATTERBOX_OPEN = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(200, CHATTERBOX_INITIAL_DATA_BODY),
+)
+
+# « ui.title » changé : le titre bouge dans le schéma et dans « config.ui »,
+# et le constat ne doit pas le lire.
+CHATTERBOX_RETITLED = chatterbox_scenario(
+    openapi=(200, chatterbox_openapi_body(title="Studio voix interne")),
+    initial_data=(200, chatterbox_initial_data_body(
+        config=chatterbox_config(title="Studio voix interne"))),
+)
+
+# Une instance du premier commit : ni « model_info », ni section « model »,
+# et le modèle original plutôt que Turbo — exposée au même titre.
+CHATTERBOX_FIRST_RELEASE = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(200, chatterbox_initial_data_body(
+        config=chatterbox_config(with_model_section=False,
+                                 generation_defaults={"temperature": 0.8,
+                                                      "exaggeration": 0.5,
+                                                      "cfg_weight": 0.5,
+                                                      "seed": 0,
+                                                      "speed_factor": 1.0,
+                                                      "language": "en"}),
+        model_info=None)),
+)
+
+# Le modèle déchargé par POST /api/unload, ou pas encore chargé : la route
+# répond quand même, et c'est bien l'instance nue.
+CHATTERBOX_MODEL_UNLOADED = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(200, chatterbox_initial_data_body(
+        model_info=CHATTERBOX_MODEL_INFO_UNLOADED)),
+)
+
+# Une instance neuve : aucun fichier déposé, aucune voix, aucun preset. C'est
+# celle qu'on trouve oubliée sur un port ouvert.
+CHATTERBOX_OPEN_EMPTY = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(200, chatterbox_initial_data_body(
+        config=chatterbox_config(last_text=""), reference_files=(),
+        predefined_voices=(), presets=())),
+)
+
+# Un intermédiaire qui réindente ce qu'il relaie.
+CHATTERBOX_OPEN_REFORMATTED = chatterbox_scenario(
+    openapi=(200, chatterbox_openapi_body(indent=2)),
+    initial_data=(200, "\n" + chatterbox_initial_data_body(indent=2) + "\n"),
+)
+
+# Un relais qui sert le corps en CRLF.
+CHATTERBOX_OPEN_CRLF = chatterbox_scenario(
+    openapi=(200, chatterbox_openapi_body(indent=2).replace("\n", "\r\n")),
+    initial_data=(200, chatterbox_initial_data_body(indent=2).replace("\n", "\r\n")),
+)
+
+# Un FastAPI plus ancien que la 0.99 : « openapi » vaut "3.0.2".
+CHATTERBOX_OPEN_OLD_FASTAPI = chatterbox_scenario(
+    openapi=(200, chatterbox_openapi_body(openapi="3.0.2")),
+    initial_data=(200, CHATTERBOX_INITIAL_DATA_BODY),
+)
+
+# Kitten TTS Server : même route, même phrase, mais ni reference_files ni
+# predefined_voices, ni exaggeration ni cfg_weight. C'est le scénario qui
+# sépare ce template d'un détecteur de la famille.
+KITTEN_OPEN = chatterbox_scenario(
+    openapi=(200, KITTEN_OPENAPI_BODY),
+    initial_data=(200, KITTEN_INITIAL_DATA_BODY),
+)
+
+# Un Kitten qui aurait un jour les deux listes de voix : les réglages du
+# modèle Chatterbox manquent toujours, et le second verrou tient.
+KITTEN_WITH_VOICE_LISTS = chatterbox_scenario(
+    openapi=(200, KITTEN_OPENAPI_BODY),
+    initial_data=(200, chatterbox_initial_data_body(
+        config=kitten_config(), presets=(), model_info={"loaded": True})),
+)
+
+# Dia TTS Server : autre phrase, et la route JSON n'existe pas.
+DIA_INSTANCE = chatterbox_scenario(
+    openapi=(200, DIA_OPENAPI_BODY),
+    initial_data=(404, FASTAPI_NOT_FOUND_BODY),
+)
+
+# Une application FastAPI quelconque.
+OTHER_FASTAPI_INSTANCE = chatterbox_scenario(
+    openapi=(200, OTHER_FASTAPI_OPENAPI_BODY),
+    initial_data=(404, FASTAPI_NOT_FOUND_BODY),
+)
+
+# Le schéma recopié par un tiers, et la route absente derrière.
+CHATTERBOX_SCHEMA_ONLY = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(404, FASTAPI_NOT_FOUND_BODY),
+)
+
+# Le handler a échoué : le schéma dit Chatterbox, la route rend son 500.
+CHATTERBOX_HANDLER_FAILED = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(500, CHATTERBOX_FAILED_BODY),
+)
+
+# Un mandataire qui authentifie devant le port — la fermeture attendue.
+CHATTERBOX_BEHIND_AUTH_PROXY = chatterbox_scenario(
+    openapi=(401, "Unauthorized"),
+    initial_data=(401, "Unauthorized"),
+)
+
+# Un portail captif qui laisse filer le schéma et répond 200 à la route avec
+# sa page de connexion.
+CHATTERBOX_BEHIND_CAPTIVE_PORTAL = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(200, "<html><body>Connexion requise</body></html>"),
+)
+
+# Un relais qui sert le schéma sur tout ce qu'on lui demande : la route n'a
+# jamais répondu.
+CHATTERBOX_SCHEMA_MIRRORED = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(200, CHATTERBOX_OPENAPI_BODY),
+)
+
+# Une supervision qui republie la charge utile sous ses propres clés.
+CHATTERBOX_SUPERVISED = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY),
+    initial_data=(200, CHATTERBOX_COMPOSITE_BODY),
+)
+
+# Une page de documentation qui cite le schéma, puis la vraie route : la
+# phrase y est, mais ce n'est pas l'instance qui a servi le document.
+CHATTERBOX_DOC_PAGE_THEN_ROUTE = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_DOC_PAGE_BODY),
+    initial_data=(200, CHATTERBOX_INITIAL_DATA_BODY),
+)
+
+# La phrase présente, mais sous une autre clé que « description ».
+CHATTERBOX_PHRASE_IN_SUMMARY = chatterbox_scenario(
+    openapi=(200, chatterbox_openapi_body(description="TTS").replace(
+        '"summary":"Get Ui Initial Data"', '"summary":"%s"' % CHATTERBOX_DESCRIPTION)),
+    initial_data=(200, CHATTERBOX_INITIAL_DATA_BODY),
+)
+
+# Le schéma republié sous un préfixe par une passerelle : la route y est
+# écrite « /tts/api/ui/initial-data », et ce n'est plus l'instance.
+CHATTERBOX_SCHEMA_PREFIXED = chatterbox_scenario(
+    openapi=(200, CHATTERBOX_OPENAPI_BODY.replace('"/api/ui/initial-data"',
+                                                  '"/tts/api/ui/initial-data"')),
+    initial_data=(200, CHATTERBOX_INITIAL_DATA_BODY),
+)
+
+# Un serveur quelconque qui répond 200 à tout ce qu'on lui demande.
+CHATTERBOX_OTHER_SERVER_ALWAYS_OK = chatterbox_scenario(
+    openapi=(200, '{"status":"ok"}'),
+    initial_data=(200, '{"status":"ok"}'),
+)
+
+
+def chatterbox_block():
+    doc = load(CHATTERBOX_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if any(p.endswith(CHATTERBOX_INITIAL_DATA_ROUTE)
+                     for p in (b.get("path") or []))]
+    assert blocks, (
+        "le template n'interroge pas GET /api/ui/initial-data — c'est pourtant "
+        "la seule route dont la réponse anonyme fait le constat, le schéma "
+        "étant partagé avec Kitten TTS Server"
+    )
+    return blocks[0]
+
+
+def chatterbox_responses(scenario):
+    """
+    Range les réponses d'un scénario dans l'ordre des chemins déclarés par le
+    template : c'est cet ordre qui donne son numéro à chaque body_N.
+    """
+    ordered = []
+    for path in chatterbox_block().get("path") or []:
+        route = path.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin que le scénario ne sert pas : {route}"
+        )
+        ordered.append(scenario[route])
+    return ordered
+
+
+def chatterbox_fires(scenario):
+    block = chatterbox_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = chatterbox_responses(scenario)
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_chatterbox_probe_reads_the_schema_and_the_bootstrap_route_and_nothing_else():
+    """
+    Le même serveur nu sert POST /tts et POST /v1/audio/speech, qui feraient
+    tourner le modèle sur le GPU de l'exploitant avec les voix qu'il a
+    déposées ; POST /upload_reference et /upload_predefined_voice, qui
+    écriraient dans ses dossiers ; POST /save_settings et /reset_settings, qui
+    réécriraient config.yaml ; POST /restart_server et /api/unload, qui
+    rechargeraient ou déchargeraient le modèle. C'est l'abus que le constat
+    signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+    """
+    doc = load(CHATTERBOX_TEMPLATE)
+
+    assert request_routes(doc) == {("GET", CHATTERBOX_OPENAPI_ROUTE),
+                                   ("GET", CHATTERBOX_INITIAL_DATA_ROUTE)}, (
+        "le template interroge autre chose que le schéma et la route de "
+        f"démarrage — {sorted(request_routes(doc))}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET", (
+            "les deux lectures sont des GET : tout ce qui agit sur l'instance "
+            "est en POST"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le bloc enverrait un corps ou une requête brute : rien de ce que "
+            "le template établit ne demande d'écrire sur l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden, why in (
+                ("/tts", "ferait tourner le modèle sur le GPU de l'exploitant"),
+                ("/v1/audio/speech", "ferait tourner le modèle sur le GPU"),
+                ("/upload_reference", "déposerait un fichier audio dans "
+                                      "reference_audio/"),
+                ("/upload_predefined_voice", "déposerait un fichier audio dans "
+                                             "voices/"),
+                ("/save_settings", "réécrirait config.yaml"),
+                ("/reset_settings", "ramènerait config.yaml aux défauts"),
+                ("/restart_server", "rechargerait le moteur"),
+                ("/api/unload", "déchargerait le modèle et arrêterait le "
+                                "service pour les usagers légitimes"),
+            ):
+                assert forbidden not in path, "%s : %s" % (path, why)
+            assert path.replace("{{BaseURL}}", "") not in ("", "/"), (
+                "GET / rend index.html, dont le titre vient de « ui.title » : "
+                "ce n'est pas une constante du produit"
+            )
+
+
+def test_chatterbox_probe_links_the_shared_schema_to_the_bootstrap_route():
+    block = chatterbox_block()
+    paths = [p.replace("{{BaseURL}}", "") for p in (block.get("path") or [])]
+
+    assert paths == [CHATTERBOX_OPENAPI_ROUTE, CHATTERBOX_INITIAL_DATA_ROUTE], (
+        "le produit d'abord, la preuve ensuite : le schéma nomme la famille, "
+        f"la route de démarrage fait le constat — {paths}"
+    )
+    assert block.get("req-condition") is True, (
+        "sans req-condition, les deux réponses ne peuvent pas être liées : le "
+        "schéma conclurait seul, or Kitten TTS Server le sert mot pour mot"
+    )
+    assert block.get("matchers-condition") != "or"
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("type") == "dsl" and matcher.get("condition") == "and", (
+            "chaque expression doit tenir : aucune ne nomme l'instance exposée "
+            f"à elle seule — {matcher}"
+        )
+        for expression in matcher.get("dsl") or []:
+            assert "status_code" not in expression, (
+                "le constat dépend du statut HTTP, qui vaut 200 sur tout "
+                f"serveur vivant — {expression}"
+            )
+            assert "Chatterbox TTS Server" not in expression, (
+                "une expression épingle le titre, que « ui.title » change "
+                f"d'une ligne — {expression}"
+            )
+            assert '"title"' not in expression, (
+                f"une expression lit le titre du schéma — {expression}"
+            )
+            assert "model_info" not in expression, (
+                "« model_info » a été ajoutée après le premier commit : "
+                "l'exiger tairait les instances plus anciennes, exposées au "
+                f"même titre — {expression}"
+            )
+
+    # Sous req-condition, le moteur évalue les extracteurs contre chacune des
+    # deux réponses et émet un résultat par extracteur qui rend quelque chose.
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul extracteur : chacun qui rend quelque chose ajoute un "
+        f"résultat, donc la même instance serait signalée deux fois — {extractors}"
+    )
+    assert extractors[0].get("part") == "body_2", (
+        "l'extracteur doit être borné à la réponse de la route : le schéma "
+        f"n'a pas la clé, mais le borner le dit — {extractors[0]}"
+    )
+    assert extractors[0].get("type") == "json" and extractors[0].get("json") == [
+        ".config.model.repo_id"], (
+        "l'extracteur ne relève pas le modèle servi — %s" % extractors[0]
+    )
+    for expression in extractors[0].get("json") or []:
+        assert "ui_state" not in expression and "reference_files" not in expression, (
+            "le rapport de scan recopierait ce que le constat reproche à la "
+            f"route de livrer — {expression}"
+        )
+
+
+def test_chatterbox_matcher_needs_the_bootstrap_payload_not_the_shared_schema():
+    """
+    Le cœur du constat. La phrase du schéma nomme la famille — Chatterbox ou
+    Kitten — et peut être recopiée ; la réponse de la route, ouverte sur
+    « config » et portant les deux listes de voix et les deux réglages du
+    modèle Chatterbox, dit que cette instance-là a livré sa configuration à
+    l'anonyme.
+    """
+    assert chatterbox_fires(CHATTERBOX_OPEN), (
+        "le template ne reconnaît pas l'instance telle que le dépôt la livre"
+    )
+
+    for scenario, why in (
+        (CHATTERBOX_RETITLED,
+         "une instance dont « ui.title » a été changé : le titre bouge dans "
+         "le schéma et dans config.ui, et le constat ne le lit pas"),
+        (CHATTERBOX_FIRST_RELEASE,
+         "une instance du premier commit, sans « model_info » ni section "
+         "« model » : exposée au même titre"),
+        (CHATTERBOX_MODEL_UNLOADED,
+         "une instance dont le modèle est déchargé : la route répond quand "
+         "même"),
+        (CHATTERBOX_OPEN_EMPTY,
+         "une instance neuve, sans fichier déposé ni preset : celle qu'on "
+         "trouve oubliée sur un port ouvert"),
+        (CHATTERBOX_OPEN_REFORMATTED,
+         "un intermédiaire qui réindente ce que Starlette sérialise compact"),
+        (CHATTERBOX_OPEN_CRLF, "un relais qui sert les corps en CRLF"),
+        (CHATTERBOX_OPEN_OLD_FASTAPI,
+         "un FastAPI antérieur à la 0.99, dont le schéma s'ouvre sur 3.0.2"),
+    ):
+        assert chatterbox_fires(scenario), "le template perd %s" % why
+
+    for scenario, why in (
+        (KITTEN_OPEN,
+         "Kitten TTS Server : même route, même phrase de description, mais ni "
+         "reference_files ni predefined_voices, ni exaggeration ni cfg_weight"),
+        (KITTEN_WITH_VOICE_LISTS,
+         "un Kitten qui porterait les deux listes de voix : les réglages du "
+         "modèle Chatterbox manquent toujours"),
+        (DIA_INSTANCE,
+         "Dia TTS Server : autre phrase, et la route JSON n'existe pas"),
+        (OTHER_FASTAPI_INSTANCE, "une application FastAPI quelconque"),
+        (CHATTERBOX_SCHEMA_ONLY,
+         "le schéma seul, la route rendant 404 : le document a pu être "
+         "recopié, et rien ne prouve que l'instance livre sa configuration"),
+        (CHATTERBOX_HANDLER_FAILED,
+         "le 500 « Failed to load initial data for UI. » du handler : "
+         "l'instance n'a rien livré"),
+        (CHATTERBOX_BEHIND_AUTH_PROXY,
+         "un mandataire qui authentifie devant le port — la fermeture attendue"),
+        (CHATTERBOX_BEHIND_CAPTIVE_PORTAL,
+         "un portail captif qui répond 200 et une page HTML à la route"),
+        (CHATTERBOX_SCHEMA_MIRRORED,
+         "un relais qui sert le schéma sur les deux chemins : la route n'a "
+         "jamais répondu"),
+        (CHATTERBOX_SUPERVISED,
+         "une supervision qui republie la charge utile sous ses propres "
+         "clés : l'ancrage sur « config » doit dire que l'instance a répondu "
+         "en tête"),
+        (CHATTERBOX_DOC_PAGE_THEN_ROUTE,
+         "une page de documentation qui cite le schéma : la phrase y est, le "
+         "JSON non"),
+        (CHATTERBOX_PHRASE_IN_SUMMARY,
+         "la phrase reprise dans un « summary » plutôt que dans la description "
+         "de l'application"),
+        (CHATTERBOX_SCHEMA_PREFIXED,
+         "le schéma republié sous un préfixe par une passerelle"),
+        (CHATTERBOX_OTHER_SERVER_ALWAYS_OK,
+         "un serveur quelconque qui répond 200 à tout"),
+    ):
+        assert not chatterbox_fires(scenario), "le template conclut sur %s" % why
+
+
+def test_chatterbox_and_the_other_openapi_readers_of_the_pack_do_not_answer_for_one_another():
+    """
+    Le pack lit /openapi.json sur plusieurs produits FastAPI : chacun doit se
+    taire devant le schéma de Chatterbox, et Chatterbox devant le leur, sans
+    quoi un serveur exposé remonterait sous plusieurs noms.
+    """
+    whisper_asr = os.path.join(TEMPLATES_DIR, "exposure", "whisper-asr-webservice-exposed.yaml")
+    whisper_block = [b for b in (load(whisper_asr).get("http") or [])
+                     if "{{BaseURL}}/openapi.json" in (b.get("path") or [])][0]
+    whisper_body_matchers = [m for m in (whisper_block.get("matchers") or [])
+                             if m.get("part") == "body"]
+    assert whisper_body_matchers
+    for body in (CHATTERBOX_OPENAPI_BODY, KITTEN_OPENAPI_BODY):
+        assert not all(body_matcher_hits(m, body) for m in whisper_body_matchers), (
+            "le template whisper-asr-webservice conclut sur un schéma Chatterbox"
+        )
+
+    for body, why in (
+        (LANGSERVE_OPENAPI_BODY, "LangServe"),
+        (VLLM_OPENAPI_BODY, "vLLM"),
+        (SPEACHES_OPENAPI_BODY, "Speaches"),
+    ):
+        assert not chatterbox_fires(chatterbox_scenario(
+            openapi=(200, body), initial_data=(200, CHATTERBOX_INITIAL_DATA_BODY))), (
+            "le template Chatterbox conclut sur le schéma de %s" % why
+        )
+
+
+def test_chatterbox_extractor_reports_the_model_served():
+    """
+    Ce qu'un lecteur veut, c'est le modèle que l'instance sert — Turbo,
+    multilingue, original ou un chemin local —, donc ce qu'un tiers peut faire
+    parler. Rien de « ui_state » ni des listes de voix.
+    """
+    payload = json.loads(CHATTERBOX_INITIAL_DATA_BODY)
+    assert payload["config"]["model"]["repo_id"] == "chatterbox-turbo", (
+        "le cas de test ne dit pas ce qu'il croit dire"
+    )
+    assert list(payload)[0] == "config", (
+        "le corps de référence n'ouvre pas sur « config », contrairement au "
+        "littéral du handler"
+    )
+    first_release = json.loads(chatterbox_responses(CHATTERBOX_FIRST_RELEASE)[1][1])
+    assert "model" not in first_release["config"] and "model_info" not in first_release, (
+        "le scénario du premier commit porte encore les clés ajoutées ensuite"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_chatterbox_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les expressions DSL, et dsl_matcher_hits
+    les réévalue en Python plutôt qu'avec le moteur : seul un scan contre un
+    vrai serveur ferme la boucle — req-condition, body_1 et body_2, l'extracteur
+    borné à body_2, et le silence devant Kitten TTS Server, devant l'instance
+    gardée et devant le relais qui sert le schéma partout.
+    """
+    def scan(scenario, content_types=None):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in scenario:
+                    status, body = scenario[self.path]
+                    kind = (content_types or {}).get(self.path, "application/json")
+                    self.reply(status, body, kind)
+                else:
+                    self.reply(404, FASTAPI_NOT_FOUND_BODY, "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", CHATTERBOX_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % httpd.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            httpd.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "chatterbox-tts-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan(CHATTERBOX_OPEN)
+    assert seen == [CHATTERBOX_OPENAPI_ROUTE, CHATTERBOX_INITIAL_DATA_ROUTE], (
+        "le scan n'émet pas les deux lectures, dans cet ordre, et rien "
+        f"d'autre — {seen}"
+    )
+    assert len(results) == 1, (
+        f"le scan ne reconnaît pas l'instance telle que le dépôt la livre — {results}"
+    )
+    assert results[0].get("extracted-results") == ["chatterbox-turbo"], (
+        "l'extracteur ne rend pas le modèle servi, une fois et une seule — %s"
+        % results[0].get("extracted-results")
+    )
+
+    for scenario, why in (
+        (CHATTERBOX_RETITLED, "une instance dont « ui.title » a été changé"),
+        (CHATTERBOX_MODEL_UNLOADED, "une instance dont le modèle est déchargé"),
+        (CHATTERBOX_OPEN_EMPTY, "une instance neuve"),
+        (CHATTERBOX_OPEN_REFORMATTED, "un intermédiaire qui réindente"),
+    ):
+        _, results = scan(scenario)
+        assert len(results) == 1, f"le scan perd {why} — {results}"
+
+    # L'instance du premier commit : le modèle n'est pas dans la configuration,
+    # et l'extracteur ne doit pas empêcher le constat.
+    _, results = scan(CHATTERBOX_FIRST_RELEASE)
+    assert len(results) == 1, (
+        f"le scan perd une instance du premier commit — {results}"
+    )
+
+    for scenario, why in (
+        (KITTEN_OPEN, "Kitten TTS Server"),
+        (KITTEN_WITH_VOICE_LISTS, "un Kitten portant les deux listes de voix"),
+        (DIA_INSTANCE, "Dia TTS Server"),
+        (OTHER_FASTAPI_INSTANCE, "une application FastAPI quelconque"),
+        (CHATTERBOX_SCHEMA_ONLY, "le schéma seul, la route rendant 404"),
+        (CHATTERBOX_HANDLER_FAILED, "le 500 du handler"),
+        (CHATTERBOX_BEHIND_AUTH_PROXY, "une instance gardée par un mandataire"),
+        (CHATTERBOX_SCHEMA_MIRRORED, "un relais qui sert le schéma partout"),
+        (CHATTERBOX_SUPERVISED, "une supervision qui republie la charge utile"),
+        (CHATTERBOX_SCHEMA_PREFIXED, "un schéma republié sous un préfixe"),
+    ):
+        _, results = scan(scenario)
+        assert results == [], f"le scan conclut sur {why} — {results}"
+
+    _, results = scan(CHATTERBOX_BEHIND_CAPTIVE_PORTAL,
+                      content_types={CHATTERBOX_INITIAL_DATA_ROUTE: "text/html"})
+    assert results == [], f"le scan conclut sur un portail captif — {results}"

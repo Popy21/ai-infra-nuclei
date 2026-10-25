@@ -1,0 +1,233 @@
+id: chatterbox-tts-server-exposed
+
+info:
+  name: Chatterbox TTS Server - Unauthenticated Configuration and Voice Inventory Exposed
+  author: popy21
+  severity: medium
+  description: |
+    Chatterbox TTS Server (devnen/Chatterbox-TTS-Server) est le serveur FastAPI
+    auto-hébergé que l'on pose devant le modèle Chatterbox de Resemble AI pour
+    la synthèse et le clonage vocal : une interface web, une API maison et une
+    API compatible OpenAI servies par le même processus. L'application est
+    construite en une seule expression — « app = FastAPI(title=get_ui_title(),
+    description="Text-to-Speech server with advanced UI and API capabilities.",
+    version="2.0.2", lifespan=lifespan) » — sans « openapi_url=None », donc
+    FastAPI monte le schéma sur /openapi.json, et la phrase de description y
+    arrive telle quelle. Le titre, lui, vient de la configuration :
+    « config_manager.get_string("ui.title", ...) », « Chatterbox TTS Server »
+    par défaut, modifiable par l'exploitant.
+    La route qui porte le constat est « @app.get("/api/ui/initial-data",
+    tags=["UI Helpers"]) », celle que l'interface appelle au chargement et que
+    le README donne pour « UI bootstrap + comprehensive health check ». Son
+    handler rend un dictionnaire de six clés dans cet ordre : « config »,
+    « reference_files », « predefined_voices », « presets »,
+    « initial_gen_result », « model_info » — les cinq premières depuis le
+    premier commit du dépôt (31 mai 2025), la sixième ajoutée ensuite. La
+    première vaut « get_full_config_for_template() », soit une copie profonde
+    de « config_manager.get_all() » : la configuration complète de l'instance,
+    DEFAULT_CONFIG fusionné avec le config.yaml de l'exploitant — « server »
+    avec hôte, port et chemin du journal, « model.repo_id », « tts_engine » avec
+    le périphérique et les dossiers de voix, « paths », « generation_defaults »,
+    « audio_output », « ui » et « ui_state », dont « last_text » est le dernier
+    texte que l'interface a enregistré via /save_settings. « reference_files »
+    liste les fichiers du dossier reference_audio/, c'est-à-dire les voix que
+    l'exploitant a déposées pour être clonées, et « predefined_voices » ceux du
+    dossier voices/ avec leur nom d'affichage.
+    L'absence d'authentification n'est pas un réglage manqué mais une
+    fonctionnalité absente du produit. server.py ne déclare ni dépendance
+    « Security(...) », ni vérification de clé ou de jeton, ni intergiciel autre
+    que « CORSMiddleware » à « allow_origins=["*", "null"] » et
+    « allow_credentials=True », qui autorise toute origine — y compris un
+    fichier ouvert localement — à appeler l'API depuis un navigateur. Les champs
+    « use_auth », « auth_username » et « auth_password » de DEFAULT_CONFIG sont
+    commentés « Placeholder for basic authentication (if used) » et aucun autre
+    fichier ne les lit : les poser dans config.yaml ne ferme rien, et leurs
+    valeurs — « user » et « password » par défaut — ressortent dans le bloc
+    « config » de la réponse. L'écoute est sur toutes les interfaces par
+    construction : « "host": "0.0.0.0" » dans DEFAULT_CONFIG, « port: 8004 »
+    dans le config.yaml livré (8000 dans DEFAULT_CONFIG), « EXPOSE 8004 » dans
+    le Dockerfile et « "${PORT:-8004}:8004" » dans docker-compose.yml. Ce qui
+    sépare l'instance du réseau n'est que la publication du port.
+    Le même auteur publie Kitten TTS Server à partir du même code : même route,
+    la même phrase de description dans /openapi.json, et quatre clés en commun
+    — « config », « presets », « initial_gen_result », « model_info ». Il n'a
+    ni « reference_files » ni « predefined_voices », faute de clonage vocal, et
+    c'est une première séparation. La seconde se lit dans la configuration :
+    « generation_defaults » porte « exaggeration » et « cfg_weight », les deux
+    réglages propres au modèle Chatterbox — importés depuis config.py dès le
+    premier commit —, là où Kitten n'a que « speed » et « language ». Le
+    constat exige les deux, en plus des trois clés qui nomment la route et de
+    la phrase qui nomme la famille. Dia TTS Server, du même auteur encore,
+    porte une autre phrase et rend son interface côté serveur sans route JSON.
+  impact: |
+    Le bloc « config » livre d'abord la configuration complète de l'instance :
+    hôte et port d'écoute, chemins des dossiers de modèles, de voix et de
+    sorties, chemin du fichier journal, modèle chargé, et « ui_state.last_text »,
+    le dernier texte que quelqu'un a fait lire au serveur — l'interface
+    l'enregistre à chaque génération via /save_settings. « reference_files » et
+    « predefined_voices » nomment les fichiers audio déposés pour le clonage :
+    souvent le prénom de la personne dont la voix a été enregistrée.
+    Mais l'inventaire n'est que le témoin, et la même absence de garde couvre
+    tout le serveur. POST /tts et POST /v1/audio/speech font traverser le modèle
+    à un texte arbitraire, en mode « predefined » sur une voix du dossier
+    voices/ ou en mode « clone » sur n'importe quel fichier de reference_files
+    — soit de la synthèse et du clonage vocal gratuits sur le GPU de
+    l'exploitant, avec les voix qu'il a lui-même déposées, sans compte à
+    débiter et sans limite de débit. POST /upload_reference et POST
+    /upload_predefined_voice déposent des fichiers audio dans ces mêmes
+    dossiers. POST /save_settings fusionne un JSON arbitraire dans config.yaml
+    et l'écrit sur le disque — « server », « tts_engine », « paths » et
+    « model » compris, le handler se contentant d'annoncer qu'« a server
+    restart may be required » — et POST /reset_settings le ramène aux défauts.
+    POST /restart_server recharge le moteur avec la configuration courante, donc
+    avec le « model.repo_id » qu'un tiers vient d'écrire ; POST /api/unload
+    décharge le modèle et libère le GPU, et le handler écrit lui-même que « the
+    model will need to be reloaded (via /restart_server) before TTS requests
+    can be processed » : un seul POST arrête le service pour les usagers
+    légitimes. Rien de tout cela ne sera attribué : le serveur n'a jamais
+    réclamé d'identité, donc aucune trace n'en portera.
+  remediation: |
+    Il n'y a rien à activer dans le produit : « use_auth », « auth_username »
+    et « auth_password » sont des emplacements que le serveur ne lit pas, et
+    server.py ne porte aucune vérification de clé ni d'en-tête d'autorisation.
+    Le contrôle d'accès se pose à l'extérieur — un intermédiaire qui
+    authentifie devant le port (authentification HTTP, mTLS, oauth2-proxy), ou
+    l'isolement réseau.
+    Restreindre l'écoute d'abord, parce que le défaut ne la restreint pas :
+    « server.host: 127.0.0.1 » dans config.yaml quand l'instance n'a pas à être
+    atteinte depuis l'extérieur de la machine, et « -p 127.0.0.1:8004:8004 »
+    côté conteneur, là où « -p 8004:8004 » publie le port sur toutes les
+    interfaces de l'hôte. « ssl_certfile » et « ssl_keyfile » chiffrent le
+    transport, ils n'identifient personne.
+    Ne pas confondre le symptôme et la brèche. Changer « ui.title » ne change
+    rien à ce constat, qui ne le lit pas ; masquer le schéma — en construisant
+    l'application avec « openapi_url=None, docs_url=None » — retire la lecture
+    qui nomme le produit, mais ne retire rien à /api/ui/initial-data ni aux
+    routes d'écriture, qui restent servies au même anonyme.
+    Vérifier la prise en compte depuis l'extérieur du périmètre : « curl -s -o
+    /dev/null -w '%{http_code}' http://<hote>:8004/api/ui/initial-data » ne
+    doit plus rendre 200. Après une exposition, considérer config.yaml comme
+    réécrit — le relire, « model.repo_id », « paths » et « server » en premier
+    — et comparer le contenu de reference_audio/ et de voices/ à ce qui y a été
+    déposé volontairement. Le journal configuré par « server.log_file_path »
+    (logs/tts_server.log) porte une ligne « Request received for
+    /save_settings. », « /restart_server (Model Hot-Swap). » ou « /api/unload
+    (Model Unload). » par appel, sans identité d'appelant : il n'y en a jamais
+    eu à porter.
+  reference:
+    - https://github.com/devnen/Chatterbox-TTS-Server/blob/main/server.py
+    - https://github.com/devnen/Chatterbox-TTS-Server/blob/main/config.py
+    - https://github.com/devnen/Chatterbox-TTS-Server/blob/main/config.yaml
+    - https://github.com/devnen/Chatterbox-TTS-Server/blob/main/Dockerfile
+    - https://github.com/devnen/Chatterbox-TTS-Server/blob/main/docker-compose.yml
+    - https://github.com/devnen/Chatterbox-TTS-Server
+    - https://github.com/devnen/Kitten-TTS-Server/blob/main/server.py
+  metadata:
+    max-request: 2
+    vendor: devnen
+    product: chatterbox-tts-server
+  tags: ai,ml,chatterbox,tts,speech,voice-cloning,fastapi,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et leur séparation tient au produit.
+  #
+  # GET /openapi.json nomme la famille : la phrase « Text-to-Speech server with
+  # advanced UI and API capabilities. » est un littéral du constructeur, et la
+  # route /api/ui/initial-data y est déclarée en GET. Mais ce document, Kitten
+  # TTS Server le sert mot pour mot — même auteur, même code —, et un schéma
+  # peut être recopié par une passerelle. Il identifie, il ne prouve rien.
+  #
+  # GET /api/ui/initial-data est la route de l'interface, et c'est elle qui
+  # porte le constat : son handler rend la configuration complète de l'instance
+  # et l'inventaire des voix, et il le rend à l'anonyme parce que rien dans
+  # server.py ne sait faire autrement. Les deux réglages « exaggeration » et
+  # « cfg_weight » qu'on y lit sont ceux du modèle Chatterbox, et c'est ce qui
+  # sépare cette instance d'un Kitten TTS Server.
+  #
+  # En lecture, et rien d'autre. Le même serveur nu sert POST /tts et POST
+  # /v1/audio/speech, qui feraient tourner le modèle sur le GPU de l'exploitant
+  # avec les voix qu'il a déposées ; POST /upload_reference et POST
+  # /upload_predefined_voice, qui écriraient des fichiers dans ses dossiers ;
+  # POST /save_settings et POST /reset_settings, qui réécriraient config.yaml ;
+  # POST /restart_server et POST /api/unload, qui rechargeraient ou
+  # déchargeraient le modèle. C'est l'abus que le constat signale, pas ce qu'un
+  # scanner a le droit de faire pour l'établir. GET /api/model-info,
+  # /get_reference_files et /get_predefined_voices ne rendent que des
+  # sous-ensembles de la réponse déjà lue.
+  - method: GET
+    path:
+      - "{{BaseURL}}/openapi.json"
+      - "{{BaseURL}}/api/ui/initial-data"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, le schéma conclurait seul — or il est
+    # partagé avec un autre produit et ne dit pas que la route répond.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'ouverture du schéma. get_openapi() rend un document dont
+          # « openapi » est la première clé, et la valeur est laissée au seul
+          # chiffre majeur : FastAPI écrit "3.1.0" depuis la 0.99 et "3.0.2"
+          # avant elle. L'ancrage écarte la page de documentation du projet,
+          # qui cite la phrase sans être du JSON, et le document d'une
+          # supervision qui agrégerait le schéma sous une clé à elle.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3", trim_space(body_1))'
+
+          # La phrase de description, littérale dans le constructeur et posée
+          # dans info.description sans retouche. Épinglée à une clé
+          # « description » plutôt que cherchée nue : reprise dans un
+          # « summary », un titre ou une page qui la cite, elle ne serait pas
+          # celle du constructeur. Le titre n'entre pas dans la condition :
+          # « get_ui_title() » le lit dans « ui.title », que l'exploitant
+          # change d'une ligne.
+          - 'regex("\"description\"\\s*:\\s*\"Text-to-Speech server with advanced UI and API capabilities\\.\"", body_1)'
+
+          # La route du constat, déclarée comme une route — « get » derrière la
+          # clé — et non citée dans une valeur. Le guillemet ouvrant est exigé :
+          # une passerelle qui republierait le schéma sous un préfixe écrirait
+          # « /tts/api/ui/initial-data », et ce n'est plus l'instance qui répond.
+          - 'regex("\"/api/ui/initial-data\"\\s*:\\s*\\{\\s*\"get\"", body_1)'
+
+          # La seconde réponse ouvre sur « config », et c'est une propriété du
+          # code : le handler rend un littéral de dictionnaire dont « config »
+          # est la première entrée, et jsonable_encoder préserve l'ordre
+          # d'insertion. C'est lui qui dit que l'instance a répondu d'elle-même
+          # — et non un relais qui servirait le schéma sur tout chemin, ni une
+          # supervision qui republierait la charge utile sous ses propres clés.
+          - 'regex("^\\{\\s*\"config\"\\s*:\\s*\\{", trim_space(body_2))'
+
+          # Les trois clés que la route rend depuis le premier commit, vérifiées
+          # sur leurs noms plutôt que sur la sérialisation compacte du serveur :
+          # un intermédiaire qui réindente ce qu'il relaie les laisse intactes.
+          # « model_info » n'est pas exigée : elle a été ajoutée après coup, et
+          # une instance plus ancienne est exposée au même titre.
+          - 'contains(body_2, "\"reference_files\"") && contains(body_2, "\"predefined_voices\"") && contains(body_2, "\"initial_gen_result\"")'
+
+          # Ce qui nomme Chatterbox, et non Kitten. « exaggeration » et
+          # « cfg_weight » sont les deux réglages du modèle de Resemble AI ;
+          # DEFAULT_CONFIG les porte dans « generation_defaults » et la fusion
+          # avec config.yaml les garantit dans la copie que « get_all() » rend,
+          # même si l'exploitant ne les a jamais écrits. Kitten TTS Server n'a
+          # ni l'un ni l'autre : ses défauts de génération sont « speed » et
+          # « language ».
+          - 'contains(body_2, "\"exaggeration\"") && contains(body_2, "\"cfg_weight\"")'
+
+    extractors:
+      # Le modèle que l'instance sert — « chatterbox-turbo », « multilingual »,
+      # « ResembleAI/chatterbox » ou un chemin local —, c'est-à-dire ce qu'un
+      # tiers peut faire parler, et avec quelles capacités.
+      #
+      # Un seul extracteur, et borné à body_2 — sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse et émet un résultat par
+      # extracteur qui rend quelque chose, et le schéma n'a de toute façon pas
+      # cette clé. Rien n'est extrait de « ui_state » ni des listes de voix :
+      # le rapport de scan n'a pas à recopier ce que le constat reproche à la
+      # route de livrer.
+      - type: json
+        part: body_2
+        name: model
+        json:
+          - '.config.model.repo_id'
