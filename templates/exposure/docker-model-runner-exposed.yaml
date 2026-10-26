@@ -1,0 +1,135 @@
+id: docker-model-runner-exposed
+
+info:
+  name: Docker Model Runner - Unauthenticated Inference and Model Management API Exposed
+  author: popy21
+  severity: high
+  description: |
+    Docker Model Runner (docker/model-runner) est le moteur d'inférence intégré
+    à Docker Desktop et à Docker Engine — le conteneur « docker-model-runner »
+    que pose « docker model install-runner », distribué aussi en binaire
+    « dmr ». Il tire des modèles depuis un registre OCI, les range dans son
+    magasin et les sert par llama.cpp, vLLM, MLX, SGLang ou Diffusers derrière
+    une API compatible OpenAI, Ollama et Anthropic.
+    La route qui porte le constat est « GET /engines/v1/models », déclarée dans
+    pkg/inference/models/http_handler.go avec ses variantes « GET
+    /engines/{backend}/v1/models » et l'alias « /v1/ ». Son handler rend
+    « ToOpenAIList(available) » encodé par encoding/json, donc dans l'ordre de
+    déclaration des structures de pkg/inference/models/api.go :
+    « OpenAIModelList » écrit « object » puis « data », « OpenAIModel » écrit
+    « id », « object », « created », « owned_by » puis « dmr ». Et
+    « ToOpenAI » fixe deux littéraux : « Object: "model" » et « OwnedBy:
+    "docker" » — le commentaire du champ dit « At the moment, it is always
+    "docker" ». Aucun autre serveur compatible OpenAI du pack n'écrit ce
+    propriétaire dans cet ordre.
+    L'absence d'authentification n'est pas un réglage manqué mais une
+    fonctionnalité absente du produit. pkg/server/server.go sert « Handler:
+    svc.Router » sans aucune vérification de clé ni de jeton — le seul
+    intergiciel des routes de modèles est « CorsMiddleware » —, et la référence
+    d'API officielle l'écrit en clair : « Not required. DMR ignores the
+    Authorization header ». Dès que « MODEL_RUNNER_PORT » est défini, le
+    serveur écoute sur « ":" + tcpPort », toutes les interfaces du conteneur ou
+    de l'hôte. Ce qui le sépare du réseau n'est que la publication du port
+    12434 : « install-runner » le publie par défaut sur 127.0.0.1 et sur la
+    passerelle du pont Docker (172.17.0.1, l'adresse que la documentation donne
+    aux conteneurs), mais « --host 0.0.0.0 », un « -p 12434:12434 » écrit à la
+    main ou l'accès TCP côté hôte de Docker Desktop ouvert sur une interface
+    publique le mettent à portée de quiconque.
+  impact: |
+    POST /engines/v1/chat/completions, /engines/v1/completions et
+    /engines/v1/embeddings font tourner les modèles listés sur le CPU ou le GPU
+    de l'exploitant pour un appelant anonyme : de l'inférence gratuite, sans
+    compte à débiter ni limite de débit. POST /models/create tire un modèle
+    arbitraire depuis n'importe quel registre OCI vers le magasin local —
+    plusieurs dizaines de gigaoctets de disque et de bande passante sur un seul
+    appel —, POST /models/load en importe une archive, et DELETE
+    /models/{nom} et DELETE /models/purge suppriment les modèles de
+    l'exploitant, ce qui interrompt le service pour ses usagers légitimes.
+    GET /models et la réponse lue ici nomment les modèles en place, leur
+    architecture, leur quantification et leur taille. Rien de tout cela n'est
+    attribué : le serveur ne réclame aucune identité.
+  remediation: |
+    Il n'y a rien à activer dans le produit : DMR n'a ni clé d'API ni jeton,
+    et ignore l'en-tête Authorization. Le contrôle d'accès se pose à
+    l'extérieur — un intermédiaire qui authentifie devant le port
+    (authentification HTTP, mTLS, oauth2-proxy) — ou par l'isolement réseau.
+    Restreindre la publication d'abord : réinstaller le runner sans
+    « --host 0.0.0.0 » (« docker model reinstall-runner » le republie sur
+    127.0.0.1 et la passerelle du pont), publier « -p 127.0.0.1:12434:12434 »
+    plutôt que « -p 12434:12434 » quand on lance l'image à la main, et ne pas
+    exposer l'accès TCP côté hôte de Docker Desktop au-delà de la boucle
+    locale. Un pare-feu d'hôte ne suffit pas toujours : les ports publiés par
+    Docker contournent les règles UFW de la chaîne INPUT.
+    Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hote>:12434/engines/v1/models » ne doit plus répondre. Après une
+    exposition, comparer « docker model ls » à ce qui a été tiré volontairement.
+  reference:
+    - https://docs.docker.com/ai/model-runner/api-reference/
+    - https://github.com/docker/model-runner
+    - https://github.com/docker/model-runner/blob/main/pkg/inference/models/api.go
+    - https://github.com/docker/model-runner/blob/main/pkg/inference/models/http_handler.go
+    - https://github.com/docker/model-runner/blob/main/pkg/inference/api.go
+    - https://github.com/docker/model-runner/blob/main/pkg/server/server.go
+    - https://github.com/docker/model-runner/blob/main/cmd/cli/pkg/standalone/containers.go
+  metadata:
+    max-request: 1
+    vendor: docker
+    product: model-runner
+  tags: ai,ml,llm,docker,model-runner,dmr,openai,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, sous le préfixe /engines que DMR est seul à servir.
+  # L'alias /v1/models rend le même corps, mais c'est la route que lisent déjà
+  # vLLM, LMDeploy, MLC LLM et les autres templates du pack ; /engines/v1/models
+  # est celle que la référence d'API documente, et elle ne nomme que DMR.
+  #
+  # GET / (« Docker Model Runner is running ») et GET /version ne sont pas lus :
+  # le premier n'est enregistré que par le binaire autonome, dans les
+  # ExtraRoutes de pkg/server/server.go, et le second rend un
+  # {"version":...} que n'importe quel service écrit.
+  #
+  # En lecture seule, et strictement. POST /engines/v1/chat/completions ferait
+  # tourner un modèle sur la machine de l'exploitant, POST /models/create
+  # tirerait un modèle depuis un registre, DELETE /models/... en supprimerait
+  # un : c'est l'abus que le constat signale, pas ce qu'un scanner a le droit
+  # de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/engines/v1/models"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture, tenu sur l'ordre de déclaration des deux
+      # structures Go : « object » puis « data » pour la liste, puis « id »,
+      # « object », « created », « owned_by » pour la première entrée. Le
+      # littéral « docker » de ToOpenAI est le discriminant — la forme
+      # {"object":"list","data":[...]} est celle de tout serveur compatible
+      # OpenAI. Exigé sur la première entrée, et suivi d'une virgule ou d'une
+      # accolade : un propriétaire « docker-hub » n'est pas la constante, et un
+      # agrégateur qui placerait l'entrée derrière celle d'un autre serveur
+      # n'est pas le handler. Les \s* laissent passer l'intermédiaire qui
+      # réindente ce qu'encoding/json écrit compact.
+      #
+      # Une instance sans modèle rend {"object":"list","data":[]} : rien n'y
+      # nomme DMR, et le template se tait — limite assumée du constat.
+      #
+      # Pas de matcher de statut : le corps seul dit le produit.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"object"\s*:\s*"list"\s*,\s*"data"\s*:\s*\[\s*\{\s*"id"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"object"\s*:\s*"model"\s*,\s*"created"\s*:\s*-?\d+\s*,\s*"owned_by"\s*:\s*"docker"\s*[,}]'
+
+    extractors:
+      # Les modèles en place — la première étiquette de chacun, normalisée
+      # avec son registre (« docker.io/ai/smollm2:135M-Q4_0 » sur l'instance
+      # relevée) —, c'est-à-dire ce qu'un tiers peut faire tourner.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'

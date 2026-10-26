@@ -44419,3 +44419,329 @@ def test_chatterbox_matcher_compiles_and_fires_against_a_live_server():
     _, results = scan(CHATTERBOX_BEHIND_CAPTIVE_PORTAL,
                       content_types={CHATTERBOX_INITIAL_DATA_ROUTE: "text/html"})
     assert results == [], f"le scan conclut sur un portail captif — {results}"
+
+
+# --------------------------------------------------------------------------
+# Docker Model Runner — docker/model-runner, le moteur d'inférence de Docker
+# Desktop et de Docker Engine (conteneur « docker-model-runner », binaire
+# « dmr »). Une seule route porte le constat : GET /engines/v1/models, dont le
+# handler encode « ToOpenAIList(available) » avec encoding/json, donc dans
+# l'ordre de déclaration des structures de pkg/inference/models/api.go —
+# « object », « data » pour la liste, « id », « object », « created »,
+# « owned_by », « dmr » pour chaque entrée — et dont ToOpenAI fixe en dur
+# « Object: "model" » et « OwnedBy: "docker" ». Aucune vérification de clé
+# (« DMR ignores the Authorization header ») ; l'écoute est sur « ":" +
+# tcpPort » dès que MODEL_RUNNER_PORT est défini. Le corps ci-dessous a été
+# relevé tel quel sur docker/model-runner:latest (v1.2.9) le 2026-10-26, après
+# un POST /models/create de « ai/smollm2:135M-Q4_0 » sur l'instance locale :
+# l'identifiant revient normalisé avec son registre, et « dmr » porte
+# architecture, parameters, quantization et size — « context_window » est omis
+# quand la configuration du modèle ne le donne pas. Le même corps sort sur
+# /engines/llama.cpp/v1/models et, par l'alias /v1/, sur /v1/models : c'est la
+# route que lisent les templates frères, qui doivent donc s'y taire.
+
+DMR_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "docker-model-runner-exposed.yaml")
+
+DMR_MODELS_ROUTE = "/engines/v1/models"
+
+DMR_MODEL_ID = "docker.io/ai/smollm2:135M-Q4_0"
+
+# Relevé sur l'instance réelle, octet pour octet (Encode ajoute le saut de
+# ligne final).
+DMR_OPEN_BODY = (
+    '{"object":"list","data":[{"id":"docker.io/ai/smollm2:135M-Q4_0",'
+    '"object":"model","created":1745572126,"owned_by":"docker",'
+    '"dmr":{"architecture":"llama","parameters":"134.52 M",'
+    '"quantization":"Q4_0","size":"85.77 MiB"}}]}\n'
+)
+
+
+def dmr_model_entry(model_id, created=1745572126, owned_by="docker",
+                    dmr=None, openai_order=True):
+    """
+    Une entrée telle qu'encoding/json sérialise OpenAIModel : id, object,
+    created, owned_by, puis dmr s'il n'est pas nil. `openai_order=False`
+    écrit l'ordre de ModelResponse de MLC (created avant object), que DMR ne
+    rend jamais.
+    """
+    if openai_order:
+        entry = {"id": model_id, "object": "model", "created": created,
+                 "owned_by": owned_by}
+    else:
+        entry = {"id": model_id, "created": created, "object": "model",
+                 "owned_by": owned_by}
+    if dmr is not None:
+        entry["dmr"] = dmr
+    return entry
+
+
+def dmr_models_body(entries, indent=None):
+    payload = {"object": "list", "data": list(entries)}
+    if indent is not None:
+        return json.dumps(payload, indent=indent)
+    return json.dumps(payload, separators=(",", ":")) + "\n"
+
+
+# Deux modèles, le second sans configuration lisible (dmr omis) et avec
+# context_window quand il est connu.
+DMR_TWO_MODELS_BODY = dmr_models_body([
+    dmr_model_entry("docker.io/ai/gemma3:4B-Q4_K_M",
+                    dmr={"context_window": 131072, "architecture": "gemma3",
+                         "parameters": "3.88 B", "quantization": "Q4_K_M",
+                         "size": "2.31 GiB"}),
+    dmr_model_entry("hf.co/bartowski/qwen2.5-0.5b-instruct-gguf"),
+])
+
+# Une entrée sans métadonnées : owned_by est alors le dernier champ.
+DMR_NO_METADATA_BODY = dmr_models_body([dmr_model_entry(DMR_MODEL_ID)])
+
+# Un modèle sans date de création : ToOpenAI écrit alors created à 0.
+DMR_CREATED_ZERO_BODY = dmr_models_body([dmr_model_entry(DMR_MODEL_ID, created=0)])
+
+# L'instance sans modèle, relevée elle aussi : rien n'y nomme DMR.
+DMR_EMPTY_BODY = '{"object":"list","data":[]}\n'
+
+# Les autres réponses du même serveur, que le template ne lit pas.
+DMR_ROOT_BODY = "Docker Model Runner is running"
+DMR_VERSION_BODY = '{"version":"v1.2.9"}\n'
+DMR_NOT_FOUND_BODY = "404 page not found\n"
+
+# Des documents qui ressemblent sans être le handler.
+DMR_OTHER_OWNER_BODY = dmr_models_body(
+    [dmr_model_entry(DMR_MODEL_ID, owned_by="docker-hub")])
+DMR_UPPER_OWNER_BODY = dmr_models_body(
+    [dmr_model_entry(DMR_MODEL_ID, owned_by="Docker")])
+DMR_MLC_ORDER_BODY = dmr_models_body(
+    [dmr_model_entry(DMR_MODEL_ID, openai_order=False)])
+DMR_NOT_FIRST_BODY = dmr_models_body([
+    json.loads(OTHER_OPENAI_API_BODY)["data"][0],
+    dmr_model_entry(DMR_MODEL_ID),
+])
+DMR_COMPOSITE_BODY = '{"probe":"dmr","upstream":%s}' % DMR_OPEN_BODY.strip()
+DMR_DOC_PAGE_BODY = "<html><body><pre>%s</pre></body></html>" % DMR_OPEN_BODY
+
+
+def dmr_block():
+    doc = load(DMR_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % DMR_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — c'est la seule route que DMR "
+        "est seul à servir et dont le corps le nomme" % DMR_MODELS_ROUTE
+    )
+    return blocks[0]
+
+
+def dmr_fires(status=200, body=DMR_OPEN_BODY, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête."""
+    block = dmr_block()
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        kind = matcher.get("type")
+        if kind == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, " ".join(headers.values())))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_dmr_probe_is_a_single_read_only_get_under_engines():
+    """
+    Le même serveur nu sert POST /engines/v1/chat/completions, qui ferait
+    tourner un modèle sur la machine de l'exploitant, POST /models/create, qui
+    tirerait un modèle arbitraire depuis un registre OCI, et DELETE
+    /models/{nom} ou /models/purge, qui supprimeraient ses modèles : c'est
+    l'abus que le constat signale, pas ce qu'un scanner a le droit de faire.
+    """
+    doc = load(DMR_TEMPLATE)
+    assert request_routes(doc) == {("GET", DMR_MODELS_ROUTE)}, (
+        "le template interroge autre chose que GET /engines/v1/models — "
+        f"{sorted(request_routes(doc))}"
+    )
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET"
+        assert not block.get("body") and not block.get("raw"), (
+            "rien de ce que le template établit ne demande d'écrire sur "
+            "l'instance auditée"
+        )
+        for path in (block.get("path") or []):
+            for forbidden in ("/chat/completions", "/completions", "/embeddings",
+                              "/models/create", "/models/load", "/purge",
+                              "/version"):
+                assert forbidden not in path, path
+            assert path.replace("{{BaseURL}}", "") not in ("", "/"), (
+                "GET / n'est enregistré que par le binaire autonome, et son "
+                "texte ne dit rien des routes de modèles"
+            )
+
+
+def test_dmr_matcher_fires_on_the_body_captured_from_a_real_instance():
+    assert dmr_fires(), (
+        "le template ne reconnaît pas le corps relevé sur "
+        "docker/model-runner:latest"
+    )
+    assert dmr_fires(status=203), "le constat ne doit pas dépendre du statut"
+
+    for body, why in (
+        (DMR_OPEN_BODY.strip(), "le corps sans le saut de ligne final"),
+        (DMR_TWO_MODELS_BODY, "deux modèles, dont un avec context_window"),
+        (DMR_NO_METADATA_BODY, "une entrée sans objet dmr"),
+        (DMR_CREATED_ZERO_BODY, "un modèle sans date de création"),
+        (dmr_models_body([dmr_model_entry(DMR_MODEL_ID)], indent=2),
+         "un intermédiaire qui réindente le JSON"),
+        (dmr_models_body([dmr_model_entry(DMR_MODEL_ID)], indent=2)
+         .replace("\n", "\r\n"), "un relais qui sert le corps en CRLF"),
+    ):
+        assert dmr_fires(body=body), "le template perd %s" % why
+
+
+def test_dmr_matcher_needs_the_docker_owner_not_the_generic_shape():
+    """
+    {"object":"list","data":[...]} est la forme de tout serveur compatible
+    OpenAI ; « "owned_by":"docker" » sur la première entrée, dans l'ordre
+    d'encoding/json, est ce que seul ToOpenAI rend.
+    """
+    for body, why in (
+        (VLLM_MODELS_BODY, "vLLM"),
+        (LMDEPLOY_OPEN_BODY, "LMDeploy"),
+        (TRTLLM_OPEN_BODY, "TensorRT-LLM"),
+        (LLAMASWAP_MODELS_BODY, "llama-swap"),
+        (MISTRALRS_OPEN_BODY, "mistral.rs"),
+        (MLC_OPEN_BODY, "MLC LLM"),
+        (KOKORO_MODELS_BODY, "Kokoro-FastAPI"),
+        (SPEACHES_MODELS_BODY, "Speaches"),
+        (KSERVE_MODELS_BODY, "KServe"),
+        (OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (DMR_EMPTY_BODY, "une instance sans modèle — limite assumée"),
+        (DMR_ROOT_BODY, "le texte de GET /"),
+        (DMR_VERSION_BODY, "le corps de GET /version"),
+        (DMR_NOT_FOUND_BODY, "le 404 de net/http"),
+        (DMR_OTHER_OWNER_BODY, "un propriétaire qui commence par le littéral"),
+        (DMR_UPPER_OWNER_BODY, "une casse que ToOpenAI n'écrit pas"),
+        (DMR_MLC_ORDER_BODY, "created avant object : pas encoding/json sur "
+                             "OpenAIModel"),
+        (DMR_NOT_FIRST_BODY, "l'entrée derrière celle d'un autre serveur"),
+        (DMR_COMPOSITE_BODY, "une supervision qui republie la réponse"),
+        (DMR_DOC_PAGE_BODY, "une page de documentation qui cite la réponse"),
+        ("", "une réponse vide"),
+    ):
+        assert not dmr_fires(body=body), "le template conclut sur %s" % why
+
+    assert not dmr_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+    block = dmr_block()
+    assert block.get("matchers-condition") == "and"
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}
+
+
+def test_dmr_siblings_on_v1_models_stay_silent_on_the_dmr_body():
+    """
+    L'alias /v1/ de DMR sert le même corps sur /v1/models, la route que lisent
+    les templates frères : chacun doit s'y taire, sans quoi une instance DMR
+    remonterait sous un autre nom.
+    """
+    vllm_block = [b for b in (load(VLLM_TEMPLATE).get("http") or [])
+                  if "{{BaseURL}}/v1/models" in (b.get("path") or [])][0]
+    vllm_body_matchers = [m for m in (vllm_block.get("matchers") or [])
+                          if m.get("type") == "word" and m.get("part") == "body"]
+    for body in (DMR_OPEN_BODY, DMR_TWO_MODELS_BODY):
+        assert not all(word_matcher_hits(m, body) for m in vllm_body_matchers), "vLLM"
+        assert not lmdeploy_fires(body=body), "LMDeploy"
+        assert not trtllm_fires(body=body), "TensorRT-LLM"
+        assert not llamaswap_fires(body), "llama-swap"
+        assert not mistralrs_fires(body=body), "mistral.rs"
+        assert not mlc_fires(body=body), "MLC LLM"
+        assert not kokoro_fires(body=body), "Kokoro"
+        assert not speaches_fires(body=body), "Speaches"
+
+
+def test_dmr_extractor_reports_the_models_in_place():
+    extractors = dmr_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("json") == [".data[].id"], extractors[0]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_dmr_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas la regex : seul un scan ferme la boucle,
+    sur le corps relevé, sur l'instance vide et sur les produits voisins.
+    """
+    def scan(body=DMR_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in (DMR_MODELS_ROUTE, "/v1/models"):
+                    self.reply(200, body, content_type)
+                elif self.path == "/":
+                    self.reply(200, DMR_ROOT_BODY, "text/plain; charset=utf-8")
+                else:
+                    self.reply(404, DMR_NOT_FOUND_BODY, "text/plain; charset=utf-8")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", DMR_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "docker-model-runner-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [DMR_MODELS_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [DMR_MODEL_ID], results
+
+    _, results = scan(body=DMR_TWO_MODELS_BODY)
+    assert len(results) == 1 and sorted(results[0].get("extracted-results") or []) == sorted([
+        "docker.io/ai/gemma3:4B-Q4_K_M",
+        "hf.co/bartowski/qwen2.5-0.5b-instruct-gguf"]), results
+
+    for body, why in (
+        (DMR_EMPTY_BODY, "une instance sans modèle"),
+        (MLC_OPEN_BODY, "MLC LLM"),
+        (VLLM_MODELS_BODY, "vLLM"),
+        (DMR_OTHER_OWNER_BODY, "un propriétaire qui commence par le littéral"),
+        (DMR_COMPOSITE_BODY, "une supervision qui republie la réponse"),
+    ):
+        _, results = scan(body=body)
+        assert results == [], f"le scan conclut sur {why} — {results}"
