@@ -1,0 +1,116 @@
+id: vllm-production-stack-router-exposed
+
+info:
+  name: vLLM Production Stack Router - Unauthenticated Engine Inventory and Inference Proxy Exposed
+  author: popy21
+  severity: high
+  description: |
+    vLLM Production Stack (vllm-project/production-stack) est le système de
+    référence de vLLM pour un déploiement à l'échelle d'un cluster Kubernetes.
+    Sa pièce frontale, le routeur « vllm-router », est un serveur FastAPI
+    compatible OpenAI placé devant un parc de moteurs vLLM : il découvre les
+    moteurs (liste statique, Kubernetes) et répartit sur eux les requêtes
+    d'inférence. C'est un produit distinct de vLLM, que couvre déjà
+    vllm-unauthenticated-api.
+    La route qui porte le constat est « GET /engines », déclarée dans
+    src/vllm_router/routers/main_router.py. Son handler construit pour chaque
+    moteur découvert une carte aux trois clés littérales « "engine_id":
+    endpoint.Id », « "serving_models": endpoint.model_names », « "created":
+    endpoint.added_timestamp », puis rend « JSONResponse(content=engines_cards) »
+    — un tableau nu, sérialisé compact dans l'ordre d'insertion du dict.
+    L'identifiant vient toujours d'un uuid4 (découverte statique) ou d'un uuid5
+    (découverte Kubernetes) de service_discovery.py : la forme canonique d'un
+    UUID en minuscules. Aucun autre serveur du pack n'écrit ce trio.
+    L'absence d'authentification n'est pas un réglage manqué mais une
+    fonctionnalité absente du produit. main_router.py ne déclare aucun
+    « Depends(...) » ni vérification de clé, src/vllm_router/app.py crée
+    « app = FastAPI(lifespan=lifespan) » sans aucun « add_middleware » et y
+    inclut main_router, files_router, batches_router et metrics_router tels
+    quels, et src/vllm_router/parsers/parser.py ne connaît aucun argument de clé
+    d'API. Ce même parseur donne à « --host » la valeur par défaut « 0.0.0.0 »
+    et à « --port » « 8001 » : le routeur écoute sur toutes les interfaces sans
+    qu'aucun drapeau ne soit passé.
+  impact: |
+    POST /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/responses
+    et /v1/messages sont relayés vers tout le parc GPU pour un appelant
+    anonyme : de l'inférence gratuite sur les modèles listés, sans compte à
+    débiter ni limite de débit. POST /sleep et /wake_up mettent en veille ou
+    réveillent les moteurs — choisis un à un par « ?id=<engine_id> », que la
+    réponse lue ici donne — et le routeur y ajoute lui-même
+    « Authorization: Bearer $VLLM_API_KEY » quand cette variable est définie :
+    une clé posée sur les moteurs ne protège pas de ce chemin, le routeur
+    s'authentifie à la place de l'appelant. /v1/files et /v1/batches sont
+    servis par le même routeur non protégé. GET /engines nomme chaque moteur et
+    les modèles qu'il sert.
+  remediation: |
+    Il n'y a rien à activer dans le routeur : il n'a ni clé d'API ni jeton. Le
+    contrôle d'accès se pose devant lui — une ingress ou un intermédiaire qui
+    authentifie (oauth2-proxy, authentification HTTP, mTLS) — ou par
+    l'isolement réseau : un Service de type ClusterIP plutôt que LoadBalancer
+    ou NodePort, et une NetworkPolicy qui n'admet que les clients prévus. Hors
+    Kubernetes, lancer le routeur avec « --host 127.0.0.1 » plutôt que de
+    laisser la valeur par défaut « 0.0.0.0 ».
+    Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hote>:8001/engines » ne doit plus répondre.
+  reference:
+    - https://github.com/vllm-project/production-stack
+    - https://github.com/vllm-project/production-stack/blob/main/src/vllm_router/routers/main_router.py
+    - https://github.com/vllm-project/production-stack/blob/main/src/vllm_router/app.py
+    - https://github.com/vllm-project/production-stack/blob/main/src/vllm_router/parsers/parser.py
+    - https://github.com/vllm-project/production-stack/blob/main/src/vllm_router/service_discovery.py
+    - https://github.com/vllm-project/production-stack/blob/main/src/vllm_router/services/request_service/request.py
+  metadata:
+    max-request: 1
+    vendor: vllm-project
+    product: production-stack
+  tags: ai,ml,llm,vllm,production-stack,vllm-router,kubernetes,openai,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /engines, que le routeur est seul à servir.
+  # GET /v1/models rend la forme OpenAI générique — {"object":"list",...} avec
+  # owned_by « vllm », sans max_model_len — que lit déjà le template vLLM ;
+  # GET /health rend {"status":"healthy"}, que n'importe quel service écrit,
+  # et GET /version un {"version":...} tout aussi anonyme.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions ferait tourner
+  # un modèle sur le parc de l'exploitant, POST /sleep mettrait un moteur en
+  # veille : c'est l'abus que le constat signale, pas ce qu'un scanner a le
+  # droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/engines"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'ancrage d'ouverture, tenu sur l'ordre d'insertion de engine_card :
+      # « engine_id » (un UUID canonique en minuscules, ce que str(uuid.uuid4())
+      # et str(uuid.uuid5(...)) écrivent), « serving_models » (un tableau de
+      # chaînes, vide admis), puis « created » (un horodatage numérique).
+      # Exigé sur la première carte, et suivi d'une virgule ou d'une accolade :
+      # un agrégateur qui placerait la carte derrière autre chose n'est pas le
+      # handler. Les \s* laissent passer l'intermédiaire qui réindente ce que
+      # JSONResponse écrit compact.
+      #
+      # Un routeur sans moteur découvert (« --service-discovery external-only »,
+      # ou parc vide) rend [] : rien n'y nomme le produit, et le template se
+      # tait — limite assumée du constat.
+      #
+      # Pas de matcher de statut : le corps seul dit le produit.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\[\s*\{\s*"engine_id"\s*:\s*"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"\s*,\s*"serving_models"\s*:\s*\[\s*(?:"(?:[^"\\]|\\.)*"\s*(?:,\s*"(?:[^"\\]|\\.)*"\s*)*)?\]\s*,\s*"created"\s*:\s*-?\d+(?:\.\d+)?\s*[,}]'
+
+    extractors:
+      # Les modèles servis par le parc, moteur par moteur — ce qu'un tiers peut
+      # faire tourner à travers le routeur.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.[].serving_models[]'

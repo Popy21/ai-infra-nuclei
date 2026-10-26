@@ -44745,3 +44745,287 @@ def test_dmr_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# vLLM Production Stack — vllm-project/production-stack, le routeur
+# « vllm-router » compatible OpenAI placé devant un parc de moteurs vLLM.
+# Une seule route porte le constat : GET /engines, dont le handler de
+# src/vllm_router/routers/main_router.py construit pour chaque moteur la carte
+# {"engine_id": endpoint.Id, "serving_models": endpoint.model_names,
+# "created": endpoint.added_timestamp} et rend
+# « JSONResponse(content=engines_cards) » — un tableau nu, compact, dans
+# l'ordre d'insertion du dict. L'identifiant est un str(uuid.uuid4()) en
+# découverte statique, un str(uuid.uuid5(...)) en découverte Kubernetes.
+# Aucun Depends ni middleware (app.py : « FastAPI(lifespan=lifespan) » sans
+# add_middleware), aucun argument de clé dans parser.py, et « --host » vaut
+# « 0.0.0.0 » par défaut. Les corps ci-dessous ont été relevés tels quels le
+# 2026-10-26 sur le routeur installé depuis le dépôt au commit cd5c5fc
+# (version « 0.1.14.dev20+gcd5c5fc2e »), lancé en
+# « --service-discovery static » devant deux moteurs factices.
+
+PSTACK_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "vllm-production-stack-router-exposed.yaml")
+
+PSTACK_ENGINES_ROUTE = "/engines"
+
+PSTACK_MODELS = ["meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct"]
+
+# Relevé sur l'instance réelle, octet pour octet.
+PSTACK_OPEN_BODY = (
+    '[{"engine_id":"60538059-89bb-42fb-928b-64c10b5816b4",'
+    '"serving_models":["meta-llama/Llama-3.1-8B-Instruct"],'
+    '"created":1793002113},'
+    '{"engine_id":"7dcc630a-84de-4926-90dd-5b04ffe7e72f",'
+    '"serving_models":["Qwen/Qwen2.5-7B-Instruct"],"created":1793002113}]'
+)
+
+# Les autres réponses du même routeur, relevées elles aussi, que le template
+# ne lit pas : /v1/models a la forme OpenAI générique (owned_by « vllm », sans
+# max_model_len), /health et /version sont anonymes.
+PSTACK_V1_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"meta-llama/Llama-3.1-8B-Instruct",'
+    '"object":"model","created":1793002114,"owned_by":"vllm","root":null,'
+    '"parent":null},{"id":"Qwen/Qwen2.5-7B-Instruct","object":"model",'
+    '"created":1793002114,"owned_by":"vllm","root":null,"parent":null}]}'
+)
+PSTACK_HEALTH_BODY = '{"status":"healthy"}'
+PSTACK_VERSION_BODY = '{"version":"0.1.14.dev20+gcd5c5fc2e"}'
+PSTACK_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Un routeur sans moteur découvert (external-only, ou parc vide).
+PSTACK_EMPTY_BODY = "[]"
+
+
+def pstack_card(engine_id="60538059-89bb-42fb-928b-64c10b5816b4",
+                models=("meta-llama/Llama-3.1-8B-Instruct",),
+                created=1793002113, order=("engine_id", "serving_models", "created")):
+    values = {"engine_id": engine_id, "serving_models": list(models),
+              "created": created}
+    return {key: values[key] for key in order}
+
+
+def pstack_body(cards, indent=None):
+    if indent is not None:
+        return json.dumps(list(cards), indent=indent)
+    return json.dumps(list(cards), separators=(",", ":"))
+
+
+# Un moteur Kubernetes : uuid5 sur le nom, plusieurs modèles (adaptateurs LoRA).
+PSTACK_K8S_BODY = pstack_body([pstack_card(
+    engine_id=str(uuid.uuid5(uuid.NAMESPACE_DNS, "vllm-llama3-deployment-vllm-0")),
+    models=("meta-llama/Llama-3.1-8B-Instruct", "sql-lora"))])
+# Un moteur dont la liste de modèles n'est pas encore connue.
+PSTACK_NO_MODEL_BODY = pstack_body([pstack_card(models=())])
+
+# Des documents qui ressemblent sans être le handler.
+PSTACK_REORDERED_BODY = pstack_body([pstack_card(
+    order=("serving_models", "engine_id", "created"))])
+PSTACK_NON_UUID_BODY = pstack_body([pstack_card(engine_id="engine-0")])
+PSTACK_UPPER_UUID_BODY = pstack_body([pstack_card(
+    engine_id="60538059-89BB-42FB-928B-64C10B5816B4")])
+PSTACK_STRING_MODELS_BODY = (
+    '[{"engine_id":"60538059-89bb-42fb-928b-64c10b5816b4",'
+    '"serving_models":"meta-llama/Llama-3.1-8B-Instruct","created":1793002113}]'
+)
+PSTACK_STRING_CREATED_BODY = pstack_body([pstack_card(
+    created="2026-10-26T08:08:33Z")])
+PSTACK_WRAPPED_BODY = '{"engines":%s}' % PSTACK_OPEN_BODY
+PSTACK_NOT_FIRST_BODY = '[{"name":"autre"},%s' % PSTACK_OPEN_BODY[1:]
+PSTACK_DOC_PAGE_BODY = "<html><body><pre>%s</pre></body></html>" % PSTACK_OPEN_BODY
+
+
+def pstack_block():
+    doc = load(PSTACK_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % PSTACK_ENGINES_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /engines — c'est la seule route que "
+        "le routeur est seul à servir et dont le corps le nomme"
+    )
+    return blocks[0]
+
+
+def pstack_fires(status=200, body=PSTACK_OPEN_BODY, headers=None):
+    """Sémantique nuclei d'un bloc à une seule requête."""
+    block = pstack_block()
+    headers = headers if headers is not None else {"Content-Type": "application/json"}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, " ".join(headers.values())))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_pstack_probe_is_a_single_read_only_get_on_engines():
+    """
+    Le même routeur nu relaie POST /v1/chat/completions vers tout le parc GPU
+    et met les moteurs en veille sur POST /sleep : c'est l'abus que le constat
+    signale, pas ce qu'un scanner a le droit de faire.
+    """
+    doc = load(PSTACK_TEMPLATE)
+    assert request_routes(doc) == {("GET", PSTACK_ENGINES_ROUTE)}, (
+        f"le template interroge autre chose que GET /engines — "
+        f"{sorted(request_routes(doc))}"
+    )
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET"
+        assert not block.get("body") and not block.get("raw")
+    meta = (doc.get("info") or {}).get("metadata") or {}
+    assert meta.get("product") == "production-stack", (
+        "le routeur est un produit distinct de vLLM, déjà couvert"
+    )
+    assert (doc.get("info") or {}).get("severity") == "high"
+
+
+def test_pstack_matcher_fires_on_the_body_captured_from_a_real_router():
+    assert pstack_fires(), "le template ne reconnaît pas le corps relevé"
+    assert pstack_fires(status=203), "le constat ne doit pas dépendre du statut"
+
+    for body, why in (
+        (PSTACK_K8S_BODY, "un moteur Kubernetes à identifiant uuid5"),
+        (PSTACK_NO_MODEL_BODY, "un moteur sans modèle connu"),
+        (pstack_body([pstack_card(created=1793002113.25)]),
+         "un horodatage flottant"),
+        (pstack_body(json.loads(PSTACK_OPEN_BODY), indent=2),
+         "un intermédiaire qui réindente le JSON"),
+        (pstack_body(json.loads(PSTACK_OPEN_BODY), indent=2)
+         .replace("\n", "\r\n"), "un relais qui sert le corps en CRLF"),
+        (json.dumps(json.loads(PSTACK_OPEN_BODY)), "les séparateurs de json.dumps"),
+    ):
+        assert pstack_fires(body=body), "le template perd %s" % why
+
+
+def test_pstack_matcher_needs_the_engine_card_not_a_generic_shape():
+    for body, why in (
+        (PSTACK_V1_MODELS_BODY, "le /v1/models du routeur, forme OpenAI générique"),
+        (PSTACK_HEALTH_BODY, "le corps de /health, générique"),
+        (PSTACK_VERSION_BODY, "le corps de /version"),
+        (PSTACK_NOT_FOUND_BODY, "le 404 de FastAPI"),
+        (PSTACK_EMPTY_BODY, "un routeur sans moteur — limite assumée"),
+        (VLLM_MODELS_BODY, "vLLM"),
+        (OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (DMR_OPEN_BODY, "Docker Model Runner"),
+        (PSTACK_REORDERED_BODY, "un ordre de clés que engine_card n'écrit pas"),
+        (PSTACK_NON_UUID_BODY, "un identifiant qui n'est pas un UUID"),
+        (PSTACK_UPPER_UUID_BODY, "une casse que str(uuid) n'écrit pas"),
+        (PSTACK_STRING_MODELS_BODY, "serving_models qui n'est pas un tableau"),
+        (PSTACK_STRING_CREATED_BODY, "created qui n'est pas un horodatage"),
+        (PSTACK_WRAPPED_BODY, "une supervision qui republie la réponse"),
+        (PSTACK_NOT_FIRST_BODY, "la carte derrière un autre objet"),
+        (PSTACK_DOC_PAGE_BODY, "une page de documentation qui cite la réponse"),
+        ("", "une réponse vide"),
+    ):
+        assert not pstack_fires(body=body), "le template conclut sur %s" % why
+
+    assert not pstack_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+    block = pstack_block()
+    assert block.get("matchers-condition") == "and"
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}
+
+
+def test_pstack_vllm_sibling_stays_silent_on_the_router_v1_models():
+    """
+    Le routeur sert aussi /v1/models, la route du template vLLM : sans
+    max_model_len, ce corps ne doit pas remonter un routeur sous le nom vLLM.
+    """
+    vllm_block = [b for b in (load(VLLM_TEMPLATE).get("http") or [])
+                  if "{{BaseURL}}/v1/models" in (b.get("path") or [])][0]
+    vllm_body_matchers = [m for m in (vllm_block.get("matchers") or [])
+                          if m.get("type") == "word" and m.get("part") == "body"]
+    assert vllm_body_matchers
+    assert not all(word_matcher_hits(m, PSTACK_V1_MODELS_BODY)
+                   for m in vllm_body_matchers)
+
+
+def test_pstack_extractor_reports_the_models_served():
+    extractors = pstack_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("json") == [".[].serving_models[]"], extractors[0]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_pstack_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas la regex : seul un scan ferme la boucle,
+    sur le corps relevé, sur le routeur vide et sur les corps voisins.
+    """
+    def scan(body=PSTACK_OPEN_BODY, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == PSTACK_ENGINES_ROUTE:
+                    self.reply(200, body, content_type)
+                elif self.path == "/v1/models":
+                    self.reply(200, PSTACK_V1_MODELS_BODY, "application/json")
+                elif self.path == "/health":
+                    self.reply(200, PSTACK_HEALTH_BODY, "application/json")
+                else:
+                    self.reply(404, PSTACK_NOT_FOUND_BODY, "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", PSTACK_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "vllm-production-stack-router-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [PSTACK_ENGINES_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert len(results) == 1, results
+    assert sorted(results[0].get("extracted-results") or []) == sorted(PSTACK_MODELS), results
+
+    _, results = scan(body=PSTACK_K8S_BODY)
+    assert len(results) == 1 and sorted(results[0].get("extracted-results") or []) == sorted([
+        "meta-llama/Llama-3.1-8B-Instruct", "sql-lora"]), results
+
+    for body, why in (
+        (PSTACK_EMPTY_BODY, "un routeur sans moteur"),
+        (PSTACK_V1_MODELS_BODY, "le /v1/models du routeur"),
+        (PSTACK_NON_UUID_BODY, "un identifiant qui n'est pas un UUID"),
+        (PSTACK_WRAPPED_BODY, "une supervision qui republie la réponse"),
+    ):
+        _, results = scan(body=body)
+        assert results == [], f"le scan conclut sur {why} — {results}"
