@@ -45311,3 +45311,268 @@ def test_kmr_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(v1=v1, alpha=None)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# Inspect AI — UKGovernmentBEIS/inspect_ai, le cadre d'évaluation de LLM de
+# l'AI Security Institute britannique. « inspect view » sert les journaux
+# d'évaluation sur le port 7575 ; GET /api/logs rend un LogListingResponse
+# (log_dir, log_dir_uri, files[] de LogHandle : name, mtime, task, task_id),
+# qu'InspectJsonResponse écrit compact dans l'ordre des champs. Sans
+# INSPECT_VIEW_AUTHORIZATION_TOKEN, aucun middleware n'authentifie l'appelant.
+# Les corps ci-dessous ont été relevés tels quels le 2026-10-27 sur inspect-ai
+# 0.3.285 (pip), « inspect view --log-dir logs » après deux évaluations
+# mockllm/model, puis sur un répertoire vide et avec un jeton.
+
+INSPECT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "inspect-ai-view-exposed.yaml")
+
+INSPECT_ROUTE = "/api/logs"
+
+INSPECT_CONTENT_TYPE = "application/json"
+
+# Relevés sur l'instance réelle, octet pour octet.
+INSPECT_OPEN_BODY = (
+    '{"log_dir":"file:///private/tmp/inspect-lab/logs",'
+    '"log_dir_uri":"file:///private/tmp/inspect-lab/logs","files":['
+    '{"name":"file:///private/tmp/inspect-lab/logs/2026-10-27T07-50-34-00-00_'
+    'private-benchmark_iwaCuXP8BEvoKdCEHRYSo7.eval","mtime":1793087438449.7983,'
+    '"task":"private-benchmark","task_id":"iwaCuXP8BEvoKdCEHRYSo7"},'
+    '{"name":"file:///private/tmp/inspect-lab/logs/2026-10-27T07-49-47-00-00_'
+    'jailbreak-probe_JWhWJ23zHpLHBJgLivsmXo.eval","mtime":1793087413552.5435,'
+    '"task":"jailbreak-probe","task_id":"JWhWJ23zHpLHBJgLivsmXo"}]}'
+)
+INSPECT_EMPTY_BODY = (
+    '{"log_dir":"file:///private/tmp/inspect-lab/empty",'
+    '"log_dir_uri":"file:///private/tmp/inspect-lab/empty","files":[]}'
+)
+INSPECT_UNAUTHORIZED_BODY = "Unauthorized"
+INSPECT_BAD_HOST_BODY = "Invalid host header"
+INSPECT_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+INSPECT_LOG_DIR_BODY = '{"log_dir":"file:///private/tmp/inspect-lab/logs"}'
+
+INSPECT_TASKS = ["private-benchmark", "jailbreak-probe"]
+
+# Les champs optionnels de LogHandle et log_dir_uri, à null : le modèle les
+# sérialise quand même.
+INSPECT_NULLS_BODY = (
+    '{"log_dir":"s3://evals/logs","log_dir_uri":null,"files":['
+    '{"name":"s3://evals/logs/run.eval","mtime":null,"task":null,'
+    '"task_id":null}]}'
+)
+
+# Des documents qui ressemblent sans être le serveur.
+# Le listing d'avant #4498 (juillet 2026) : pas de log_dir_uri.
+INSPECT_NO_URI_BODY = (
+    '{"log_dir":"file:///private/tmp/inspect-lab/logs","files":['
+    '{"name":"file:///private/tmp/inspect-lab/logs/run.eval",'
+    '"mtime":1793087438449.7983,"task":"private-benchmark",'
+    '"task_id":"iwaCuXP8BEvoKdCEHRYSo7"}]}'
+)
+INSPECT_NO_TASK_ID_BODY = (
+    '{"log_dir":"file:///private/tmp/inspect-lab/logs",'
+    '"log_dir_uri":"file:///private/tmp/inspect-lab/logs","files":['
+    '{"name":"file:///private/tmp/inspect-lab/logs/run.eval",'
+    '"mtime":1793087438449.7983,"task":"private-benchmark"}]}'
+)
+INSPECT_REORDERED_BODY = (
+    '{"files":[{"name":"run.eval","mtime":1,"task":"t","task_id":"x"}],'
+    '"log_dir":"logs","log_dir_uri":"file:///logs"}'
+)
+INSPECT_STRING_MTIME_BODY = (
+    '{"log_dir":"logs","log_dir_uri":"file:///logs","files":['
+    '{"name":"run.eval","mtime":"1793087438449","task":"t","task_id":"x"}]}'
+)
+INSPECT_EXTRA_KEY_BODY = INSPECT_OPEN_BODY[:-1] + ',"total":2}'
+INSPECT_WRAPPED_BODY = '{"viewer":%s}' % INSPECT_OPEN_BODY
+INSPECT_DOC_PAGE_BODY = "<html><body><pre>%s</pre></body></html>" % INSPECT_OPEN_BODY
+
+
+def inspect_block():
+    doc = load(INSPECT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % INSPECT_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % INSPECT_ROUTE
+    return blocks[0]
+
+
+def inspect_fires(status=200, body=INSPECT_OPEN_BODY, headers=None):
+    """Sémantique nuclei d'un bloc, appliquée à une réponse."""
+    block = inspect_block()
+    headers = headers if headers is not None else {"Content-Type": INSPECT_CONTENT_TYPE}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, " ".join(headers.values())))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_inspect_probe_is_read_only_on_the_log_listing():
+    """
+    DELETE /api/log-delete et POST /api/log-edit n'exigent que
+    X-Inspect-View-Request: true — supprimer ou réécrire un journal est l'abus
+    que le constat signale, pas ce qu'un scanner a le droit de faire.
+    """
+    doc = load(INSPECT_TEMPLATE)
+    assert request_routes(doc) == {("GET", INSPECT_ROUTE)}, (
+        f"le template interroge autre chose que /api/logs — "
+        f"{sorted(request_routes(doc))}"
+    )
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET"
+        assert not block.get("body") and not block.get("raw")
+        assert not block.get("headers"), (
+            "aucun en-tête n'est nécessaire, et surtout pas X-Inspect-View-Request"
+        )
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "inspect-ai"
+    assert meta.get("max-request") == 1
+    assert info.get("severity") == "medium"
+
+
+def test_inspect_matcher_fires_on_the_body_captured_from_a_real_server():
+    assert inspect_fires(), "le template ne reconnaît pas le corps relevé"
+    assert inspect_fires(body=INSPECT_NULLS_BODY), (
+        "le template perd un listing dont les champs optionnels valent null"
+    )
+    assert inspect_fires(status=203), "le constat ne doit pas dépendre du statut"
+
+    for body, why in (
+        (json.dumps(json.loads(INSPECT_OPEN_BODY), indent=2),
+         "un intermédiaire qui réindente le JSON"),
+        (json.dumps(json.loads(INSPECT_OPEN_BODY), indent=2).replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+        (json.dumps(json.loads(INSPECT_OPEN_BODY)), "les séparateurs de json.dumps"),
+        (INSPECT_OPEN_BODY + "\n", "un saut de ligne final"),
+        (INSPECT_OPEN_BODY.replace('"mtime":1793087438449.7983', '"mtime":1.7e12'),
+         "un mtime en notation exponentielle"),
+        (INSPECT_OPEN_BODY.replace("private-benchmark_", 'quote\\"d_'),
+         "un nom de fichier qui échappe un guillemet"),
+    ):
+        assert inspect_fires(body=body), "le template perd %s" % why
+
+
+def test_inspect_matcher_needs_log_dir_uri_and_task_id():
+    for body, why in (
+        (INSPECT_EMPTY_BODY, "un répertoire sans journal"),
+        (INSPECT_UNAUTHORIZED_BODY, "le 401 d'un visualiseur à jeton"),
+        (INSPECT_BAD_HOST_BODY, "le 400 de HostValidationMiddleware"),
+        (INSPECT_NOT_FOUND_BODY, "le 404 de FastAPI"),
+        (INSPECT_LOG_DIR_BODY, "la réponse de /api/log-dir"),
+        (INSPECT_NO_URI_BODY, "un listing sans log_dir_uri"),
+        (INSPECT_NO_TASK_ID_BODY, "un LogHandle sans task_id"),
+        (INSPECT_REORDERED_BODY, "un ordre de clés que le modèle n'écrit pas"),
+        (INSPECT_STRING_MTIME_BODY, "un mtime qui n'est pas un nombre"),
+        (INSPECT_EXTRA_KEY_BODY, "une clé que LogListingResponse ne porte pas"),
+        (INSPECT_WRAPPED_BODY, "une supervision qui republie la réponse"),
+        (INSPECT_DOC_PAGE_BODY, "une page de documentation qui cite la réponse"),
+        (KMR_OPEN_BODY, "Kubeflow Model Registry"),
+        ("", "une réponse vide"),
+    ):
+        assert not inspect_fires(body=body), "le template conclut sur %s" % why
+
+    assert not inspect_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+    block = inspect_block()
+    assert block.get("matchers-condition") == "and"
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}
+
+
+def test_inspect_extractor_reports_the_evaluated_tasks():
+    extractors = inspect_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("json") == [".files[].task"], extractors[0]
+
+
+def test_inspect_description_keeps_the_network_hardening_nuance():
+    """
+    Depuis #4368 un bind hors boucle locale sans jeton est refusé : le template
+    doit dire ce qu'il faut avoir passé pour être exposé, et que l'en-tête des
+    routes mutantes n'est pas une authentification.
+    """
+    info = load(INSPECT_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("authorization_middleware", "OnlyDirAccessPolicy",
+                   "INSPECT_VIEW_AUTHORIZATION_TOKEN", "--unsafe-allow-unauthenticated",
+                   "--trusted-host", "log_dir_uri", "task_id", "7575"):
+        assert needle in description, needle
+    impact = info.get("impact") or ""
+    for needle in ("X-Inspect-View-Request", "/api/log-delete", "/api/log-edit"):
+        assert needle in impact, needle
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_inspect_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas la regex : seul un scan ferme la boucle,
+    sur le corps relevé et sur les réponses voisines.
+    """
+    def scan(body=INSPECT_OPEN_BODY, status=200, content_type=INSPECT_CONTENT_TYPE):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == INSPECT_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, INSPECT_NOT_FOUND_BODY, "application/json")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", INSPECT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "inspect-ai-view-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [INSPECT_ROUTE], seen
+    assert len(results) == 1, results
+    assert sorted(results[0].get("extracted-results") or []) == sorted(INSPECT_TASKS), results
+
+    for body, status, content_type, why in (
+        (INSPECT_EMPTY_BODY, 200, INSPECT_CONTENT_TYPE, "un répertoire sans journal"),
+        (INSPECT_UNAUTHORIZED_BODY, 401, "text/plain", "le 401 d'un visualiseur à jeton"),
+        (INSPECT_NO_URI_BODY, 200, INSPECT_CONTENT_TYPE, "un listing sans log_dir_uri"),
+        (INSPECT_WRAPPED_BODY, 200, INSPECT_CONTENT_TYPE, "une supervision qui republie"),
+    ):
+        _, results = scan(body=body, status=status, content_type=content_type)
+        assert results == [], f"le scan conclut sur {why} — {results}"

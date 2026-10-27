@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-134 templates, 131 produits.
+135 templates, 132 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -70,6 +70,7 @@ amont.
 | hayhooks | [`hayhooks-status-exposed`](templates/exposure/hayhooks-status-exposed.yaml) | high |
 | infinity | [`infinity-embedding-server-exposed`](templates/exposure/infinity-embedding-server-exposed.yaml) | medium |
 | infinity-db | [`infinity-db-databases-exposed`](templates/exposure/infinity-db-databases-exposed.yaml) | high |
+| inspect-ai | [`inspect-ai-view-exposed`](templates/exposure/inspect-ai-view-exposed.yaml) | medium |
 | invokeai | [`invokeai-runtime-config-exposed`](templates/exposure/invokeai-runtime-config-exposed.yaml) | high |
 | jupyter_server | [`jupyter-no-token`](templates/exposure/jupyter-no-token.yaml) | critical |
 | kedro-viz | [`kedro-viz-exposed`](templates/exposure/kedro-viz-exposed.yaml) | medium |

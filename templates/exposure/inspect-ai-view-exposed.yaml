@@ -1,0 +1,110 @@
+id: inspect-ai-view-exposed
+
+info:
+  name: Inspect AI Log Viewer - Unauthenticated Evaluation Log Listing
+  author: popy21
+  severity: medium
+  description: |
+    Inspect AI (UKGovernmentBEIS/inspect_ai, « A framework for large language
+    model evaluations » de l'AI Security Institute britannique) range chaque
+    évaluation dans un journal : prompts, sorties du modèle, scores, échantillons
+    du jeu de test. « inspect view » sert ces journaux sur le port 7575, dans une
+    SPA FastAPI dont l'API est montée sous « /api » (fastapi_server.py,
+    api_mount = "/api").
+    La route qui porte le constat est « GET /api/logs ». Elle rend un
+    LogListingResponse (src/inspect_ai/_view/common.py) : « log_dir », « log_dir_uri »
+    — l'URI canonique du répertoire de journaux — et « files », une liste de
+    LogHandle dont chacun porte « name », « mtime », « task » et « task_id ».
+    InspectJsonResponse l'écrit compact, dans l'ordre des champs du modèle. Le
+    couple « log_dir_uri » et « task_id » est propre au produit : c'est sur lui
+    que porte le constat, pas sur le titre « Inspect View » de la SPA.
+    L'authentification est une option, pas un défaut : view() déclare
+    « authorization: str | None = None » (« Validate requests by checking for
+    this authorization header »), que la CLI lit dans
+    INSPECT_VIEW_AUTHORIZATION_TOKEN, et standalone_view_app n'ajoute
+    authorization_middleware(...) que lorsqu'elle est définie. Sans elle,
+    OnlyDirAccessPolicy(log_dir) borne les chemins au répertoire de journaux mais
+    n'authentifie personne. L'hôte par défaut est 127.0.0.1. Depuis le
+    durcissement de juillet 2026 (network.py, « harden standalone network
+    trust », #4368), un bind hors boucle locale sans jeton est refusé à moins
+    de passer « --unsafe-allow-unauthenticated », et « --host 0.0.0.0 » exige en
+    plus « --trusted-host » ou « --trusted-origin » : HostValidationMiddleware
+    rend « 400 Invalid host header » à toute autorité non déclarée. Une instance
+    qui répond ici a donc été exposée sciemment, ou sert le port publié d'un
+    conteneur lancé avec ces options. Les champs relevés sont ceux d'inspect-ai
+    0.3.285 ; log_dir_uri est apparu en juillet 2026 (#4498).
+  impact: |
+    Un appelant anonyme liste les évaluations du répertoire et télécharge chaque
+    journal entier par GET /api/logs/{log}, /api/log-bytes/{log} ou
+    /api/log-download/{log} : prompts, réponses du modèle évalué, scores et
+    échantillons de jeux de test privés. Les routes mutantes DELETE
+    /api/log-delete/{log} et POST /api/log-edit/{log} n'exigent que l'en-tête
+    « X-Inspect-View-Request: true », une protection CSRF et non une
+    authentification : le même appelant supprime ou réécrit les journaux, donc
+    les résultats d'évaluation qu'ils établissent.
+  remediation: |
+    Définir INSPECT_VIEW_AUTHORIZATION_TOKEN et ne servir le visualiseur que
+    derrière un proxy qui authentifie et pose l'en-tête Authorization
+    correspondant, ou le laisser sur 127.0.0.1 et y accéder par un tunnel SSH.
+    Ne pas lancer « inspect view » avec « --unsafe-allow-unauthenticated » sur
+    une interface joignable, et ne pas publier le port 7575 d'un conteneur qui
+    l'utilise. Après une exposition, comparer les journaux à une copie de
+    confiance : ils se suppriment et se réécrivent par une seule requête.
+    Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hote>:7575/api/logs » doit rendre 401.
+  reference:
+    - https://github.com/UKGovernmentBEIS/inspect_ai
+    - https://inspect.aisi.org.uk/log-viewer.html
+    - https://github.com/UKGovernmentBEIS/inspect_ai/blob/main/src/inspect_ai/_view/common.py
+    - https://github.com/UKGovernmentBEIS/inspect_ai/blob/main/src/inspect_ai/_view/fastapi_server.py
+    - https://github.com/UKGovernmentBEIS/inspect_ai/blob/main/src/inspect_ai/_view/view.py
+    - https://github.com/UKGovernmentBEIS/inspect_ai/blob/main/src/inspect_ai/_view/network.py
+    - https://github.com/UKGovernmentBEIS/inspect_ai/pull/4368
+  metadata:
+    max-request: 1
+    vendor: ukgovernmentbeis
+    product: inspect-ai
+  tags: ai,llm,evaluation,inspect-ai,exposure,unauth,misconfig
+
+http:
+  # En lecture seule, et strictement. DELETE /api/log-delete et POST
+  # /api/log-edit ne demandent que « X-Inspect-View-Request: true » : supprimer
+  # ou réécrire un journal est l'abus que le constat signale, pas ce qu'un
+  # scanner a le droit de faire pour l'établir. Aucun paramètre : sans
+  # « log_dir », la route liste le répertoire servi.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/logs"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # LogListingResponse de la première à la dernière accolade : « log_dir »,
+      # « log_dir_uri » (une chaîne, ou null), puis « files » dont le premier
+      # LogHandle aligne « name », « mtime », « task » et « task_id » dans
+      # l'ordre des champs du modèle. Il faut au moins un journal : un
+      # répertoire vide n'a rien à livrer, et « files »: [] seul ne dit pas le
+      # produit.
+      #
+      # Ancrée aux deux bouts : une supervision qui republie la réponse ou une
+      # page de documentation qui la cite n'est pas le serveur. Les \s* laissent
+      # passer l'intermédiaire qui réindente ce que InspectJsonResponse écrit
+      # compact.
+      #
+      # Pas de matcher de statut : le corps seul dit le produit.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"log_dir"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"log_dir_uri"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,\s*"files"\s*:\s*\[\s*\{\s*"name"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"mtime"\s*:\s*(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|null)\s*,\s*"task"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,\s*"task_id"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*\}[\s\S]*\]\s*\}\s*$'
+
+    extractors:
+      # Les tâches évaluées — ce que l'exploitant mesure, et sur quoi.
+      - type: json
+        part: body
+        name: task
+        json:
+          - '.files[].task'
