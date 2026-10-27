@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-133 templates, 130 produits.
+134 templates, 131 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -112,6 +112,7 @@ amont.
 | mlflow | [`mlflow-tracking-server-unauth`](templates/exposure/mlflow-tracking-server-unauth.yaml) | critical |
 | mlrun | [`mlrun-client-spec-exposed`](templates/exposure/mlrun-client-spec-exposed.yaml) | high |
 | mlserver | [`mlserver-metadata-exposed`](templates/exposure/mlserver-metadata-exposed.yaml) | high |
+| model-registry | [`kubeflow-model-registry-exposed`](templates/exposure/kubeflow-model-registry-exposed.yaml) | high |
 | model-runner | [`docker-model-runner-exposed`](templates/exposure/docker-model-runner-exposed.yaml) | high |
 | nemo-guardrails | [`nemo-guardrails-server-exposed`](templates/exposure/nemo-guardrails-server-exposed.yaml) | high |
 | nextchat | [`nextchat-open-instance`](templates/exposure/nextchat-open-instance.yaml) | high |

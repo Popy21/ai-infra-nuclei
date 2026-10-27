@@ -1,0 +1,128 @@
+id: kubeflow-model-registry-exposed
+
+info:
+  name: Kubeflow Model Registry - Unauthenticated REST API (Registered Model Inventory)
+  author: popy21
+  severity: high
+  description: |
+    Kubeflow Model Registry (kubeflow/model-registry, renommé kubeflow/hub — « The
+    project was formerly known as Model Registry ») est le registre de modèles de
+    Kubeflow : il range les modèles enregistrés, leurs versions et les artefacts
+    qui les portent. C'est un composant distinct de Kubeflow Pipelines, que couvre
+    déjà kubeflow-pipelines-exposed.
+    La route qui porte le constat est « GET /api/model_registry/v1/registered_models »,
+    l'opération getRegisteredModels de api/openapi/model-registry-v1.yaml (« Model
+    Registry REST API », version v1). Elle rend un RegisteredModelList : « items »
+    plus l'enveloppe de pagination de BaseResourceList, dont « nextPageToken »,
+    « pageSize » et « size » sont tous trois requis. ToMap pose les quatre clés
+    dans un map que encoding/json sérialise en ordre alphabétique — l'ordre est
+    donc fixe — et une instance sans aucun modèle rend encore l'enveloppe entière
+    autour d'un tableau vide.
+    L'absence d'authentification n'est pas un réglage manqué mais une
+    fonctionnalité absente du serveur. cmd/proxy.go monte chaque route v1alpha3
+    et v1 sur un routeur chi dont les seuls middlewares sont le journal de chi,
+    les en-têtes de dépréciation de « --alpha-sunset-date », CORS et un contrôle
+    des octets nuls (internal/server/middleware/router.go) ; cmd/config.go ne
+    connaît ni identifiant, ni jeton, ni TLS côté serveur, « cors-allowed-origins »
+    étant la seule option d'accès. La spécification OpenAPI déclare pourtant un
+    securitySchemes « Bearer » (type http, scheme bearer, bearerFormat JWT) et un
+    « security: - Bearer: [] » global : c'est une déclaration documentaire, que le
+    serveur Go généré ne vérifie nulle part — aucun handler ni middleware ne lit
+    l'en-tête Authorization, et une requête qui porte un jeton inventé reçoit la
+    même réponse que celle qui n'en porte pas. Dans un Kubeflow complet, c'est la
+    passerelle Istio et oauth2-proxy de la plateforme qui filtrent, pas le
+    registre. Le README documente lui-même l'exposition : « docker run -d -p
+    <hostname>:<port>:8080 ... model-registry proxy -n 0.0.0.0 », « the `-n
+    0.0.0.0` option allows the server port to be exposed ».
+  impact: |
+    GET /api/model_registry/v1/registered_models, /model_versions,
+    /model_artifacts et /artifacts rendent à un appelant anonyme l'inventaire des
+    modèles de l'exploitant, leurs versions, leurs propriétaires et l'URI de
+    stockage de chaque artefact. L'écriture passe par le même routeur non protégé :
+    POST sur /registered_models, /registered_models/{id}/versions,
+    /model_versions/{id}/artifacts, /model_artifacts, /artifacts,
+    /serving_environments et /serving_environments/{id}/inference_services
+    inscrit de nouvelles ressources, et PATCH sur chaque ressource par
+    identifiant la modifie — un « uri » d'artefact réécrit envoie vers un autre
+    fichier tout consommateur qui déploie la version depuis le registre, et un
+    « state » passé à ARCHIVED retire un modèle de la circulation. Le routeur ne
+    déclare aucune route DELETE.
+  remediation: |
+    Il n'y a rien à activer dans le serveur : il n'a ni compte ni jeton, et le
+    schéma Bearer de la spécification n'y est pas appliqué. Le contrôle d'accès se
+    pose devant lui — la passerelle Istio et l'authentification de la plateforme
+    Kubeflow, une ingress qui authentifie (oauth2-proxy, mTLS) — ou par
+    l'isolement réseau : un Service ClusterIP plutôt que NodePort ou
+    LoadBalancer, et une NetworkPolicy qui n'admet que les clients prévus. Hors
+    Kubernetes, ne pas passer « -n 0.0.0.0 » : le serveur écoute sur localhost par
+    défaut.
+    Après une exposition, relire l'« uri » de chaque artefact de modèle plutôt que
+    de le supposer intact : il se réécrit par une seule requête.
+    Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hote>:8080/api/model_registry/v1/registered_models » ne doit plus
+    répondre.
+  reference:
+    - https://github.com/kubeflow/hub
+    - https://github.com/kubeflow/hub/blob/main/api/openapi/model-registry-v1.yaml
+    - https://github.com/kubeflow/hub/blob/main/api/openapi/model-registry.yaml
+    - https://github.com/kubeflow/hub/blob/main/internal/server/openapi/v1/api_model_registry_service.go
+    - https://github.com/kubeflow/hub/blob/main/pkg/openapi/model_registered_model_list.go
+    - https://github.com/kubeflow/hub/blob/main/cmd/proxy.go
+    - https://github.com/kubeflow/hub/blob/main/cmd/config.go
+    - https://github.com/kubeflow/hub/blob/main/internal/server/middleware/router.go
+  metadata:
+    max-request: 2
+    vendor: kubeflow
+    product: model-registry
+  tags: ai,ml,mlops,kubeflow,model-registry,exposure,unauth,misconfig
+
+http:
+  # Deux chemins, un seul constat : la même opération getRegisteredModels sous
+  # l'API v1 et sous l'API historique v1alpha3 (api/openapi/model-registry.yaml),
+  # en cours de retrait mais que les déploiements antérieurs servent seule.
+  # Les versions récentes servent les deux : stop-at-first-match pour ne pas
+  # signaler deux fois la même instance.
+  #
+  # En lecture seule, et strictement. POST et PATCH sur le même routeur
+  # inscriraient un modèle ou réécriraient l'URI d'un artefact : c'est l'abus que
+  # le constat signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+  # Aucun paramètre de requête : les défauts du serveur suffisent.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/model_registry/v1/registered_models"
+      - "{{BaseURL}}/api/model_registry/v1alpha3/registered_models"
+
+    stop-at-first-match: true
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # L'enveloppe entière, de la première à la dernière accolade : « items »
+      # en tête, puis « nextPageToken » (une chaîne, vide sur la dernière page,
+      # base64 sinon), « pageSize » et « size » (des entiers) — l'ordre
+      # alphabétique que encoding/json impose au map de ToMap, et rien après.
+      # Un tableau vide est admis : une instance sans modèle rend la même
+      # enveloppe, et le registre est alors tout aussi ouvert en écriture.
+      #
+      # Ancrée aux deux bouts : une supervision qui republie la réponse ou une
+      # page de documentation qui la cite n'est pas le serveur. Les \s* laissent
+      # passer l'intermédiaire qui réindente ce que json.Marshal écrit compact.
+      #
+      # Pas de matcher de statut : le corps seul dit le produit.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"items"\s*:\s*\[[\s\S]*\]\s*,\s*"nextPageToken"\s*:\s*"[A-Za-z0-9+/=_-]*"\s*,\s*"pageSize"\s*:\s*\d+\s*,\s*"size"\s*:\s*\d+\s*\}\s*$'
+
+    extractors:
+      # Les noms des modèles enregistrés — l'inventaire que l'exploitant tient
+      # dans son registre.
+      - type: json
+        part: body
+        name: model
+        json:
+          - '.items[].name'

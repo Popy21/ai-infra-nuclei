@@ -45029,3 +45029,285 @@ def test_pstack_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# Kubeflow Model Registry — kubeflow/model-registry, renommé kubeflow/hub, le
+# registre de modèles de Kubeflow. La route qui porte le constat est
+# GET /api/model_registry/v1/registered_models (getRegisteredModels), doublée de
+# l'API historique /api/model_registry/v1alpha3/registered_models. La réponse
+# est un RegisteredModelList dont ToMap pose « items », « nextPageToken »,
+# « pageSize » et « size » dans un map : encoding/json l'écrit en ordre
+# alphabétique, compact. cmd/proxy.go ne monte devant les routes que le journal
+# de chi, CORS et un contrôle d'octets nuls — aucun ne lit Authorization, malgré
+# le schéma Bearer que déclare la spécification. Les corps ci-dessous ont été
+# relevés tels quels le 2026-10-27 sur le serveur compilé depuis kubeflow/hub au
+# commit 613cc41 (« model-registry proxy --datastore-type embedmd
+# --embedmd-database-type postgres »), d'abord vide, puis après inscription de
+# deux modèles, d'une version et d'un artefact.
+
+KMR_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "kubeflow-model-registry-exposed.yaml")
+
+KMR_V1_ROUTE = "/api/model_registry/v1/registered_models"
+KMR_ALPHA_ROUTE = "/api/model_registry/v1alpha3/registered_models"
+
+KMR_CONTENT_TYPE = "application/json; charset=UTF-8"
+
+# Relevés sur l'instance réelle, octet pour octet.
+KMR_EMPTY_BODY = '{"items":[],"nextPageToken":"","pageSize":0,"size":0}'
+KMR_OPEN_BODY = (
+    '{"items":[{"createTimeSinceEpoch":"1793085448495","customProperties":'
+    '{"team":{"metadataType":"MetadataStringValue","string_value":"risk"}},'
+    '"description":"Scoring des transactions carte","externalId":"fd-2026",'
+    '"id":"1","lastUpdateTimeSinceEpoch":"1793085448495",'
+    '"name":"fraud-detector","owner":"ml-team@example.com","state":"LIVE"},'
+    '{"createTimeSinceEpoch":"1793085448793","customProperties":{},"id":"3",'
+    '"lastUpdateTimeSinceEpoch":"1793085448793","name":"churn-model",'
+    '"state":"LIVE"}],"nextPageToken":"","pageSize":0,"size":2}'
+)
+# ?pageSize=1 : la page suivante existe, le jeton est en base64.
+KMR_PAGED_BODY = (
+    '{"items":[{"createTimeSinceEpoch":"1793085448495","customProperties":'
+    '{"team":{"metadataType":"MetadataStringValue","string_value":"risk"}},'
+    '"description":"Scoring des transactions carte","externalId":"fd-2026",'
+    '"id":"1","lastUpdateTimeSinceEpoch":"1793085448495",'
+    '"name":"fraud-detector","owner":"ml-team@example.com","state":"LIVE"}],'
+    '"nextPageToken":"MTox","pageSize":1,"size":1}'
+)
+# Le 404 de chi, en texte.
+KMR_NOT_FOUND_BODY = "404 page not found\n"
+
+KMR_MODELS = ["fraud-detector", "churn-model"]
+
+# Des documents qui ressemblent sans être le serveur.
+KMR_REORDERED_BODY = (
+    '{"nextPageToken":"","pageSize":0,"size":0,"items":[]}'
+)
+KMR_NO_TOKEN_BODY = '{"items":[],"pageSize":0,"size":0}'
+KMR_NUMERIC_TOKEN_BODY = '{"items":[],"nextPageToken":0,"pageSize":0,"size":0}'
+KMR_STRING_SIZE_BODY = '{"items":[],"nextPageToken":"","pageSize":"0","size":"0"}'
+KMR_EXTRA_KEY_BODY = (
+    '{"items":[],"nextPageToken":"","pageSize":0,"size":0,"total":0}'
+)
+KMR_WRAPPED_BODY = '{"registry":%s}' % KMR_OPEN_BODY
+KMR_DOC_PAGE_BODY = "<html><body><pre>%s</pre></body></html>" % KMR_OPEN_BODY
+# La recherche de modèles enregistrés de MLflow, son voisin le plus proche.
+KMR_MLFLOW_REGISTERED_MODELS_BODY = (
+    '{"registered_models":[{"name":"fraud-detector",'
+    '"creation_timestamp":1793085448495,'
+    '"last_updated_timestamp":1793085448495}],"next_page_token":"MTox"}'
+)
+# Une liste Kubernetes, qui écrit aussi « items ».
+KMR_K8S_LIST_BODY = (
+    '{"apiVersion":"v1","items":[],"kind":"List",'
+    '"metadata":{"resourceVersion":""}}'
+)
+KMR_GENERIC_PAGE_BODY = '{"items":[],"page":1,"size":0,"total":0}'
+
+
+def kmr_block():
+    doc = load(KMR_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % KMR_V1_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET %s — la route dont le corps nomme le "
+        "registre" % KMR_V1_ROUTE
+    )
+    return blocks[0]
+
+
+def kmr_fires(status=200, body=KMR_OPEN_BODY, headers=None):
+    """Sémantique nuclei d'un bloc, appliquée à une réponse."""
+    block = kmr_block()
+    headers = headers if headers is not None else {"Content-Type": KMR_CONTENT_TYPE}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, " ".join(headers.values())))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_kmr_probe_is_read_only_on_the_two_registered_model_routes():
+    """
+    Le même routeur non protégé accepte POST et PATCH — inscrire un modèle,
+    réécrire l'URI d'un artefact : c'est l'abus que le constat signale, pas ce
+    qu'un scanner a le droit de faire.
+    """
+    doc = load(KMR_TEMPLATE)
+    assert request_routes(doc) == {("GET", KMR_V1_ROUTE), ("GET", KMR_ALPHA_ROUTE)}, (
+        f"le template interroge autre chose que getRegisteredModels — "
+        f"{sorted(request_routes(doc))}"
+    )
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET"
+        assert not block.get("body") and not block.get("raw")
+        assert not block.get("headers"), (
+            "aucun en-tête n'est nécessaire : le serveur ne lit pas Authorization"
+        )
+    block = kmr_block()
+    assert block.get("path") == ["{{BaseURL}}%s" % KMR_V1_ROUTE,
+                                 "{{BaseURL}}%s" % KMR_ALPHA_ROUTE], (
+        "v1 d'abord, l'API historique ensuite"
+    )
+    assert block.get("stop-at-first-match") is True, (
+        "un serveur récent sert les deux chemins : une seule instance, un seul constat"
+    )
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "model-registry", (
+        "le registre est un composant distinct de Kubeflow Pipelines, déjà couvert"
+    )
+    assert meta.get("max-request") == 2
+    assert info.get("severity") == "high"
+
+
+def test_kmr_matcher_fires_on_the_bodies_captured_from_a_real_server():
+    assert kmr_fires(), "le template ne reconnaît pas le corps relevé"
+    assert kmr_fires(body=KMR_EMPTY_BODY), (
+        "une instance vide rend la même enveloppe, et reste ouverte en écriture"
+    )
+    assert kmr_fires(body=KMR_PAGED_BODY), "le template perd un jeton de page base64"
+    assert kmr_fires(status=203), "le constat ne doit pas dépendre du statut"
+
+    for body, why in (
+        (json.dumps(json.loads(KMR_OPEN_BODY), indent=2),
+         "un intermédiaire qui réindente le JSON"),
+        (json.dumps(json.loads(KMR_OPEN_BODY), indent=2).replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+        (json.dumps(json.loads(KMR_OPEN_BODY)), "les séparateurs de json.dumps"),
+        (KMR_OPEN_BODY + "\n", "un saut de ligne final"),
+        ('{"items":[],"nextPageToken":"Mjox_-+/=","pageSize":1,"size":0}',
+         "un jeton base64 url ou standard avec remplissage"),
+    ):
+        assert kmr_fires(body=body), "le template perd %s" % why
+
+
+def test_kmr_matcher_needs_the_whole_envelope_not_a_generic_list():
+    for body, why in (
+        (KMR_NOT_FOUND_BODY, "le 404 de chi"),
+        (KMR_REORDERED_BODY, "un ordre de clés que encoding/json n'écrit pas"),
+        (KMR_NO_TOKEN_BODY, "une enveloppe sans nextPageToken requis"),
+        (KMR_NUMERIC_TOKEN_BODY, "un nextPageToken qui n'est pas une chaîne"),
+        (KMR_STRING_SIZE_BODY, "pageSize et size qui ne sont pas des entiers"),
+        (KMR_EXTRA_KEY_BODY, "une clé que RegisteredModelList ne porte pas"),
+        (KMR_WRAPPED_BODY, "une supervision qui republie la réponse"),
+        (KMR_DOC_PAGE_BODY, "une page de documentation qui cite la réponse"),
+        (KMR_MLFLOW_REGISTERED_MODELS_BODY, "le registre de modèles de MLflow"),
+        (KMR_K8S_LIST_BODY, "une liste Kubernetes"),
+        (KMR_GENERIC_PAGE_BODY, "une pagination quelconque"),
+        (KUBEFLOW_PIPELINES_BODY, "Kubeflow Pipelines"),
+        ("", "une réponse vide"),
+    ):
+        assert not kmr_fires(body=body), "le template conclut sur %s" % why
+
+    assert not kmr_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+    block = kmr_block()
+    assert block.get("matchers-condition") == "and"
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}
+
+
+def test_kmr_extractor_reports_the_registered_model_names():
+    extractors = kmr_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("json") == [".items[].name"], extractors[0]
+
+
+def test_kmr_description_keeps_the_bearer_nuance():
+    """
+    La spécification déclare un schéma Bearer que le serveur n'applique pas : le
+    template doit le dire, sans quoi on le lirait comme une protection.
+    """
+    info = load(KMR_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("securitySchemes", "Bearer", "Authorization", "0.0.0.0"):
+        assert needle in description, needle
+    assert "DELETE" in (info.get("impact") or "")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_kmr_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas la regex : seul un scan ferme la boucle,
+    sur les corps relevés, sur chacun des deux chemins et sur les corps voisins.
+    """
+    def scan(v1=KMR_OPEN_BODY, alpha=KMR_OPEN_BODY, content_type=KMR_CONTENT_TYPE):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == KMR_V1_ROUTE and v1 is not None:
+                    self.reply(200, v1, content_type)
+                elif self.path == KMR_ALPHA_ROUTE and alpha is not None:
+                    self.reply(200, alpha, content_type)
+                else:
+                    self.reply(404, KMR_NOT_FOUND_BODY, "text/plain; charset=utf-8")
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", KMR_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "kubeflow-model-registry-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [KMR_V1_ROUTE], (
+        f"stop-at-first-match n'a pas arrêté le scan sur v1 — {seen}"
+    )
+    assert len(results) == 1, results
+    assert sorted(results[0].get("extracted-results") or []) == sorted(KMR_MODELS), results
+
+    seen, results = scan(v1=None)
+    assert seen == [KMR_V1_ROUTE, KMR_ALPHA_ROUTE], seen
+    assert len(results) == 1 and results[0].get("matched-at", "").endswith(
+        KMR_ALPHA_ROUTE), results
+
+    _, results = scan(v1=KMR_EMPTY_BODY)
+    assert len(results) == 1, "le scan perd l'instance vide — %s" % results
+
+    for v1, why in (
+        (KMR_REORDERED_BODY, "un ordre de clés que encoding/json n'écrit pas"),
+        (KMR_WRAPPED_BODY, "une supervision qui republie la réponse"),
+        (KMR_MLFLOW_REGISTERED_MODELS_BODY, "le registre de modèles de MLflow"),
+    ):
+        _, results = scan(v1=v1, alpha=None)
+        assert results == [], f"le scan conclut sur {why} — {results}"
