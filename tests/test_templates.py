@@ -45576,3 +45576,384 @@ def test_inspect_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body, status=status, content_type=content_type)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# New API — QuantumNous/new-api, passerelle qui agrège des fournisseurs de LLM
+# derrière des API compatibles OpenAI, Claude et Gemini et les redistribue par
+# quotas. Sur une base neuve, model.CheckSetup() laisse constant.Setup à false
+# et l'assistant d'initialisation reste ouvert à l'anonyme : GET /api/status
+# rend « "setup":false », GET /api/setup rend « "status":false,
+# "root_init":false », et POST /api/setup — que le template ne doit jamais
+# envoyer — crée le compte root à partir du seul corps.
+#
+# Les deux réponses sont des gin.H que encoding/json écrit clés triées (aucun
+# build du dépôt ne pose de tag sonic ou jsoniter) ; sous « data », /api/setup
+# rend la struct Setup dans l'ordre de ses champs. Une fois l'assistant
+# terminé, GetSetup ne calcule plus root_init : il vaut false là aussi, et
+# c'est « status » qui tranche.
+#
+# Les corps ci-dessous ont été relevés tels quels le 2026-10-28 sur l'image
+# calciumion/new-api:latest (v1.0.0-rc.47, sha256:938fa2713d49…), lancée avec
+# « -p 127.0.0.1:3000:3000 » sur une base SQLite vide, puis après un POST
+# /api/setup envoyé à cette instance de laboratoire.
+
+NEWAPI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "new-api-setup-uninitialized.yaml")
+
+NEWAPI_STATUS_ROUTE = "/api/status"
+NEWAPI_SETUP_ROUTE = "/api/setup"
+
+NEWAPI_VERSION = "v1.0.0-rc.47"
+
+# Relevé sur l'instance neuve, octet pour octet.
+NEWAPI_OPEN_STATUS_BODY = (
+    '{"data":{"HeaderNavModules":"","SidebarModulesAdmin":"",'
+    '"announcements":[],"announcements_enabled":true,"api_info":[],'
+    '"api_info_enabled":true,'
+    '"chats":[{"Cherry Studio":"cherrystudio://providers/api-keys?v=1\\u0026d'
+    'ata={cherryConfig}"},'
+    '{"AionUI":"aionui://provider/add?v=1\\u0026data={aionuiConfig}"},'
+    '{"流畅阅读":"fluentread"},{"CC Switch":"ccswitch"},'
+    '{"DeepChat":"deepchat://provider/install?v=1\\u0026data={deepchatConfig}'
+    '"},{"AQBot":"aqbot://providers?{aqbotConfig}"},'
+    '{"Lobe Chat 官方示例":"https://chat-preview.lobehub.com/?settings={\\"keyVau'
+    'lts\\":{\\"openai\\":{\\"apiKey\\":\\"{key}\\",'
+    '\\"baseURL\\":\\"{address}/v1\\"}}}"},'
+    '{"AI as Workspace":"https://aiaw.app/set-provider?provider={\\"type\\":'
+    '\\"openai\\",\\"settings\\":{\\"apiKey\\":\\"{key}\\",'
+    '\\"baseURL\\":\\"{address}/v1\\",\\"compatibility\\":\\"strict\\"}}"},'
+    '{"AMA 问天":"ama://set-api-key?server={address}\\u0026key={key}"},'
+    '{"OpenCat":"opencat://team/join?domain={address}\\u0026token={key}"}],'
+    '"checkin_enabled":false,"custom_currency_exchange_rate":1,'
+    '"custom_currency_symbol":"¤","data_export_default_time":"hour",'
+    '"default_collapse_sidebar":false,"default_use_auto_group":false,'
+    '"demo_site_enabled":false,"discord_client_id":"","discord_oauth":false,'
+    '"display_in_currency":true,"docs_link":"https://docs.newapi.pro",'
+    '"email_verification":false,"enable_batch_update":false,'
+    '"enable_data_export":true,"enable_drawing":true,"enable_task":true,'
+    '"faq":[],"faq_enabled":true,"footer_html":"","github_client_id":"",'
+    '"github_oauth":false,"linuxdo_client_id":"",'
+    '"linuxdo_minimum_trust_level":0,"linuxdo_oauth":false,'
+    '"log_export_enabled":true,"log_max_range_days":365,"logo":"",'
+    '"mj_notify_enabled":false,"oidc_authorization_endpoint":"",'
+    '"oidc_client_id":"","oidc_display_name":"OIDC","oidc_enabled":false,'
+    '"passkey_allow_insecure":false,"passkey_attachment":"",'
+    '"passkey_display_name":"New API","passkey_login":false,'
+    '"passkey_rp_id":"localhost","passkey_rp_ids":["localhost"],'
+    '"passkey_user_verification":"preferred","password_login_enabled":true,'
+    '"password_login_encryption_enabled":false,'
+    '"password_register_enabled":true,"price":7.3,'
+    '"privacy_policy_enabled":false,"quota_display_type":"USD",'
+    '"quota_per_unit":500000,"quota_remind_enabled":true,'
+    '"quota_remind_threshold":1000,"register_enabled":true,'
+    '"self_use_mode_enabled":false,"server_address":"http://localhost:3000",'
+    '"setup":false,"start_time":1793172160,"stripe_unit_price":8,'
+    '"system_name":"New API","telegram_bot_name":"","telegram_oauth":false,'
+    '"telegram_oauth_configured":false,"theme":"default",'
+    '"turnstile_check":false,"turnstile_site_key":"",'
+    '"uptime_kuma_enabled":true,"usd_exchange_rate":7.3,'
+    '"user_agreement_enabled":false,"version":"v1.0.0-rc.47",'
+    '"wechat_login":false,"wechat_qrcode":""},"message":"","success":true}'
+)
+NEWAPI_OPEN_SETUP_BODY = (
+    '{"data":{"status":false,"root_init":false,"database_type":"sqlite"},'
+    '"success":true}'
+)
+
+# Après l'assistant, relevés eux aussi : /api/status ne diffère que par
+# « setup », et /api/setup garde root_init à false.
+NEWAPI_DONE_STATUS_BODY = NEWAPI_OPEN_STATUS_BODY.replace('"setup":false',
+                                                          '"setup":true')
+NEWAPI_DONE_SETUP_BODY = (
+    '{"data":{"status":true,"root_init":false,"database_type":""},'
+    '"success":true}'
+)
+# La réponse de la passerelle à une route /api inconnue, relevée sur
+# /api/nope et transposée à /api/setup.
+NEWAPI_NOT_FOUND_BODY = (
+    '{"error":{"message":"Invalid URL (GET /api/setup)",'
+    '"type":"invalid_request_error","param":"","code":""}}'
+)
+# Une page HTML à la place du JSON, comme en sert l'interface web.
+NEWAPI_SPA_BODY = ('<!doctype html><html lang="zh"><head><meta charset="utf-8">'
+                   '<title>New API</title></head><body><div id="root"></div>'
+                   '</body></html>')
+
+NEWAPI_OPEN = ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY))
+NEWAPI_DONE = ((200, NEWAPI_DONE_STATUS_BODY), (200, NEWAPI_DONE_SETUP_BODY))
+
+
+def newapi_without(*keys):
+    """Le statut relevé, privé de clés de « data », réécrit à la façon de Go."""
+    document = json.loads(NEWAPI_OPEN_STATUS_BODY)
+    for key in keys:
+        del document["data"][key]
+    return json.dumps(document, separators=(",", ":"), ensure_ascii=False,
+                      sort_keys=True)
+
+
+# Ce qui ne doit pas conclure.
+# Une base dont le root existe sans enregistrement de setup : PostSetup ne
+# créerait pas de root.
+NEWAPI_ROOT_EXISTS_SETUP_BODY = NEWAPI_OPEN_SETUP_BODY.replace(
+    '"root_init":false', '"root_init":true')
+# Un /api/status antérieur à l'assistant (commit f33ebc8e2c) : pas de « setup ».
+NEWAPI_NO_SETUP_KEY_STATUS_BODY = newapi_without("setup")
+NEWAPI_NO_MODES_STATUS_BODY = newapi_without("self_use_mode_enabled",
+                                             "demo_site_enabled")
+NEWAPI_NO_QUOTA_STATUS_BODY = newapi_without("quota_per_unit")
+NEWAPI_STRING_SETUP_STATUS_BODY = NEWAPI_OPEN_STATUS_BODY.replace(
+    '"setup":false', '"setup":"false"')
+NEWAPI_FAILED_STATUS_BODY = NEWAPI_OPEN_STATUS_BODY.replace(
+    '"success":true}', '"success":false}')
+NEWAPI_APPENDED_STATUS_BODY = NEWAPI_OPEN_STATUS_BODY[:-1] + ',"checked_at":0}'
+NEWAPI_WRAPPED_STATUS_BODY = '{"newapi":%s,"checked_at":0}' % NEWAPI_OPEN_STATUS_BODY
+NEWAPI_DOC_PAGE_BODY = ("<html><body><pre>%s</pre></body></html>"
+                        % NEWAPI_OPEN_STATUS_BODY)
+NEWAPI_REORDERED_SETUP_BODY = (
+    '{"success":true,"data":{"status":false,"root_init":false,'
+    '"database_type":"sqlite"}}'
+)
+NEWAPI_EMPTY_DB_TYPE_SETUP_BODY = NEWAPI_OPEN_SETUP_BODY.replace(
+    '"database_type":"sqlite"', '"database_type":""')
+# « status » à true sous une base nommée : le code ne l'écrit pas, mais c'est
+# lui qui doit trancher, et non le seul database_type.
+NEWAPI_STATUS_TRUE_SETUP_BODY = NEWAPI_OPEN_SETUP_BODY.replace(
+    '"status":false', '"status":true')
+NEWAPI_WRAPPED_SETUP_BODY = '{"newapi":%s}' % NEWAPI_OPEN_SETUP_BODY
+
+
+def newapi_block():
+    doc = load(NEWAPI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % NEWAPI_STATUS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % NEWAPI_STATUS_ROUTE
+    return blocks[0]
+
+
+def newapi_fires(status=NEWAPI_OPEN[0], setup=NEWAPI_OPEN[1]):
+    """
+    Sémantique nuclei du bloc sous req-condition, sans stop-at-first-match :
+    les deux requêtes partent et le matcher est évalué contre les deux.
+    """
+    block = newapi_block()
+    assert block.get("req-condition") is True
+    assert not block.get("stop-at-first-match")
+    matcher, = block.get("matchers")
+    assert matcher.get("type") == "dsl" and matcher.get("condition") == "and"
+    return dsl_matcher_hits(matcher, [status, setup])
+
+
+def test_newapi_probe_reads_the_wizard_state_and_never_posts_the_setup():
+    """
+    POST /api/setup crée le compte root et ferme l'assistant : c'est l'abus que
+    le constat signale. Deux GET, dans cet ordre, sans corps ni en-tête.
+    """
+    doc = load(NEWAPI_TEMPLATE)
+    assert request_routes(doc) == {("GET", NEWAPI_STATUS_ROUTE),
+                                   ("GET", NEWAPI_SETUP_ROUTE)}, (
+        sorted(request_routes(doc)))
+    block = newapi_block()
+    assert block.get("path") == ["{{BaseURL}}%s" % NEWAPI_STATUS_ROUTE,
+                                 "{{BaseURL}}%s" % NEWAPI_SETUP_ROUTE]
+    for b in doc.get("http") or []:
+        assert b.get("method", "GET") == "GET"
+        assert not b.get("body") and not b.get("raw")
+        assert not b.get("headers")
+
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "new-api"
+    assert meta.get("max-request") == 2
+    assert info.get("severity") == "high"
+
+
+def test_newapi_matcher_fires_on_the_bodies_captured_from_a_real_server():
+    assert newapi_fires(), "le template ne reconnaît pas les corps relevés"
+
+    def reindented(body, **kwargs):
+        return json.dumps(json.loads(body), ensure_ascii=False, **kwargs)
+
+    for status, setup, why in (
+        ((203, NEWAPI_OPEN_STATUS_BODY), (203, NEWAPI_OPEN_SETUP_BODY),
+         "un statut qui n'est pas 200"),
+        ((200, reindented(NEWAPI_OPEN_STATUS_BODY, indent=2)),
+         (200, reindented(NEWAPI_OPEN_SETUP_BODY, indent=2)),
+         "un intermédiaire qui réindente le JSON"),
+        ((200, reindented(NEWAPI_OPEN_STATUS_BODY, indent=2).replace("\n", "\r\n")),
+         (200, reindented(NEWAPI_OPEN_SETUP_BODY, indent=2).replace("\n", "\r\n")),
+         "un relais qui sert le corps en CRLF"),
+        ((200, reindented(NEWAPI_OPEN_STATUS_BODY)),
+         (200, reindented(NEWAPI_OPEN_SETUP_BODY)),
+         "les séparateurs de json.dumps"),
+        ((200, NEWAPI_OPEN_STATUS_BODY + "\n"), (200, NEWAPI_OPEN_SETUP_BODY + "\n"),
+         "un saut de ligne final"),
+        ((200, NEWAPI_OPEN_STATUS_BODY.replace('"system_name":"New API"',
+                                               '"system_name":"Acme LLM Hub"')),
+         (200, NEWAPI_OPEN_SETUP_BODY), "un nom de système changé"),
+        ((200, NEWAPI_OPEN_STATUS_BODY.replace('"self_use_mode_enabled":false',
+                                               '"self_use_mode_enabled":true')),
+         (200, NEWAPI_OPEN_SETUP_BODY), "le mode usage personnel actif"),
+        ((200, NEWAPI_OPEN_STATUS_BODY),
+         (200, NEWAPI_OPEN_SETUP_BODY.replace('"sqlite"', '"postgres"')),
+         "une base PostgreSQL"),
+    ):
+        assert newapi_fires(status, setup), "le template perd %s" % why
+
+
+def test_newapi_matcher_needs_both_an_open_wizard_and_no_root():
+    for status, setup, why in (
+        (NEWAPI_DONE[0], NEWAPI_DONE[1], "une instance initialisée"),
+        ((200, NEWAPI_DONE_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "un statut à setup:true"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_DONE_SETUP_BODY),
+         "root_init à false sur une instance initialisée"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_ROOT_EXISTS_SETUP_BODY),
+         "un root déjà créé"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (404, NEWAPI_NOT_FOUND_BODY),
+         "le statut seul, sans route d'assistant"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_SPA_BODY),
+         "le statut seul, /api/setup tombée dans l'interface web"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_REORDERED_SETUP_BODY),
+         "un ordre de clés que gin n'écrit pas"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_EMPTY_DB_TYPE_SETUP_BODY),
+         "un database_type vide, propre à la branche initialisée"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_STATUS_TRUE_SETUP_BODY),
+         "un assistant à status:true"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_WRAPPED_SETUP_BODY),
+         "une supervision qui republie /api/setup"),
+        ((200, NEWAPI_NO_SETUP_KEY_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "un statut sans clé setup"),
+        ((200, NEWAPI_NO_MODES_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "un statut sans les modes de l'assistant"),
+        ((200, NEWAPI_NO_QUOTA_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "un statut sans quota_per_unit"),
+        ((200, NEWAPI_STRING_SETUP_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "setup en chaîne et non en booléen"),
+        ((200, NEWAPI_FAILED_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "un statut à success:false"),
+        ((200, NEWAPI_APPENDED_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "une clé que GetStatus n'écrit pas après success"),
+        ((200, NEWAPI_WRAPPED_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "une supervision qui republie /api/status"),
+        ((200, NEWAPI_DOC_PAGE_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "une page de documentation qui cite la réponse"),
+        ((200, NEWAPI_SPA_BODY), (200, NEWAPI_SPA_BODY),
+         "l'interface web sur les deux routes"),
+        ((200, ""), (200, ""), "deux réponses vides"),
+    ):
+        assert not newapi_fires(status, setup), "le template conclut sur %s" % why
+
+
+def test_newapi_conclusion_is_carried_by_the_bodies_and_never_by_the_status():
+    matcher, = newapi_block().get("matchers")
+    assert matcher.get("type") == "dsl"
+    for expr in matcher.get("dsl") or []:
+        assert "status_code" not in expr, expr
+
+
+def test_newapi_extractor_reports_the_served_version():
+    extractors = newapi_block().get("extractors") or []
+    assert len(extractors) == 1, extractors
+    extractor, = extractors
+    assert extractor.get("type") == "json"
+    assert extractor.get("part") == "body_1"
+    assert extractor.get("json") == [".data.version"]
+
+
+def test_newapi_description_keeps_the_wizard_nuances():
+    """
+    Le constat tient à l'assistant ouvert, pas à /api/status public : le
+    template doit dire ce que PostSetup vérifie, et que root_init seul ne
+    tranche pas.
+    """
+    info = load(NEWAPI_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("CheckSetup", "constant.Setup", "RootUserExists",
+                   "RoleRootUser", "root_init", "quota_per_unit",
+                   "127.0.0.1:3000:3000", "3000:3000", "f33ebc8e2c"):
+        assert needle in description, needle
+    impact = info.get("impact") or ""
+    assert "POST /api/setup" in impact
+    assert "root" in impact
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_newapi_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas les regex du DSL : seul un scan ferme la
+    boucle sur RE2 et gojq — et il dit aussi ce que le template envoie
+    vraiment, donc qu'aucun POST /api/setup ne part.
+    """
+    def scan(status=NEWAPI_OPEN[0], setup=NEWAPI_OPEN[1]):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.path == NEWAPI_STATUS_ROUTE:
+                    self.reply(*status)
+                elif self.path == NEWAPI_SETUP_ROUTE:
+                    self.reply(*setup)
+                else:
+                    self.reply(200, NEWAPI_SPA_BODY)
+
+            def do_POST(self):
+                seen.append((self.command, self.path))
+                self.reply(405, "")
+
+            def reply(self, code, payload):
+                encoded = payload.encode()
+                self.send_response(code)
+                kind = "text/html" if payload.startswith("<") else "application/json"
+                self.send_header("Content-Type", kind + "; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", NEWAPI_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "new-api-setup-uninitialized"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", NEWAPI_STATUS_ROUTE), ("GET", NEWAPI_SETUP_ROUTE)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [NEWAPI_VERSION], results
+
+    for status, setup, why in (
+        (NEWAPI_DONE[0], NEWAPI_DONE[1], "une instance initialisée"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_DONE_SETUP_BODY),
+         "root_init à false sur une instance initialisée"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (200, NEWAPI_ROOT_EXISTS_SETUP_BODY),
+         "un root déjà créé"),
+        ((200, NEWAPI_OPEN_STATUS_BODY), (404, NEWAPI_NOT_FOUND_BODY),
+         "le statut seul, sans route d'assistant"),
+        ((200, NEWAPI_WRAPPED_STATUS_BODY), (200, NEWAPI_OPEN_SETUP_BODY),
+         "une supervision qui republie /api/status"),
+    ):
+        seen, results = scan(status, setup)
+        assert results == [], f"le scan conclut sur {why} — {results}"
+        assert all(method == "GET" for method, _ in seen), seen

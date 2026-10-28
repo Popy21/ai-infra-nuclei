@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-135 templates, 132 produits.
+136 templates, 133 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -116,6 +116,7 @@ amont.
 | model-registry | [`kubeflow-model-registry-exposed`](templates/exposure/kubeflow-model-registry-exposed.yaml) | high |
 | model-runner | [`docker-model-runner-exposed`](templates/exposure/docker-model-runner-exposed.yaml) | high |
 | nemo-guardrails | [`nemo-guardrails-server-exposed`](templates/exposure/nemo-guardrails-server-exposed.yaml) | high |
+| new-api | [`new-api-setup-uninitialized`](templates/exposure/new-api-setup-uninitialized.yaml) | high |
 | nextchat | [`nextchat-open-instance`](templates/exposure/nextchat-open-instance.yaml) | high |
 | nim | [`nvidia-nim-metadata-exposed`](templates/exposure/nvidia-nim-metadata-exposed.yaml) | high |
 | nvidia_gpu_exporter | [`nvidia-gpu-exporter-metrics-exposed`](templates/exposure/nvidia-gpu-exporter-metrics-exposed.yaml) | medium |

@@ -1,0 +1,143 @@
+id: new-api-setup-uninitialized
+
+info:
+  name: New API - Uninitialized Setup Wizard Allows Anonymous Root Account Creation
+  author: popy21
+  severity: high
+  description: |
+    New API (QuantumNous/new-api, « A unified AI model hub for aggregation &
+    distribution ») est une passerelle auto-hébergée qui agrège des
+    fournisseurs de LLM derrière des API compatibles OpenAI, Claude et Gemini
+    et les redistribue par jetons et par quotas. Au premier démarrage, la base
+    est vide et un assistant d'initialisation crée le compte administrateur.
+    model.CheckSetup(), appelé par main.go, laisse « constant.Setup = false »
+    tant qu'il n'existe ni enregistrement de setup ni utilisateur root — le cas
+    de toute base neuve — et le serveur écoute alors déjà sur « Addr: ":" +
+    port », toutes les interfaces, port 3000 par défaut.
+    Trois routes du groupe « /api » portent l'assistant, sans UserAuth() ni
+    RootAuth() : router/api-router.go déclare « apiRouter.GET("/setup",
+    controller.GetSetup) », « apiRouter.POST("/setup",
+    anonymousRequestBodyLimit, controller.PostSetup) » et
+    « apiRouter.GET("/status", controller.GetStatus) », le groupe ne posant que
+    l'étiquetage, gzip, l'audit des jetons d'accès, le nettoyage du corps et la
+    limitation de débit. GetStatus est public par conception — l'interface le
+    lit avant toute connexion — et rend, entre autres, « quota_per_unit »,
+    « system_name », « self_use_mode_enabled », « demo_site_enabled » et
+    « "setup": constant.Setup ». GetSetup rend la struct Setup, dont les tags
+    json sont « status », « root_init » et « database_type » ; « root_init »
+    n'est calculé (model.RootUserExists()) que tant que l'assistant n'est pas
+    terminé, et vaut false une fois qu'il l'est. PostSetup ne vérifie que « if
+    constant.Setup » puis « model.RootUserExists() » avant de créer, à partir
+    des champs « username », « password » et « confirmPassword » du corps, un
+    utilisateur « Role: common.RoleRootUser », sans session ni jeton.
+    Le constat n'est donc pas que /api/status réponde, mais qu'il réponde
+    « "setup":false » et que /api/setup confirme « "status":false » et
+    « "root_init":false » : l'instance a été publiée avant que son exploitant
+    ne termine l'assistant. Le README la lance avec « -p
+    127.0.0.1:3000:3000 » et demande de finir l'assistant sur
+    http://localhost:3000 ; le docker-compose.yml du dépôt, lui, publie
+    « "3000:3000" » sur toutes les interfaces de l'hôte. Les deux routes et la
+    clé « setup » sont apparues ensemble (commit f33ebc8e2c, avril 2025) ; les
+    corps relevés sont ceux de v1.0.0-rc.47.
+  impact: |
+    Le premier appelant anonyme qui envoie POST /api/setup avec un nom
+    d'utilisateur et un mot de passe de son choix devient root de la passerelle
+    avant son exploitant, et l'assistant se ferme derrière lui : PostSetup
+    passe « constant.Setup » à true et écrit l'enregistrement de setup, si bien
+    que l'exploitant ne peut plus le rejouer. Le compte root administre tout :
+    les canaux, c'est-à-dire les clés d'API des fournisseurs que l'exploitant y
+    déposera ensuite, les jetons émis aux usagers et leurs quotas, les
+    utilisateurs et les réglages système — et la même requête fixe
+    « SelfUseModeEnabled » et « DemoSiteEnabled » comme l'appelant l'entend.
+  remediation: |
+    Terminer l'assistant d'initialisation avant de rendre le port joignable :
+    lancer le conteneur avec « -p 127.0.0.1:3000:3000 » comme le README le
+    fait, ou, avec le docker-compose.yml du dépôt, remplacer « "3000:3000" »
+    par « "127.0.0.1:3000:3000" », créer le compte administrateur sur
+    http://localhost:3000, et n'exposer la passerelle qu'ensuite, derrière le
+    proxy prévu. Si l'assistant se révèle déjà terminé sans que l'exploitant
+    l'ait fait, un tiers détient le compte root : repartir d'une base neuve
+    plutôt que de tenter de reprendre la main sur celle-ci. Vérifier depuis
+    l'extérieur du périmètre : « curl -s http://<hote>:3000/api/setup » doit
+    rendre « "status":true ».
+  reference:
+    - https://github.com/QuantumNous/new-api
+    - https://github.com/QuantumNous/new-api/blob/main/controller/setup.go
+    - https://github.com/QuantumNous/new-api/blob/main/controller/misc.go
+    - https://github.com/QuantumNous/new-api/blob/main/router/api-router.go
+    - https://github.com/QuantumNous/new-api/blob/main/model/main.go
+    - https://github.com/QuantumNous/new-api/blob/main/docker-compose.yml
+    - https://github.com/QuantumNous/new-api/commit/f33ebc8e2c
+  metadata:
+    max-request: 2
+    vendor: quantumnous
+    product: new-api
+  tags: ai,llm,new-api,gateway,proxy,setup,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et rien d'autre.
+  #
+  # GET /api/status nomme le produit et dit que l'assistant n'est pas terminé.
+  # GET /api/setup confirme qu'il n'existe aucun utilisateur root — la seule
+  # condition que PostSetup vérifie, avec « constant.Setup », avant d'en créer
+  # un. Ni l'une ni l'autre ne modifie l'instance.
+  #
+  # Jamais POST /api/setup : il crée le compte root et ferme l'assistant. C'est
+  # l'abus que le constat signale, et il ôterait l'instance à son exploitant —
+  # pas ce qu'un scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/status"
+      - "{{BaseURL}}/api/setup"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois : « "setup":false » sans « "root_init":false » ne dit
+    # pas que la création d'un root est ouverte, et « "root_init":false » seul
+    # se lit aussi sur une instance initialisée.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # GetStatus rend un gin.H que encoding/json écrit clés triées :
+          # « data », « message », « success ». La réponse ouvre donc sur
+          # « data » et ferme sur un « message » vide suivi de « "success":true ».
+          # Ancrée aux deux bouts : une supervision qui republie la réponse
+          # sous ses propres clés, ou une page qui la cite, n'est pas le
+          # serveur. Les \s* laissent passer un intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"data\"\\s*:\\s*\\{", trim_space(body_1))'
+          - 'regex("\\}\\s*,\\s*\"message\"\\s*:\\s*\"\"\\s*,\\s*\"success\"\\s*:\\s*true\\s*\\}$", trim_space(body_1))'
+
+          # La passerelle à quotas : « quota_per_unit » (common.QuotaPerUnit,
+          # un nombre) et « system_name », toujours présents dans GetStatus.
+          # Le nom lui-même n'entre pas dans la condition : l'exploitant le
+          # change dans ses réglages.
+          - 'regex("[,{]\\s*\"quota_per_unit\"\\s*:\\s*-?[0-9]", body_1) && regex("[,{]\\s*\"system_name\"\\s*:\\s*\"", body_1)'
+
+          # Les deux modes que l'assistant de New API fait choisir
+          # (SetupRequest.SelfUseModeEnabled et DemoSiteEnabled), publiés en
+          # booléens.
+          - 'regex("[,{]\\s*\"self_use_mode_enabled\"\\s*:\\s*(true|false)\\s*[,}]", body_1) && regex("[,{]\\s*\"demo_site_enabled\"\\s*:\\s*(true|false)\\s*[,}]", body_1)'
+
+          # Le constat, côté statut : « "setup": constant.Setup » à false.
+          - 'regex("[,{]\\s*\"setup\"\\s*:\\s*false\\s*[,}]", body_1)'
+
+          # Le constat, côté assistant : la struct Setup, ses champs dans
+          # l'ordre de déclaration, sous un gin.H trié — « data » puis
+          # « success ». « status » à false, et « root_init » à false : aucun
+          # utilisateur root, donc PostSetup en créera un. « database_type »
+          # n'est renseigné que dans cette branche, d'où la chaîne non vide ;
+          # sur une instance initialisée la route rend « "status":true,
+          # "root_init":false,"database_type":"" ».
+          - 'regex("^\\{\\s*\"data\"\\s*:\\s*\\{\\s*\"status\"\\s*:\\s*false\\s*,\\s*\"root_init\"\\s*:\\s*false\\s*,\\s*\"database_type\"\\s*:\\s*\"[a-z]+\"\\s*\\}\\s*,\\s*\"success\"\\s*:\\s*true\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # La version servie (common.Version, posée au build). Un seul extracteur,
+      # borné à body_1 : sous req-condition le moteur évalue les extracteurs
+      # contre chaque réponse, et /api/setup n'a pas cette clé.
+      - type: json
+        part: body_1
+        name: version
+        json:
+          - '.data.version'
