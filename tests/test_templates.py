@@ -45957,3 +45957,280 @@ def test_newapi_matcher_compiles_and_fires_against_a_live_server():
         seen, results = scan(status, setup)
         assert results == [], f"le scan conclut sur {why} — {results}"
         assert all(method == "GET" for method, _ in seen), seen
+
+
+# --------------------------------------------------------------------------
+# Lightpanda — lightpanda-io/browser, le navigateur sans interface pour agents.
+# « lightpanda serve » ouvre un serveur CDP sur le port 9222 ; GET /json/version
+# rend le document de buildJSONVersionResponse (src/server/http.zig) :
+# Browser, Protocol-Version, User-Agent, Lightpanda-Version,
+# webSocketDebuggerUrl, littéraux dans cet ordre, espace après « : » et « , ».
+# Aucun jeton sur la route ; l'upgrade WebSocket ne contrôle qu'Origin (s'il est
+# présent) et Host (tout littéral IP passe). Les corps ci-dessous ont été
+# relevés tels quels le 2026-10-28 sur les images officielles
+# lightpanda/browser:0.4.1, :latest (1.0.2) et :nightly, lancées sans option.
+
+LIGHTPANDA_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "lightpanda-cdp-exposed.yaml")
+
+LIGHTPANDA_ROUTE = "/json/version"
+
+LIGHTPANDA_CONTENT_TYPE = "application/json; charset=UTF-8"
+
+LIGHTPANDA_VERSION = "1.0.2"
+
+# Relevés sur les instances réelles, octet pour octet.
+LIGHTPANDA_OPEN_BODY = (
+    '{"Browser": "Lightpanda/1.0", "Protocol-Version": "1.3", '
+    '"User-Agent": "Lightpanda/1.0", "Lightpanda-Version": "1.0.2", '
+    '"webSocketDebuggerUrl": "ws://127.0.0.1:9222/"}'
+)
+LIGHTPANDA_NIGHTLY_BODY = LIGHTPANDA_OPEN_BODY.replace(
+    '"1.0.2"', '"1.1.0-nightly.11227+0eee96bf2"')
+LIGHTPANDA_OLD_BODY = LIGHTPANDA_OPEN_BODY.replace('"1.0.2"', '"0.4.1"')
+LIGHTPANDA_LIST_BODY = "[]"
+# Le 404 d'une route inconnue ou d'une porte fermée : sans Content-Type.
+LIGHTPANDA_NOT_FOUND_BODY = "Not found"
+
+# Les autres formes que le constructeur produit : --advertise-host, et le
+# socket Unix dont std.json.fmt échappe le chemin (test amont
+# « server: buildJSONVersionResponse »).
+LIGHTPANDA_ADVERTISED_BODY = LIGHTPANDA_OPEN_BODY.replace(
+    "ws://127.0.0.1:9222/", "ws://lightpanda:9222/")
+LIGHTPANDA_UNIX_BODY = LIGHTPANDA_OPEN_BODY.replace(
+    '"ws://127.0.0.1:9222/"', '"ws+unix:///tmp/a\\"b.sock:/"')
+
+# Des documents qui ressemblent sans être le serveur.
+# La forme de /json/version d'un Chrome à DevTools ouvert.
+LIGHTPANDA_CHROME_BODY = json.dumps({
+    "Browser": "Chrome/72.0.3601.0",
+    "Protocol-Version": "1.3",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_1) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/72.0.3601.0 Safari/537.36",
+    "V8-Version": "7.2.233",
+    "WebKit-Version": "537.36 (@cfede9db1d154de0468cb0538479f34c0755a0f4)",
+    "webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/"
+                            "b0b8a4fb-bb17-4359-9533-a8d9f3908bd8",
+}, indent=4)
+LIGHTPANDA_NO_VERSION_BODY = LIGHTPANDA_OPEN_BODY.replace(
+    '"Lightpanda-Version": "1.0.2", ', "")
+LIGHTPANDA_EMPTY_VERSION_BODY = LIGHTPANDA_OPEN_BODY.replace('"1.0.2"', '""')
+LIGHTPANDA_NO_WS_BODY = LIGHTPANDA_OPEN_BODY.replace(
+    ', "webSocketDebuggerUrl": "ws://127.0.0.1:9222/"', "")
+LIGHTPANDA_HTTP_URL_BODY = LIGHTPANDA_OPEN_BODY.replace(
+    "ws://127.0.0.1:9222/", "http://127.0.0.1:9222/")
+LIGHTPANDA_OTHER_BROWSER_BODY = LIGHTPANDA_OPEN_BODY.replace(
+    '"Browser": "Lightpanda/1.0"', '"Browser": "HeadlessChrome/124.0.6367.29"')
+LIGHTPANDA_REORDERED_BODY = (
+    '{"webSocketDebuggerUrl": "ws://127.0.0.1:9222/", '
+    '"Browser": "Lightpanda/1.0", "Protocol-Version": "1.3", '
+    '"User-Agent": "Lightpanda/1.0", "Lightpanda-Version": "1.0.2"}'
+)
+LIGHTPANDA_EXTRA_KEY_BODY = LIGHTPANDA_OPEN_BODY[:-1] + ', "Lightpanda-Pool": 4}'
+LIGHTPANDA_WRAPPED_BODY = '{"cdp": %s}' % LIGHTPANDA_OPEN_BODY
+LIGHTPANDA_DOC_PAGE_BODY = "<pre>%s</pre>" % LIGHTPANDA_OPEN_BODY
+
+
+def lightpanda_block():
+    doc = load(LIGHTPANDA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LIGHTPANDA_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % LIGHTPANDA_ROUTE
+    return blocks[0]
+
+
+def lightpanda_fires(status=200, body=LIGHTPANDA_OPEN_BODY, headers=None):
+    """Sémantique nuclei d'un bloc, appliquée à une réponse."""
+    block = lightpanda_block()
+    headers = headers if headers is not None else {"Content-Type": LIGHTPANDA_CONTENT_TYPE}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, " ".join(headers.values())))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_lightpanda_probe_is_a_single_read_only_get_on_json_version():
+    """
+    L'upgrade WebSocket de GET / lancerait un navigateur sur l'instance
+    auditée : c'est l'abus que le constat signale, pas ce qu'un scanner a le
+    droit de faire. /json/list ne rend que « [] » et ne nomme rien.
+    """
+    doc = load(LIGHTPANDA_TEMPLATE)
+    assert request_routes(doc) == {("GET", LIGHTPANDA_ROUTE)}, (
+        f"le template interroge autre chose que /json/version — "
+        f"{sorted(request_routes(doc))}"
+    )
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET"
+        assert not block.get("body") and not block.get("raw")
+        assert not block.get("headers"), (
+            "aucun en-tête n'est nécessaire, et surtout pas Upgrade: websocket"
+        )
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "lightpanda"
+    assert meta.get("max-request") == 1
+    assert info.get("severity") == "high"
+
+
+def test_lightpanda_matcher_fires_on_the_bodies_captured_from_real_instances():
+    assert lightpanda_fires(), "le template ne reconnaît pas le corps de la 1.0.2"
+    for body, why in (
+        (LIGHTPANDA_NIGHTLY_BODY, "la nightly"),
+        (LIGHTPANDA_OLD_BODY, "la 0.4.1"),
+        (LIGHTPANDA_ADVERTISED_BODY, "une instance lancée avec --advertise-host"),
+        (LIGHTPANDA_UNIX_BODY, "un socket Unix au chemin échappé"),
+    ):
+        assert lightpanda_fires(body=body), "le template perd %s" % why
+    assert lightpanda_fires(status=203), "le constat ne doit pas dépendre du statut"
+
+    for body, why in (
+        (json.dumps(json.loads(LIGHTPANDA_OPEN_BODY), indent=2),
+         "un intermédiaire qui réindente le JSON"),
+        (json.dumps(json.loads(LIGHTPANDA_OPEN_BODY), indent=2).replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+        (json.dumps(json.loads(LIGHTPANDA_OPEN_BODY), separators=(",", ":")),
+         "un intermédiaire qui compacte le JSON"),
+        (LIGHTPANDA_OPEN_BODY + "\n", "un saut de ligne final"),
+    ):
+        assert lightpanda_fires(body=body), "le template perd %s" % why
+
+
+def test_lightpanda_matcher_needs_lightpanda_version_and_websocket_url():
+    for body, why in (
+        (LIGHTPANDA_CHROME_BODY, "le /json/version d'un Chrome à DevTools ouvert"),
+        (LIGHTPANDA_LIST_BODY, "le [] de /json/list"),
+        (LIGHTPANDA_NOT_FOUND_BODY, "le 404 d'une porte CDP fermée"),
+        (LIGHTPANDA_NO_VERSION_BODY, "un document sans Lightpanda-Version"),
+        (LIGHTPANDA_EMPTY_VERSION_BODY, "une Lightpanda-Version vide"),
+        (LIGHTPANDA_NO_WS_BODY, "un document sans webSocketDebuggerUrl"),
+        (LIGHTPANDA_HTTP_URL_BODY, "une URL de débogage qui n'est pas un ws://"),
+        (LIGHTPANDA_OTHER_BROWSER_BODY, "un Browser qui n'est pas Lightpanda"),
+        (LIGHTPANDA_REORDERED_BODY, "un ordre que le constructeur n'écrit pas"),
+        (LIGHTPANDA_EXTRA_KEY_BODY, "une clé que le constructeur n'écrit pas"),
+        (LIGHTPANDA_WRAPPED_BODY, "une supervision qui republie la réponse"),
+        (LIGHTPANDA_DOC_PAGE_BODY, "une page de documentation qui cite la réponse"),
+        (INSPECT_OPEN_BODY, "Inspect AI"),
+        ("", "une réponse vide"),
+    ):
+        assert not lightpanda_fires(body=body), "le template conclut sur %s" % why
+
+    assert not lightpanda_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+    block = lightpanda_block()
+    assert block.get("matchers-condition") == "and"
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}
+
+
+def test_lightpanda_extractor_reports_the_served_version():
+    extractors = lightpanda_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("json") == ['.["Lightpanda-Version"]'], extractors[0]
+    assert json.loads(LIGHTPANDA_OPEN_BODY)["Lightpanda-Version"] == LIGHTPANDA_VERSION
+
+
+def test_lightpanda_description_keeps_the_auth_and_impact_nuances():
+    """
+    Le template doit dire pourquoi l'upgrade n'arrête pas un client direct, où
+    survient l'exposition, et ne pas prétendre reprendre la session d'un agent
+    que le relevé n'a pas montrée.
+    """
+    info = load(LIGHTPANDA_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("webSocketAccept", "isAllowedHost", "--advertise-host",
+                   "Lightpanda-Version", "webSocketDebuggerUrl", "V8-Version",
+                   '"--host", "0.0.0.0"', "127.0.0.1:9222:9222", "9222"):
+        assert needle in description, needle
+    impact = info.get("impact") or ""
+    for needle in ("Page.navigate", "Runtime.evaluate", "LP.getMarkdown",
+                   "Tracing.start", "spawnWorker"):
+        assert needle in impact, needle
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_lightpanda_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas la regex : seul un scan ferme la boucle
+    sur RE2 et gojq — et il dit aussi ce que le template envoie vraiment, donc
+    qu'aucun upgrade WebSocket ne part.
+    """
+    def scan(body=LIGHTPANDA_OPEN_BODY, status=200, content_type=LIGHTPANDA_CONTENT_TYPE):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path, self.headers.get("Upgrade")))
+                if self.path == LIGHTPANDA_ROUTE:
+                    self.reply(status, body, content_type)
+                elif self.path in ("/json", "/json/list"):
+                    self.reply(200, LIGHTPANDA_LIST_BODY, LIGHTPANDA_CONTENT_TYPE)
+                else:
+                    self.reply(404, LIGHTPANDA_NOT_FOUND_BODY, None)
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                if kind:
+                    self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LIGHTPANDA_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "lightpanda-cdp-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", LIGHTPANDA_ROUTE, None)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [LIGHTPANDA_VERSION], results
+
+    seen, results = scan(body=LIGHTPANDA_UNIX_BODY)
+    assert len(results) == 1, "le scan perd le socket Unix au chemin échappé"
+
+    for body, status, content_type, why in (
+        (LIGHTPANDA_CHROME_BODY, 200, "application/json; charset=UTF-8",
+         "le /json/version d'un Chrome à DevTools ouvert"),
+        (LIGHTPANDA_NOT_FOUND_BODY, 404, None, "le 404 d'une porte CDP fermée"),
+        (LIGHTPANDA_LIST_BODY, 200, LIGHTPANDA_CONTENT_TYPE, "un [] sur /json/version"),
+        (LIGHTPANDA_NO_VERSION_BODY, 200, LIGHTPANDA_CONTENT_TYPE,
+         "un document sans Lightpanda-Version"),
+        (LIGHTPANDA_WRAPPED_BODY, 200, LIGHTPANDA_CONTENT_TYPE,
+         "une supervision qui republie"),
+    ):
+        _, results = scan(body=body, status=status, content_type=content_type)
+        assert results == [], f"le scan conclut sur {why} — {results}"

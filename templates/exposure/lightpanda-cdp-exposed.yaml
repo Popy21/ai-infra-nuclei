@@ -1,0 +1,148 @@
+id: lightpanda-cdp-exposed
+
+info:
+  name: Lightpanda - CDP Server Exposed Without Authentication
+  author: popy21
+  severity: high
+  description: |
+    Lightpanda (lightpanda-io/browser, « Lightpanda: the headless browser
+    designed for AI and automation », 37 076 étoiles, dépôt non archivé) est le
+    navigateur sans interface que les agents et les scripts d'automatisation
+    pilotent par le Chrome DevTools Protocol. « lightpanda serve » ouvre ce
+    serveur CDP sur le port 9222.
+    La route qui porte le constat est « GET /json/version ». src/server/http.zig
+    la déclare « .{ .method = .GET, .path = "/json/version", .gate = .cdp,
+    .handler = serveJSONVersion } » et sert la réponse que
+    buildJSONVersionResponse construit une fois au démarrage, en
+    « Content-Type: application/json; charset=UTF-8 » : « {"Browser":
+    "Lightpanda/1.0", "Protocol-Version": "1.3", "User-Agent": "Lightpanda/1.0",
+    "Lightpanda-Version": "<version>", "webSocketDebuggerUrl": "ws://…/"} »,
+    littéraux dans cet ordre, avec une espace après chaque deux-points et chaque
+    virgule. Aucun jeton n'est vérifié sur cette route ; « /json/list » et
+    « /json » rendent « [] ». La porte .cdp ne se ferme que si le serveur est
+    lancé sans le protocole CDP (« --protocol webdriver » seul) : la route rend
+    alors 404 (« A closed gate makes the route invisible (404), not
+    forbidden »), et le template se tait.
+    L'absence d'authentification est une fonctionnalité absente du produit, pas
+    un réglage oublié. Dans le même fichier, webSocketAccept n'applique à
+    l'upgrade WebSocket de « GET / » que deux contrôles. Celui d'Origin n'est
+    exécuté que si l'en-tête est présent : une requête sans Origin passe. Celui
+    de Host (isAllowedHost) admet tout littéral IP, « localhost:<port> » et le
+    nom passé par « --advertise-host ». Un client CDP non navigateur qui joint
+    l'instance par son adresse IP la pilote donc sans identifiant. Quand
+    Lightpanda écoute sur 0.0.0.0 sans --advertise-host, webSocketDebuggerUrl
+    annonce 127.0.0.1 (advertiseHostFallback), mais cela ne protège rien : un
+    client qui compose lui-même l'adresse scannée est accepté.
+    L'hôte par défaut est 127.0.0.1 et le port 9222 (src/Config.zig). Le
+    Dockerfile officiel lance pourtant « CMD ["/bin/lightpanda", "serve",
+    "--host", "0.0.0.0", "--port", "9222", "--log-level", "info"] » avec
+    « EXPOSE 9222/tcp ». Le README publie le port en « -p 127.0.0.1:9222:9222 » :
+    l'exposition survient dès qu'on le publie sur toutes les interfaces.
+    La clé « Lightpanda-Version » est propre au produit. C'est elle, jointe à
+    « webSocketDebuggerUrl », qui sépare Lightpanda d'un Chrome ou d'un
+    Chromium à DevTools ouvert. Celui-ci sert aussi /json/version, mais avec
+    « V8-Version » et « WebKit-Version » à cet endroit. Le statut HTTP ne sépare
+    rien, pas plus que le « [] » de /json/list.
+    Corps relevés le 2026-10-28 sur les images officielles
+    lightpanda/browser:0.4.1, :latest (1.0.2) et :nightly
+    (1.1.0-nightly.11227+0eee96bf2) : même forme, seule la version change.
+  impact: |
+    Relevé le 2026-10-28 sur lightpanda/browser:latest (Lightpanda 1.0.2, image
+    sha256:5d1d724c476957d8c2f8393a51fd089477523b0e5aa9c783c48688785d934fb9).
+    Le conteneur était publié sur l'hôte et partageait un réseau Docker avec un
+    service web joignable de ce seul réseau. Un client CDP sans en-tête Origin,
+    Host égal à un littéral IP, a obtenu le 101 et piloté le navigateur sans
+    identifiant. Target.createTarget puis Target.attachToTarget ont ouvert un
+    onglet. Page.navigate l'a envoyé sur le service interne, puis
+    Runtime.evaluate (« document.body.innerText ») et LP.getMarkdown en ont
+    rendu le contenu. Page.captureScreenshot, Page.printToPDF, DOM.getDocument,
+    Accessibility.getFullAXTree, Network.getCookies, Storage.getCookies,
+    Fetch.enable, Input.dispatchKeyEvent, Emulation.setUserAgentOverride et
+    Debugger.enable ont répondu sans erreur. Tracing.start et SystemInfo.getInfo
+    ont rendu « wasn't found » (-32601). Le répartiteur de
+    src/server/cdp/CDP.zig sert les domaines LP, IO, DOM, Log, CSS, Page, Fetch,
+    Input, Target, Audits, WebMCP, Browser, Runtime, Network, Storage, Console,
+    Security, Debugger, Emulation, Inspector, Performance et Accessibility.
+    Un appelant anonyme se sert donc de l'instance comme d'un navigateur placé
+    à la position réseau de l'hôte. Il atteint les adresses internes que
+    celui-ci voit, exécute du JavaScript dans les pages qu'il y charge et en lit
+    le contenu rendu. Ce que le relevé n'établit pas : chaque upgrade CDP
+    lance son propre worker (Server.upgradeConnection → spawnWorker). Le
+    template n'affirme donc pas qu'un appelant reprend l'onglet, les cookies ou
+    la session d'un agent légitime déjà connecté.
+  remediation: |
+    Lightpanda n'a pas d'authentification à activer : la fermeture est réseau.
+    Laisser « lightpanda serve » sur sa valeur par défaut « --host 127.0.0.1 »,
+    et, sous Docker, publier le port comme le fait le README
+    (« -p 127.0.0.1:9222:9222 ») plutôt que « -p 9222:9222 ». L'image officielle
+    écoute sur 0.0.0.0 dans le conteneur, donc c'est la publication du port qui
+    décide de l'exposition. Si le client CDP tourne sur une autre machine,
+    passer par un tunnel SSH ou un intermédiaire qui authentifie et ne relaie
+    que ce client. Un réseau Docker interne, sans publication, suffit quand
+    client et navigateur sont deux services d'un même Compose (« --advertise-host
+    <nom du service> »).
+    Ne pas compter sur les contrôles de l'upgrade WebSocket. Origin n'est vérifié
+    que s'il est envoyé, et Host admet tout littéral IP : ils écartent une page
+    web malveillante ou un rebinding DNS, pas un client direct.
+    Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hote>:9222/json/version » ne doit pas aboutir.
+  reference:
+    - https://github.com/lightpanda-io/browser
+    - https://github.com/lightpanda-io/browser/blob/main/src/server/http.zig
+    - https://github.com/lightpanda-io/browser/blob/main/src/server/Server.zig
+    - https://github.com/lightpanda-io/browser/blob/main/src/server/cdp/CDP.zig
+    - https://github.com/lightpanda-io/browser/blob/main/src/Config.zig
+    - https://github.com/lightpanda-io/browser/blob/main/Dockerfile
+    - https://hub.docker.com/r/lightpanda/browser
+  metadata:
+    max-request: 1
+    vendor: lightpanda-io
+    product: lightpanda
+  tags: ai,agent,browser,cdp,lightpanda,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture. L'upgrade WebSocket de « GET / » ouvrirait une session
+  # CDP, donc lancerait un navigateur sur l'instance auditée : c'est l'abus que
+  # le constat signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+  # /json/list et /json ne sont pas interrogés : leur « [] » ne nomme aucun
+  # produit.
+  - method: GET
+    path:
+      - "{{BaseURL}}/json/version"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      # Le document de buildJSONVersionResponse, de la première à la dernière
+      # accolade, dans l'ordre de ses littéraux. « Lightpanda-Version » est le
+      # constat : Chrome sert aussi /json/version, mais avec V8-Version et
+      # WebKit-Version à cet endroit. webSocketDebuggerUrl dit que c'est le
+      # serveur CDP qui répond. Les deux sont exigés ensemble, et le préfixe
+      # « Lightpanda/ » de Browser avec eux. Protocol-Version et User-Agent
+      # sont exigés à leur place mais sans valeur imposée.
+      #
+      # webSocketDebuggerUrl est un ws:// ou, sur socket Unix, un ws+unix://
+      # que std.json.fmt échappe : le motif accepte les échappements.
+      #
+      # Ancrée aux deux bouts : une supervision qui republie la réponse ou une
+      # page de documentation qui la cite n'est pas le serveur. Les \s*
+      # admettent l'intermédiaire qui réindente ou compacte le JSON, et le saut
+      # de ligne final qu'il ajouterait.
+      #
+      # Pas de matcher de statut : le corps seul dit le produit.
+      - type: regex
+        part: body
+        regex:
+          - '^\s*\{\s*"Browser"\s*:\s*"Lightpanda/[^"\\]*"\s*,\s*"Protocol-Version"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"User-Agent"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"Lightpanda-Version"\s*:\s*"[^"\\]+"\s*,\s*"webSocketDebuggerUrl"\s*:\s*"ws(?:\+unix)?://(?:[^"\\]|\\.)*"\s*\}\s*$'
+
+    extractors:
+      # La version servie : de quoi situer l'instance dans les releases.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.["Lightpanda-Version"]'
