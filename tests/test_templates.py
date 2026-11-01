@@ -46234,3 +46234,357 @@ def test_lightpanda_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body, status=status, content_type=content_type)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# LLaMA-Factory — hiyouga/LLaMA-Factory, `llamafactory-cli api`. create_app()
+# (src/llamafactory/api/app.py) monte verify_api_key sur GET /v1/models,
+# POST /v1/chat/completions et POST /v1/score/evaluation ; sans API_KEY elle
+# laisse tout passer. GET /openapi.json est servi sans dépendance, avec ou sans
+# clé. Les corps ci-dessous ont été relevés le 2026-11-01 sur app.py et
+# protocol.py de main (9997aa0) instanciés tels quels — moteur d'inférence
+# remplacé par un bouchon —, avec et sans API_KEY, puis avec API_MODEL_NAME.
+
+LLAMA_FACTORY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                      "llama-factory-api-exposed.yaml")
+
+LLAMA_FACTORY_MODELS_ROUTE = "/v1/models"
+LLAMA_FACTORY_OPENAPI_ROUTE = "/openapi.json"
+
+LLAMA_FACTORY_DEFAULT_MODEL = "gpt-3.5-turbo"
+
+# Relevés tels quels, octet pour octet.
+LLAMA_FACTORY_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"gpt-3.5-turbo","object":"model",'
+    '"created":1793518847,"owned_by":"owner"}]}'
+)
+LLAMA_FACTORY_NAMED_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"acme/qwen2.5-7b-sft","object":"model",'
+    '"created":1793518847,"owned_by":"owner"}]}'
+)
+# API_KEY posée, requête sans jeton : HTTPException(401, "Invalid API key.").
+LLAMA_FACTORY_UNAUTHORIZED_BODY = '{"detail":"Invalid API key."}'
+LLAMA_FACTORY_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Les trois entrées de paths, recopiées telles que get_openapi() les a rendues.
+LLAMA_FACTORY_PATHS = {
+    "/v1/models": {"get": {
+        "summary": "List Models",
+        "operationId": "list_models_v1_models_get",
+        "responses": {"200": {
+            "description": "Successful Response",
+            "content": {"application/json": {"schema": {
+                "$ref": "#/components/schemas/ModelList"}}}}},
+        "security": [{"HTTPBearer": []}]}},
+    "/v1/chat/completions": {"post": {
+        "summary": "Create Chat Completion",
+        "operationId": "create_chat_completion_v1_chat_completions_post",
+        "requestBody": {"content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/ChatCompletionRequest"}}},
+            "required": True},
+        "responses": {
+            "200": {"description": "Successful Response",
+                    "content": {"application/json": {"schema": {
+                        "$ref": "#/components/schemas/ChatCompletionResponse"}}}},
+            "422": {"description": "Validation Error",
+                    "content": {"application/json": {"schema": {
+                        "$ref": "#/components/schemas/HTTPValidationError"}}}}},
+        "security": [{"HTTPBearer": []}]}},
+    "/v1/score/evaluation": {"post": {
+        "summary": "Create Score Evaluation",
+        "operationId": "create_score_evaluation_v1_score_evaluation_post",
+        "requestBody": {"content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/ScoreEvaluationRequest"}}},
+            "required": True},
+        "responses": {
+            "200": {"description": "Successful Response",
+                    "content": {"application/json": {"schema": {
+                        "$ref": "#/components/schemas/ScoreEvaluationResponse"}}}},
+            "422": {"description": "Validation Error",
+                    "content": {"application/json": {"schema": {
+                        "$ref": "#/components/schemas/HTTPValidationError"}}}}},
+        "security": [{"HTTPBearer": []}]}},
+}
+
+
+def llama_factory_openapi_body(paths=LLAMA_FACTORY_PATHS, indent=None):
+    """
+    Le document de GET /openapi.json : ouverture, info et paths tels que
+    relevés, composants réduits au schéma ModelCard et au schéma de sécurité
+    (le relevé complet fait 8 302 octets). `indent` réécrit le document comme
+    un intermédiaire qui réindente ce qu'il relaie.
+    """
+    document = {
+        "openapi": "3.1.0",
+        "info": {"title": "FastAPI", "version": "0.1.0"},
+        "paths": paths,
+        "components": {
+            "schemas": {"ModelCard": {
+                "properties": {
+                    "id": {"type": "string", "title": "Id"},
+                    "object": {"type": "string", "const": "model",
+                               "title": "Object", "default": "model"},
+                    "created": {"type": "integer", "title": "Created"},
+                    "owned_by": {"type": "string", "const": "owner",
+                                 "title": "Owned By", "default": "owner"}},
+                "type": "object", "required": ["id"], "title": "ModelCard"}},
+            "securitySchemes": {"HTTPBearer": {"type": "http",
+                                               "scheme": "bearer"}},
+        },
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"), ensure_ascii=False)
+
+
+LLAMA_FACTORY_OPENAPI_BODY = llama_factory_openapi_body()
+
+# QwenLM/Qwen, openai_api.py : même id par défaut, même owned_by, mais la carte
+# porte aussi root, parent et permission, et son API n'a pas de score.
+LLAMA_FACTORY_QWEN_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"gpt-3.5-turbo","object":"model",'
+    '"created":1793518847,"owned_by":"owner","root":null,"parent":null,'
+    '"permission":null}]}'
+)
+LLAMA_FACTORY_QWEN_OPENAPI_BODY = llama_factory_openapi_body(paths={
+    route: LLAMA_FACTORY_PATHS[route]
+    for route in ("/v1/models", "/v1/chat/completions")})
+
+# Des documents qui ressemblent sans être le produit.
+LLAMA_FACTORY_TWO_CARDS_BODY = (
+    '{"object":"list","data":[{"id":"a","object":"model","created":1,'
+    '"owned_by":"owner"},{"id":"b","object":"model","created":1,'
+    '"owned_by":"owner"}]}'
+)
+LLAMA_FACTORY_OTHER_OWNER_BODY = LLAMA_FACTORY_MODELS_BODY.replace(
+    '"owner"', '"openai"')
+LLAMA_FACTORY_REORDERED_BODY = (
+    '{"data":[{"id":"gpt-3.5-turbo","object":"model","created":1793518847,'
+    '"owned_by":"owner"}],"object":"list"}'
+)
+LLAMA_FACTORY_WRAPPED_BODY = '{"upstream":%s}' % LLAMA_FACTORY_MODELS_BODY
+LLAMA_FACTORY_DOC_PAGE_BODY = "<pre>%s</pre>" % LLAMA_FACTORY_MODELS_BODY
+# Le chemin cité ailleurs que sous paths, par une page qui n'est pas un schéma.
+LLAMA_FACTORY_QUOTED_SCORE_BODY = json.dumps(
+    {"routes": ["/v1/models", "/v1/score/evaluation"]}, separators=(",", ":"))
+# Un schéma qui cite le chemin sans le servir comme opération.
+LLAMA_FACTORY_SCORE_AS_TEXT_OPENAPI_BODY = llama_factory_openapi_body(paths={
+    "/v1/models": dict(LLAMA_FACTORY_PATHS["/v1/models"],
+                       description="see /v1/score/evaluation")})
+
+
+def llama_factory_block():
+    doc = load(LLAMA_FACTORY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LLAMA_FACTORY_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % LLAMA_FACTORY_MODELS_ROUTE
+    return blocks[0]
+
+
+def llama_factory_fires(models=(200, LLAMA_FACTORY_MODELS_BODY),
+                        openapi=(200, LLAMA_FACTORY_OPENAPI_BODY)):
+    scenario = {
+        LLAMA_FACTORY_MODELS_ROUTE: models,
+        LLAMA_FACTORY_OPENAPI_ROUTE: openapi,
+    }
+    block = llama_factory_block()
+    responses = []
+    for target in block.get("path") or []:
+        _, route = normalise_route(block.get("method"), target)
+        assert route in scenario, f"le template interroge {route}"
+        responses.append(scenario[route])
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "la conclusion doit lier les deux réponses : un matcher hors dsl ne "
+        "verrait que la dernière"
+    )
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_llama_factory_probe_is_two_read_only_gets():
+    """
+    POST /v1/chat/completions et POST /v1/score/evaluation feraient tourner le
+    modèle sur le GPU de l'exploitant : c'est l'abus que le constat signale.
+    """
+    doc = load(LLAMA_FACTORY_TEMPLATE)
+    assert request_routes(doc) == {("GET", LLAMA_FACTORY_MODELS_ROUTE),
+                                   ("GET", LLAMA_FACTORY_OPENAPI_ROUTE)}, (
+        sorted(request_routes(doc)))
+    block = llama_factory_block()
+    assert [normalise_route(block.get("method"), t)[1]
+            for t in block.get("path") or []] == [
+        LLAMA_FACTORY_MODELS_ROUTE, LLAMA_FACTORY_OPENAPI_ROUTE]
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 n'existe pas et la preuve d'ouverture ne "
+        "peut pas être liée au schéma"
+    )
+    for item in doc.get("http") or []:
+        assert item.get("method", "GET") == "GET"
+        assert not item.get("body") and not item.get("raw")
+        assert not item.get("headers"), "aucun jeton, aucun en-tête"
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "llama-factory"
+    assert meta.get("max-request") == 2
+    assert info.get("severity") == "high"
+
+
+def test_llama_factory_matcher_fires_on_the_bodies_captured_from_the_app():
+    assert llama_factory_fires(), "le template ne reconnaît pas l'instance ouverte"
+    assert llama_factory_fires(models=(200, LLAMA_FACTORY_NAMED_MODELS_BODY)), (
+        "le template perd une instance lancée avec API_MODEL_NAME"
+    )
+    assert llama_factory_fires(models=(203, LLAMA_FACTORY_MODELS_BODY)), (
+        "le constat ne doit pas dépendre du statut"
+    )
+    reindented = json.dumps(json.loads(LLAMA_FACTORY_MODELS_BODY), indent=2)
+    for models, openapi, why in (
+        (reindented, LLAMA_FACTORY_OPENAPI_BODY, "une liste réindentée"),
+        (reindented.replace("\n", "\r\n"), LLAMA_FACTORY_OPENAPI_BODY,
+         "une liste servie en CRLF"),
+        (LLAMA_FACTORY_MODELS_BODY + "\n", LLAMA_FACTORY_OPENAPI_BODY,
+         "un saut de ligne final"),
+        (LLAMA_FACTORY_MODELS_BODY, llama_factory_openapi_body(indent=2),
+         "un schéma réindenté"),
+        (LLAMA_FACTORY_MODELS_BODY.replace("gpt-3.5-turbo", 'my \\"sft\\" v2'),
+         LLAMA_FACTORY_OPENAPI_BODY, "un nom de modèle à guillemet échappé"),
+    ):
+        assert llama_factory_fires(models=(200, models), openapi=(200, openapi)), (
+            "le template perd %s" % why)
+
+
+def test_llama_factory_matcher_needs_the_open_list_and_the_score_route():
+    for models, openapi, why in (
+        ((401, LLAMA_FACTORY_UNAUTHORIZED_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "une instance lancée avec API_KEY"),
+        ((200, LLAMA_FACTORY_QWEN_MODELS_BODY), (200, LLAMA_FACTORY_QWEN_OPENAPI_BODY),
+         "le serveur openai_api.py de Qwen"),
+        ((200, LLAMA_FACTORY_QWEN_MODELS_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "une carte qui porte root, parent et permission"),
+        ((200, LLAMA_FACTORY_MODELS_BODY), (200, LLAMA_FACTORY_QWEN_OPENAPI_BODY),
+         "un schéma sans /v1/score/evaluation"),
+        ((200, LLAMA_FACTORY_MODELS_BODY), (404, LLAMA_FACTORY_NOT_FOUND_BODY),
+         "un /openapi.json absent"),
+        ((200, LLAMA_FACTORY_MODELS_BODY), (200, LLAMA_FACTORY_QUOTED_SCORE_BODY),
+         "un document qui cite le chemin sans être un schéma"),
+        ((200, LLAMA_FACTORY_MODELS_BODY),
+         (200, LLAMA_FACTORY_SCORE_AS_TEXT_OPENAPI_BODY),
+         "un schéma qui cite le chemin sans le servir"),
+        ((200, LLAMA_FACTORY_TWO_CARDS_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "une liste de deux cartes, que list_models() ne rend jamais"),
+        ((200, LLAMA_FACTORY_OTHER_OWNER_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "un owned_by qui n'est pas owner"),
+        ((200, LLAMA_FACTORY_REORDERED_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "un ordre que ModelList ne sérialise pas"),
+        ((200, LLAMA_FACTORY_WRAPPED_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "une supervision qui republie la liste"),
+        ((200, LLAMA_FACTORY_DOC_PAGE_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "une page de documentation qui cite la liste"),
+        ((200, VLLM_MODELS_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY), "vLLM"),
+        ((200, OTHER_OPENAI_API_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "une API compatible OpenAI quelconque"),
+        ((200, ""), (200, ""), "des réponses vides"),
+    ):
+        assert not llama_factory_fires(models=models, openapi=openapi), (
+            "le template conclut sur %s" % why)
+
+
+def test_llama_factory_extractor_reports_the_served_model():
+    extractors = llama_factory_block().get("extractors") or []
+    assert len(extractors) == 1, "un résultat par extracteur sous req-condition"
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("part") == "body_1"
+    assert extractors[0].get("json") == [".data[].id"], extractors[0]
+    assert [card["id"] for card in json.loads(LLAMA_FACTORY_MODELS_BODY)["data"]] == [
+        LLAMA_FACTORY_DEFAULT_MODEL]
+
+
+def test_llama_factory_description_keeps_the_auth_nuances():
+    info = load(LLAMA_FACTORY_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ('os.getenv("API_KEY")', "verify_api_key", "/v1/score/evaluation",
+                   '"0.0.0.0"', '"8000"', 'allow_origins=["*"]',
+                   '{"detail":"Invalid API key."}', 'owned_by: Literal["owner"]',
+                   "API_MODEL_NAME", "QwenLM/Qwen"):
+        assert needle in description, needle
+    assert "API_KEY" in (info.get("remediation") or "")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_llama_factory_matcher_compiles_and_fires_against_a_live_server():
+    """
+    Seul un scan ferme la boucle sur RE2 et sur l'évaluation de body_1 sous
+    req-condition — et il dit ce que le template envoie vraiment.
+    """
+    def scan(models=(200, LLAMA_FACTORY_MODELS_BODY),
+             openapi=(200, LLAMA_FACTORY_OPENAPI_BODY)):
+        seen = []
+        routes = {LLAMA_FACTORY_MODELS_ROUTE: models,
+                  LLAMA_FACTORY_OPENAPI_ROUTE: openapi}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization")))
+                code, payload = routes.get(self.path,
+                                           (404, LLAMA_FACTORY_NOT_FOUND_BODY))
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LLAMA_FACTORY_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "llama-factory-api-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", LLAMA_FACTORY_MODELS_ROUTE, None),
+                    ("GET", LLAMA_FACTORY_OPENAPI_ROUTE, None)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [LLAMA_FACTORY_DEFAULT_MODEL], results
+
+    _, results = scan(models=(200, LLAMA_FACTORY_NAMED_MODELS_BODY),
+                      openapi=(200, llama_factory_openapi_body(indent=2)))
+    assert len(results) == 1, "le scan perd un modèle nommé derrière un schéma réindenté"
+    assert results[0].get("extracted-results") == ["acme/qwen2.5-7b-sft"], results
+
+    for models, openapi, why in (
+        ((401, LLAMA_FACTORY_UNAUTHORIZED_BODY), (200, LLAMA_FACTORY_OPENAPI_BODY),
+         "une instance lancée avec API_KEY"),
+        ((200, LLAMA_FACTORY_QWEN_MODELS_BODY), (200, LLAMA_FACTORY_QWEN_OPENAPI_BODY),
+         "le serveur openai_api.py de Qwen"),
+        ((200, LLAMA_FACTORY_MODELS_BODY), (200, LLAMA_FACTORY_QWEN_OPENAPI_BODY),
+         "un schéma sans /v1/score/evaluation"),
+        ((200, LLAMA_FACTORY_MODELS_BODY), (404, LLAMA_FACTORY_NOT_FOUND_BODY),
+         "un /openapi.json absent"),
+    ):
+        _, results = scan(models=models, openapi=openapi)
+        assert results == [], f"le scan conclut sur {why} — {results}"

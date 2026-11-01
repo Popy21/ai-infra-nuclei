@@ -1,0 +1,132 @@
+id: llama-factory-api-exposed
+
+info:
+  name: LLaMA-Factory - OpenAI-Compatible API Exposed Without an API Key
+  author: popy21
+  severity: high
+  description: |
+    LLaMA-Factory (hiyouga/LLaMA-Factory, 75 812 étoiles, dépôt non archivé —
+    dernier push 2026-10-31) est un framework de fine-tuning de LLM. Son README
+    sert le modèle entraîné par « API_PORT=8000 llamafactory-cli api
+    examples/inference/qwen3.yaml infer_backend=vllm » : run_api() dans
+    src/llamafactory/api/app.py lance uvicorn sur « os.getenv("API_HOST",
+    "0.0.0.0") » et « int(os.getenv("API_PORT", "8000")) », donc sur toutes les
+    interfaces par défaut, derrière un CORSMiddleware à « allow_origins=["*"] ».
+    L'authentification n'existe que si l'exploitant pose une variable
+    d'environnement. create_app() lit « api_key = os.getenv("API_KEY") » et la
+    dépendance verify_api_key ne refuse que « if api_key and (auth is None or
+    auth.credentials != api_key) » : sans API_KEY, la condition est fausse et
+    tout passe. Cette dépendance est montée sur les trois routes de
+    l'application — GET /v1/models, POST /v1/chat/completions et POST
+    /v1/score/evaluation —, si bien que /v1/models, à la différence d'autres
+    serveurs compatibles OpenAI qui l'exemptent, porte à lui seul la preuve :
+    une instance à clé y rend 401 et « {"detail":"Invalid API key."} », une
+    instance ouverte la liste des modèles.
+    Cette liste a une forme fixe. list_models() rend « ModelList(data=[
+    model_card]) » avec « ModelCard(id=os.getenv("API_MODEL_NAME",
+    "gpt-3.5-turbo")) », et protocol.py déclare « object: Literal["model"] =
+    "model" », « owned_by: Literal["owner"] = "owner" » et, pour ModelList,
+    « object: Literal["list"] = "list" » : un document d'une seule carte,
+    « {"object":"list","data":[{"id":"gpt-3.5-turbo","object":"model",
+    "created":...,"owned_by":"owner"}]} », identique de la v0.8.0 à main. Mais
+    « "owned_by":"owner" » n'est pas propre au produit — l'openai_api.py de
+    QwenLM/Qwen sert le même id « gpt-3.5-turbo » avec le même owned_by, suivi
+    de root, parent et permission —, d'où la seconde lecture : FastAPI(...) est
+    construit sans docs_url ni openapi_url, donc GET /openapi.json est servi,
+    sans dépendance, et nomme le chemin /v1/score/evaluation, que l'API OpenAI
+    ne connaît pas. Les trois réponses ont été relevées sur app.py et
+    protocol.py de main (9997aa0) instanciés tels quels, moteur d'inférence
+    remplacé par un bouchon, avec et sans API_KEY.
+  impact: |
+    Le corps de /v1/models est la preuve, pas le butin. La même absence
+    d'API_KEY ouvre POST /v1/chat/completions : n'importe qui peut faire tourner
+    de l'inférence sur le GPU de l'hôte, aux frais de l'exploitant, sur le
+    modèle qu'il sert — le plus souvent un fine-tune maison, puisque c'est
+    l'objet du framework, avec ce qu'il a appris de données parfois internes.
+    Les requêtes concurrentes saturent la mémoire vidéo et privent les usages
+    légitimes de leur capacité ; aucune notion d'utilisateur, aucune trace
+    d'appelant. Le CORS à « allow_origins=["*"] » permet en outre à n'importe
+    quelle page web visitée par un poste du réseau interne d'appeler l'instance
+    depuis le navigateur. L'identifiant rendu par /v1/models — API_MODEL_NAME
+    quand il est posé — peut nommer le modèle interne.
+  remediation: |
+    Lancer `llamafactory-cli api` avec API_KEY posée dans l'environnement :
+    verify_api_key ferme alors les trois routes, et les clients doivent
+    présenter « Authorization: Bearer <clé> ». La clé est un jeton statique
+    partagé : elle ferme l'accès anonyme sans remplacer une authentification
+    par utilisateur.
+    Poser API_HOST=127.0.0.1 tant que le service n'est pas destiné au réseau,
+    ou publier le conteneur en « -p 127.0.0.1:8000:8000 », et placer un reverse
+    proxy qui authentifie devant le port pour tout usage partagé.
+    Vérifier depuis l'extérieur, sur la route même du constat : « curl -s
+    http://<hote>:8000/v1/models » doit rendre 401 et « {"detail":"Invalid API
+    key."} », plus la liste des modèles.
+  reference:
+    - https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/api/app.py
+    - https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/api/protocol.py
+    - https://github.com/hiyouga/LLaMA-Factory#deploy-with-openai-style-api-and-vllm
+  metadata:
+    max-request: 2
+    vendor: hiyouga
+    product: llama-factory
+  tags: ai,llm,llama-factory,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /v1/models est la preuve d'ouverture : verify_api_key y est montée,
+  # donc son corps ne sort que d'une instance sans API_KEY. Mais sa forme ne
+  # nomme pas assez le produit.
+  #
+  # GET /openapi.json le nomme par /v1/score/evaluation. Il répond sur une
+  # instance à clé comme sur une instance ouverte — seul, il dirait « c'est
+  # bien LLaMA-Factory », jamais « il est ouvert ».
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions ferait tourner
+  # le modèle sur le GPU de l'exploitant, POST /v1/score/evaluation aussi : ce
+  # sont les abus que le constat signale, pas ce qu'un scanner a le droit de
+  # faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+      - "{{BaseURL}}/openapi.json"
+
+    # req-condition accumule body_N pour que la conclusion porte sur les deux
+    # réponses à la fois.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document entier, ancré aux deux bouts : ModelList déclare object
+          # puis data, ModelCard id, object, created puis owned_by, et
+          # list_models() ne rend jamais qu'une carte. Tenir le document entier
+          # plutôt qu'un mot écarte les serveurs qui écrivent aussi
+          # "owned_by":"owner" mais ajoutent root, parent ou permission à la
+          # carte, et le 401 « {"detail":"Invalid API key."} » d'une instance à
+          # clé. Aucune expression ne lit le statut : le corps dit ce qui est
+          # servi. FastAPI sérialise compact ; les \s* absorbent l'intermédiaire
+          # qui réindente.
+          - 'regex("^\\{\\s*\"object\"\\s*:\\s*\"list\"\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"owner\"\\s*\\}\\s*\\]\\s*\\}$", trim_space(body_1))'
+
+          # Le schéma, ouvert sur openapi puis info comme get_openapi()
+          # l'écrit : l'instance a servi le document elle-même, ce n'est pas
+          # une page qui le recopie. Le titre n'est pas exigé — l'app est créée
+          # sans title, il vaut le « FastAPI » générique.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3\\.[0-9.]+\"\\s*,\\s*\"info\"\\s*:\\s*\\{", trim_space(body_2))'
+
+          # Et le chemin propre au produit, tenu pour une clé de paths suivie de
+          # son opération : la route de notation des modèles de récompense,
+          # absente de l'API OpenAI et des autres runtimes du pack.
+          - 'regex("\"/v1/score/evaluation\"\\s*:\\s*\\{\\s*\"post\"\\s*:", body_2)'
+
+    extractors:
+      # Le modèle servi, tel qu'API_MODEL_NAME le nomme. Un seul extracteur,
+      # borné à body_1 : sous req-condition le moteur émet un résultat par
+      # extracteur qui rend quelque chose.
+      - type: json
+        part: body_1
+        name: model
+        json:
+          - '.data[].id'
