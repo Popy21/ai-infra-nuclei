@@ -46957,3 +46957,460 @@ def test_ms_swift_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(models=models, openapi=openapi)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# AIO Sandbox — agent-infra/sandbox, le bac à sable tout-en-un pour agents IA.
+# Le dépôt ne porte que la documentation, les SDK et les exemples ; le serveur
+# n'est livré que par l'image ghcr.io/agent-infra/sandbox, port 8080, dont la
+# passerelle nginx n'exige une clé que si SANDBOX_API_KEY (ou JWT_PUBLIC_KEY)
+# est posée. GET /v1/sandbox rend alors le SandboxResponse compact de FastAPI,
+# dans l'ordre des champs du modèle ; avec une clé, nginx rend sa page 401 en
+# text/html avant l'application. Les corps ci-dessous ont été relevés tels
+# quels le 2026-11-03 sur ghcr.io/agent-infra/sandbox:latest (v1.11.0, arm64),
+# lancée sans variable d'environnement, puis avec SANDBOX_API_KEY, puis avec
+# JWT_PUBLIC_KEY.
+
+AIO_SANDBOX_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                    "aio-sandbox-context-exposed.yaml")
+
+AIO_SANDBOX_ROUTE = "/v1/sandbox"
+
+AIO_SANDBOX_CONTENT_TYPE = "application/json"
+
+AIO_SANDBOX_VERSION = "1.11.0"
+
+# Le résumé texte que l'application met dans data : le même contenu que
+# detail, en Markdown.
+AIO_SANDBOX_DATA = (
+    "## System Environment (v1.11.0):\n"
+    "- Ubuntu 22.04.5 LTS 22.04.5 (aarch64)\n"
+    "- User: gem, use `sudo` to switch to root\n"
+    "- Home directory: /home/gem\n"
+    "- Workspace: /home/gem\n"
+    "- Timezone: Asia/Singapore\n"
+    "- Occupied Ports: 33021,33869,38661,39977,40105,46595,50062,54324,54689,"
+    "55539,57511,5900,59479,60677,6080,8080,8091,8092,8100,8200,8888,9222\n"
+    "\n"
+    "## Development Environment:\n"
+    "Python:\n"
+    "- Python 3.10.12(path: /usr/bin/python3.10)\n"
+    "- Python 3.11.13(path: /opt/python3.11/bin/python3.11)\n"
+    "- Python 3.12.11(path: /opt/python3.12/bin/python3.12)\n"
+    "\n"
+    "Node.js:\n"
+    "- v22.23.0(path: /opt/fnm/node-versions/v22.23.0/installation/bin/node)\n"
+    "\n"
+    "## Available Tools:\n"
+    "- Text editors: vim, nano\n"
+    "- File operations: wget, curl, tar, zip, unzip, tree, rsync, lsyncd\n"
+    "- Development: git, gh, uv\n"
+    "- Network tools: ping, telnet, netcat, nmap\n"
+    "- Text processing: grep, sed, awk, jq, rg\n"
+    "- System monitoring: htop, procps\n"
+    "- Image processing: imagemagick\n"
+    "- Audio/Video Downloader: yt-dlp\n"
+)
+
+AIO_SANDBOX_OCCUPIED_PORTS = [
+    "33021", "33869", "38661", "39977", "40105", "46595", "50062", "54324",
+    "54689", "55539", "57511", "5900", "59479", "60677", "6080", "8080",
+    "8091", "8092", "8100", "8200", "8888", "9222",
+]
+
+AIO_SANDBOX_PYTHON = [
+    {"ver": "Python 3.10.12", "bin": "/usr/bin/python3.10",
+     "alias": ["python", "python3", "pip", "pip3"]},
+    {"ver": "Python 3.11.13", "bin": "/opt/python3.11/bin/python3.11",
+     "alias": ["python3.11", "pip3.11"]},
+    {"ver": "Python 3.12.11", "bin": "/opt/python3.12/bin/python3.12",
+     "alias": ["python3.12", "pip3.12"]},
+]
+AIO_SANDBOX_NODEJS = [
+    {"ver": "v22.23.0",
+     "bin": "/opt/fnm/node-versions/v22.23.0/installation/bin/node",
+     "alias": []},
+]
+
+
+def aio_sandbox_tools(*names):
+    return [{"name": name, "description": ""} for name in names]
+
+
+AIO_SANDBOX_UTILS = [
+    {"category": "Text editors", "tools": aio_sandbox_tools("vim", "nano")},
+    {"category": "File operations",
+     "tools": aio_sandbox_tools("wget", "curl", "tar", "zip", "unzip", "tree",
+                                "rsync", "lsyncd")},
+    {"category": "Development", "tools": aio_sandbox_tools("git", "gh", "uv")},
+    {"category": "Network tools",
+     "tools": aio_sandbox_tools("ping", "telnet", "netcat", "nmap")},
+    {"category": "Text processing",
+     "tools": aio_sandbox_tools("grep", "sed", "awk", "jq")
+     + [{"name": "rg", "description": "ripgrep"}]},
+    {"category": "System monitoring", "tools": aio_sandbox_tools("htop", "procps")},
+    {"category": "Image processing", "tools": aio_sandbox_tools("imagemagick")},
+    {"category": "Audio/Video Downloader", "tools": aio_sandbox_tools("yt-dlp")},
+]
+
+
+def aio_sandbox_context(**overrides):
+    """
+    Le SandboxResponse de l'instance, champ par champ dans l'ordre du modèle.
+    `overrides` remplace une clé de premier niveau ; la valeur `...` la retire.
+    """
+    document = {
+        "success": True,
+        "message": "Environment information retrieved",
+        "data": AIO_SANDBOX_DATA,
+        "hint": None,
+        "home_dir": "/home/gem",
+        "workspace": "/home/gem",
+        "version": AIO_SANDBOX_VERSION,
+        "detail": {
+            "system": {
+                "os": "Ubuntu 22.04.5 LTS", "os_version": "22.04.5",
+                "arch": "aarch64", "user": "gem", "home_dir": "/home/gem",
+                "workspace": "/home/gem", "timezone": "Asia/Singapore",
+                "occupied_ports": list(AIO_SANDBOX_OCCUPIED_PORTS),
+            },
+            "runtime": {"python": [dict(t) for t in AIO_SANDBOX_PYTHON],
+                        "nodejs": [dict(t) for t in AIO_SANDBOX_NODEJS]},
+            "utils": [dict(c) for c in AIO_SANDBOX_UTILS],
+        },
+    }
+    for key, value in overrides.items():
+        if value is ...:
+            document.pop(key, None)
+        else:
+            document[key] = value
+    return document
+
+
+def aio_sandbox_body(document=None, indent=None):
+    """
+    Sérialisé comme FastAPI le fait — compact, ensure_ascii à False, dans
+    l'ordre d'insertion. `indent` réécrit le document comme un intermédiaire
+    qui réindente ce qu'il relaie.
+    """
+    document = aio_sandbox_context() if document is None else document
+    if indent is not None:
+        return json.dumps(document, indent=indent, ensure_ascii=False)
+    return json.dumps(document, separators=(",", ":"), ensure_ascii=False)
+
+
+# Le relevé, octet pour octet : 3 095 octets, dont l'empreinte est celle du
+# corps lu sur l'instance.
+AIO_SANDBOX_OPEN_BODY = aio_sandbox_body()
+AIO_SANDBOX_OPEN_BODY_SHA256 = (
+    "e4e2f35071c21d6621be25d93edf01940dc54cd917b9551f341a5ad30151eb6f")
+
+# Avec SANDBOX_API_KEY ou JWT_PUBLIC_KEY, sans clé : la page de nginx, en
+# text/html, avant l'application — identique sur /v1/sandbox, /health,
+# /v1/docs, /mcp, /code-server/, /vnc/index.html et /v1/file/read.
+AIO_SANDBOX_GATEWAY_401_BODY = (
+    "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n"
+    "<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n"
+    "<hr><center>nginx/1.18.0 (Ubuntu)</center>\r\n</body>\r\n</html>\r\n"
+)
+# Le 401 que la documentation d'aiod, le démon de nouvelle génération, écrit
+# dans l'enveloppe standard.
+AIO_SANDBOX_AIOD_401_BODY = (
+    '{"success":false,"message":"Unauthorized","data":null,"hint":null}')
+# Le 404 de l'application sur une route inconnue (/v1/health) : la même
+# enveloppe.
+AIO_SANDBOX_NOT_FOUND_BODY = (
+    '{"success":false,"message":"Not Found","data":null,"hint":null}')
+# GET /health sur l'instance ouverte.
+AIO_SANDBOX_HEALTH_BODY = '{"status":"healthy"}'
+
+# Les autres formes que le modèle admet.
+# Le défaut du schéma pour message, data et hint absents (ni l'un ni l'autre
+# n'est requis), workspace nul.
+AIO_SANDBOX_BARE_BODY = aio_sandbox_body(aio_sandbox_context(
+    message="Operation successful", data=..., hint=..., workspace=None))
+# Un document sans workspace du tout — le champ n'est requis nulle part.
+AIO_SANDBOX_NO_WORKSPACE_BODY = aio_sandbox_body(aio_sandbox_context(workspace=...))
+
+
+def aio_sandbox_detail_body(**detail_overrides):
+    document = aio_sandbox_context()
+    for key, value in detail_overrides.items():
+        if value is ...:
+            document["detail"].pop(key, None)
+        else:
+            document["detail"][key] = value
+    return aio_sandbox_body(document)
+
+
+def aio_sandbox_system_body(**system_overrides):
+    document = aio_sandbox_context()
+    for key, value in system_overrides.items():
+        if value is ...:
+            document["detail"]["system"].pop(key, None)
+        else:
+            document["detail"]["system"][key] = value
+    return aio_sandbox_body(document)
+
+
+# occupied_ports vide — « empty on every other platform », dit la
+# documentation — et un nodejs vide.
+AIO_SANDBOX_NO_PORTS_BODY = aio_sandbox_system_body(occupied_ports=[])
+AIO_SANDBOX_NO_NODE_BODY = aio_sandbox_detail_body(
+    runtime={"python": AIO_SANDBOX_PYTHON, "nodejs": []})
+
+# Des documents qui ressemblent sans être la route.
+# L'enveloppe seule, et l'enveloppe du succès d'une autre route du produit.
+AIO_SANDBOX_SUCCESS_ONLY_BODY = '{"success":true}'
+AIO_SANDBOX_OTHER_ROUTE_BODY = (
+    '{"success":true,"message":"Operation successful","data":null,"hint":null}')
+# Un detail sans occupied_ports, un runtime sans nodejs, un python vide.
+AIO_SANDBOX_NO_OCCUPIED_PORTS_KEY_BODY = aio_sandbox_system_body(occupied_ports=...)
+AIO_SANDBOX_NO_NODE_KEY_BODY = aio_sandbox_detail_body(
+    runtime={"python": AIO_SANDBOX_PYTHON})
+AIO_SANDBOX_NO_PYTHON_BODY = aio_sandbox_detail_body(
+    runtime={"python": [], "nodejs": AIO_SANDBOX_NODEJS})
+# Un ordre que le modèle n'écrit pas : detail avant version.
+AIO_SANDBOX_REORDERED_BODY = aio_sandbox_body({
+    key: value for key, value in sorted(
+        aio_sandbox_context().items(),
+        key=lambda item: (item[0] == "version", 0))})
+# Une supervision qui republie le corps, ou lui ajoute une clé.
+AIO_SANDBOX_WRAPPED_BODY = '{"sandbox":%s}' % AIO_SANDBOX_OPEN_BODY
+AIO_SANDBOX_APPENDED_BODY = AIO_SANDBOX_OPEN_BODY[:-1] + ',"checked_at":0}'
+AIO_SANDBOX_DOC_PAGE_BODY = "<pre>%s</pre>" % AIO_SANDBOX_OPEN_BODY
+
+
+def aio_sandbox_block():
+    doc = load(AIO_SANDBOX_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % AIO_SANDBOX_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % AIO_SANDBOX_ROUTE
+    return blocks[0]
+
+
+def aio_sandbox_fires(status=200, body=AIO_SANDBOX_OPEN_BODY, headers=None):
+    """Sémantique nuclei d'un bloc, appliquée à une réponse."""
+    block = aio_sandbox_block()
+    headers = headers if headers is not None else {"Content-Type": AIO_SANDBOX_CONTENT_TYPE}
+    verdicts = []
+    for matcher in block.get("matchers") or []:
+        if matcher.get("type") == "status":
+            verdicts.append(status in (matcher.get("status") or []))
+        elif matcher.get("part") == "header":
+            verdicts.append(body_matcher_hits(matcher, " ".join(headers.values())))
+        else:
+            verdicts.append(body_matcher_hits(matcher, body))
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_aio_sandbox_fixture_is_the_body_read_on_the_image():
+    """
+    Le corps est reconstruit champ par champ pour rester lisible ; l'empreinte
+    garantit qu'il est, à l'octet près, celui que l'image a servi.
+    """
+    assert len(AIO_SANDBOX_OPEN_BODY) == 3095
+    assert hashlib.sha256(AIO_SANDBOX_OPEN_BODY.encode()).hexdigest() == (
+        AIO_SANDBOX_OPEN_BODY_SHA256)
+
+
+def test_aio_sandbox_probe_is_a_single_read_only_get_on_v1_sandbox():
+    """
+    /v1/shell/exec, /v1/file/write, /v1/jupyter/execute et /v1/browser/*
+    sont les abus que le constat signale : aucun n'est appelé. /v1/openapi.json
+    répond pareil avec et sans clé et ne prouverait rien ; /health ne nomme
+    rien.
+    """
+    doc = load(AIO_SANDBOX_TEMPLATE)
+    assert request_routes(doc) == {("GET", AIO_SANDBOX_ROUTE)}, (
+        f"le template interroge autre chose que {AIO_SANDBOX_ROUTE} — "
+        f"{sorted(request_routes(doc))}"
+    )
+    for block in (doc.get("http") or []):
+        assert block.get("method", "GET") == "GET"
+        assert not block.get("body") and not block.get("raw")
+        assert not block.get("headers"), "aucune clé, aucun en-tête"
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "aio-sandbox"
+    assert meta.get("max-request") == 1
+    assert info.get("severity") == "critical"
+
+
+def test_aio_sandbox_matcher_fires_on_the_body_captured_from_the_image():
+    assert aio_sandbox_fires(), "le template ne reconnaît pas le corps de la 1.11.0"
+    for body, why in (
+        (AIO_SANDBOX_BARE_BODY, "le message par défaut du schéma, sans data ni hint"),
+        (AIO_SANDBOX_NO_WORKSPACE_BODY, "un document sans workspace"),
+        (AIO_SANDBOX_NO_PORTS_BODY, "un occupied_ports vide"),
+        (AIO_SANDBOX_NO_NODE_BODY, "un nodejs vide"),
+    ):
+        assert aio_sandbox_fires(body=body), "le template perd %s" % why
+    assert aio_sandbox_fires(status=203), "le constat ne doit pas dépendre du statut"
+    assert aio_sandbox_fires(headers={"Content-Type": "application/json; charset=utf-8"}), (
+        "le template perd un Content-Type à charset"
+    )
+
+    for body, why in (
+        (aio_sandbox_body(indent=2), "un intermédiaire qui réindente le JSON"),
+        (aio_sandbox_body(indent=2).replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+        (AIO_SANDBOX_OPEN_BODY + "\n", "un saut de ligne final"),
+    ):
+        assert aio_sandbox_fires(body=body), "le template perd %s" % why
+
+
+def test_aio_sandbox_matcher_needs_the_sandbox_detail_not_the_envelope():
+    for body, why in (
+        (AIO_SANDBOX_AIOD_401_BODY, "le 401 d'aiod dans l'enveloppe standard"),
+        (AIO_SANDBOX_NOT_FOUND_BODY, "le 404 de l'application"),
+        (AIO_SANDBOX_HEALTH_BODY, "le corps de /health"),
+        (AIO_SANDBOX_SUCCESS_ONLY_BODY, "« success » à true, seul"),
+        (AIO_SANDBOX_OTHER_ROUTE_BODY, "l'enveloppe du succès d'une autre route"),
+        (AIO_SANDBOX_NO_OCCUPIED_PORTS_KEY_BODY, "un system sans occupied_ports"),
+        (AIO_SANDBOX_NO_NODE_KEY_BODY, "un runtime sans nodejs"),
+        (AIO_SANDBOX_NO_PYTHON_BODY, "un python vide, que l'image n'écrit jamais"),
+        (AIO_SANDBOX_REORDERED_BODY, "un ordre que le modèle n'écrit pas"),
+        (AIO_SANDBOX_WRAPPED_BODY, "une supervision qui republie le corps"),
+        (AIO_SANDBOX_APPENDED_BODY, "une clé ajoutée au document"),
+        (AIO_SANDBOX_DOC_PAGE_BODY, "une page de documentation qui cite le corps"),
+        (AIO_SANDBOX_GATEWAY_401_BODY, "la page 401 de nginx, même servie en JSON"),
+        (OPENCODE_HEALTH_BODY, "opencode"),
+        ("", "une réponse vide"),
+    ):
+        assert not aio_sandbox_fires(body=body), "le template conclut sur %s" % why
+
+    assert not aio_sandbox_fires(status=401, body=AIO_SANDBOX_GATEWAY_401_BODY,
+                                 headers={"Content-Type": "text/html"}), (
+        "le template conclut sur une instance à clé"
+    )
+    assert not aio_sandbox_fires(headers={"Content-Type": "text/html"}), (
+        "le template conclut sur un corps servi comme HTML"
+    )
+
+    block = aio_sandbox_block()
+    assert block.get("matchers-condition") == "and"
+    assert "status" not in {m.get("type") for m in block.get("matchers") or []}
+    regex = [m for m in block.get("matchers") or [] if m.get("type") == "regex"]
+    assert len(regex) == 1 and regex[0].get("condition") == "and", (
+        "les expressions doivent toutes tenir sur le même corps"
+    )
+
+
+def test_aio_sandbox_extractor_reports_the_served_version():
+    extractors = aio_sandbox_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("json") == [".version"], extractors[0]
+    assert json.loads(AIO_SANDBOX_OPEN_BODY)["version"] == AIO_SANDBOX_VERSION
+
+
+def test_aio_sandbox_description_keeps_the_auth_and_impact_nuances():
+    """
+    Le template doit dire que la clé est une option, comment la passerelle
+    ferme l'instance à clé, ce que l'instance ouverte écrit vraiment, et que
+    seule l'image a pu être relevée — le serveur n'est pas publié.
+    """
+    info = load(AIO_SANDBOX_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("SANDBOX_API_KEY", "JWT_PUBLIC_KEY", "X-AIO-API-Key",
+                   "services remain open (backward compatible)",
+                   "127.0.0.1:8080:8080", "0.0.0.0",
+                   "get_sandbox_context_v1_sandbox_get",
+                   "Environment information retrieved", "Operation successful",
+                   "occupied_ports", "nodejs", "401 Authorization Required",
+                   "nginx/1.18.0 (Ubuntu)", "/v1/openapi.json", "v1.11.0",
+                   "aiod", "le serveur n'est livré que par"):
+        assert needle in description, needle
+    impact = info.get("impact") or ""
+    for needle in ("/v1/shell/exec", "/v1/file/read", "/v1/file/write",
+                   "/v1/jupyter/execute", "/v1/browser/screenshot",
+                   "/code-server/", "/vnc/index.html", "sudo"):
+        assert needle in impact, needle
+    remediation = info.get("remediation") or ""
+    for needle in ("SANDBOX_API_KEY", "127.0.0.1:8080:8080", "9222",
+                   "401 Authorization"):
+        assert needle in remediation, needle
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_aio_sandbox_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile pas la regex : seul un scan ferme la boucle
+    sur RE2 et gojq — et il dit aussi ce que le template envoie vraiment.
+    """
+    def scan(body=AIO_SANDBOX_OPEN_BODY, status=200,
+             content_type=AIO_SANDBOX_CONTENT_TYPE):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization"),
+                             self.headers.get("X-AIO-API-Key")))
+                if self.path == AIO_SANDBOX_ROUTE:
+                    self.reply(status, body, content_type)
+                elif self.path == "/health":
+                    self.reply(200, AIO_SANDBOX_HEALTH_BODY, AIO_SANDBOX_CONTENT_TYPE)
+                else:
+                    self.reply(404, AIO_SANDBOX_NOT_FOUND_BODY, AIO_SANDBOX_CONTENT_TYPE)
+
+            def reply(self, code, payload, kind):
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", AIO_SANDBOX_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "aio-sandbox-context-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", AIO_SANDBOX_ROUTE, None, None)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [AIO_SANDBOX_VERSION], results
+
+    _, results = scan(body=aio_sandbox_body(indent=2))
+    assert len(results) == 1, "le scan perd un corps réindenté"
+
+    for body, status, content_type, why in (
+        (AIO_SANDBOX_GATEWAY_401_BODY, 401, "text/html",
+         "une instance lancée avec SANDBOX_API_KEY"),
+        (AIO_SANDBOX_AIOD_401_BODY, 401, AIO_SANDBOX_CONTENT_TYPE,
+         "le 401 d'aiod"),
+        (AIO_SANDBOX_OTHER_ROUTE_BODY, 200, AIO_SANDBOX_CONTENT_TYPE,
+         "l'enveloppe du succès d'une autre route"),
+        (AIO_SANDBOX_NO_OCCUPIED_PORTS_KEY_BODY, 200, AIO_SANDBOX_CONTENT_TYPE,
+         "un system sans occupied_ports"),
+        (AIO_SANDBOX_WRAPPED_BODY, 200, AIO_SANDBOX_CONTENT_TYPE,
+         "une supervision qui republie"),
+    ):
+        _, results = scan(body=body, status=status, content_type=content_type)
+        assert results == [], f"le scan conclut sur {why} — {results}"

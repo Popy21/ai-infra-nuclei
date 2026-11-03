@@ -1,0 +1,176 @@
+id: aio-sandbox-context-exposed
+
+info:
+  name: AIO Sandbox - Agent Sandbox API Exposed Without an API Key (Shell Execution)
+  author: popy21
+  severity: critical
+  description: |
+    AIO Sandbox (agent-infra/sandbox, 6 266 étoiles, dépôt non archivé —
+    dernier push 2026-09-14, dernière release v1.11.0 du 2026-06-23) est le
+    bac à sable « tout-en-un » pour agents IA : navigateur, shell, fichiers,
+    Jupyter, MCP et VSCode Server dans un seul conteneur, image
+    ghcr.io/agent-infra/sandbox, port 8080. Le dépôt ne porte que la
+    documentation, les SDK et les exemples — le serveur n'est livré que par
+    l'image —, et c'est l'image qui a été relevée, le 2026-11-03, sur
+    ghcr.io/agent-infra/sandbox:latest (v1.11.0, arm64), sans variable
+    d'environnement, puis avec SANDBOX_API_KEY, puis avec JWT_PUBLIC_KEY.
+    Le README publie l'image avec « -p 127.0.0.1:8080:8080 » parce que « the
+    sandbox listens on 0.0.0.0 inside the container », et documente
+    l'authentification comme une option : « Without SANDBOX_API_KEY,
+    services remain open (backward compatible) ». La clé, acceptée en
+    en-tête X-AIO-API-Key, en « Authorization: Bearer » ou en « ?api_key= »,
+    n'est documentée dans le README que depuis le 2026-06-26 (#216, après la
+    v1.11.0) ; l'image 1.11.0 l'honore. Le démon de nouvelle génération que
+    la documentation de main décrit (aiod, AIO_API_KEY, SANDBOX_API_KEY en
+    alias) garde la même règle — « When no key is configured, every route is
+    open » — et « /v1/sandbox keeps the 1.x layout ».
+    GET /v1/sandbox est l'opération get_sandbox_context_v1_sandbox_get de la
+    spécification publiée (website/docs/public/v1/openapi.json, 1.9.4, sans
+    aucun champ security ni securitySchemes), présente dès la première
+    spécification publiée (1.0.0.107, 2025-09-10). L'instance ouverte rend
+    200, « Content-Type: application/json », et le SandboxResponse compact,
+    dans l'ordre des champs du modèle :
+    « {"success":true,"message":"Environment information retrieved",
+    "data":"## System Environment (v1.11.0):\n…","hint":null,
+    "home_dir":"/home/gem","workspace":"/home/gem","version":"1.11.0",
+    "detail":{"system":{"os":"Ubuntu 22.04.5 LTS","os_version":"22.04.5",
+    "arch":"aarch64","user":"gem","home_dir":"/home/gem",
+    "workspace":"/home/gem","timezone":"Asia/Singapore",
+    "occupied_ports":["33021",…,"8080",…,"9222"]},"runtime":{"python":[
+    {"ver":"Python 3.10.12","bin":"/usr/bin/python3.10","alias":["python",
+    "python3","pip","pip3"]},…],"nodejs":[{"ver":"v22.23.0","bin":"/opt/fnm/
+    node-versions/v22.23.0/installation/bin/node","alias":[]}]},"utils":[
+    {"category":"Text editors","tools":[{"name":"vim","description":""},
+    …]},…]}} » — 3 095 octets. Le message n'est pas le défaut du schéma,
+    « Operation successful » ; data est le résumé texte du même contenu.
+    Avec SANDBOX_API_KEY, la passerelle nginx de l'image (« Server:
+    nginx/1.18.0 (Ubuntu) ») arrête la requête sans clé avant l'application :
+    401, « Content-Type: text/html », et sa page
+    « 401 Authorization Required » — sur /v1/sandbox comme sur /health,
+    /v1/docs, /mcp, /code-server/, /vnc/index.html et /v1/file/read ; seul
+    /v1/openapi.json reste servi. Avec JWT_PUBLIC_KEY, l'autre mécanisme documenté
+    (guide/advanced/security.md), /v1/sandbox sans jeton rend aussi 401. Le
+    constat repose donc sur le corps de /v1/sandbox seul : l'enveloppe
+    success/message/data/hint, puis home_dir, version et detail, avec
+    occupied_ports sous system et le couple python/nodejs sous runtime — une
+    forme que rien d'autre n'écrit —, jamais sur « "success":true » ni sur le
+    statut.
+  impact: |
+    Le corps de /v1/sandbox est la preuve, pas le butin — même s'il nomme
+    déjà l'utilisateur, le système, l'architecture, le fuseau horaire, chaque
+    port occupé et chaque interpréteur installé. Le même service, sans clé,
+    sert POST /v1/shell/exec (une commande shell dans le conteneur, sous
+    l'utilisateur gem, « use `sudo` to switch to root » dit le résumé
+    lui-même), POST /v1/file/read et /v1/file/write (les fichiers du
+    workspace, où l'agent dépose ce qu'il produit et ce qu'on lui a confié),
+    POST /v1/jupyter/execute et /v1/nodejs/execute (du code Python ou Node),
+    POST /v1/browser/screenshot et /v1/browser/actions (le navigateur de
+    l'agent, avec ses sessions), /code-server/ (un VSCode complet) et
+    /vnc/index.html (le bureau). Un appelant anonyme exécute ce qu'il veut
+    dans le conteneur de l'agent, lit ses données, pivote par son navigateur
+    vers ce que le réseau interne lui laisse voir — et rien n'est attribuable,
+    aucun compte n'existe.
+  remediation: |
+    Lancer l'image avec SANDBOX_API_KEY posée (« -e SANDBOX_API_KEY=<clé> »,
+    ou la variable du docker-compose.yaml du dépôt) : la passerelle exige
+    alors la clé sur tout sauf /v1/openapi.json, en X-AIO-API-Key,
+    « Authorization: Bearer <clé> » ou « ?api_key=<clé> » pour les URL de VNC
+    et de WebSocket qui ne portent pas d'en-tête. Sur une image antérieure
+    qui ignorerait la variable, JWT_PUBLIC_KEY ferme de même les routes, ou
+    mettre à jour. La clé est un jeton statique partagé : elle ferme l'accès
+    anonyme sans remplacer une authentification par utilisateur.
+    Publier le conteneur en « -p 127.0.0.1:8080:8080 », comme le README, ou
+    en service ClusterIP ; n'ouvrir 8080 sur aucune interface publique ni
+    groupe de sécurité, et placer devant un reverse proxy qui termine TLS et
+    authentifie (guide « Cloud Deployment »). Ne jamais exposer le port CDP
+    9222, sans authentification propre.
+    Vérifier depuis l'extérieur, sur la route même du constat : « curl -si
+    http://<hote>:8080/v1/sandbox » doit rendre « 401 Authorization
+    Required » et non « {"success":true,"message":"Environment information
+    retrieved",… ».
+  reference:
+    - https://github.com/agent-infra/sandbox
+    - https://github.com/agent-infra/sandbox/blob/main/website/docs/public/v1/openapi.json
+    - https://github.com/agent-infra/sandbox/blob/main/website/docs/en/guide/advanced/security.md
+    - https://github.com/agent-infra/sandbox/blob/main/website/docs/en/guide/start/cloud-deployment.mdx
+    - https://github.com/agent-infra/sandbox/blob/main/website/docs/en/daemon/basic/authentication.md
+    - https://github.com/agent-infra/sandbox/pull/216
+  metadata:
+    max-request: 1
+    vendor: agent-infra
+    product: aio-sandbox
+  tags: ai,llm,agent,sandbox,aio-sandbox,agent-infra,rce,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, celle que le SDK fait en premier (sandbox.get_context()).
+  #
+  # Sur une instance à clé, la passerelle nginx de l'image rend 401 et sa page
+  # HTML avant l'application : la route ne répond donc avec ce corps que sans
+  # clé, et il nomme le produit à lui seul. /v1/openapi.json n'est pas
+  # interrogé — public par conception, il répond pareil avec et sans clé et ne
+  # dirait jamais « ouvert ». /health ne rend que {"status":"healthy"}.
+  #
+  # En lecture seule, et strictement : /v1/shell/exec, /v1/file/*,
+  # /v1/jupyter/execute et /v1/browser/* sont les abus que le constat signale,
+  # pas ce qu'un scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/sandbox"
+
+    matchers-condition: and
+    matchers:
+      # La page 401 de nginx est servie en text/html ; le SandboxResponse en
+      # application/json. Une page de documentation qui citerait le corps
+      # n'est pas le serveur non plus.
+      - type: word
+        part: header
+        words:
+          - "application/json"
+
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          # L'ouverture, ancrée au début : l'enveloppe commune des réponses du
+          # produit — success à true, message, puis data et hint que le
+          # schéma n'exige pas (admis absents, nuls ou chaînes, data étant le
+          # résumé texte qui porte des \n et des guillemets échappés) —, puis
+          # ce qui est propre à cette route, dans l'ordre du modèle :
+          # home_dir, workspace (requis nulle part, admis absent ou nul),
+          # version, et detail ouvert sur system — os, os_version, arch,
+          # user, home_dir. Le 401 d'aiod, « {"success":false,"message":
+          # "Unauthorized",… », et le 404 de l'application, même enveloppe,
+          # s'arrêtent à success. Les \s* absorbent l'intermédiaire qui
+          # réindente.
+          - '^\s*\{\s*"success"\s*:\s*true\s*,\s*"message"\s*:\s*"(?:[^"\\]|\\.)*"\s*,(?:\s*"data"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,)?(?:\s*"hint"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,)?\s*"home_dir"\s*:\s*"(?:[^"\\]|\\.)*"\s*,(?:\s*"workspace"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,)?\s*"version"\s*:\s*"[^"\\]+"\s*,\s*"detail"\s*:\s*\{\s*"system"\s*:\s*\{\s*"os"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"os_version"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"arch"\s*:\s*"[^"\\]*"\s*,\s*"user"\s*:\s*"[^"\\]*"\s*,\s*"home_dir"\s*:\s*"(?:[^"\\]|\\.)*"\s*,'
+
+          # La fin de system : timezone puis occupied_ports, une liste de
+          # ports en chaînes — lue dans /proc/net/tcp, vide hors Linux dit la
+          # documentation, donc admise vide.
+          - '"timezone"\s*:\s*"[^"\\]*"\s*,\s*"occupied_ports"\s*:\s*\[\s*(?:"[0-9]+"\s*(?:,\s*"[0-9]+"\s*)*)?\]'
+
+          # runtime : python, une liste de ToolSpec — ver, bin, alias, dans
+          # cet ordre, et l'image en porte toujours au moins un —, puis
+          # nodejs. C'est ce couple, avec occupied_ports, qui nomme le
+          # produit.
+          - '"runtime"\s*:\s*\{\s*"python"\s*:\s*\[\s*\{\s*"ver"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,\s*"bin"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,\s*"alias"\s*:\s*\['
+          - '\]\s*,\s*"nodejs"\s*:\s*\['
+
+          # utils, ouvert sur une catégorie — category puis tools —, et la
+          # fermeture ancrée à la fin : tools, la catégorie, utils, detail,
+          # le document. Une supervision qui republie le corps au fond d'un
+          # autre objet, ou qui lui ajoute une clé, ne finit pas ainsi.
+          - '\]\s*\}\s*,\s*"utils"\s*:\s*\[\s*\{\s*"category"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"tools"\s*:\s*\['
+          - '\]\s*\}\s*\]\s*\}\s*\}\s*$'
+
+      # Pas de matcher de statut : 200 est celui de tout serveur, et seul le
+      # corps sépare.
+
+    extractors:
+      # La version du produit, « 1.11.0 » sur l'instance relevée : de quoi
+      # situer l'instance dans les releases.
+      - type: json
+        part: body
+        name: version
+        json:
+          - '.version'
