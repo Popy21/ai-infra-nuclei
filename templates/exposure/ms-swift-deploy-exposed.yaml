@@ -1,0 +1,166 @@
+id: ms-swift-deploy-exposed
+
+info:
+  name: ms-swift - Deploy Server (OpenAI-Compatible API) Exposed Without an API Key
+  author: popy21
+  severity: high
+  description: |
+    ms-swift (modelscope/ms-swift, 16 028 étoiles, dépôt non archivé — dernier
+    push 2026-11-03, v4.0 annoncée le 2026-03-03) est le framework
+    d'entraînement et de déploiement de ModelScope. « swift deploy --model …
+    --infer_backend vllm » sert le modèle par une API compatible OpenAI — un
+    produit distinct des moteurs vLLM, SGLang ou LMDeploy qu'il pilote en
+    back-end — et swift/arguments/deploy_args.py fixe ses défauts :
+    « host: str = '0.0.0.0' », « port: int = 8000 », « api_key: Optional[str]
+    = None », « owned_by: str = 'swift' ». L'authentification n'existe que si
+    l'exploitant passe --api_key : dans swift/pipelines/infer/deploy.py,
+    _install_auth_middleware() commence par « if not self.args.api_key:
+    return » et ne monte rien, _check_api_key() rend None sans clé, et run()
+    se borne à _warn_if_unauthenticated(), un avertissement dans les journaux.
+    GET /v1/models nomme le produit. get_available_models() rend
+    « ModelList(data=[Model(id=model_id, owned_by=self.args.owned_by) …]) »,
+    une carte par nom servi — served_model_name ou le suffixe du chemin du
+    modèle, puis chaque adaptateur LoRA de adapter_mapping. protocol.py
+    déclare Model et ModelList en dataclasses : « id », « object: str =
+    'model' », « created: int = field(default_factory=lambda:
+    int(time.time())) », « owned_by: str = 'ms-swift' » pour l'une, « data:
+    List[Model] » puis « object: str = 'list' » pour l'autre. Le défaut de
+    classe 'ms-swift' n'est jamais servi, le déploiement passe toujours
+    args.owned_by, donc 'swift'. Et FastAPI sérialise une dataclass par
+    asdict(), dans l'ordre de déclaration, donc data avant object :
+    « {"data":[{"id":"Qwen2.5-7B-Instruct","object":"model","created":...,
+    "owned_by":"swift"}],"object":"list"} » — l'inverse des serveurs pydantic
+    (vLLM, LMDeploy, LLaMA-Factory), qui ouvrent sur "object":"list".
+    Mais /v1/models ne prouve pas l'ouverture : « _AUTH_EXEMPT_PATHS =
+    frozenset({'/health', '/health/', '/ping', '/v1/models'}) », donc une
+    instance à clé y répond exactement pareil, 200 et la même liste. La
+    preuve est sur un chemin non exempté, et GET /openapi.json en est un :
+    « FastAPI(lifespan=self.lifespan) » est construit sans openapi_url, le
+    schéma est donc servi, et le middleware — « if request.url.path not in
+    self._AUTH_EXEMPT_PATHS » — l'arrête sur une instance à clé par
+    create_error_response(HTTPStatus.BAD_REQUEST, 'API key error'), soit 400
+    et « {"message":"API key error","object":"error"} ». Sur une instance
+    ouverte il rend le schéma, et le schéma nomme le produit : la route
+    « "/infer/":{"post":{"summary":"Infer Handler","operationId":
+    "infer_handler_infer__post" », le point d'inférence brut des rollouts,
+    que l'API OpenAI ne connaît pas.
+    Les versions : /infer/ est enregistré dans deploy.py depuis le 2026-06-02
+    (#9457, v4.3.0) ; _check_api_key n'y est appelé que depuis le 2026-09-08
+    (#10066) et le middleware n'existe que depuis le 2026-09-23 (#10234), tous
+    deux livrés en v4.6.0 (2026-10-13). De v4.3.0 à v4.5.3, POST /infer/
+    n'exige donc aucune clé même quand --api_key est posé, et /openapi.json
+    répond toujours : le constat y reste vrai. Avant v4.3.0 le schéma ne
+    porte pas /infer/ et le template se tait. Les réponses ont été relevées
+    le 2026-11-03 sur deploy.py et protocol.py de main (df0bc0f) instanciés
+    tels quels, moteur d'inférence remplacé par un bouchon, avec et sans
+    --api_key, puis avec served_model_name et un adaptateur.
+  impact: |
+    Le corps de /v1/models est la preuve d'identité, le schéma la preuve
+    d'ouverture ; le butin est ailleurs. Le même processus, sans clé, sert
+    POST /v1/chat/completions, /v1/completions, /v1/embeddings et /infer/ :
+    n'importe qui fait tourner de l'inférence sur le GPU de l'hôte, aux frais
+    de l'exploitant, sur le modèle qu'il sert — souvent un fine-tune maison,
+    puisque c'est l'objet du framework, avec ce qu'il a appris de données
+    parfois internes. Les requêtes concurrentes saturent la mémoire vidéo et
+    privent les usages légitimes de leur capacité ; aucune notion
+    d'utilisateur, aucune trace d'appelant. Une requête de chat peut en outre
+    nommer une URL de média que le serveur va chercher lui-même
+    (_materialize_media() appelle SafeUrlFetcher.read) — le docstring de
+    _warn_if_unauthenticated() le dit en toutes lettres. Les identifiants
+    rendus par /v1/models — nom servi et adaptateurs LoRA — peuvent nommer
+    le modèle interne.
+  remediation: |
+    Lancer « swift deploy » avec --api_key <clé>, sur v4.6.0 ou plus récente :
+    le middleware ferme alors tout sauf /health, /ping et /v1/models, et les
+    clients doivent présenter « Authorization: Bearer <clé> », comparée par
+    secrets.compare_digest. Avant v4.6.0 la clé ne protège ni /infer/ ni le
+    schéma : mettre à jour. La clé est un jeton statique partagé — elle ferme
+    l'accès anonyme sans remplacer une authentification par utilisateur.
+    Poser --host 127.0.0.1 tant que le service n'est pas destiné au réseau,
+    ou publier le conteneur en « -p 127.0.0.1:8000:8000 », et placer un
+    reverse proxy qui authentifie devant le port pour tout usage partagé.
+    Vérifier depuis l'extérieur, sur la route même du constat : « curl -s
+    http://<hote>:8000/openapi.json » doit rendre 400 et « {"message":"API
+    key error","object":"error"} », plus le schéma. /v1/models continue de
+    répondre — la route est exempte par conception.
+  reference:
+    - https://github.com/modelscope/ms-swift/blob/main/swift/pipelines/infer/deploy.py
+    - https://github.com/modelscope/ms-swift/blob/main/swift/infer_engine/protocol.py
+    - https://github.com/modelscope/ms-swift/blob/main/swift/arguments/deploy_args.py
+    - https://github.com/modelscope/ms-swift/blob/main/docs/source_en/Instruction/Inference-and-deployment.md
+    - https://github.com/modelscope/ms-swift/pull/10234
+    - https://github.com/modelscope/ms-swift/pull/10066
+  metadata:
+    max-request: 2
+    vendor: modelscope
+    product: ms-swift
+  tags: ai,llm,ms-swift,modelscope,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, et chacune porte une moitié du constat.
+  #
+  # GET /v1/models nomme le produit : la liste en dataclass, data avant
+  # object, chaque carte à "owned_by":"swift". Mais la route est exempte
+  # d'authentification — une instance à clé la sert pareil — donc elle ne
+  # dit jamais « ouvert ».
+  #
+  # GET /openapi.json n'est pas exempt : sur une instance à clé le middleware
+  # le rend 400 « {"message":"API key error","object":"error"} », sur une
+  # instance ouverte le schéma, qui porte /infer/ et infer_handler. C'est
+  # l'écart de corps sur cette route, pas le statut, qui prouve l'ouverture.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions avec un corps
+  # vide rendrait 422 sans clé et 400 avec, sans lancer d'inférence — mais
+  # c'est écrire sur la route d'inférence, et c'est l'abus que le constat
+  # signale, pas ce qu'un scanner a le droit de faire pour l'établir. Le
+  # schéma dit la même chose en GET.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+      - "{{BaseURL}}/openapi.json"
+
+    # req-condition accumule body_N pour que la conclusion porte sur les deux
+    # réponses à la fois.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document entier, ancré aux deux bouts, dans l'ordre que
+          # asdict() donne aux deux dataclasses : data d'abord, une carte par
+          # modèle servi — id, object, created, owned_by — toutes à "swift"
+          # puisque get_available_models() passe le même args.owned_by à
+          # chacune, puis object en dernier. Tenir l'ordre écarte les serveurs
+          # pydantic qui ouvrent sur "object":"list", et toute page qui
+          # republierait la liste au fond d'un autre objet. Aucune expression
+          # ne lit le statut : le corps dit ce qui est servi. FastAPI
+          # sérialise compact ; les \s* absorbent l'intermédiaire qui
+          # réindente.
+          - 'regex("^\\{\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"swift\"\\s*\\}(?:\\s*,\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"swift\"\\s*\\})*\\s*\\]\\s*,\\s*\"object\"\\s*:\\s*\"list\"\\s*\\}$", trim_space(body_1))'
+
+          # Le schéma, ouvert sur openapi puis info comme get_openapi()
+          # l'écrit : l'instance l'a servi elle-même, ce n'est ni une page qui
+          # le recopie ni le 400 du middleware. Le titre n'est pas exigé —
+          # l'app est créée sans title, il vaut le « FastAPI » générique.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3\\.[0-9.]+\"\\s*,\\s*\"info\"\\s*:\\s*\\{", trim_space(body_2))'
+
+          # Et la route propre au produit, tenue pour une clé de paths suivie
+          # de son opération, avec l'operationId que FastAPI dérive du nom du
+          # handler : « infer_handler ». Exiger /infer/ borne aussi les
+          # versions — il n'existe que depuis v4.3.0, et c'est à partir de là
+          # que le schéma servi prouve une inférence ouverte (voir la
+          # description) ; avant, le template se tait plutôt que de deviner.
+          - 'regex("\"/infer/\"\\s*:\\s*\\{\\s*\"post\"\\s*:\\s*\\{", body_2)'
+          - 'regex("\"operationId\"\\s*:\\s*\"infer_handler_infer__post\"", body_2)'
+
+    extractors:
+      # Les noms servis — served_model_name ou suffixe du modèle, puis les
+      # adaptateurs LoRA. Un seul extracteur, borné à body_1 : sous
+      # req-condition le moteur émet un résultat par extracteur qui rend
+      # quelque chose.
+      - type: json
+        part: body_1
+        name: models
+        json:
+          - '.data[].id'

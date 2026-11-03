@@ -46588,3 +46588,372 @@ def test_llama_factory_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(models=models, openapi=openapi)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# ms-swift — modelscope/ms-swift, `swift deploy`. SwiftDeploy
+# (swift/pipelines/infer/deploy.py) n'installe le middleware d'authentification
+# que si --api_key est passé, et ce middleware exempte /health, /health/,
+# /ping et /v1/models : la liste des modèles répond pareil avec ou sans clé,
+# c'est GET /openapi.json — non exempt — qui sépare les deux. Les corps
+# ci-dessous ont été relevés le 2026-11-03 sur deploy.py et protocol.py de
+# main (df0bc0f) instanciés tels quels — moteur d'inférence remplacé par un
+# bouchon —, sans --api_key, avec, puis avec served_model_name et un
+# adaptateur LoRA.
+
+MS_SWIFT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "ms-swift-deploy-exposed.yaml")
+
+MS_SWIFT_MODELS_ROUTE = "/v1/models"
+MS_SWIFT_OPENAPI_ROUTE = "/openapi.json"
+
+MS_SWIFT_DEFAULT_MODEL = "Qwen2.5-7B-Instruct"
+
+# Relevés tels quels, octet pour octet. Dataclasses sérialisées par asdict() :
+# data avant object, et "owned_by":"swift" vient de DeployArguments.owned_by,
+# jamais du défaut de classe 'ms-swift'.
+MS_SWIFT_MODELS_BODY = (
+    '{"data":[{"id":"Qwen2.5-7B-Instruct","object":"model",'
+    '"created":1793710403,"owned_by":"swift"}],"object":"list"}'
+)
+# --served_model_name acme/qwen2.5-7b-sft --adapters lora-support=<chemin> :
+# une carte par nom servi, puis une par adaptateur.
+MS_SWIFT_NAMED_MODELS_BODY = (
+    '{"data":[{"id":"acme/qwen2.5-7b-sft","object":"model",'
+    '"created":1793710403,"owned_by":"swift"},{"id":"lora-support",'
+    '"object":"model","created":1793710403,"owned_by":"swift"}],"object":"list"}'
+)
+# --api_key posée, requête sans jeton sur un chemin non exempt :
+# create_error_response(HTTPStatus.BAD_REQUEST, 'API key error').
+MS_SWIFT_UNAUTHORIZED_BODY = '{"message":"API key error","object":"error"}'
+MS_SWIFT_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Les huit entrées de paths, recopiées telles que get_openapi() les a rendues.
+MS_SWIFT_EMPTY_200 = {"200": {"description": "Successful Response",
+                              "content": {"application/json": {"schema": {}}}}}
+MS_SWIFT_VALIDATION_422 = {"422": {"description": "Validation Error",
+                                   "content": {"application/json": {"schema": {
+                                       "$ref": "#/components/schemas/HTTPValidationError"}}}}}
+MS_SWIFT_PATHS = {
+    "/health": {"get": {
+        "summary": "Health", "description": "Health check endpoint.",
+        "operationId": "health_health_get", "responses": MS_SWIFT_EMPTY_200}},
+    "/health/": {"get": {
+        "summary": "Health", "description": "Health check endpoint.",
+        "operationId": "health_health__get", "responses": MS_SWIFT_EMPTY_200}},
+    "/ping": {
+        "get": {"summary": "Ping",
+                "description": "Ping check endpoint. Required for SageMaker compatibility.",
+                "operationId": "ping_ping_get", "responses": MS_SWIFT_EMPTY_200},
+        "post": {"summary": "Ping",
+                 "description": "Ping check endpoint. Required for SageMaker compatibility.",
+                 "operationId": "ping_ping_post", "responses": MS_SWIFT_EMPTY_200}},
+    "/v1/models": {"get": {
+        "summary": "Get Available Models",
+        "operationId": "get_available_models_v1_models_get",
+        "responses": MS_SWIFT_EMPTY_200}},
+    "/v1/chat/completions": {"post": {
+        "summary": "Create Chat Completion",
+        "operationId": "create_chat_completion_v1_chat_completions_post",
+        "parameters": [{"name": "return_cmpl_response", "in": "query", "required": False,
+                        "schema": {"type": "boolean", "default": False,
+                                   "title": "Return Cmpl Response"}}],
+        "requestBody": {"required": True, "content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/ChatCompletionRequest"}}}},
+        "responses": {**MS_SWIFT_EMPTY_200, **MS_SWIFT_VALIDATION_422}}},
+    "/v1/completions": {"post": {
+        "summary": "Create Completion",
+        "operationId": "create_completion_v1_completions_post",
+        "requestBody": {"content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/CompletionRequest"}}}, "required": True},
+        "responses": {**MS_SWIFT_EMPTY_200, **MS_SWIFT_VALIDATION_422}}},
+    "/v1/embeddings": {"post": {
+        "summary": "Create Embedding",
+        "operationId": "create_embedding_v1_embeddings_post",
+        "requestBody": {"content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/EmbeddingRequest"}}}, "required": True},
+        "responses": {**MS_SWIFT_EMPTY_200, **MS_SWIFT_VALIDATION_422}}},
+    "/infer/": {"post": {
+        "summary": "Infer Handler", "operationId": "infer_handler_infer__post",
+        "responses": MS_SWIFT_EMPTY_200}},
+}
+
+
+def ms_swift_openapi_body(paths=MS_SWIFT_PATHS, indent=None):
+    """
+    Le document de GET /openapi.json : ouverture, info et paths tels que
+    relevés, composants réduits au schéma HTTPValidationError (le relevé
+    complet fait 10 345 octets). `indent` réécrit le document comme un
+    intermédiaire qui réindente ce qu'il relaie.
+    """
+    document = {
+        "openapi": "3.1.0",
+        "info": {"title": "FastAPI", "version": "0.1.0"},
+        "paths": paths,
+        "components": {"schemas": {"HTTPValidationError": {
+            "properties": {"detail": {"items": {"$ref": "#/components/schemas/ValidationError"},
+                                      "type": "array", "title": "Detail"}},
+            "type": "object", "title": "HTTPValidationError"}}},
+    }
+    if indent is not None:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"), ensure_ascii=False)
+
+
+MS_SWIFT_OPENAPI_BODY = ms_swift_openapi_body()
+
+# Le schéma d'une version antérieure à v4.3.0 : mêmes routes OpenAI, pas de
+# /infer/. Une instance à clé y servait aussi le schéma — rien n'y prouve
+# l'ouverture, le template doit se taire.
+MS_SWIFT_PRE_INFER_OPENAPI_BODY = ms_swift_openapi_body(paths={
+    route: MS_SWIFT_PATHS[route] for route in MS_SWIFT_PATHS if route != "/infer/"})
+
+# Des listes qui ressemblent sans être le produit.
+# L'ordre d'un serveur pydantic — celui que la roadmap avait deviné.
+MS_SWIFT_PYDANTIC_ORDER_BODY = (
+    '{"object":"list","data":[{"id":"Qwen2.5-7B-Instruct","object":"model",'
+    '"created":1793710403,"owned_by":"swift"}]}'
+)
+# Le défaut de classe de protocol.Model, que le déploiement ne sert jamais.
+MS_SWIFT_CLASS_DEFAULT_OWNER_BODY = MS_SWIFT_MODELS_BODY.replace('"swift"', '"ms-swift"')
+# Une liste dont une carte seulement est à swift.
+MS_SWIFT_MIXED_OWNER_BODY = MS_SWIFT_NAMED_MODELS_BODY.replace(
+    '"lora-support","object":"model","created":1793710403,"owned_by":"swift"',
+    '"lora-support","object":"model","created":1793710403,"owned_by":"acme"')
+MS_SWIFT_EMPTY_LIST_BODY = '{"data":[],"object":"list"}'
+MS_SWIFT_WRAPPED_BODY = '{"upstream":%s}' % MS_SWIFT_MODELS_BODY
+MS_SWIFT_DOC_PAGE_BODY = "<pre>%s</pre>" % MS_SWIFT_MODELS_BODY
+# Un document qui cite la route et l'operationId sans être un schéma.
+MS_SWIFT_QUOTED_INFER_BODY = json.dumps(
+    {"/infer/": {"post": {}}, "operationId": "infer_handler_infer__post"},
+    separators=(",", ":"))
+# Un schéma qui cite /infer/ dans une description sans servir l'opération.
+MS_SWIFT_INFER_AS_TEXT_OPENAPI_BODY = ms_swift_openapi_body(paths={
+    "/v1/models": {"get": dict(MS_SWIFT_PATHS["/v1/models"]["get"],
+                               description='see "/infer/": {"post": …} upstream')}})
+
+
+def ms_swift_block():
+    doc = load(MS_SWIFT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MS_SWIFT_MODELS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % MS_SWIFT_MODELS_ROUTE
+    return blocks[0]
+
+
+def ms_swift_fires(models=(200, MS_SWIFT_MODELS_BODY),
+                   openapi=(200, MS_SWIFT_OPENAPI_BODY)):
+    scenario = {
+        MS_SWIFT_MODELS_ROUTE: models,
+        MS_SWIFT_OPENAPI_ROUTE: openapi,
+    }
+    block = ms_swift_block()
+    responses = []
+    for target in block.get("path") or []:
+        _, route = normalise_route(block.get("method"), target)
+        assert route in scenario, f"le template interroge {route}"
+        responses.append(scenario[route])
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "la conclusion doit lier les deux réponses : un matcher hors dsl ne "
+        "verrait que la dernière"
+    )
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_ms_swift_probe_is_two_read_only_gets():
+    """
+    POST /v1/chat/completions, /v1/completions, /v1/embeddings et /infer/
+    feraient tourner le modèle sur le GPU de l'exploitant : c'est l'abus que
+    le constat signale. /health et /ping ne prouveraient rien — exempts, et
+    sans corps.
+    """
+    doc = load(MS_SWIFT_TEMPLATE)
+    assert request_routes(doc) == {("GET", MS_SWIFT_MODELS_ROUTE),
+                                   ("GET", MS_SWIFT_OPENAPI_ROUTE)}, (
+        sorted(request_routes(doc)))
+    block = ms_swift_block()
+    assert [normalise_route(block.get("method"), t)[1]
+            for t in block.get("path") or []] == [
+        MS_SWIFT_MODELS_ROUTE, MS_SWIFT_OPENAPI_ROUTE]
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 n'existe pas et l'identité ne peut pas "
+        "être liée à la preuve d'ouverture"
+    )
+    for item in doc.get("http") or []:
+        assert item.get("method", "GET") == "GET"
+        assert not item.get("body") and not item.get("raw")
+        assert not item.get("headers"), "aucun jeton, aucun en-tête"
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "ms-swift"
+    assert meta.get("max-request") == 2
+    assert info.get("severity") == "high"
+
+
+def test_ms_swift_matcher_fires_on_the_bodies_captured_from_the_app():
+    assert ms_swift_fires(), "le template ne reconnaît pas l'instance ouverte"
+    assert ms_swift_fires(models=(200, MS_SWIFT_NAMED_MODELS_BODY)), (
+        "le template perd une instance lancée avec served_model_name et un "
+        "adaptateur"
+    )
+    assert ms_swift_fires(models=(203, MS_SWIFT_MODELS_BODY),
+                          openapi=(203, MS_SWIFT_OPENAPI_BODY)), (
+        "le constat ne doit pas dépendre du statut"
+    )
+    reindented = json.dumps(json.loads(MS_SWIFT_NAMED_MODELS_BODY), indent=2)
+    for models, openapi, why in (
+        (reindented, MS_SWIFT_OPENAPI_BODY, "une liste réindentée"),
+        (reindented.replace("\n", "\r\n"), MS_SWIFT_OPENAPI_BODY,
+         "une liste servie en CRLF"),
+        (MS_SWIFT_MODELS_BODY + "\n", MS_SWIFT_OPENAPI_BODY,
+         "un saut de ligne final"),
+        (MS_SWIFT_MODELS_BODY, ms_swift_openapi_body(indent=2),
+         "un schéma réindenté"),
+        (MS_SWIFT_MODELS_BODY.replace("Qwen2.5-7B-Instruct", 'my \\"sft\\" v2'),
+         MS_SWIFT_OPENAPI_BODY, "un nom de modèle à guillemet échappé"),
+    ):
+        assert ms_swift_fires(models=(200, models), openapi=(200, openapi)), (
+            "le template perd %s" % why)
+
+
+def test_ms_swift_matcher_needs_the_swift_list_and_the_open_schema():
+    for models, openapi, why in (
+        ((200, MS_SWIFT_MODELS_BODY), (400, MS_SWIFT_UNAUTHORIZED_BODY),
+         "une instance lancée avec --api_key, dont /v1/models répond pourtant"),
+        ((200, MS_SWIFT_MODELS_BODY), (200, MS_SWIFT_PRE_INFER_OPENAPI_BODY),
+         "un schéma sans /infer/, où rien ne prouve l'ouverture"),
+        ((200, MS_SWIFT_MODELS_BODY), (404, MS_SWIFT_NOT_FOUND_BODY),
+         "un /openapi.json absent"),
+        ((200, MS_SWIFT_MODELS_BODY), (200, MS_SWIFT_QUOTED_INFER_BODY),
+         "un document qui cite la route sans être un schéma"),
+        ((200, MS_SWIFT_MODELS_BODY), (200, MS_SWIFT_INFER_AS_TEXT_OPENAPI_BODY),
+         "un schéma qui cite /infer/ sans le servir"),
+        ((200, MS_SWIFT_PYDANTIC_ORDER_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "l'ordre object puis data, que asdict() ne produit pas"),
+        ((200, MS_SWIFT_CLASS_DEFAULT_OWNER_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "le défaut de classe ms-swift, jamais servi"),
+        ((200, MS_SWIFT_MIXED_OWNER_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "une liste dont une carte n'est pas à swift"),
+        ((200, MS_SWIFT_EMPTY_LIST_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "une liste vide, que _get_model_list() ne rend jamais"),
+        ((200, MS_SWIFT_WRAPPED_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "une supervision qui republie la liste"),
+        ((200, MS_SWIFT_DOC_PAGE_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "une page de documentation qui cite la liste"),
+        ((200, VLLM_MODELS_BODY), (200, MS_SWIFT_OPENAPI_BODY), "vLLM"),
+        ((200, LMDEPLOY_OPEN_BODY), (200, MS_SWIFT_OPENAPI_BODY), "LMDeploy"),
+        ((200, LLAMA_FACTORY_MODELS_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "LLaMA-Factory"),
+        ((200, OTHER_OPENAI_API_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "une API compatible OpenAI quelconque"),
+        ((200, ""), (200, ""), "des réponses vides"),
+    ):
+        assert not ms_swift_fires(models=models, openapi=openapi), (
+            "le template conclut sur %s" % why)
+
+
+def test_ms_swift_extractor_reports_the_served_models():
+    extractors = ms_swift_block().get("extractors") or []
+    assert len(extractors) == 1, "un résultat par extracteur sous req-condition"
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("part") == "body_1"
+    assert extractors[0].get("json") == [".data[].id"], extractors[0]
+    assert [card["id"] for card in json.loads(MS_SWIFT_NAMED_MODELS_BODY)["data"]] == [
+        "acme/qwen2.5-7b-sft", "lora-support"]
+
+
+def test_ms_swift_description_keeps_the_auth_nuances():
+    info = load(MS_SWIFT_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("_AUTH_EXEMPT_PATHS", "'/v1/models'", "_install_auth_middleware",
+                   "if not self.args.api_key", "_warn_if_unauthenticated",
+                   "owned_by: str = 'swift'", "owned_by: str = 'ms-swift'",
+                   "host: str = '0.0.0.0'", "port: int = 8000",
+                   '{"message":"API key error","object":"error"}',
+                   "infer_handler_infer__post", "v4.3.0", "v4.6.0", "asdict()"):
+        assert needle in description, needle
+    remediation = info.get("remediation") or ""
+    assert "--api_key" in remediation and "v4.6.0" in remediation
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_ms_swift_matcher_compiles_and_fires_against_a_live_server():
+    """
+    Seul un scan ferme la boucle sur RE2 et sur l'évaluation de body_1 sous
+    req-condition — et il dit ce que le template envoie vraiment.
+    """
+    def scan(models=(200, MS_SWIFT_MODELS_BODY),
+             openapi=(200, MS_SWIFT_OPENAPI_BODY)):
+        seen = []
+        routes = {MS_SWIFT_MODELS_ROUTE: models,
+                  MS_SWIFT_OPENAPI_ROUTE: openapi}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization")))
+                code, payload = routes.get(self.path,
+                                           (404, MS_SWIFT_NOT_FOUND_BODY))
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MS_SWIFT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "ms-swift-deploy-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", MS_SWIFT_MODELS_ROUTE, None),
+                    ("GET", MS_SWIFT_OPENAPI_ROUTE, None)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [MS_SWIFT_DEFAULT_MODEL], results
+
+    _, results = scan(models=(200, MS_SWIFT_NAMED_MODELS_BODY),
+                      openapi=(200, ms_swift_openapi_body(indent=2)))
+    assert len(results) == 1, "le scan perd un nom servi derrière un schéma réindenté"
+    assert results[0].get("extracted-results") == ["acme/qwen2.5-7b-sft",
+                                                   "lora-support"], results
+
+    for models, openapi, why in (
+        ((200, MS_SWIFT_MODELS_BODY), (400, MS_SWIFT_UNAUTHORIZED_BODY),
+         "une instance lancée avec --api_key"),
+        ((200, MS_SWIFT_MODELS_BODY), (200, MS_SWIFT_PRE_INFER_OPENAPI_BODY),
+         "un schéma sans /infer/"),
+        ((200, MS_SWIFT_PYDANTIC_ORDER_BODY), (200, MS_SWIFT_OPENAPI_BODY),
+         "l'ordre object puis data"),
+        ((200, VLLM_MODELS_BODY), (200, MS_SWIFT_OPENAPI_BODY), "vLLM"),
+        ((200, MS_SWIFT_MODELS_BODY), (404, MS_SWIFT_NOT_FOUND_BODY),
+         "un /openapi.json absent"),
+    ):
+        _, results = scan(models=models, openapi=openapi)
+        assert results == [], f"le scan conclut sur {why} — {results}"
