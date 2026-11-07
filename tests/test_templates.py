@@ -47414,3 +47414,296 @@ def test_aio_sandbox_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(body=body, status=status, content_type=content_type)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# Aphrodite Engine — aphrodite-engine/aphrodite-engine, `aphrodite serve`.
+# init_entrypoints_middleware() (serve/middleware/register.py) n'ajoute
+# AuthenticationMiddleware que si --api-key ou APHRODITE_API_KEY est posé, et
+# ce middleware garde GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere")
+# en rendant 401 {"error":"Unauthorized"} : GET /v1/models ne répond donc que
+# sur une instance ouverte, et sa carte porte "owned_by":"aphrodite", que vLLM
+# — même ModelCard à ce mot près — n'écrit jamais. Les corps ci-dessous ont été
+# rendus le 2026-11-07 sur protocol.py, serving.py et models/api_router.py de
+# main (c824d85) instanciés tels quels — moteur d'inférence remplacé par un
+# bouchon —, modèle nu, puis --served-model-name, puis un adaptateur LoRA.
+
+APHRODITE_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "aphrodite-engine-exposed.yaml")
+
+APHRODITE_ROUTE = "/v1/models"
+
+APHRODITE_DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
+
+# Relevés tels quels, octet pour octet. JSONResponse(content=model_dump())
+# sérialise compact dans l'ordre des champs pydantic : ModelList object puis
+# data ; ModelCard id, object, created, owned_by, root, parent, max_model_len,
+# permission ; ModelPermission id « modelperm-<16 hex> » puis les drapeaux.
+APHRODITE_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"Qwen/Qwen3-0.6B","object":"model",'
+    '"created":1794036051,"owned_by":"aphrodite","root":"Qwen/Qwen3-0.6B",'
+    '"parent":null,"max_model_len":40960,"permission":[{"id":'
+    '"modelperm-ac45d309ad051403","object":"model_permission",'
+    '"created":1794036051,"allow_create_engine":false,"allow_sampling":true,'
+    '"allow_logprobs":true,"allow_search_indices":false,"allow_view":true,'
+    '"allow_fine_tuning":false,"organization":"*","group":null,'
+    '"is_blocking":false}]}]}'
+)
+# --served-model-name qwen3 : id prend le nom servi, root garde le dépôt.
+APHRODITE_SERVED_NAME_BODY = (
+    '{"object":"list","data":[{"id":"qwen3","object":"model",'
+    '"created":1794036051,"owned_by":"aphrodite","root":"Qwen/Qwen3-0.6B",'
+    '"parent":null,"max_model_len":40960,"permission":[{"id":'
+    '"modelperm-bb83e9a94daa5695","object":"model_permission",'
+    '"created":1794036051,"allow_create_engine":false,"allow_sampling":true,'
+    '"allow_logprobs":true,"allow_search_indices":false,"allow_view":true,'
+    '"allow_fine_tuning":false,"organization":"*","group":null,'
+    '"is_blocking":false}]}]}'
+)
+# Et un adaptateur LoRA : seconde carte, parent renseigné, max_model_len null.
+APHRODITE_LORA_BODY = (
+    '{"object":"list","data":[{"id":"qwen3","object":"model",'
+    '"created":1794036051,"owned_by":"aphrodite","root":"Qwen/Qwen3-0.6B",'
+    '"parent":null,"max_model_len":40960,"permission":[{"id":'
+    '"modelperm-b5caf9466217e6fa","object":"model_permission",'
+    '"created":1794036051,"allow_create_engine":false,"allow_sampling":true,'
+    '"allow_logprobs":true,"allow_search_indices":false,"allow_view":true,'
+    '"allow_fine_tuning":false,"organization":"*","group":null,'
+    '"is_blocking":false}]},{"id":"support-sft","object":"model",'
+    '"created":1794036051,"owned_by":"aphrodite",'
+    '"root":"/models/adapters/support-sft","parent":"qwen3",'
+    '"max_model_len":null,"permission":[{"id":"modelperm-8ce2e2d4845320b0",'
+    '"object":"model_permission","created":1794036051,'
+    '"allow_create_engine":false,"allow_sampling":true,"allow_logprobs":true,'
+    '"allow_search_indices":false,"allow_view":true,"allow_fine_tuning":false,'
+    '"organization":"*","group":null,"is_blocking":false}]}]}'
+)
+# --api-key posée, requête sans jeton sur un chemin gardé : authenticate.py.
+APHRODITE_UNAUTHORIZED_BODY = '{"error":"Unauthorized"}'
+APHRODITE_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# v0.10.0 : random_uuid() rendait uuid4().hex, 32 hexadécimaux.
+APHRODITE_V0_10_BODY = APHRODITE_MODELS_BODY.replace(
+    "modelperm-ac45d309ad051403", "modelperm-ac45d309ad0514039f2b7c6e1d8a4b30")
+
+# Des listes qui ressemblent sans être le produit ouvert.
+# v0.9.1 et la lignée 0.6 : la même carte, owned_by "pygmalionai".
+APHRODITE_LEGACY_OWNER_BODY = APHRODITE_MODELS_BODY.replace('"aphrodite"', '"pygmalionai"')
+# vLLM, dont Aphrodite dérive : la même carte, à owned_by près.
+APHRODITE_VLLM_LOOKALIKE_BODY = APHRODITE_MODELS_BODY.replace('"aphrodite"', '"vllm"')
+# Une liste dont une carte seulement est à aphrodite.
+APHRODITE_MIXED_OWNER_BODY = APHRODITE_LORA_BODY.replace(
+    '"created":1794036051,"owned_by":"aphrodite","root":"/models/adapters/support-sft"',
+    '"created":1794036051,"owned_by":"acme","root":"/models/adapters/support-sft"')
+# Une passerelle qui republie la carte réduite aux quatre champs OpenAI.
+APHRODITE_TRIMMED_CARD_BODY = (
+    '{"object":"list","data":[{"id":"Qwen/Qwen3-0.6B","object":"model",'
+    '"created":1794036051,"owned_by":"aphrodite"}]}'
+)
+# L'ordre d'un serveur en dataclasses (ms-swift) : data avant object.
+APHRODITE_DATA_FIRST_BODY = (
+    '{"data":' + APHRODITE_MODELS_BODY[len('{"object":"list","data":'):-1]
+    + ',"object":"list"}'
+)
+APHRODITE_EMPTY_LIST_BODY = '{"object":"list","data":[]}'
+APHRODITE_WRAPPED_BODY = '{"upstream":%s}' % APHRODITE_MODELS_BODY
+APHRODITE_DOC_PAGE_BODY = "<pre>%s</pre>" % APHRODITE_MODELS_BODY
+# GET /api/v1/model, l'émulation KoboldAI du même processus : nomme le produit
+# sans rien prouver — /api n'est pas gardé.
+APHRODITE_KOBOLD_MODEL_BODY = '{"result":"aphrodite/Qwen/Qwen3-0.6B"}'
+
+
+def aphrodite_block():
+    doc = load(APHRODITE_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % APHRODITE_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % APHRODITE_ROUTE
+    return blocks[0]
+
+
+def aphrodite_fires(status=200, body=APHRODITE_MODELS_BODY):
+    block = aphrodite_block()
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "le constat tient au corps entier : un matcher word ou status ne "
+        "lirait qu'un mot ou qu'un code"
+    )
+    verdicts = [dsl_matcher_hits(m, [(status, body)]) for m in matchers]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_aphrodite_probe_is_a_single_read_only_get():
+    """
+    POST /v1/chat/completions, /v1/completions, /v1/messages, /cohere/v2/chat
+    ou /api/v1/generate feraient tourner le modèle sur le GPU de l'exploitant :
+    c'est l'abus que le constat signale. /api/v1/model et /api/extra/version,
+    hors GUARDED_PREFIX, répondent avec ou sans clé et ne prouveraient rien.
+    """
+    doc = load(APHRODITE_TEMPLATE)
+    assert request_routes(doc) == {("GET", APHRODITE_ROUTE)}, (
+        sorted(request_routes(doc)))
+    for item in doc.get("http") or []:
+        assert item.get("method", "GET") == "GET"
+        assert not item.get("body") and not item.get("raw")
+        assert not item.get("headers"), "aucun jeton, aucun en-tête"
+    exprs = [e for m in aphrodite_block().get("matchers") or [] for e in m.get("dsl") or []]
+    assert exprs and all("status_code" not in e for e in exprs), (
+        "le constat ne doit pas lire le statut : le corps dit ce qui est servi"
+    )
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "aphrodite-engine"
+    assert meta.get("max-request") == 1
+    assert info.get("severity") == "high"
+
+
+def test_aphrodite_matcher_fires_on_the_bodies_rendered_from_the_app():
+    assert aphrodite_fires(), "le template ne reconnaît pas l'instance ouverte"
+    assert aphrodite_fires(body=APHRODITE_SERVED_NAME_BODY), (
+        "le template perd une instance lancée avec --served-model-name"
+    )
+    assert aphrodite_fires(body=APHRODITE_LORA_BODY), (
+        "le template perd une instance qui sert un adaptateur LoRA — parent "
+        "renseigné, max_model_len null"
+    )
+    assert aphrodite_fires(body=APHRODITE_V0_10_BODY), (
+        "le template perd v0.10.0, dont modelperm fait 32 hexadécimaux"
+    )
+    assert aphrodite_fires(status=203, body=APHRODITE_MODELS_BODY), (
+        "le constat ne doit pas dépendre du statut"
+    )
+    reindented = json.dumps(json.loads(APHRODITE_LORA_BODY), indent=2)
+    for body, why in (
+        (reindented, "une liste réindentée"),
+        (reindented.replace("\n", "\r\n"), "une liste servie en CRLF"),
+        (APHRODITE_MODELS_BODY + "\n", "un saut de ligne final"),
+        (APHRODITE_MODELS_BODY.replace("Qwen/Qwen3-0.6B", 'my \\"sft\\" v2'),
+         "un nom de modèle à guillemet échappé"),
+        (APHRODITE_MODELS_BODY.replace('"max_model_len":40960', '"max_model_len":1048576'),
+         "une fenêtre de contexte à sept chiffres"),
+    ):
+        assert aphrodite_fires(body=body), "le template perd %s" % why
+
+
+def test_aphrodite_matcher_needs_the_whole_aphrodite_card_not_a_word():
+    for status, body, why in (
+        (401, APHRODITE_UNAUTHORIZED_BODY,
+         "une instance lancée avec --api-key, le 401 du middleware"),
+        (200, APHRODITE_LEGACY_OWNER_BODY, "v0.9.1, owned_by pygmalionai"),
+        (200, APHRODITE_VLLM_LOOKALIKE_BODY, "vLLM, la même carte à owned_by près"),
+        (200, VLLM_MODELS_BODY, "vLLM, déjà couvert par son propre template"),
+        (200, APHRODITE_MIXED_OWNER_BODY, "une liste dont une carte n'est pas à aphrodite"),
+        (200, APHRODITE_TRIMMED_CARD_BODY,
+         "une passerelle qui republie la carte sans root, parent, max_model_len "
+         "ni permission"),
+        (200, APHRODITE_DATA_FIRST_BODY, "l'ordre data puis object, que pydantic ne produit pas"),
+        (200, APHRODITE_EMPTY_LIST_BODY, "une liste vide, qu'un serveur lancé ne rend jamais"),
+        (200, APHRODITE_WRAPPED_BODY, "une supervision qui republie la liste"),
+        (200, APHRODITE_DOC_PAGE_BODY, "une page de documentation qui cite la liste"),
+        (200, APHRODITE_KOBOLD_MODEL_BODY, "le corps Kobold /api/v1/model, qui ne prouve rien"),
+        (200, LMDEPLOY_OPEN_BODY, "LMDeploy"),
+        (200, LLAMA_FACTORY_MODELS_BODY, "LLaMA-Factory"),
+        (200, MS_SWIFT_MODELS_BODY, "ms-swift"),
+        (200, OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (404, APHRODITE_NOT_FOUND_BODY, "un /v1/models absent"),
+        (200, "", "une réponse vide"),
+    ):
+        assert not aphrodite_fires(status=status, body=body), (
+            "le template conclut sur %s" % why)
+
+
+def test_aphrodite_extractor_reports_the_served_models():
+    extractors = aphrodite_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("part") == "body"
+    assert extractors[0].get("json") == [".data[].id"], extractors[0]
+    assert [card["id"] for card in json.loads(APHRODITE_LORA_BODY)["data"]] == [
+        "qwen3", "support-sft"]
+
+
+def test_aphrodite_description_keeps_the_auth_nuances():
+    info = load(APHRODITE_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("aphrodite serve", "host: str | None = None", "port: int = 2242",
+                   'args.host or ""', "APHRODITE_API_KEY",
+                   'GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere")',
+                   '{"error": "Unauthorized"}', 'owned_by: str = "aphrodite"',
+                   "pygmalionai", "v0.10.0", "KoboldCpp", "/api/v1/model",
+                   "model_dump()", "modelperm-"):
+        assert needle in description, needle
+    remediation = info.get("remediation") or ""
+    for needle in ("--api-key", "APHRODITE_API_KEY", "--host 127.0.0.1",
+                   "/api/v1/generate", '{"error":"Unauthorized"}'):
+        assert needle in remediation, needle
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_aphrodite_matcher_compiles_and_fires_against_a_live_server():
+    """
+    Seul un scan ferme la boucle sur RE2 — le motif tient deux cartes et des
+    alternances nullables — et dit ce que le template envoie vraiment.
+    """
+    def scan(status=200, body=APHRODITE_MODELS_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization")))
+                code, payload = ((status, body) if self.path == APHRODITE_ROUTE
+                                 else (404, APHRODITE_NOT_FOUND_BODY))
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", APHRODITE_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "aphrodite-engine-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", APHRODITE_ROUTE, None)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [APHRODITE_DEFAULT_MODEL], results
+
+    _, results = scan(body=json.dumps(json.loads(APHRODITE_LORA_BODY), indent=2))
+    assert len(results) == 1, "le scan perd une liste réindentée à deux cartes"
+    assert results[0].get("extracted-results") == ["qwen3", "support-sft"], results
+
+    for status, body, why in (
+        (401, APHRODITE_UNAUTHORIZED_BODY, "une instance lancée avec --api-key"),
+        (200, APHRODITE_LEGACY_OWNER_BODY, "v0.9.1, owned_by pygmalionai"),
+        (200, APHRODITE_VLLM_LOOKALIKE_BODY, "vLLM"),
+        (200, APHRODITE_TRIMMED_CARD_BODY, "une carte réduite"),
+        (200, APHRODITE_EMPTY_LIST_BODY, "une liste vide"),
+    ):
+        _, results = scan(status=status, body=body)
+        assert results == [], f"le scan conclut sur {why} — {results}"

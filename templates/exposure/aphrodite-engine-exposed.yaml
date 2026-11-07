@@ -1,0 +1,169 @@
+id: aphrodite-engine-exposed
+
+info:
+  name: Aphrodite Engine - OpenAI-Compatible API Exposed Without an API Key
+  author: popy21
+  severity: high
+  description: |
+    Aphrodite Engine (aphrodite-engine/aphrodite-engine, 1 904 étoiles, dépôt
+    non archivé — dernier push 2026-11-07, dernière release v0.24.1 le
+    2026-09-11) est le moteur d'inférence LLM de PygmalionAI, dérivé de vLLM
+    et resynchronisé en continu sur l'amont. « aphrodite serve <modèle> »
+    (aphrodite/entrypoints/cli/serve.py, « name = "serve" », usage
+    « aphrodite serve [model_tag] [options] » ; « aphrodite run » en est
+    l'alias hérité, et « python -m aphrodite.entrypoints.openai.api_server »
+    une cale dépréciée qui appelle le même main()) sert une API compatible
+    OpenAI dont aphrodite/entrypoints/common/cli_args.py fixe les défauts dans
+    FrontendArgs : « host: str | None = None », « port: int = 2242 »,
+    « api_key: list[str] | None = None ». setup_server(), dans
+    aphrodite/entrypoints/launchers/launcher.py, ouvre la socket sur
+    « sock_addr = (args.host or "", args.port) » — bind sur "" , donc toutes
+    les interfaces IPv4 — et journalise « addr or "0.0.0.0" » ; le
+    « http://127.0.0.1:2242 » du README est l'adresse qu'un client local
+    compose, pas une liaison.
+    L'authentification n'existe que si l'exploitant la demande.
+    init_entrypoints_middleware(), dans
+    aphrodite/entrypoints/serve/middleware/register.py, n'ajoute
+    AuthenticationMiddleware que sous « if tokens := [key for key in
+    (args.api_key or [envs.APHRODITE_API_KEY]) if key]: ». Quand il est
+    monté, aphrodite/entrypoints/serve/middleware/authenticate.py garde
+    « GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere") » et rend
+    « JSONResponse(content={"error": "Unauthorized"}, status_code=401) » à
+    toute requête hors OPTIONS dont le chemin commence par l'un d'eux. GET
+    /v1/models est donc gardé : son corps ne sort que d'une instance sans clé,
+    et il porte à lui seul la preuve.
+    Ce corps a une forme fixe. aphrodite/entrypoints/launchers/api_server/
+    routers.py enregistre le routeur des modèles sans condition ;
+    aphrodite/entrypoints/openai/models/api_router.py rend
+    « JSONResponse(content=models_.model_dump()) », compact, dans l'ordre des
+    champs pydantic ; show_available_models(), dans
+    aphrodite/entrypoints/openai/models/serving.py, construit une carte par
+    modèle de base — « ModelCard(id=base_model.name,
+    max_model_len=max_model_len, root=base_model.model_path,
+    permission=[ModelPermission()]) » — puis une par adaptateur LoRA
+    (« root=lora.path », « parent=<modèle de base> », max_model_len laissé à
+    None) ; et aphrodite/entrypoints/serve/engine/protocol.py déclare
+    ModelCard « id », « object: str = "model" », « created »,
+    « owned_by: str = "aphrodite" », « root », « parent », « max_model_len »,
+    « permission », ModelList « object: str = "list" » puis « data », et
+    ModelPermission « id » à « modelperm-{random_uuid()} » puis « object: str
+    = "model_permission" ». Soit « {"object":"list","data":[{"id":"Qwen/
+    Qwen3-0.6B","object":"model","created":...,"owned_by":"aphrodite",
+    "root":"Qwen/Qwen3-0.6B","parent":null,"max_model_len":40960,
+    "permission":[{"id":"modelperm-...","object":"model_permission",...}]}]} ».
+    owned_by n'est jamais surchargé : « "owned_by":"aphrodite" » est propre
+    au produit et le sépare de vLLM, dont la carte est identique à ce mot
+    près.
+    Les versions : « owned_by: str = "aphrodite" » date de v0.10.0
+    (2025-11-08) ; v0.9.1 et la lignée 0.6 servaient « "pygmalionai" »
+    (aphrodite/endpoints/openai/protocol.py), et le template se tait sur
+    elles. De v0.10.0 à v0.20.0 le middleware ne gardait que « /v1 »
+    (api_server.py puis server_utils.py), avec le même 401 ; /v1/models y est
+    gardé pareil. random_uuid() rendait 32 hexadécimaux (uuid4().hex) en
+    v0.10.0 et en rend 16 sur main : le motif admet les deux.
+    L'émulation KoboldAI ne prouve rien. aphrodite/entrypoints/generate/
+    api_router.py monte son routeur sans condition dès qu'une tâche
+    « generate » est servie ; GET /api/v1/model rend « {"result":
+    "aphrodite/<modèle>"} » et GET /api/extra/version « {"result":
+    "KoboldCpp", "version": "1.63"} » — sans champ protected, donc sans
+    collision avec KoboldCpp —, mais « /api » n'est pas dans GUARDED_PREFIX :
+    ces chemins répondent pareil avec ou sans clé. Les trois corps ont été
+    rendus le 2026-11-07 sur protocol.py, serving.py et api_router.py de main
+    (c824d85) instanciés tels quels, moteur d'inférence remplacé par un
+    bouchon : modèle nu, --served-model-name, puis un adaptateur LoRA.
+  impact: |
+    Le corps de /v1/models est la preuve, pas le butin. La même absence de
+    clé ouvre tout ce que le processus sert : POST /v1/chat/completions,
+    /v1/completions, /v1/responses, /v1/embeddings et /v2/embed, l'API
+    Anthropic /v1/messages, Cohere /cohere/v2/chat et la génération KoboldAI
+    /api/v1/generate. N'importe qui fait tourner de l'inférence sur le GPU de
+    l'hôte, aux frais de l'exploitant, sur le modèle qu'il sert ; les
+    requêtes concurrentes saturent la mémoire vidéo et privent les usages
+    légitimes de leur capacité ; aucune notion d'utilisateur, aucune trace
+    d'appelant. La liste elle-même renseigne : « root » donne le chemin
+    local ou le dépôt du modèle, les cartes d'adaptateurs nomment des
+    fine-tunes maison et leur chemin sur disque, « max_model_len » la
+    fenêtre de contexte.
+  remediation: |
+    Lancer « aphrodite serve » avec --api-key <clé> (répétable) ou
+    APHRODITE_API_KEY posée dans l'environnement : le middleware ferme alors
+    /v1, /v2, /inference et /cohere, et les clients doivent présenter
+    « Authorization: Bearer <clé> », comparée par secrets.compare_digest. La
+    clé est un jeton statique partagé — elle ferme l'accès anonyme sans
+    remplacer une authentification par utilisateur — et elle ne garde pas
+    « /api » : l'émulation KoboldAI (/api/v1/generate, /api/extra/generate/
+    stream) répond toujours sans jeton, comme /health, /metrics et
+    /tokenize.
+    Poser --host 127.0.0.1 tant que le service n'est pas destiné au réseau —
+    le défaut écoute sur toutes les interfaces —, ou publier le conteneur en
+    « -p 127.0.0.1:2242:2242 », et placer un reverse proxy qui authentifie
+    devant le port pour tout usage partagé : c'est le seul moyen de fermer
+    aussi les chemins hors GUARDED_PREFIX.
+    Vérifier depuis l'extérieur, sur la route même du constat : « curl -s
+    http://<hote>:2242/v1/models » doit rendre 401 et
+    « {"error":"Unauthorized"} », plus la liste des modèles ; et
+    « curl -s http://<hote>:2242/api/v1/model » ne doit plus répondre du
+    tout.
+  reference:
+    - https://github.com/aphrodite-engine/aphrodite-engine
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/serve/engine/protocol.py
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/openai/models/serving.py
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/openai/models/api_router.py
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/serve/middleware/register.py
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/serve/middleware/authenticate.py
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/common/cli_args.py
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/launchers/launcher.py
+    - https://github.com/aphrodite-engine/aphrodite-engine/blob/main/aphrodite/entrypoints/openai/kobold/api_router.py
+    - https://sonar.dphn.ai/serving/openai/
+  metadata:
+    max-request: 1
+    vendor: aphrodite-engine
+    product: aphrodite-engine
+  tags: ai,llm,aphrodite,aphrodite-engine,pygmalionai,inference,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /v1/models, gardé par le middleware. Il nomme le
+  # produit — "owned_by":"aphrodite", que vLLM n'écrit jamais — et prouve
+  # l'ouverture à la fois : sur une instance à clé il rend 401
+  # {"error":"Unauthorized"}, jamais la liste.
+  #
+  # GET /api/v1/model et /api/extra/version, l'émulation KoboldAI, ne sont pas
+  # lus : hors GUARDED_PREFIX, ils répondent pareil avec ou sans clé et ne
+  # prouvent donc rien.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions ou
+  # /api/v1/generate ferait tourner le modèle sur le GPU de l'exploitant :
+  # c'est l'abus que le constat signale, pas ce qu'un scanner a le droit de
+  # faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document entier, ancré aux deux bouts, dans l'ordre des champs
+          # pydantic : ModelList object puis data ; chaque ModelCard id, object,
+          # created, owned_by, root, parent, max_model_len, permission ; et dans
+          # permission une ModelPermission ouverte sur son id « modelperm-… »
+          # (16 ou 32 hexadécimaux selon la version) puis « model_permission ».
+          # Une carte au moins, toutes à "aphrodite" — show_available_models()
+          # ne surcharge owned_by nulle part — et root, parent, max_model_len
+          # nullables : un adaptateur LoRA a parent renseigné et max_model_len
+          # null. Tenir le document entier plutôt qu'un mot écarte vLLM (même
+          # carte, owned_by "vllm"), la lignée pygmalionai, le 401 du
+          # middleware, et toute page ou passerelle qui republierait une carte
+          # réduite. Aucune expression ne lit le statut : le corps dit ce qui
+          # est servi. JSONResponse sérialise compact ; les \s* absorbent
+          # l'intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"object\"\\s*:\\s*\"list\"\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"aphrodite\"\\s*,\\s*\"root\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"parent\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"max_model_len\"\\s*:\\s*(?:[0-9]+|null)\\s*,\\s*\"permission\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"modelperm-[0-9a-f]+\"\\s*,\\s*\"object\"\\s*:\\s*\"model_permission\"\\s*,[^\\[\\]]*\\}\\s*\\]\\s*\\}(?:\\s*,\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"aphrodite\"\\s*,\\s*\"root\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"parent\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"max_model_len\"\\s*:\\s*(?:[0-9]+|null)\\s*,\\s*\"permission\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"modelperm-[0-9a-f]+\"\\s*,\\s*\"object\"\\s*:\\s*\"model_permission\"\\s*,[^\\[\\]]*\\}\\s*\\]\\s*\\})*\\s*\\]\\s*\\}$", trim_space(body))'
+
+    extractors:
+      # Les modèles servis — served_model_name ou nom du dépôt, puis les
+      # adaptateurs LoRA : ce qu'un tiers peut faire tourner sans clé.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'
