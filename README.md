@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-141 templates, 138 produits.
+142 templates, 139 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -61,6 +61,7 @@ amont.
 | evidently | [`evidently-ui-exposed`](templates/exposure/evidently-ui-exposed.yaml) | medium |
 | exo | [`exo-cluster-state-exposed`](templates/exposure/exo-cluster-state-exposed.yaml) | high |
 | fastchat | [`fastchat-controller-exposed`](templates/exposure/fastchat-controller-exposed.yaml) | high |
+| fastdeploy | [`fastdeploy-api-server-exposed`](templates/exposure/fastdeploy-api-server-exposed.yaml) | high |
 | feast | [`feast-vector-stores-exposed`](templates/exposure/feast-vector-stores-exposed.yaml) | high |
 | fiftyone | [`fiftyone-app-server-exposed`](templates/exposure/fiftyone-app-server-exposed.yaml) | high |
 | firecrawl | [`firecrawl-self-hosted-unauthenticated`](templates/exposure/firecrawl-self-hosted-unauthenticated.yaml) | high |

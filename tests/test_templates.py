@@ -47707,3 +47707,286 @@ def test_aphrodite_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(status=status, body=body)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# FastDeploy — PaddlePaddle/FastDeploy, `python -m
+# fastdeploy.entrypoints.openai.api_server`. api_server.py n'ajoute
+# AuthenticationMiddleware que si --api-key ou FD_API_KEY est posé, et
+# middleware.py garde tout chemin « startswith("/v1") » en rendant 401
+# {"error":"Unauthorized"} : GET /v1/models ne répond donc que sur une instance
+# ouverte, et sa carte porte "owned_by":"FastDeploy", que ni vLLM ni Aphrodite —
+# même ModelInfo à ce mot près — n'écrivent. Les corps ci-dessous ont été rendus
+# le 2026-11-07 sur protocol.py, serving_models.py et middleware.py de develop
+# (d923caf) instanciés tels quels — moteur Paddle remplacé par un bouchon —,
+# modèle nu, puis --served-model-name, puis un nœud non maître, puis une
+# instance à clé interrogée sans jeton.
+
+FASTDEPLOY_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "fastdeploy-api-server-exposed.yaml")
+
+FASTDEPLOY_ROUTE = "/v1/models"
+
+FASTDEPLOY_DEFAULT_MODEL = "baidu/ERNIE-4.5-0.3B-Paddle"
+
+# Relevés tels quels, octet pour octet. JSONResponse(content=model_dump())
+# sérialise compact dans l'ordre des champs pydantic : ModelList object puis
+# data ; ModelInfo id, object, created, owned_by, root, parent, max_model_len,
+# permission ; ModelPermission id « modelperm-<32 hex> » puis les drapeaux.
+# Le quick start : --model baidu/ERNIE-4.5-0.3B-Paddle --max-model-len 32768.
+FASTDEPLOY_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"baidu/ERNIE-4.5-0.3B-Paddle",'
+    '"object":"model","created":1794038336,"owned_by":"FastDeploy",'
+    '"root":"baidu/ERNIE-4.5-0.3B-Paddle","parent":null,"max_model_len":32768,'
+    '"permission":[{"id":"modelperm-89ee691b6ef94fbca8c501e76e407637",'
+    '"object":"model_permission","created":1794038336,'
+    '"allow_create_engine":false,"allow_sampling":true,"allow_logprobs":true,'
+    '"allow_search_indices":false,"allow_view":true,"allow_fine_tuning":false,'
+    '"organization":"*","group":null,"is_blocking":false}]}]}'
+)
+# --served-model-name ernie-4.5 --model /models/ERNIE-4.5-21B-A3B-Paddle, sans
+# --max-model-len : id prend le nom servi, root le chemin, max_model_len 2048.
+FASTDEPLOY_SERVED_NAME_BODY = (
+    '{"object":"list","data":[{"id":"ernie-4.5","object":"model",'
+    '"created":1794038336,"owned_by":"FastDeploy",'
+    '"root":"/models/ERNIE-4.5-21B-A3B-Paddle","parent":null,'
+    '"max_model_len":2048,"permission":[{"id":'
+    '"modelperm-6b59b2155ecb4802825261468c8822a3","object":"model_permission",'
+    '"created":1794038336,"allow_create_engine":false,"allow_sampling":true,'
+    '"allow_logprobs":true,"allow_search_indices":false,"allow_view":true,'
+    '"allow_fine_tuning":false,"organization":"*","group":null,'
+    '"is_blocking":false}]}]}'
+)
+# --api-key posée, requête sans jeton sur un chemin /v1 : middleware.py.
+FASTDEPLOY_UNAUTHORIZED_BODY = '{"error":"Unauthorized"}'
+# Nœud non maître d'un déploiement --ips : list_models() rend ErrorResponse,
+# en 200. Le produit se nomme presque, mais rien n'est servi.
+FASTDEPLOY_NOT_MASTER_BODY = (
+    '{"error":{"message":"Only master node can accept models request, please '
+    'send request to master node: 10.0.0.1","type":"internal_error",'
+    '"param":null,"code":null}}'
+)
+# --dynamic-load-weight sans worker vivant : 304.
+FASTDEPLOY_WORKERS_DOWN_BODY = '{"error":"Worker Service Not Healthy"}'
+FASTDEPLOY_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Des listes qui ressemblent sans être le produit ouvert.
+# vLLM et Aphrodite, la même carte à owned_by près.
+FASTDEPLOY_VLLM_LOOKALIKE_BODY = FASTDEPLOY_MODELS_BODY.replace('"FastDeploy"', '"vllm"')
+FASTDEPLOY_APHRODITE_LOOKALIKE_BODY = FASTDEPLOY_MODELS_BODY.replace('"FastDeploy"', '"aphrodite"')
+# La casse : le littéral est "FastDeploy", pas le nom du paquet.
+FASTDEPLOY_LOWERCASE_OWNER_BODY = FASTDEPLOY_MODELS_BODY.replace('"FastDeploy"', '"fastdeploy"')
+# Une liste dont une carte seulement est à FastDeploy.
+FASTDEPLOY_MIXED_OWNER_BODY = (
+    FASTDEPLOY_MODELS_BODY[:-2] + ','
+    + FASTDEPLOY_SERVED_NAME_BODY[len('{"object":"list","data":['):-2]
+    .replace('"owned_by":"FastDeploy"', '"owned_by":"acme"') + ']}'
+)
+# Une passerelle qui republie la carte réduite aux quatre champs OpenAI.
+FASTDEPLOY_TRIMMED_CARD_BODY = (
+    '{"object":"list","data":[{"id":"baidu/ERNIE-4.5-0.3B-Paddle",'
+    '"object":"model","created":1794038336,"owned_by":"FastDeploy"}]}'
+)
+# L'ordre d'un serveur en dataclasses (ms-swift) : data avant object.
+FASTDEPLOY_DATA_FIRST_BODY = (
+    '{"data":' + FASTDEPLOY_MODELS_BODY[len('{"object":"list","data":'):-1]
+    + ',"object":"list"}'
+)
+FASTDEPLOY_EMPTY_LIST_BODY = '{"object":"list","data":[]}'
+FASTDEPLOY_WRAPPED_BODY = '{"upstream":%s}' % FASTDEPLOY_MODELS_BODY
+FASTDEPLOY_DOC_PAGE_BODY = "<pre>%s</pre>" % FASTDEPLOY_MODELS_BODY
+
+
+def fastdeploy_block():
+    doc = load(FASTDEPLOY_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % FASTDEPLOY_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % FASTDEPLOY_ROUTE
+    return blocks[0]
+
+
+def fastdeploy_fires(status=200, body=FASTDEPLOY_MODELS_BODY):
+    block = fastdeploy_block()
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "le constat tient au corps entier : un matcher word ou status ne "
+        "lirait qu'un mot ou qu'un code"
+    )
+    verdicts = [dsl_matcher_hits(m, [(status, body)]) for m in matchers]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_fastdeploy_probe_is_a_single_read_only_get():
+    """
+    POST /v1/chat/completions, /v1/completions ou /v1/embeddings feraient
+    tourner le modèle sur le GPU de l'exploitant, /v1/pause ou /v1/sleep
+    arrêteraient le service : c'est l'abus que le constat signale. /health,
+    /ping et /load, hors "/v1", répondent avec ou sans clé et ne prouveraient
+    rien.
+    """
+    doc = load(FASTDEPLOY_TEMPLATE)
+    assert request_routes(doc) == {("GET", FASTDEPLOY_ROUTE)}, (
+        sorted(request_routes(doc)))
+    for item in doc.get("http") or []:
+        assert item.get("method", "GET") == "GET"
+        assert not item.get("body") and not item.get("raw")
+        assert not item.get("headers"), "aucun jeton, aucun en-tête"
+    exprs = [e for m in fastdeploy_block().get("matchers") or [] for e in m.get("dsl") or []]
+    assert exprs and all("status_code" not in e for e in exprs), (
+        "le constat ne doit pas lire le statut : le corps dit ce qui est servi"
+    )
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "fastdeploy"
+    assert meta.get("max-request") == 1
+    assert info.get("severity") == "high"
+
+
+def test_fastdeploy_matcher_fires_on_the_bodies_rendered_from_the_app():
+    assert fastdeploy_fires(), "le template ne reconnaît pas l'instance ouverte"
+    assert fastdeploy_fires(body=FASTDEPLOY_SERVED_NAME_BODY), (
+        "le template perd une instance lancée avec --served-model-name — id "
+        "nommé, root sur un chemin local, max_model_len au défaut 2048"
+    )
+    assert fastdeploy_fires(status=203, body=FASTDEPLOY_MODELS_BODY), (
+        "le constat ne doit pas dépendre du statut"
+    )
+    reindented = json.dumps(json.loads(FASTDEPLOY_SERVED_NAME_BODY), indent=2)
+    for body, why in (
+        (reindented, "une liste réindentée"),
+        (reindented.replace("\n", "\r\n"), "une liste servie en CRLF"),
+        (FASTDEPLOY_MODELS_BODY + "\n", "un saut de ligne final"),
+        (FASTDEPLOY_MODELS_BODY.replace("baidu/ERNIE-4.5-0.3B-Paddle", 'my \\"sft\\" v2'),
+         "un nom de modèle à guillemet échappé"),
+        (FASTDEPLOY_MODELS_BODY.replace('"max_model_len":32768', '"max_model_len":1048576'),
+         "une fenêtre de contexte à sept chiffres"),
+    ):
+        assert fastdeploy_fires(body=body), "le template perd %s" % why
+
+
+def test_fastdeploy_matcher_needs_the_whole_fastdeploy_card_not_a_word():
+    for status, body, why in (
+        (401, FASTDEPLOY_UNAUTHORIZED_BODY,
+         "une instance lancée avec --api-key, le 401 du middleware"),
+        (200, FASTDEPLOY_NOT_MASTER_BODY, "l'ErrorResponse d'un nœud non maître"),
+        (304, FASTDEPLOY_WORKERS_DOWN_BODY, "un service dont les workers sont morts"),
+        (200, FASTDEPLOY_VLLM_LOOKALIKE_BODY, "vLLM, la même carte à owned_by près"),
+        (200, FASTDEPLOY_APHRODITE_LOOKALIKE_BODY, "Aphrodite, la même carte à owned_by près"),
+        (200, FASTDEPLOY_LOWERCASE_OWNER_BODY, "le nom du paquet en minuscules, que le code n'écrit pas"),
+        (200, VLLM_MODELS_BODY, "vLLM, déjà couvert par son propre template"),
+        (200, APHRODITE_MODELS_BODY, "Aphrodite, déjà couvert par son propre template"),
+        (200, FASTDEPLOY_MIXED_OWNER_BODY, "une liste dont une carte n'est pas à FastDeploy"),
+        (200, FASTDEPLOY_TRIMMED_CARD_BODY,
+         "une passerelle qui republie la carte sans root, parent, max_model_len "
+         "ni permission"),
+        (200, FASTDEPLOY_DATA_FIRST_BODY, "l'ordre data puis object, que pydantic ne produit pas"),
+        (200, FASTDEPLOY_EMPTY_LIST_BODY, "une liste vide, qu'un serveur lancé ne rend jamais"),
+        (200, FASTDEPLOY_WRAPPED_BODY, "une supervision qui republie la liste"),
+        (200, FASTDEPLOY_DOC_PAGE_BODY, "une page de documentation qui cite la liste"),
+        (200, LMDEPLOY_OPEN_BODY, "LMDeploy"),
+        (200, LLAMA_FACTORY_MODELS_BODY, "LLaMA-Factory"),
+        (200, MS_SWIFT_MODELS_BODY, "ms-swift"),
+        (200, OTHER_OPENAI_API_BODY, "une API compatible OpenAI quelconque"),
+        (404, FASTDEPLOY_NOT_FOUND_BODY, "un /v1/models absent"),
+        (200, "", "une réponse vide"),
+    ):
+        assert not fastdeploy_fires(status=status, body=body), (
+            "le template conclut sur %s" % why)
+
+
+def test_fastdeploy_extractor_reports_the_served_model():
+    extractors = fastdeploy_block().get("extractors") or []
+    assert len(extractors) == 1
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("part") == "body"
+    assert extractors[0].get("json") == [".data[].id"], extractors[0]
+    assert [card["id"] for card in json.loads(FASTDEPLOY_SERVED_NAME_BODY)["data"]] == [
+        "ernie-4.5"]
+
+
+def test_fastdeploy_description_keeps_the_auth_nuances():
+    info = load(FASTDEPLOY_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("fastdeploy.entrypoints.openai.api_server", 'default="0.0.0.0"',
+                   "default=8000", 'action="append"', "FD_API_KEY",
+                   'startswith("/v1")', '{"error": "Unauthorized"}',
+                   'owned_by: str = "FastDeploy"', "ms-swift", "model_dump()",
+                   "modelperm-", "Only master", "Worker Service Not Healthy",
+                   "v2.2.0", "v2.4.0", "#4806"):
+        assert needle in description, needle
+    remediation = info.get("remediation") or ""
+    for needle in ("--api-key", "FD_API_KEY", "--host 127.0.0.1", "/health",
+                   "--metrics-port", '{"error":"Unauthorized"}'):
+        assert needle in remediation, needle
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_fastdeploy_matcher_compiles_and_fires_against_a_live_server():
+    """
+    Seul un scan ferme la boucle sur RE2 — le motif tient plusieurs cartes et
+    des alternances nullables — et dit ce que le template envoie vraiment.
+    """
+    def scan(status=200, body=FASTDEPLOY_MODELS_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization")))
+                code, payload = ((status, body) if self.path == FASTDEPLOY_ROUTE
+                                 else (404, FASTDEPLOY_NOT_FOUND_BODY))
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", FASTDEPLOY_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "fastdeploy-api-server-exposed"}, r.stdout + r.stderr
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", FASTDEPLOY_ROUTE, None)], seen
+    assert len(results) == 1, results
+    assert results[0].get("extracted-results") == [FASTDEPLOY_DEFAULT_MODEL], results
+
+    _, results = scan(body=json.dumps(json.loads(FASTDEPLOY_SERVED_NAME_BODY), indent=2))
+    assert len(results) == 1, "le scan perd une liste réindentée, nommée par --served-model-name"
+    assert results[0].get("extracted-results") == ["ernie-4.5"], results
+
+    for status, body, why in (
+        (401, FASTDEPLOY_UNAUTHORIZED_BODY, "une instance lancée avec --api-key"),
+        (200, FASTDEPLOY_NOT_MASTER_BODY, "un nœud non maître"),
+        (200, FASTDEPLOY_VLLM_LOOKALIKE_BODY, "vLLM"),
+        (200, FASTDEPLOY_APHRODITE_LOOKALIKE_BODY, "Aphrodite"),
+        (200, FASTDEPLOY_TRIMMED_CARD_BODY, "une carte réduite"),
+        (200, FASTDEPLOY_EMPTY_LIST_BODY, "une liste vide"),
+    ):
+        _, results = scan(status=status, body=body)
+        assert results == [], f"le scan conclut sur {why} — {results}"

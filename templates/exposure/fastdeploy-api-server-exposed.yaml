@@ -1,0 +1,159 @@
+id: fastdeploy-api-server-exposed
+
+info:
+  name: FastDeploy - OpenAI-Compatible API Server Exposed Without an API Key
+  author: popy21
+  severity: high
+  description: |
+    FastDeploy (PaddlePaddle/FastDeploy, 3 725 étoiles, dépôt non archivé —
+    branche develop, dernier commit d923caf le 2026-09-24, dernière release
+    v2.5.0 le 2026-04-09) est la boîte à outils de déploiement LLM / VLM de
+    PaddlePaddle, qui sert notamment les modèles ERNIE. Son serveur compatible
+    OpenAI se lance par « python -m fastdeploy.entrypoints.openai.api_server
+    --model baidu/ERNIE-4.5-0.3B-Paddle --port 8180 --max-model-len 32768 »
+    (docs/get_started/quick_start.md), et fastdeploy/entrypoints/openai/
+    utils.py fixe les défauts : « --port » default=8000, « --host »
+    default="0.0.0.0", « --api-key » type=str, action="append", sans valeur
+    par défaut. Sans drapeau, le processus écoute donc sur toutes les
+    interfaces et sans clé.
+    L'authentification n'existe que si l'exploitant la demande. api_server.py
+    lit « env_api_key_func = environment_variables.get("FD_API_KEY") » —
+    fastdeploy/envs.py la définit comme « os.environ["FD_API_KEY"].split(",") »,
+    liste vide sinon — puis n'ajoute AuthenticationMiddleware que sous « if
+    tokens := [key for key in (args.api_key or env_tokens) if key]: ». Quand il
+    est monté, fastdeploy/entrypoints/openai/middleware.py laisse passer
+    OPTIONS et tout chemin hors « /v1 », et rend « JSONResponse(content=
+    {"error": "Unauthorized"}, status_code=401) » à toute requête dont « url_
+    path.startswith("/v1") » sans « Authorization: Bearer <clé> » valide
+    (comparée en sha256 par secrets.compare_digest). GET /v1/models est donc
+    gardé : son corps ne sort que d'une instance sans clé, et il porte à lui
+    seul la preuve — ce n'est pas le piège de ms-swift, qui exempte ce chemin.
+    Ce corps a une forme fixe. « @app.get("/v1/models") » (api_server.py)
+    appelle « app.state.model_handler.list_models() » et rend « JSONResponse(
+    content=models.model_dump()) », compact, dans l'ordre des champs pydantic.
+    fastdeploy/entrypoints/openai/serving_models.py construit « ModelInfo(id=
+    model.name, max_model_len=self.max_model_len, root=model.model_path,
+    permission=[ModelPermission()]) » pour l'unique « ModelPath(name=served_
+    model_names, model_path=args.model, verification=…) » qu'api_server.py lui
+    donne — « id » vaut --served-model-name s'il est posé, sinon --model ;
+    « root » vaut toujours --model ; « max_model_len » vaut --max-model-len,
+    2048 par défaut (EngineArgs) — puis « ModelList(data=model_infos) ».
+    fastdeploy/entrypoints/openai/protocol.py déclare ModelInfo « id »,
+    « object: str = "model" », « created », « owned_by: str = "FastDeploy" »,
+    « root », « parent », « max_model_len », « permission » ; ModelList
+    « object: str = "list" » puis « data » ; et ModelPermission « id » à
+    « modelperm-{uuid.uuid4().hex} » (32 hexadécimaux), « object: str =
+    "model_permission" », puis ses drapeaux. Soit « {"object":"list","data":
+    [{"id":"baidu/ERNIE-4.5-0.3B-Paddle","object":"model","created":...,
+    "owned_by":"FastDeploy","root":"baidu/ERNIE-4.5-0.3B-Paddle","parent":
+    null,"max_model_len":32768,"permission":[{"id":"modelperm-...","object":
+    "model_permission",...}]}]} ». owned_by n'est surchargé nulle part :
+    « "owned_by":"FastDeploy" » est propre au produit et le sépare de vLLM
+    (« vllm ») et d'Aphrodite (« aphrodite »), dont la carte est identique à
+    ce mot près.
+    Deux réponses du même chemin ne prouvent rien et le template se tait :
+    sur un nœud non maître d'un déploiement multi-machines (--ips),
+    list_models() rend « ErrorResponse » — « {"error":{"message":"Only master
+    node can accept models request, please send request to master node:
+    …","type":"internal_error",…}} » en 200 — ; et avec --dynamic-load-weight
+    sans worker vivant, « {"error": "Worker Service Not Healthy"} » en 304.
+    Les versions : /v1/models et « owned_by: str = "FastDeploy" » datent de
+    la PR #3073 (2025-08-21), livrée en v2.2.0 (2025-09-08) ; « --api-key »
+    et FD_API_KEY datent de la PR #4806 (2025-11-08), livrée en v2.4.0
+    (2026-01-23) — v2.2.0, v2.2.1 et v2.3.0 n'ont aucun moyen de fermer
+    l'API, release/2.0.0 et v2.1.x n'ont pas de /v1/models. Les corps ont été
+    rendus le 2026-11-07 sur protocol.py, serving_models.py et middleware.py
+    de develop (d923caf) instanciés tels quels, moteur Paddle remplacé par un
+    bouchon : modèle nu, --served-model-name, nœud non maître, puis une
+    instance à clé interrogée sans jeton.
+  impact: |
+    Le corps de /v1/models est la preuve, pas le butin. La même absence de
+    clé ouvre tout ce que le processus sert : POST /v1/chat/completions,
+    /v1/completions, /v1/embeddings et /v1/reward font tourner le modèle sur
+    le GPU de l'hôte, aux frais de l'exploitant, sans notion d'utilisateur ni
+    trace d'appelant ; les requêtes concurrentes saturent la mémoire vidéo et
+    privent les usages légitimes de leur capacité. Le même préfixe porte la
+    commande du moteur : POST /v1/pause, /v1/resume, /v1/sleep et /v1/wakeup
+    arrêtent ou endorment le service, /v1/abort_requests interrompt les
+    requêtes en cours, /v1/update_weights recharge des poids. La liste
+    elle-même renseigne : « root » donne le chemin local ou le dépôt du
+    modèle — souvent un fine-tune maison —, « max_model_len » la fenêtre de
+    contexte.
+  remediation: |
+    Lancer le serveur avec --api-key <clé> (répétable) ou FD_API_KEY="k1,k2"
+    dans l'environnement (docs/parameters.md) : le middleware ferme alors tout
+    « /v1 », et les clients doivent présenter « Authorization: Bearer <clé> ».
+    La clé est un jeton statique partagé — elle ferme l'accès anonyme sans
+    remplacer une authentification par utilisateur — et elle ne garde que ce
+    préfixe : /health, /load, /ping, /update_model_weight, /clear_load_weight,
+    /rearrange_experts répondent toujours sans jeton, comme le serveur de
+    métriques de --metrics-port, qui écoute lui aussi sur 0.0.0.0.
+    Poser --host 127.0.0.1 tant que le service n'est pas destiné au réseau —
+    le défaut écoute sur toutes les interfaces —, ou publier le conteneur en
+    « -p 127.0.0.1:8000:8000 », et placer un reverse proxy qui authentifie
+    devant le port pour tout usage partagé : c'est le seul moyen de fermer
+    aussi les chemins hors « /v1 ».
+    Vérifier depuis l'extérieur, sur la route même du constat : « curl -s
+    http://<hote>:8000/v1/models » doit rendre 401 et
+    « {"error":"Unauthorized"} », plus la liste des modèles.
+  reference:
+    - https://github.com/PaddlePaddle/FastDeploy
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/fastdeploy/entrypoints/openai/protocol.py
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/fastdeploy/entrypoints/openai/serving_models.py
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/fastdeploy/entrypoints/openai/api_server.py
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/fastdeploy/entrypoints/openai/middleware.py
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/fastdeploy/entrypoints/openai/utils.py
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/fastdeploy/envs.py
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/docs/parameters.md
+    - https://github.com/PaddlePaddle/FastDeploy/blob/develop/docs/get_started/quick_start.md
+    - https://github.com/PaddlePaddle/FastDeploy/pull/4806
+  metadata:
+    max-request: 1
+    vendor: paddlepaddle
+    product: fastdeploy
+  tags: ai,llm,fastdeploy,paddlepaddle,ernie,inference,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /v1/models, gardé par le middleware. Il nomme le
+  # produit — "owned_by":"FastDeploy", que ni vLLM ni Aphrodite n'écrivent — et
+  # prouve l'ouverture à la fois : sur une instance à clé il rend 401
+  # {"error":"Unauthorized"}, jamais la liste.
+  #
+  # /health, /ping et /load ne sont pas lus : hors "/v1", ils répondent pareil
+  # avec ou sans clé et ne prouvent donc rien.
+  #
+  # En lecture seule, et strictement. POST /v1/chat/completions ferait tourner
+  # le modèle sur le GPU de l'exploitant, /v1/pause arrêterait le service :
+  # c'est l'abus que le constat signale, pas ce qu'un scanner a le droit de
+  # faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document entier, ancré aux deux bouts, dans l'ordre des champs
+          # pydantic : ModelList object puis data ; chaque ModelInfo id, object,
+          # created, owned_by, root, parent, max_model_len, permission ; et dans
+          # permission une ModelPermission ouverte sur son id « modelperm-… »
+          # puis « model_permission ». Une carte au moins, toutes à
+          # "FastDeploy" — list_models() ne surcharge owned_by nulle part — et
+          # root, parent, max_model_len nullables comme protocol.py les déclare.
+          # Tenir le document entier plutôt qu'un mot écarte vLLM et Aphrodite
+          # (même carte, autre owned_by), le 401 du middleware, l'ErrorResponse
+          # du nœud non maître, et toute page ou passerelle qui republierait
+          # une carte réduite. Aucune expression ne lit le statut : le corps
+          # dit ce qui est servi. JSONResponse sérialise compact ; les \s*
+          # absorbent l'intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"object\"\\s*:\\s*\"list\"\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"FastDeploy\"\\s*,\\s*\"root\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"parent\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"max_model_len\"\\s*:\\s*(?:[0-9]+|null)\\s*,\\s*\"permission\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"modelperm-[0-9a-f]+\"\\s*,\\s*\"object\"\\s*:\\s*\"model_permission\"\\s*,[^\\[\\]]*\\}\\s*\\]\\s*\\}(?:\\s*,\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"FastDeploy\"\\s*,\\s*\"root\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"parent\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|null)\\s*,\\s*\"max_model_len\"\\s*:\\s*(?:[0-9]+|null)\\s*,\\s*\"permission\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"modelperm-[0-9a-f]+\"\\s*,\\s*\"object\"\\s*:\\s*\"model_permission\"\\s*,[^\\[\\]]*\\}\\s*\\]\\s*\\})*\\s*\\]\\s*\\}$", trim_space(body))'
+
+    extractors:
+      # Le modèle servi — --served-model-name ou la valeur de --model : ce
+      # qu'un tiers peut faire tourner sans clé.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '.data[].id'
