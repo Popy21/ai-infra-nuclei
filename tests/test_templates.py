@@ -47990,3 +47990,333 @@ def test_fastdeploy_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(status=status, body=body)
         assert results == [], f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# AI Toolkit — ostris/ai-toolkit, l'UI Next.js d'entraînement de LoRA servie
+# sur 8675 par « node dist/cron/fileServer.js start --port 8675 ».
+# ui/src/middleware.ts (matcher /api/:path*) approuve tout tant
+# qu'AI_TOOLKIT_AUTH n'est pas posé — « if not set, approve all requests » — et
+# rend sinon 401 {"error":"Unauthorized"} à toute requête sans « Authorization:
+# Bearer ». GET /api/settings verse la table Settings (key/value, des chaînes)
+# dans un objet plat et garantit TRAINING_FOLDER et DATASETS_FOLDER par repli ;
+# HF_TOKEN y sort en clair dès que la page Settings a été enregistrée. Les corps
+# ci-dessous ont été reconstruits le 2026-11-08 depuis route.ts et paths.ts de
+# main (beb9482) — le reduce, les replis et le JSON.stringify de
+# NextResponse.json rejoués sous Node, cwd /app/ai-toolkit/ui de l'image —,
+# base vide, puis base enregistrée, puis une installation d'avant MODELS_PATH.
+
+AI_TOOLKIT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                   "ai-toolkit-ui-exposed.yaml")
+
+AI_TOOLKIT_ROUTE = "/api/settings"
+
+# Un jeton de la forme des jetons Hugging Face, qui n'en est pas un : il sert à
+# prouver que le scan ne le recopie nulle part.
+AI_TOOLKIT_FAKE_HF_TOKEN = "hf_" + "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7"
+
+# Installation neuve : aucune ligne en base, les trois replis de paths.ts
+# depuis TOOLKIT_ROOT, dans l'ordre où route.ts les pose.
+AI_TOOLKIT_DEFAULT_SETTINGS_BODY = (
+    '{"TRAINING_FOLDER":"/app/ai-toolkit/output",'
+    '"DATASETS_FOLDER":"/app/ai-toolkit/datasets",'
+    '"MODELS_PATH":"/app/ai-toolkit/models"}'
+)
+# Page Settings enregistrée : POST /api/settings a inséré HF_TOKEN,
+# TRAINING_FOLDER, DATASETS_FOLDER et MODELS_PATH, rendus dans l'ordre des id.
+AI_TOOLKIT_SAVED_SETTINGS_BODY = (
+    '{"HF_TOKEN":"%s","TRAINING_FOLDER":"/workspace/ai-toolkit/output",'
+    '"DATASETS_FOLDER":"/workspace/ai-toolkit/datasets",'
+    '"MODELS_PATH":"/workspace/ai-toolkit/models"}' % AI_TOOLKIT_FAKE_HF_TOKEN
+)
+# Une installation manuelle d'avant 8502a84 (2026-08-03) : deux replis, pas de
+# MODELS_PATH.
+AI_TOOLKIT_PRE_MODELS_PATH_BODY = (
+    '{"TRAINING_FOLDER":"/home/ubuntu/ai-toolkit/output",'
+    '"DATASETS_FOLDER":"/home/ubuntu/ai-toolkit/datasets"}'
+)
+# Windows : path.join écrit des antislashs, JSON.stringify les échappe ; un
+# jeton enregistré vide reste une ligne à chaîne vide.
+AI_TOOLKIT_WINDOWS_BODY = (
+    '{"HF_TOKEN":"","TRAINING_FOLDER":"C:\\\\Users\\\\me\\\\ai-toolkit\\\\output",'
+    '"DATASETS_FOLDER":"D:\\\\datasets",'
+    '"MODELS_PATH":"C:\\\\Users\\\\me\\\\ai-toolkit\\\\models"}'
+)
+# AI_TOOLKIT_AUTH posé, requête sans jeton : middleware.ts.
+AI_TOOLKIT_UNAUTHORIZED_BODY = '{"error":"Unauthorized"}'
+# Base inaccessible : le catch de route.ts, en 500.
+AI_TOOLKIT_DB_ERROR_BODY = '{"error":"Failed to fetch settings"}'
+# Les autres routes du même produit, qui ne sont pas le constat.
+AI_TOOLKIT_GPU_BODY = (
+    '{"hasNvidiaSmi":true,"gpus":[{"index":0,"name":"NVIDIA GeForce RTX 4090",'
+    '"driverVersion":"550.120","temperature":41,"utilization":{"gpu":0,'
+    '"memory":0},"memory":{"total":24564,"free":23786,"used":497},'
+    '"power":{"draw":21.63,"limit":450},"clocks":{"graphics":210,'
+    '"memory":405},"fan":{"speed":30}}]}'
+)
+AI_TOOLKIT_AUTH_ROUTE_BODY = '{"isAuthenticated":true}'
+# Le /api/settings d'un autre produit : l'objet de configuration LLM
+# d'OpenHands, booléens et nuls compris.
+AI_TOOLKIT_OPENHANDS_SETTINGS_BODY = (
+    '{"language":"en","agent":"CodeActAgent",'
+    '"llm_model":"anthropic/claude-sonnet-4-20250514","llm_base_url":null,'
+    '"llm_api_key_set":true,"confirmation_mode":false}'
+)
+# Des objets plats de réglages qui ne portent pas les deux chemins.
+AI_TOOLKIT_OTHER_FLAT_BODY = '{"THEME":"dark","LOCALE":"fr"}'
+AI_TOOLKIT_TRAINING_ONLY_BODY = '{"TRAINING_FOLDER":"/srv/output"}'
+# Des formes que la table Settings ne produit pas : une valeur nulle, une
+# valeur imbriquée.
+AI_TOOLKIT_NULL_PATH_BODY = '{"TRAINING_FOLDER":"/srv/output","DATASETS_FOLDER":null}'
+AI_TOOLKIT_NESTED_BODY = (
+    '{"TRAINING_FOLDER":"/srv/output","DATASETS_FOLDER":"/srv/datasets",'
+    '"PROFILE":{"name":"default"}}'
+)
+AI_TOOLKIT_WRAPPED_BODY = '{"upstream":%s}' % AI_TOOLKIT_DEFAULT_SETTINGS_BODY
+AI_TOOLKIT_DOC_PAGE_BODY = "<pre>%s</pre>" % AI_TOOLKIT_DEFAULT_SETTINGS_BODY
+# Un Next.js qui ne sert pas cette route : sa page 404.
+AI_TOOLKIT_NEXT_404_BODY = (
+    '<!DOCTYPE html><html lang="en"><head><meta charSet="utf-8"/>'
+    '<title>404: This page could not be found.</title></head><body>'
+    '<h1 class="next-error-h1">404</h1><h2>This page could not be found.</h2>'
+    '</body></html>'
+)
+
+
+def ai_toolkit_block():
+    doc = load(AI_TOOLKIT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % AI_TOOLKIT_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % AI_TOOLKIT_ROUTE
+    return blocks[0]
+
+
+def ai_toolkit_fires(status=200, body=AI_TOOLKIT_DEFAULT_SETTINGS_BODY):
+    """
+    Sémantique nuclei du bloc. Le statut est reçu pour la symétrie des
+    tableaux ci-dessous et n'entre dans aucun matcher : seul le corps sépare.
+    """
+    del status
+    block = ai_toolkit_block()
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"regex"}, (
+        "le constat tient à la forme du document : un matcher word lirait un "
+        "mot, un matcher status un code"
+    )
+    assert all(m.get("part") == "body" for m in matchers), (
+        "un matcher qui ne lit pas le corps ne lit pas le constat"
+    )
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_ai_toolkit_probe_is_a_single_read_only_get():
+    """
+    POST /api/settings réécrirait les réglages et le jeton, GET
+    /api/jobs/<id>/start, /stop, /kill ou /delete piloterait un entraînement
+    sur le GPU de l'exploitant : c'est l'abus que le constat signale. /api/gpu
+    ne rend ni GPU ni driverVersion sans nvidia-smi, /api/auth ne nomme rien,
+    /api/img/ et /api/files/ sont publics par construction.
+    """
+    doc = load(AI_TOOLKIT_TEMPLATE)
+    assert request_routes(doc) == {("GET", AI_TOOLKIT_ROUTE)}, (
+        sorted(request_routes(doc)))
+    for item in doc.get("http") or []:
+        assert item.get("method", "GET") == "GET"
+        assert not item.get("body") and not item.get("raw")
+        assert not item.get("headers"), "aucun jeton, aucun en-tête"
+    assert all(m.get("type") != "status" for m in ai_toolkit_block().get("matchers") or []), (
+        "le constat ne doit pas lire le statut : le corps dit ce qui est servi"
+    )
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "ai-toolkit"
+    assert meta.get("max-request") == 1
+    assert info.get("severity") == "high"
+
+
+def test_ai_toolkit_matcher_fires_on_the_bodies_rendered_from_the_route():
+    assert ai_toolkit_fires(), "le template ne reconnaît pas l'installation neuve"
+    assert ai_toolkit_fires(body=AI_TOOLKIT_SAVED_SETTINGS_BODY), (
+        "le template perd l'instance dont la page Settings a été enregistrée — "
+        "celle qui porte HF_TOKEN"
+    )
+    assert ai_toolkit_fires(body=AI_TOOLKIT_PRE_MODELS_PATH_BODY), (
+        "le template perd une installation d'avant MODELS_PATH (8502a84, "
+        "2026-08-03) : les deux chemins suffisent"
+    )
+    assert ai_toolkit_fires(body=AI_TOOLKIT_WINDOWS_BODY), (
+        "le template perd une installation Windows — antislashs échappés, "
+        "jeton enregistré vide"
+    )
+    assert ai_toolkit_fires(status=203, body=AI_TOOLKIT_DEFAULT_SETTINGS_BODY), (
+        "le constat ne doit pas dépendre du statut"
+    )
+    reindented = json.dumps(json.loads(AI_TOOLKIT_SAVED_SETTINGS_BODY), indent=2)
+    for body, why in (
+        (reindented, "un objet réindenté"),
+        (reindented.replace("\n", "\r\n"), "un objet servi en CRLF"),
+        (AI_TOOLKIT_DEFAULT_SETTINGS_BODY + "\n", "un saut de ligne final"),
+        (AI_TOOLKIT_DEFAULT_SETTINGS_BODY.replace("/app/ai-toolkit/datasets", 'my \\"sets\\" v2'),
+         "un chemin à guillemet échappé"),
+        (AI_TOOLKIT_DEFAULT_SETTINGS_BODY.replace("/app/ai-toolkit/output", "/mnt/données/sortie"),
+         "un chemin accentué"),
+    ):
+        assert ai_toolkit_fires(body=body), "le template perd %s" % why
+
+
+def test_ai_toolkit_matcher_needs_the_settings_document_not_a_word():
+    for status, body, why in (
+        (401, AI_TOOLKIT_UNAUTHORIZED_BODY,
+         "une instance lancée avec AI_TOOLKIT_AUTH, le 401 du middleware"),
+        (500, AI_TOOLKIT_DB_ERROR_BODY, "une base inaccessible"),
+        (200, AI_TOOLKIT_GPU_BODY, "/api/gpu du même produit, qui n'est pas le constat"),
+        (200, AI_TOOLKIT_AUTH_ROUTE_BODY, "/api/auth, trop court pour nommer quoi que ce soit"),
+        (200, AI_TOOLKIT_OPENHANDS_SETTINGS_BODY, "le /api/settings d'OpenHands"),
+        (200, AI_TOOLKIT_OTHER_FLAT_BODY, "un objet de réglages sans les deux chemins"),
+        (200, AI_TOOLKIT_TRAINING_ONLY_BODY, "TRAINING_FOLDER seul"),
+        (200, AI_TOOLKIT_NULL_PATH_BODY, "un chemin nul, que la table ne stocke pas"),
+        (200, AI_TOOLKIT_NESTED_BODY, "une valeur imbriquée, que la table ne stocke pas"),
+        (200, AI_TOOLKIT_WRAPPED_BODY, "une supervision qui republie l'objet"),
+        (200, AI_TOOLKIT_DOC_PAGE_BODY, "une page de documentation qui cite l'objet"),
+        (404, AI_TOOLKIT_NEXT_404_BODY, "la page 404 d'un autre Next.js"),
+        (200, "{}", "un objet vide"),
+        (200, "[]", "une liste vide"),
+        (200, "", "une réponse vide"),
+    ):
+        assert not ai_toolkit_fires(status=status, body=body), (
+            "le template conclut sur %s" % why)
+
+
+def test_ai_toolkit_extractors_flag_the_token_without_carrying_it():
+    """
+    « hf_token_stored » dit s'il y a un jeton à révoquer ; sa valeur ne sort
+    jamais. Le dossier d'entraînement situe l'installation.
+    """
+    extractors = ai_toolkit_block().get("extractors") or []
+    assert [(e.get("type"), e.get("part"), e.get("name"), e.get("json"))
+            for e in extractors] == [
+        ("json", "body", "hf_token_stored", ['has("HF_TOKEN")']),
+        ("json", "body", "training_folder", [".TRAINING_FOLDER"]),
+    ], extractors
+    with open(AI_TOOLKIT_TEMPLATE) as f:
+        assert ".HF_TOKEN" not in f.read(), (
+            "le template extrait la valeur du jeton : le rapport la recopierait"
+        )
+    saved = json.loads(AI_TOOLKIT_SAVED_SETTINGS_BODY)
+    assert "HF_TOKEN" in saved
+    assert saved["TRAINING_FOLDER"] == "/workspace/ai-toolkit/output"
+    assert "HF_TOKEN" not in json.loads(AI_TOOLKIT_DEFAULT_SETTINGS_BODY)
+
+
+def test_ai_toolkit_description_keeps_the_auth_nuances():
+    info = load(AI_TOOLKIT_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("fileServer.js start --port 8675", "server.listen(publicPort)",
+                   "AI_TOOLKIT_AUTH", "approve all requests",
+                   '{"error":"Unauthorized"}', "/api/img/", "/api/files/",
+                   "/api/audio/art/", "${AI_TOOLKIT_AUTH:-", "settings.findMany()",
+                   "defaultTrainFolder", "defaultDatasetsFolder",
+                   "defaultModelsFolder", "path.resolve('@', '..', '..')",
+                   "HF_TOKEN", "Failed to fetch", "hasNvidiaSmi", "b13fcc1",
+                   "710c6de", "3a6b24f", "8502a84"):
+        assert needle in description, needle
+    remediation = info.get("remediation") or ""
+    for needle in ("AI_TOOLKIT_AUTH", "Authorization: Bearer", "/api/files/",
+                   "127.0.0.1:8675:8675", "huggingface.co/settings/tokens",
+                   '{"error":"Unauthorized"}'):
+        assert needle in remediation, needle
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_ai_toolkit_matcher_compiles_and_fires_against_a_live_server():
+    """
+    Seul un scan ferme la boucle sur RE2 et sur gojq — « has("HF_TOKEN") » doit
+    rendre un booléen, pas le jeton — et dit ce que le template envoie
+    vraiment.
+    """
+    def scan(status=200, body=AI_TOOLKIT_DEFAULT_SETTINGS_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization")))
+                code, payload = ((status, body) if self.path == AI_TOOLKIT_ROUTE
+                                 else (404, AI_TOOLKIT_NEXT_404_BODY))
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json"
+                                 if code != 404 else "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", AI_TOOLKIT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "ai-toolkit-ui-exposed"}, r.stdout + r.stderr
+        # Ce que le template produit ne porte jamais le jeton. `request` et
+        # `response` sont l'écho brut de l'échange, que nuclei joint par
+        # défaut à toute ligne JSONL et que -omit-raw retire : c'est au
+        # moteur, pas au template, et il est écarté de la lecture.
+        for item in lines:
+            produced = {k: v for k, v in item.items() if k not in ("request", "response")}
+            assert AI_TOOLKIT_FAKE_HF_TOKEN not in json.dumps(produced), (
+                "le scan recopie le jeton Hugging Face dans son résultat — %s" % produced
+            )
+        # Deux extracteurs nommés : nuclei écrit une ligne par extracteur, pour
+        # la même correspondance. Les relire par nom rend le constat lisible.
+        results = {item.get("extractor-name"): item.get("extracted-results")
+                   for item in lines}
+        assert len(results) == len(lines), "un extracteur rendu deux fois — %s" % lines
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", AI_TOOLKIT_ROUTE, None)], seen
+    assert results == {"hf_token_stored": ["false"],
+                       "training_folder": ["/app/ai-toolkit/output"]}, results
+
+    _, results = scan(body=AI_TOOLKIT_SAVED_SETTINGS_BODY)
+    assert results == {"hf_token_stored": ["true"],
+                       "training_folder": ["/workspace/ai-toolkit/output"]}, (
+        "le scan perd l'instance dont le jeton est enregistré — %s" % results)
+
+    _, results = scan(body=json.dumps(json.loads(AI_TOOLKIT_PRE_MODELS_PATH_BODY), indent=2))
+    assert results == {"hf_token_stored": ["false"],
+                       "training_folder": ["/home/ubuntu/ai-toolkit/output"]}, (
+        "le scan perd un objet réindenté d'avant MODELS_PATH — %s" % results)
+
+    for status, body, why in (
+        (401, AI_TOOLKIT_UNAUTHORIZED_BODY, "une instance lancée avec AI_TOOLKIT_AUTH"),
+        (500, AI_TOOLKIT_DB_ERROR_BODY, "une base inaccessible"),
+        (200, AI_TOOLKIT_GPU_BODY, "/api/gpu"),
+        (200, AI_TOOLKIT_OPENHANDS_SETTINGS_BODY, "le /api/settings d'OpenHands"),
+        (200, AI_TOOLKIT_NESTED_BODY, "une valeur imbriquée"),
+        (200, AI_TOOLKIT_WRAPPED_BODY, "une supervision qui republie l'objet"),
+    ):
+        _, results = scan(status=status, body=body)
+        assert results == {}, f"le scan conclut sur {why} — {results}"

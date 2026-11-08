@@ -1,0 +1,188 @@
+id: ai-toolkit-ui-exposed
+
+info:
+  name: AI Toolkit - Training UI API Exposed Without an Auth Token (Hugging Face Token Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    AI Toolkit (ostris/ai-toolkit, 12 579 étoiles, dépôt non archivé — branche
+    main, dernier commit beb9482 le 2026-11-04, version.py 0.13.41, aucune
+    release ni tag GitHub) est la boîte à outils d'entraînement de LoRA et de
+    fine-tuning de modèles de diffusion (FLUX, Wan, Qwen-Image…), pilotée par
+    une interface Next.js (ui/, next ^15.5.9). Le README la lance par « cd ui
+    && npm run build_and_start », dont le script « start » (ui/package.json)
+    exécute « node dist/cron/fileServer.js start --port 8675 » :
+    ui/cron/fileServer.ts possède « the single public port », l'ouvre par
+    « server.listen(publicPort) » sans hôte — donc sur toutes les interfaces
+    — et relaie « everything else … unmodified » vers un serveur Next.js
+    confiné à 127.0.0.1. L'image docker ostris/aitoolkit expose 8675
+    (docker/Dockerfile, « EXPOSE 8675 ») et docker/start.sh lance « npm run
+    start » ; ni l'un ni l'autre ne pose AI_TOOLKIT_AUTH. Le README annonce
+    l'UI « at http://localhost:8675 or http://<your-ip>:8675 if you are
+    running it on a server » et se borne à « I highly recommend securing it
+    with an auth token ».
+    L'absence d'authentification est le défaut : ui/src/middleware.ts
+    (matcher « /api/:path* ») lit « const tokenToUse = process.env.
+    AI_TOOLKIT_AUTH || null; » et « if (!tokenToUse) { return NextResponse.
+    next(); } » — « if not set, approve all requests ». La variable posée, il
+    exige « Authorization: Bearer <jeton> » sur tout /api/ et rend sinon 401
+    « {"error":"Unauthorized"} », sauf /api/img/, /api/files/ et
+    /api/audio/art/, publics dans tous les cas (« album art is fetched by
+    plain <img> tags, which cannot send the bearer token »). Seul le
+    docker-compose.yml du dépôt pose « AI_TOOLKIT_AUTH=${AI_TOOLKIT_AUTH:-
+    password} » : ces instances-là répondent 401, avec un jeton par défaut
+    que le template ne devine pas.
+    GET /api/settings (ui/src/app/api/settings/route.ts) lit « prisma.
+    settings.findMany() », verse chaque ligne de la table Settings (schema.
+    prisma : « key String @unique », « value String ») dans un objet plat, et
+    complète « TRAINING_FOLDER » par defaultTrainFolder et « DATASETS_FOLDER »
+    par defaultDatasetsFolder quand la ligne manque ou est vide ; «
+    MODELS_PATH » vaut process.env.MODELS_PATH s'il est posé, la ligne sinon,
+    defaultModelsFolder à défaut — ui/src/paths.ts les dérive de TOOLKIT_ROOT,
+    « path.resolve('@', '..', '..') » depuis ui/, soit « output », « datasets »
+    et « models » à la racine de l'installation. « NextResponse.json(
+    settingsObject) » sérialise compact : sur une installation neuve, «
+    {"TRAINING_FOLDER":"/app/ai-toolkit/output","DATASETS_FOLDER":"/app/
+    ai-toolkit/datasets","MODELS_PATH":"/app/ai-toolkit/models"} » ; dès que
+    la page Settings a été enregistrée, POST /api/settings a inséré les
+    quatre lignes « HF_TOKEN », « TRAINING_FOLDER », « DATASETS_FOLDER » et «
+    MODELS_PATH » sans validation — rien d'autre n'écrit la table, DATA_ROOT
+    n'y est que lu — et le corps porte le jeton Hugging Face en clair. Sur une
+    base inaccessible la route rend 500 « {"error":"Failed to fetch
+    settings"} ». Le constat tient donc au corps : un objet plat dont toutes
+    les valeurs sont des chaînes, portant les clés TRAINING_FOLDER et
+    DATASETS_FOLDER — jamais au statut, jamais au titre de la page, et le
+    template n'extrait pas la valeur de HF_TOKEN. GET /api/gpu n'est pas
+    joint : sur un hôte sans nvidia-smi il rend « {"hasNvidiaSmi":false,
+    "isMac":false,"gpus":[],"error":"nvidia-smi not found or not
+    accessible"} », sans driverVersion, et il ne prouve rien de plus.
+    Les versions : l'UI et GET/POST /api/settings datent de b13fcc1
+    (2025-02-18), les replis TRAINING_FOLDER / DATASETS_FOLDER de 710c6de
+    (2025-02-22), le middleware et AI_TOOLKIT_AUTH de 3a6b24f (2025-03-20) —
+    avant lui, aucun moyen de fermer l'API —, MODELS_PATH de 8502a84
+    (2026-08-03) et fileServer.ts de ede6f9e (2026-07-23) ; une installation
+    manuelle non mise à jour depuis l'été 2026 rend les deux chemins sans
+    MODELS_PATH, et le matcher ne l'exige pas. Les corps ont été reconstruits
+    le 2026-11-08 depuis route.ts et paths.ts de main (beb9482) : le reduce,
+    les replis et le JSON.stringify de NextResponse.json rejoués sous Node,
+    cwd ui/ de l'image (/app/ai-toolkit/ui), base vide puis base enregistrée.
+  impact: |
+    Le corps de /api/settings est à la fois la preuve et un premier butin :
+    dès que l'exploitant a enregistré son jeton Hugging Face dans la page
+    Settings, HF_TOKEN sort en clair — ui/cron/actions/startJob.ts le passe
+    en variable d'environnement à chaque entraînement, pour télécharger les
+    modèles sous licence d'accès ; un jeton en écriture publie aussi sous
+    son compte. POST /api/settings réécrit HF_TOKEN, TRAINING_FOLDER,
+    DATASETS_FOLDER et MODELS_PATH sans validation : TRAINING_FOLDER et
+    DATASETS_FOLDER sont les racines que /api/files/ et /api/datasets/
+    servent et acceptent en dépôt, et MODELS_PATH celle où les poids sont
+    lus. La même absence de jeton ouvre le pilotage des entraînements — l'UI
+    « is only needed to start/stop/monitor jobs » dit le README : POST
+    /api/jobs crée une tâche, et GET /api/jobs/<id>/start, /stop, /kill et
+    /delete, GET /api/queue/<id>/start et /stop la lancent, l'arrêtent ou la
+    suppriment sur le GPU de l'hôte, aux frais de l'exploitant ; GET
+    /api/jobs/<id>/log, /samples et /files en lisent les journaux, les
+    images échantillons et les poids produits, et POST /api/datasets/upload
+    dépose des fichiers dans ses jeux de données. Rien n'est attribuable :
+    aucun compte n'existe.
+  remediation: |
+    Lancer l'UI avec AI_TOOLKIT_AUTH=<jeton> dans l'environnement (README, «
+    Securing the UI » : « AI_TOOLKIT_AUTH=super_secure_password npm run
+    build_and_start », ou « -e AI_TOOLKIT_AUTH=… » sur l'image) : le
+    middleware exige alors « Authorization: Bearer <jeton> » sur /api/ et
+    l'interface le demande à la connexion. Le jeton est un secret statique
+    partagé — il ferme l'accès anonyme sans remplacer une authentification par
+    utilisateur — et il ne garde pas /api/img/, /api/files/ ni
+    /api/audio/art/, publics par construction : seul un reverse proxy qui
+    authentifie devant le port 8675 les ferme aussi. Ne jamais publier 8675
+    sur une interface réseau ni un groupe de sécurité ouvert ; sur Docker,
+    publier en « -p 127.0.0.1:8675:8675 ». Après exposition, révoquer et
+    recréer le jeton Hugging Face sur huggingface.co/settings/tokens, puis le
+    réenregistrer.
+    Vérifier depuis l'extérieur, sur la route même du constat : « curl -s
+    http://<hote>:8675/api/settings » doit rendre 401 et
+    « {"error":"Unauthorized"} », plus les chemins ni HF_TOKEN.
+  reference:
+    - https://github.com/ostris/ai-toolkit
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/src/middleware.ts
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/src/app/api/settings/route.ts
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/src/app/api/gpu/route.ts
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/src/paths.ts
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/prisma/schema.prisma
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/cron/fileServer.ts
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/cron/actions/startJob.ts
+    - https://github.com/ostris/ai-toolkit/blob/main/ui/package.json
+    - https://github.com/ostris/ai-toolkit/blob/main/docker-compose.yml
+    - https://github.com/ostris/ai-toolkit/blob/main/README.md
+    - https://github.com/ostris/ai-toolkit/commit/3a6b24f4c8cac9c0bf49a0f4e216cf68b3416850
+    - https://github.com/ostris/ai-toolkit/commit/8502a845b16418b1042dd7e3b2d819cc86326b1c
+  metadata:
+    max-request: 1
+    vendor: ostris
+    product: ai-toolkit
+  tags: ai,training,lora,diffusion,ai-toolkit,ostris,nextjs,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /api/settings, ce que la page Settings de l'UI
+  # charge elle-même (useSettings.tsx). Le middleware la garde dès que
+  # AI_TOOLKIT_AUTH est posé — 401 {"error":"Unauthorized"} —, donc ce corps ne
+  # sort que d'une instance ouverte, et il nomme le produit à lui seul.
+  #
+  # /api/gpu n'est pas lu : sans nvidia-smi il ne rend ni GPU ni driverVersion,
+  # et il ne prouverait rien que /api/settings ne prouve déjà. /api/auth rend
+  # {"isAuthenticated":true} sur toute instance ouverte : trop court pour
+  # nommer quoi que ce soit. /api/img/ et /api/files/ sont publics par
+  # construction et ne disent jamais « ouvert ».
+  #
+  # En lecture seule, et strictement. POST /api/settings réécrirait les
+  # réglages ; GET /api/jobs/<id>/start, /stop, /kill ou /delete piloterait un
+  # entraînement sur le GPU de l'exploitant : c'est l'abus que le constat
+  # signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/settings"
+
+    matchers:
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          # Le document entier, ancré aux deux bouts : un objet plat dont
+          # chaque valeur est une chaîne — la table Settings ne stocke que des
+          # « value String », les replis sont des chemins, et un chemin Windows
+          # y porte ses antislashs échappés. Une supervision qui republierait
+          # l'objet au fond d'un autre, une page qui le citerait, ou un
+          # /api/settings d'un autre produit — objet LLM d'OpenHands, valeurs
+          # imbriquées — ne tiennent pas dans cette forme. Les \s* absorbent
+          # l'intermédiaire qui réindente.
+          - '^\s*\{\s*"(?:[^"\\]|\\.)+"\s*:\s*"(?:[^"\\]|\\.)*"\s*(?:,\s*"(?:[^"\\]|\\.)+"\s*:\s*"(?:[^"\\]|\\.)*"\s*)*\}\s*$'
+
+          # Les deux clés que route.ts garantit depuis 710c6de, ligne en base
+          # ou repli : c'est elles qui nomment le produit. MODELS_PATH n'est
+          # pas exigé — il date de 8502a84 (2026-08-03) et une installation
+          # non mise à jour ne le rend pas. HF_TOKEN non plus : il n'est là
+          # qu'une fois le jeton enregistré, et son absence n'est pas une
+          # fermeture.
+          - '"TRAINING_FOLDER"\s*:\s*"'
+          - '"DATASETS_FOLDER"\s*:\s*"'
+
+      # Pas de matcher de statut : 200 est celui de tout serveur, et seul le
+      # corps sépare.
+
+    extractors:
+      # Le jeton est-il enregistré ? « true » dit que HF_TOKEN sort en clair
+      # et qu'il faut le révoquer ; sa valeur, elle, ne figure jamais dans le
+      # résultat.
+      - type: json
+        part: body
+        name: hf_token_stored
+        json:
+          - 'has("HF_TOKEN")'
+
+      # Le dossier d'entraînement — « <racine>/output » par défaut : il situe
+      # l'installation sur l'hôte.
+      - type: json
+        part: body
+        name: training_folder
+        json:
+          - '.TRAINING_FOLDER'
