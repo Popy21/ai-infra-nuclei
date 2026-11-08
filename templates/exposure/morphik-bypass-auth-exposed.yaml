@@ -1,0 +1,188 @@
+id: morphik-bypass-auth-exposed
+
+info:
+  name: Morphik - API Served With bypass_auth_mode (Anonymous Caller Treated as dev_user)
+  author: popy21
+  severity: high
+  description: |
+    Morphik (morphik-org/morphik-core, 3 719 étoiles, dépôt non archivé —
+    branche main, dernier commit 3b048d0 le 2026-10-26, pyproject 0.1.0,
+    aucune release ni tag GitHub) est la plateforme d'ingestion et de
+    recherche multimodale de documents pour le RAG — ColPali, OCR, vision —,
+    un serveur FastAPI que start_server.py lance par « uvicorn.run(
+    "core.api:app", host=settings.HOST, port=settings.PORT) ». core/config.py
+    lit HOST et PORT dans « [api] » de morphik.toml, où le dépôt livre « host
+    = "0.0.0.0" » et « port = 8000 » : toutes les interfaces.
+    L'absence d'authentification est le défaut livré : « [auth] » du
+    morphik.toml du dépôt porte « bypass_auth_mode = true  # Enabled by
+    default for easier local development » et « dev_user_id = "dev_user" ».
+    core/config.py le lit par « config["auth"].get("bypass_auth_mode",
+    config["auth"].get("dev_mode", False)) » — l'ancienne clé dev_mode, que
+    66be7e1 (2025-11-18, #271) a renommée, ouvre toujours — sans rien qui
+    refuse le contournement sur une interface publique ; contournement actif,
+    JWT_SECRET_KEY retombe sur « os.environ.get("JWT_SECRET_KEY",
+    "dev-secret-key"),  # Default for bypass mode », et ce n'est que
+    contournement coupé que « JWT_SECRET_KEY is required when
+    bypass_auth_mode is disabled » arrête le démarrage. core/auth_utils.py,
+    verify_token, commence par « if settings.bypass_auth_mode: return
+    AuthContext(user_id=settings.dev_user_id, app_id=None) », avant toute
+    lecture de l'en-tête Authorization ; la voie normale rend sinon 401
+    « {"detail":"Missing authorization header"} » avec « WWW-Authenticate:
+    Bearer » quand l'en-tête manque, 401 « Invalid authorization header »
+    s'il n'est pas « Bearer », 401 « Token expired » ou le message de PyJWT
+    sur un jeton invalide.
+    L'image officielle ne livre pas ce réglage : le dockerfile copie
+    morphik.docker.toml — né ouvert à 35ccdb9 (2025-06-15, « dev_mode = true
+    »), fermé par d6c7a76 (2025-07-30, « dev_mode = false »), «
+    bypass_auth_mode = false » depuis le renommage — en
+    /app/morphik.toml.default, que l'entrypoint ne recopie que si
+    /app/morphik.toml manque. Mais docker-compose.yml, le compose de
+    développement construit depuis les sources, monte « ./morphik.toml:/app/
+    morphik.toml » — celui du dépôt, contournement actif — ; et
+    install_docker.sh, qui télécharge morphik.docker.toml et
+    docker-compose.run.yml pour l'image ghcr.io, demande ensuite un
+    LOCAL_URI_PASSWORD et, sur Entrée, exécute « sed -i.bak
+    's/bypass_auth_mode = false/bypass_auth_mode = true/' morphik.toml » —
+    « enabling authentication bypass (bypass_auth_mode=true) for local
+    access ». Les deux compose posent « JWT_SECRET_KEY=${JWT_SECRET_KEY:-
+    your-secret-key-here} » et publient le port — « 8000:8000 », ou
+    MORPHIK_API_PORT à défaut 8000 dans docker-compose.run.yml.
+    GET /models — core/api.py, « @app.get("/models",
+    response_model=ModelsResponse) », get_available_models(auth: AuthContext
+    = Depends(verify_token)), depuis 0bdbd13 (2025-06-20) — ouvre
+    morphik.toml, verse chaque table de « [registered_models] » en « {"id":
+    <clé>, "model": model_name, "provider": …, "config": <la table entière>}
+    », classe en embedding_models les clés qui contiennent « embedding » et
+    les autres en chat_models, ajoute « default_models » — « {"completion":
+    [completion].model, "embedding": [embedding].model} », chaîne ou null — et
+    la liste littérale « "providers": ["openai", "anthropic", "google",
+    "azure", "ollama", "custom"] ». ModelsResponse (core/models/responses.py,
+    bc5622c) déclare chat_models, embedding_models, default_models,
+    providers dans cet ordre, et FastAPI sérialise compact dans l'ordre des
+    champs : « {"chat_models":[…],"embedding_models":[…],"default_models":{
+    "completion":"ollama_qwen_vision","embedding":"ollama_embedding"},
+    "providers":["openai","anthropic","google","azure","ollama","custom"]} »
+    sur le morphik.toml du dépôt, « "completion":"openai_gpt4-1-mini",
+    "embedding":"openai_embedding" » sur celui de l'image. Une exception rend
+    500 « {"detail":"Failed to load available models"} ». La route passant
+    par verify_token, ce corps ne sort que contournement actif — la voie
+    normale exige un Bearer et un JWT valide — et il prouve l'exposition à
+    lui seul : le constat tient à la forme du document, jamais au statut.
+    GET /ping (core/routes/health.py, sans verify_token) rend
+    « {"status":"ok","message":"Server is running"} » et identifie le
+    service sans rien prouver ; GET /models/available, derrière verify_token
+    aussi, rend « {"models":[…]} », une liste codée en dur, et n'est pas le
+    constat. Les corps ont été reconstruits le 2026-11-08 depuis core/api.py
+    de main (3b048d0), le handler rejoué sous Python sur morphik.toml puis
+    morphik.docker.toml.
+  impact: |
+    Tout appelant anonyme est dev_user pour chaque route qui dépend de
+    verify_token, soit l'API entière : POST /retrieve/chunks, /retrieve/docs,
+    /search/documents et /query (core/api.py) lisent le corpus indexé et
+    interrogent le modèle dessus ; POST /ingest/text, /ingest/file et
+    /ingest/files (core/routes/ingest.py, préfixe /ingest) injectent des
+    documents dans la base RAG ; core/routes/documents.py (préfixe
+    /documents) liste, télécharge (GET /documents/<id>/file), réécrit et
+    supprime (DELETE /documents/<id>) ; core/routes/models.py enregistre des
+    modèles (POST /models) et des clés (POST /api-keys). Le corps du constat
+    est déjà un butin : « config » recopie chaque table de registered_models
+    telle quelle — api_base, donc les hôtes internes (Ollama, Lemonade,
+    l'URL Azure) — et, si l'exploitant y a posé « api_key », comme
+    morphik.toml l'y invite pour un serveur compatible OpenAI (« api_key and
+    api_base on the model »), la clé en clair. Rien n'est attribuable : un
+    seul compte, dev_user, sans jeton.
+  remediation: |
+    Dans « [auth] » de morphik.toml, poser « bypass_auth_mode = false » (et
+    retirer tout « dev_mode = true » hérité), fournir un JWT_SECRET_KEY
+    aléatoire dans l'environnement — le serveur refuse alors de démarrer sans
+    lui — et, sur l'installation Docker, répondre un LOCAL_URI_PASSWORD à
+    install_docker.sh plutôt qu'Entrée : les jetons se créent ensuite par
+    /generate_local_uri. Ne jamais laisser « your-secret-key-here » des deux
+    docker-compose en service. Tant que le contournement reste nécessaire,
+    ne jamais publier 8000 sur une interface joignable : « host =
+    "127.0.0.1" » dans « [api] », ou « 127.0.0.1:8000:8000 » dans le compose,
+    et un reverse proxy qui authentifie devant tout accès distant.
+    Vérifier depuis l'extérieur, sur la route même du constat : « curl -s -i
+    http://<hote>:8000/models » doit rendre 401 et
+    « {"detail":"Missing authorization header"} », plus le document décrit
+    ici.
+  reference:
+    - https://github.com/morphik-org/morphik-core
+    - https://github.com/morphik-org/morphik-core/blob/main/core/api.py
+    - https://github.com/morphik-org/morphik-core/blob/main/core/auth_utils.py
+    - https://github.com/morphik-org/morphik-core/blob/main/core/config.py
+    - https://github.com/morphik-org/morphik-core/blob/main/core/models/responses.py
+    - https://github.com/morphik-org/morphik-core/blob/main/core/routes/health.py
+    - https://github.com/morphik-org/morphik-core/blob/main/core/routes/ingest.py
+    - https://github.com/morphik-org/morphik-core/blob/main/core/routes/documents.py
+    - https://github.com/morphik-org/morphik-core/blob/main/morphik.toml
+    - https://github.com/morphik-org/morphik-core/blob/main/morphik.docker.toml
+    - https://github.com/morphik-org/morphik-core/blob/main/dockerfile
+    - https://github.com/morphik-org/morphik-core/blob/main/docker-compose.yml
+    - https://github.com/morphik-org/morphik-core/blob/main/docker-compose.run.yml
+    - https://github.com/morphik-org/morphik-core/blob/main/install_docker.sh
+    - https://github.com/morphik-org/morphik-core/blob/main/start_server.py
+    - https://github.com/morphik-org/morphik-core/commit/66be7e187a876087d9b7c0d85b69b02b7e339cb6
+    - https://github.com/morphik-org/morphik-core/commit/0bdbd13588063d85f68a84a483a9ded8a990cc85
+    - https://github.com/morphik-org/morphik-core/commit/35ccdb958c9a86dd06fb770f81d1d7afa3d4331b
+    - https://github.com/morphik-org/morphik-core/commit/d6c7a7681063f6ed71d7c2edc7dc2f590a7c0f64
+  metadata:
+    max-request: 1
+    vendor: morphik-org
+    product: morphik-core
+  tags: ai,rag,morphik,fastapi,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /models, derrière verify_token comme toute l'API.
+  # Contournement coupé, la route rend 401 {"detail":"Missing authorization
+  # header"} sans Bearer : ce document ne sort donc que d'une instance ouverte,
+  # et il nomme le produit à lui seul.
+  #
+  # /ping n'est pas lu : il est servi sans verify_token et ne prouverait rien.
+  # /models/available, derrière la même dépendance, rend une liste codée en
+  # dur, moins parlante que la configuration réelle. Les routes de lecture du
+  # corpus (POST /retrieve/chunks, /query…) sont l'abus que le constat signale,
+  # pas ce qu'un scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/models"
+
+    matchers:
+      - type: regex
+        part: body
+        condition: and
+        regex:
+          # Le document entier, ancré aux deux bouts, dans l'ordre des champs
+          # de ModelsResponse : deux listes, puis default_models — completion
+          # et embedding d'abord, chaîne ou null, et rien d'autre que des
+          # paires de cette forme, Dict[str, Optional[str]] oblige —, puis la
+          # liste providers. Une supervision qui republierait l'objet au fond
+          # d'un autre, une page qui le citerait, ou le /models d'un autre
+          # produit — {"object":"list","data":[…]} d'un serveur compatible
+          # OpenAI — ne tiennent pas dans cette forme. (?s) et les \s*
+          # absorbent l'intermédiaire qui réindente.
+          - '(?s)^\s*\{\s*"chat_models"\s*:\s*\[.*\]\s*,\s*"embedding_models"\s*:\s*\[.*\]\s*,\s*"default_models"\s*:\s*\{\s*"completion"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,\s*"embedding"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)(?:\s*,\s*"(?:[^"\\]|\\.)+"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null))*\s*\}\s*,\s*"providers"\s*:\s*\[[^\]]*\]\s*\}\s*$'
+
+          # La liste littérale de core/api.py, inchangée depuis 0bdbd13 : six
+          # fournisseurs, dans cet ordre. C'est elle qui nomme le produit.
+          - '"providers"\s*:\s*\[\s*"openai"\s*,\s*"anthropic"\s*,\s*"google"\s*,\s*"azure"\s*,\s*"ollama"\s*,\s*"custom"\s*\]'
+
+      # Pas de matcher de statut : 200 est celui de tout serveur, et seul le
+      # corps sépare.
+
+    extractors:
+      # Le modèle de complétion en service — la clé de registered_models que
+      # [completion] désigne : il dit sur quoi tourne l'instance.
+      - type: json
+        part: body
+        name: completion_model
+        json:
+          - '.default_models.completion'
+
+      # Les api_base recopiés par « config » : les hôtes internes que
+      # l'instance appelle (Ollama, Lemonade, Azure), dédoublonnés.
+      - type: json
+        part: body
+        name: model_endpoints
+        json:
+          - '[.chat_models[], .embedding_models[] | .config.api_base? // empty] | unique | join(" ")'

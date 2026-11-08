@@ -48320,3 +48320,389 @@ def test_ai_toolkit_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(status=status, body=body)
         assert results == {}, f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# Morphik — morphik-org/morphik-core, le serveur FastAPI d'ingestion et de
+# recherche multimodale pour le RAG, lancé par start_server.py sur [api] host
+# 0.0.0.0 port 8000. core/auth_utils.py verify_token rend AuthContext(user_id=
+# dev_user_id) avant toute lecture d'Authorization dès que [auth]
+# bypass_auth_mode est vrai — ce que le morphik.toml du dépôt livre —, et 401
+# {"detail":"Missing authorization header"} sinon. GET /models (core/api.py)
+# passe par cette dépendance et verse [registered_models] en chat_models /
+# embedding_models, puis default_models et la liste littérale providers. Les
+# corps ci-dessous rejouent le handler sous Python — la table entière en
+# « config », « embedding » dans la clé pour classer, FastAPI sérialise compact
+# dans l'ordre des champs de ModelsResponse — sur le morphik.toml du dépôt
+# (3b048d0, 2026-10-26) puis sur morphik.docker.toml.
+
+MORPHIK_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "morphik-bypass-auth-exposed.yaml")
+
+MORPHIK_ROUTE = "/models"
+
+MORPHIK_PROVIDERS = ["openai", "anthropic", "google", "azure", "ollama", "custom"]
+
+# Une clé de la forme d'une clé d'API, qui n'en est pas une : « config »
+# recopie la table entière, elle sert à prouver que le scan ne la recopie pas.
+MORPHIK_FAKE_API_KEY = "sk-" + "m0rph1kf4k3k3yf0rth3t3sts00000000000000000000"
+
+
+def morphik_provider(model_name):
+    """_extract_provider de core/api.py, tel quel."""
+    if model_name.startswith("gpt"):
+        return "openai"
+    if model_name.startswith("claude"):
+        return "anthropic"
+    if model_name.startswith("gemini"):
+        return "google"
+    if model_name.startswith("ollama"):
+        return "ollama"
+    if "azure" in model_name:
+        return "azure"
+    return "custom"
+
+
+def morphik_models_body(tables, completion, embedding, providers=MORPHIK_PROVIDERS):
+    """
+    get_available_models rejoué : chaque table de registered_models devient
+    {"id", "model", "provider", "config"}, va dans embedding_models si sa clé
+    contient « embedding », dans chat_models sinon ; default_models porte les
+    deux clés [completion].model et [embedding].model, chaîne ou None.
+    """
+    chat, emb = [], []
+    for key, table in tables:
+        info = {"id": key, "model": table.get("model_name", key),
+                "provider": morphik_provider(table.get("model_name", "")),
+                "config": table}
+        (emb if "embedding" in key.lower() else chat).append(info)
+    doc = {"chat_models": chat, "embedding_models": emb,
+           "default_models": {"completion": completion, "embedding": embedding},
+           "providers": providers}
+    return json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+
+
+MORPHIK_AZURE = {"api_base": "YOUR_AZURE_URL_HERE", "api_version": "2023-05-15"}
+# Les neuf tables communes aux deux fichiers, dans leur ordre.
+MORPHIK_COMMON_TABLES = [
+    ("openai_gpt4-1", {"model_name": "gpt-4.1"}),
+    ("openai_gpt4-1-mini", {"model_name": "gpt-4.1-mini"}),
+    ("azure_gpt4", {"model_name": "gpt-4", **MORPHIK_AZURE, "deployment_id": "gpt-4-deployment"}),
+    ("azure_gpt35", {"model_name": "gpt-3.5-turbo", **MORPHIK_AZURE,
+                     "deployment_id": "gpt-35-turbo-deployment"}),
+    ("claude_opus", {"model_name": "claude-3-opus-20240229"}),
+    ("claude_sonnet", {"model_name": "claude-3-7-sonnet-latest"}),
+    ("gemini_flash", {"model_name": "gemini/gemini-2.5-flash-preview-05-20"}),
+    ("ollama_qwen_vision", {"model_name": "ollama_chat/qwen2.5vl:latest",
+                            "api_base": "http://localhost:11434", "vision": True}),
+    ("ollama_llama_vision", {"model_name": "ollama_chat/llama3.2-vision",
+                             "api_base": "http://localhost:11434", "vision": True}),
+]
+MORPHIK_EMBEDDING_TAIL = [
+    ("openai_embedding", {"model_name": "text-embedding-3-small"}),
+    ("openai_embedding_large", {"model_name": "text-embedding-3-large"}),
+    ("azure_embedding", {"model_name": "text-embedding-ada-002", **MORPHIK_AZURE,
+                         "deployment_id": "embedding-ada-002"}),
+]
+# morphik.toml du dépôt : bypass_auth_mode = true, Ollama en complétion et en
+# embedding, Lemonade sur localhost.
+MORPHIK_DEV_TABLES = MORPHIK_COMMON_TABLES + [
+    ("ollama_qwen_1_5b", {"model_name": "ollama_chat/qwen2:1.5b", "api_base": "http://ollama:11434"}),
+    ("ollama_embedding", {"model_name": "ollama/nomic-embed-text", "api_base": "http://localhost:11434"}),
+    ("lemonade_embedding", {"model_name": "openai/nomic-embed-text-v1-GGUF",
+                            "api_base": "http://localhost:8020/api/v1"}),
+] + MORPHIK_EMBEDDING_TAIL
+MORPHIK_DEV_BODY = morphik_models_body(MORPHIK_DEV_TABLES, "ollama_qwen_vision", "ollama_embedding")
+# morphik.docker.toml, une fois install_docker.sh l'a rouvert sur Entrée :
+# OpenAI par défaut, Lemonade sur host.docker.internal.
+MORPHIK_DOCKER_TABLES = MORPHIK_COMMON_TABLES + [
+    ("lemonade_qwen", {"model_name": "openai/Qwen2.5-VL-7B-Instruct-GGUF",
+                       "api_base": "http://host.docker.internal:8020/api/v1", "vision": True}),
+    ("ollama_embedding", {"model_name": "ollama/nomic-embed-text", "api_base": "http://localhost:11434"}),
+    ("lemonade_embedding", {"model_name": "openai/nomic-embed-text-v1-GGUF",
+                            "api_base": "http://host.docker.internal:8020/api/v1"}),
+] + MORPHIK_EMBEDDING_TAIL
+MORPHIK_DOCKER_BODY = morphik_models_body(MORPHIK_DOCKER_TABLES, "openai_gpt4-1-mini", "openai_embedding")
+# Un exploitant qui a posé api_key sur un modèle de transcription compatible
+# OpenAI, comme le commentaire de morphik.toml l'y invite : « config » la
+# recopie.
+MORPHIK_API_KEY_BODY = morphik_models_body(
+    MORPHIK_DEV_TABLES + [("openai_gpt_transcribe", {
+        "model_name": "openai/gpt-transcribe", "api_key": MORPHIK_FAKE_API_KEY,
+        "api_base": "http://whisper.internal:9000/v1"})],
+    "ollama_qwen_vision", "ollama_embedding")
+# [registered_models] vide et sections absentes : deux listes vides, deux null.
+MORPHIK_BARE_BODY = morphik_models_body([], None, None)
+# Contournement coupé, sans en-tête : verify_token, 401.
+MORPHIK_MISSING_AUTH_BODY = '{"detail":"Missing authorization header"}'
+MORPHIK_INVALID_AUTH_BODY = '{"detail":"Invalid authorization header"}'
+# morphik.toml illisible : le except du handler, 500.
+MORPHIK_LOAD_ERROR_BODY = '{"detail":"Failed to load available models"}'
+# Les autres routes du même produit, qui ne sont pas le constat.
+MORPHIK_PING_BODY = '{"status":"ok","message":"Server is running"}'
+MORPHIK_AVAILABLE_BODY = (
+    '{"models":[{"id":"gpt-4o","name":"GPT-4o","provider":"openai",'
+    '"description":"OpenAI\'s most capable model with vision support"}]}'
+)
+MORPHIK_CUSTOM_MODELS_BODY = "[]"
+# Le /models d'un serveur compatible OpenAI.
+MORPHIK_OPENAI_LIST_BODY = (
+    '{"object":"list","data":[{"id":"gpt-4.1","object":"model","created":1,'
+    '"owned_by":"openai"}]}'
+)
+# Des formes que ModelsResponse ne produit pas.
+MORPHIK_OTHER_PROVIDERS_BODY = morphik_models_body(
+    MORPHIK_DEV_TABLES, "ollama_qwen_vision", "ollama_embedding", providers=["openai", "custom"])
+MORPHIK_NESTED_DEFAULT_BODY = MORPHIK_DEV_BODY.replace(
+    '"completion":"ollama_qwen_vision"', '"completion":{"model":"ollama_qwen_vision"}')
+MORPHIK_WRAPPED_BODY = '{"upstream":%s}' % MORPHIK_DEV_BODY
+MORPHIK_DOC_PAGE_BODY = "<pre>%s</pre>" % MORPHIK_DEV_BODY
+# Un FastAPI qui ne sert pas cette route.
+MORPHIK_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+
+def morphik_block():
+    doc = load(MORPHIK_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % MORPHIK_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET %s" % MORPHIK_ROUTE
+    return blocks[0]
+
+
+def morphik_fires(status=200, body=MORPHIK_DEV_BODY):
+    """
+    Sémantique nuclei du bloc. Le statut est reçu pour la symétrie des
+    tableaux ci-dessous et n'entre dans aucun matcher : seul le corps sépare.
+    """
+    del status
+    block = morphik_block()
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"regex"}, (
+        "le constat tient à la forme du document : un matcher word lirait un "
+        "mot, un matcher status un code"
+    )
+    assert all(m.get("part") == "body" for m in matchers), (
+        "un matcher qui ne lit pas le corps ne lit pas le constat"
+    )
+    verdicts = [body_matcher_hits(m, body) for m in matchers]
+    assert verdicts, "bloc sans matcher"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_morphik_probe_is_a_single_read_only_get():
+    """
+    POST /retrieve/chunks, /query ou /ingest/text seraient l'abus que le
+    constat signale. /ping est servi sans verify_token et ne prouve rien ;
+    /models/available rend une liste codée en dur.
+    """
+    doc = load(MORPHIK_TEMPLATE)
+    assert request_routes(doc) == {("GET", MORPHIK_ROUTE)}, (
+        sorted(request_routes(doc)))
+    for item in doc.get("http") or []:
+        assert item.get("method", "GET") == "GET"
+        assert not item.get("body") and not item.get("raw")
+        assert not item.get("headers"), "aucun jeton, aucun en-tête"
+    assert all(m.get("type") != "status" for m in morphik_block().get("matchers") or []), (
+        "le constat ne doit pas lire le statut : le corps dit ce qui est servi"
+    )
+    info = doc.get("info") or {}
+    meta = info.get("metadata") or {}
+    assert meta.get("product") == "morphik-core"
+    assert meta.get("max-request") == 1
+    assert info.get("severity") == "high"
+
+
+def test_morphik_matcher_fires_on_the_bodies_rendered_from_the_route():
+    assert morphik_fires(), "le template ne reconnaît pas le morphik.toml du dépôt"
+    assert morphik_fires(body=MORPHIK_DOCKER_BODY), (
+        "le template perd l'image Docker rouverte par install_docker.sh"
+    )
+    assert morphik_fires(body=MORPHIK_API_KEY_BODY), (
+        "le template perd l'instance dont un modèle porte api_key"
+    )
+    assert morphik_fires(body=MORPHIK_BARE_BODY), (
+        "le template perd une instance sans registered_models : deux listes "
+        "vides et deux null restent le document"
+    )
+    assert morphik_fires(status=203, body=MORPHIK_DEV_BODY), (
+        "le constat ne doit pas dépendre du statut"
+    )
+    reindented = json.dumps(json.loads(MORPHIK_DEV_BODY), indent=2)
+    for body, why in (
+        (reindented, "un objet réindenté"),
+        (reindented.replace("\n", "\r\n"), "un objet servi en CRLF"),
+        (MORPHIK_DEV_BODY + "\n", "un saut de ligne final"),
+        (MORPHIK_DEV_BODY.replace('"embedding":"ollama_embedding"}',
+                                  '"embedding":"ollama_embedding","vision":"ollama_qwen_vision"}'),
+         "une clé de plus dans default_models — Dict[str, Optional[str]] l'admet"),
+        (MORPHIK_DEV_BODY.replace('"embedding":"ollama_embedding"}', '"embedding":null}'),
+         "un [embedding] sans model"),
+        (MORPHIK_DEV_BODY.replace("ollama_qwen_vision", 'mod\\"èle'),
+         "une clé de modèle accentuée à guillemet échappé"),
+    ):
+        assert morphik_fires(body=body), "le template perd %s" % why
+
+
+def test_morphik_matcher_needs_the_models_document_not_a_word():
+    for status, body, why in (
+        (401, MORPHIK_MISSING_AUTH_BODY,
+         "une instance lancée avec bypass_auth_mode = false, le 401 de verify_token"),
+        (401, MORPHIK_INVALID_AUTH_BODY, "un en-tête qui n'est pas Bearer"),
+        (500, MORPHIK_LOAD_ERROR_BODY, "un morphik.toml illisible"),
+        (200, MORPHIK_PING_BODY, "/ping, servi sans verify_token"),
+        (200, MORPHIK_AVAILABLE_BODY, "/models/available, la liste codée en dur"),
+        (200, MORPHIK_CUSTOM_MODELS_BODY, "/models/custom, une liste vide"),
+        (200, MORPHIK_OPENAI_LIST_BODY, "le /models d'un serveur compatible OpenAI"),
+        (200, MORPHIK_OTHER_PROVIDERS_BODY, "une liste providers qui n'est pas celle de core/api.py"),
+        (200, MORPHIK_NESTED_DEFAULT_BODY, "un default_models imbriqué, que ModelsResponse refuse"),
+        (200, MORPHIK_WRAPPED_BODY, "une supervision qui republie l'objet"),
+        (200, MORPHIK_DOC_PAGE_BODY, "une page de documentation qui cite l'objet"),
+        (404, MORPHIK_NOT_FOUND_BODY, "le 404 d'un autre FastAPI"),
+        (200, "{}", "un objet vide"),
+        (200, "[]", "une liste vide"),
+        (200, "", "une réponse vide"),
+    ):
+        assert not morphik_fires(status=status, body=body), (
+            "le template conclut sur %s" % why)
+
+
+def test_morphik_extractors_name_the_model_and_the_endpoints_not_the_key():
+    """
+    « completion_model » dit sur quoi tourne l'instance, « model_endpoints »
+    les hôtes internes qu'elle appelle ; aucun extracteur ne lit api_key.
+    """
+    extractors = morphik_block().get("extractors") or []
+    assert [(e.get("type"), e.get("part"), e.get("name")) for e in extractors] == [
+        ("json", "body", "completion_model"),
+        ("json", "body", "model_endpoints"),
+    ], extractors
+    assert extractors[0].get("json") == [".default_models.completion"]
+    assert extractors[1].get("json") == [
+        '[.chat_models[], .embedding_models[] | .config.api_base? // empty] | unique | join(" ")'
+    ]
+    with open(MORPHIK_TEMPLATE) as f:
+        assert "api_key" not in f.read().split("http:")[1], (
+            "le bloc http lit api_key : le rapport la recopierait"
+        )
+    doc = json.loads(MORPHIK_API_KEY_BODY)
+    assert doc["default_models"]["completion"] == "ollama_qwen_vision"
+    assert MORPHIK_FAKE_API_KEY in MORPHIK_API_KEY_BODY
+    assert MORPHIK_FAKE_API_KEY not in MORPHIK_DEV_BODY
+
+
+def test_morphik_description_keeps_the_auth_nuances():
+    info = load(MORPHIK_TEMPLATE).get("info") or {}
+    description = info.get("description") or ""
+    for needle in ("uvicorn.run(", '= "0.0.0.0"', "bypass_auth_mode = true",
+                   "dev_user_id", "dev_mode", "dev-secret-key",
+                   "JWT_SECRET_KEY is required", "if settings.bypass_auth_mode",
+                   '{"detail":"Missing authorization header"}', "WWW-Authenticate",
+                   "morphik.docker.toml", "bypass_auth_mode = false",
+                   "install_docker.sh", "LOCAL_URI_PASSWORD", "your-secret-key-here",
+                   "response_model=ModelsResponse", "Depends(verify_token)",
+                   "Failed to load available models", "Server is running",
+                   "/models/available", "66be7e1", "0bdbd13", "35ccdb9", "bc5622c"):
+        assert needle in description, needle
+    remediation = info.get("remediation") or ""
+    for needle in ("bypass_auth_mode = false", "JWT_SECRET_KEY", "LOCAL_URI_PASSWORD",
+                   "/generate_local_uri", "127.0.0.1:8000:8000",
+                   '{"detail":"Missing authorization header"}'):
+        assert needle in remediation, needle
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_morphik_matcher_compiles_and_fires_against_a_live_server():
+    """
+    Seul un scan ferme la boucle sur RE2 — (?s) et le document entier — et sur
+    gojq — unique, join —, et dit ce que le template envoie vraiment.
+    """
+    def scan(status=200, body=MORPHIK_DEV_BODY):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization")))
+                code, payload = ((status, body) if self.path == MORPHIK_ROUTE
+                                 else (404, MORPHIK_NOT_FOUND_BODY))
+                encoded = payload.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", MORPHIK_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "morphik-bypass-auth-exposed"}, r.stdout + r.stderr
+        # Ce que le template produit ne porte jamais la clé. `request` et
+        # `response` sont l'écho brut de l'échange, que nuclei joint par
+        # défaut à toute ligne JSONL et que -omit-raw retire : c'est au
+        # moteur, pas au template, et il est écarté de la lecture.
+        for item in lines:
+            produced = {k: v for k, v in item.items() if k not in ("request", "response")}
+            assert MORPHIK_FAKE_API_KEY not in json.dumps(produced), (
+                "le scan recopie la clé d'API dans son résultat — %s" % produced
+            )
+        results = {item.get("extractor-name"): item.get("extracted-results")
+                   for item in lines}
+        assert len(results) == len(lines), "un extracteur rendu deux fois — %s" % lines
+        return seen, results
+
+    seen, results = scan()
+    assert seen == [("GET", MORPHIK_ROUTE, None)], seen
+    assert results == {
+        "completion_model": ["ollama_qwen_vision"],
+        "model_endpoints": ["YOUR_AZURE_URL_HERE http://localhost:11434 "
+                            "http://localhost:8020/api/v1 http://ollama:11434"],
+    }, results
+
+    _, results = scan(body=MORPHIK_DOCKER_BODY)
+    assert results == {
+        "completion_model": ["openai_gpt4-1-mini"],
+        "model_endpoints": ["YOUR_AZURE_URL_HERE http://host.docker.internal:8020/api/v1 "
+                            "http://localhost:11434"],
+    }, "le scan perd l'image Docker rouverte — %s" % results
+
+    _, results = scan(body=json.dumps(json.loads(MORPHIK_API_KEY_BODY), indent=2))
+    assert results == {
+        "completion_model": ["ollama_qwen_vision"],
+        "model_endpoints": ["YOUR_AZURE_URL_HERE http://localhost:11434 "
+                            "http://localhost:8020/api/v1 http://ollama:11434 "
+                            "http://whisper.internal:9000/v1"],
+    }, "le scan perd un objet réindenté portant api_key — %s" % results
+
+    for status, body, why in (
+        (401, MORPHIK_MISSING_AUTH_BODY, "une instance lancée avec bypass_auth_mode = false"),
+        (500, MORPHIK_LOAD_ERROR_BODY, "un morphik.toml illisible"),
+        (200, MORPHIK_PING_BODY, "/ping"),
+        (200, MORPHIK_AVAILABLE_BODY, "/models/available"),
+        (200, MORPHIK_OPENAI_LIST_BODY, "le /models d'un serveur compatible OpenAI"),
+        (200, MORPHIK_NESTED_DEFAULT_BODY, "un default_models imbriqué"),
+        (200, MORPHIK_WRAPPED_BODY, "une supervision qui republie l'objet"),
+    ):
+        _, results = scan(status=status, body=body)
+        assert results == {}, f"le scan conclut sur {why} — {results}"

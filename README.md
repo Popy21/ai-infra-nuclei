@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-143 templates, 140 produits.
+144 templates, 141 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -121,6 +121,7 @@ amont.
 | mlserver | [`mlserver-metadata-exposed`](templates/exposure/mlserver-metadata-exposed.yaml) | high |
 | model-registry | [`kubeflow-model-registry-exposed`](templates/exposure/kubeflow-model-registry-exposed.yaml) | high |
 | model-runner | [`docker-model-runner-exposed`](templates/exposure/docker-model-runner-exposed.yaml) | high |
+| morphik-core | [`morphik-bypass-auth-exposed`](templates/exposure/morphik-bypass-auth-exposed.yaml) | high |
 | ms-swift | [`ms-swift-deploy-exposed`](templates/exposure/ms-swift-deploy-exposed.yaml) | high |
 | nemo-guardrails | [`nemo-guardrails-server-exposed`](templates/exposure/nemo-guardrails-server-exposed.yaml) | high |
 | new-api | [`new-api-setup-uninitialized`](templates/exposure/new-api-setup-uninitialized.yaml) | high |
