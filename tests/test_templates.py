@@ -48771,3 +48771,429 @@ def test_morphik_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, results = scan(status=status, body=body)
         assert results == {}, f"le scan conclut sur {why} — {results}"
+
+
+# --------------------------------------------------------------------------
+# AMD Device Metrics Exporter (ROCm/device-metrics-exporter) : l'exportateur
+# officiel de télémétrie des GPU AMD Instinct, pendant côté AMD de DCGM
+# Exporter. Troisième exportateur de GPU du pack, donc la première chose que
+# cette section amarre est qu'il ne se confond avec aucun des deux autres :
+# ses séries s'appellent « gpu_… », et c'est le jeu d'étiquettes — pas le nom —
+# qui le signe.
+#
+# gpu_compute_partition_type est la signature, conjointe à card_model et à
+# gpu_id sur la même ligne. Trois points ne se devinent pas, et les fixtures
+# ci-dessous les tiennent sur des lignes relevées dans les issues et les pull
+# requests de l'amont, pas sur les exemples de la documentation (valeurs
+# factices, jeu d'étiquettes d'une publication ancienne) :
+#
+#   - l'ordre : client_golang trie les étiquettes par nom, donc card_model,
+#     puis la partition, puis gpu_id — jamais à une position fixe, puisque
+#     afid_index, card_series, container ou une étiquette personnalisée
+#     s'intercalent ;
+#   - le nom : « CommonConfig.MetricsFieldPrefix » préfixe toutes les séries,
+#     et example/config.json le règle à « amd_ » ;
+#   - les valeurs : card_model est vide en mode invité (docs/knownissues.md),
+#     gpu_partition_id vaut « NA » ou un entier selon la publication.
+#
+# Le tri ne séparant pas l'instance de sa copie republiée, c'est l'absence de
+# job et d'instance qui le fait — sans jamais lire job_id, job_user et
+# job_partition, obligatoires et vides hors Slurm, comme un « job ».
+
+AMD_DME_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "amd-device-metrics-exporter-exposed.yaml")
+
+AMD_DME_ROUTE = "/metrics"
+
+# Les aides sont celles de gpuagent_gpu_metrics.go, verbatim.
+AMD_DME_HELP = {
+    "gpu_nodes_total": "Number of GPUs in the node",
+    "gpu_clock": "List of current GPU clock frequencies in MHz",
+    "gpu_gfx_activity": "Graphics engine usage in Percentage (0-100)",
+    "gpu_edge_temperature": "Current edge temperature in Celsius",
+    "gpu_violation_current_accumulated_counter":
+        "current accumulated violation counter",
+    "pcie_tx": "Accumulated bytes transmitted to the PCIe link",
+}
+
+# Verbatim, pull request 236 de l'amont : une MI300X nue, étiquettes
+# optionnelles de example/config.json activées, gpu_partition_id à « NA ».
+AMD_DME_MI300X = (
+    'gpu_gfx_activity{card_model="102-G30211-0C",'
+    'card_series="AMD Instinct MI300X OAM",card_vendor="AMD",'
+    'cluster_name="amdgpu-k8s-metrics-exporter",container="",'
+    'driver_version="6.14.14",gpu_compute_partition_type="spx",gpu_id="0",'
+    'gpu_memory_partition_type="nps1",gpu_partition_id="NA",'
+    'gpu_uuid="a8ff74a1-0000-1000-807e-843c9b9a1d73",'
+    'hostname="smc300x-clt-r4c3-18",job_id="",job_partition="",job_user="",'
+    'namespace="",pod="",serial_number="692407004236",'
+    'vbios_version="022.040.003.042.000001"} 0')
+
+# Verbatim, pull request 509 : le jeu obligatoire seul, sur une carte qui n'a
+# pas de partition de calcul (« none ») et une série à étiquettes propres.
+AMD_DME_W7900 = (
+    'gpu_clock{card_model="Navi 31 [Radeon Pro W7900 Dual Slot]",'
+    'clock_index="0",clock_type="system",container="",'
+    'deployment_mode="baremetal",gpu_compute_partition_type="none",gpu_id="0",'
+    'gpu_memory_partition_type="none",gpu_partition_id="0",'
+    'hostname="430b1909be40",job_id="",job_partition="",job_user="",'
+    'namespace="",pod="",serial_number=""} 2564')
+
+# Verbatim, issue 171 : une MI300X en VF — card_model et serial_number vides,
+# une virgule dans card_vendor, et les deux étiquettes d'« ExtraPodLabels ».
+AMD_DME_VF = (
+    'gpu_edge_temperature{card_model="",'
+    'card_series="Aqua Vanjaram [Instinct MI300X VF]",'
+    'card_vendor="Advanced Micro Devices, Inc. [AMD/ATI]",'
+    'cluster_name="amdgpu-k8s-metrics-exporter",container="",'
+    'driver_version="6.12.12",gpu_compute_partition_type="spx",gpu_id="0",'
+    'gpu_memory_partition_type="nps1",gpu_partition_id="0",'
+    'gpu_uuid="17ff74b5-0000-1000-805c-37b0fbe69430",hostname="master-1",'
+    'job_id="",job_partition="",job_user="",namespace="",pod="",'
+    'serial_number="",usergroup_id="",'
+    'vbios_version="022.040.003.042.000001",workload_id=""} 0')
+
+# Verbatim, pull request 550 : sous « MetricsFieldPrefix: amd_ », côté
+# hyperviseur.
+AMD_DME_PREFIXED = (
+    'amd_gpu_violation_current_accumulated_counter{card_model="102-G30211-00",'
+    'container="",deployment_mode="hypervisor",'
+    'gpu_compute_partition_type="spx",gpu_id="0",'
+    'gpu_memory_partition_type="nps1",gpu_partition_id="0",'
+    'hostname="banff-cyxtera-cx58-11",job_id="",job_partition="",job_user="",'
+    'namespace="",pod="",serial_number="692415000283"} 2.1565629e+07')
+
+# Verbatim, pull request 211 : un pod occupe la carte, KFD_PROCESS_ID activée.
+AMD_DME_WORKLOAD = (
+    'gpu_gfx_activity{card_model="",card_series="",'
+    'card_vendor="Advanced Micro Devices, Inc. [AMD/ATI]",'
+    'cluster_name="amdgpu-k8s-metrics-exporter",'
+    'container="pytorch-resnet50-cifar100",driver_version="6.12.12",'
+    'gpu_compute_partition_type="spx",gpu_id="0",'
+    'gpu_memory_partition_type="nps1",gpu_partition_id="NA",'
+    'gpu_uuid="9fff74b9-0000-1000-8044-4a2fb30adeb0",'
+    'hostname="mi325x8-110.atl1.do.cpe.ice.amd.com",job_id="",'
+    'job_partition="",job_user="",kfd_process_id="2912425",'
+    'namespace="default",pod="pytorch-resnet50-cifar100",serial_number="",'
+    'vbios_version="022.042.000.002.000001"} 83')
+
+# Verbatim, pull request 316 : une partition CPX, relevée sur une des onze
+# séries « pcie_… » du produit — celles que le constat ne lit pas.
+AMD_DME_CPX_PCIE = (
+    'pcie_tx{card_model="102-G30213-0C",container="",'
+    'gpu_compute_partition_type="cpx",gpu_id="14",'
+    'gpu_memory_partition_type="nps1",gpu_partition_id="6",'
+    'hostname="723be48b185a",job_id="",job_partition="",job_user="",'
+    'namespace="",pod="",serial_number="692407005126"} 0')
+
+# L'exemple que docs/configuration/metricslist.md imprime : valeurs factices,
+# jeu d'étiquettes d'avant gpu_memory_partition_type et deployment_mode.
+AMD_DME_DOC = (
+    'gpu_clock{card_model="xxxx",clock_index="14",clock_type="data",'
+    'gpu_compute_partition_type="spx",gpu_id="3",gpu_partition_id="0",'
+    'hostname="xxxx",serial_number="xxxx"} 22')
+
+# L'exemple de gpu_afid_errors, même page : écrit à la main, étiquettes dans
+# le désordre et tronqué. Aucun rendu de client_golang ne sort ainsi.
+AMD_DME_DOC_HANDWRITTEN = (
+    'gpu_afid_errors{afid_index="0", severity="fatal", gpu_id="0", ...} 30')
+
+
+def amd_dme_body(samples=None, metadata=True, nodes_total=True):
+    """
+    Le corps de GET /metrics : pour chaque famille, les métadonnées que le
+    format d'exposition impose, puis ses échantillons. gpu_nodes_total ouvre
+    le corps comme sur une instance — la série ne porte que hostname
+    (GetExporterNonGPULabels), donc rien de ce que le constat cherche.
+    """
+    if samples is None:
+        samples = [AMD_DME_MI300X]
+    if nodes_total:
+        samples = ['gpu_nodes_total{hostname="smc300x-clt-r4c3-18"} 8'] + list(samples)
+    lines, declared = [], set()
+    for sample in samples:
+        family = sample.split("{", 1)[0]
+        if metadata and family not in declared:
+            declared.add(family)
+            help_line = AMD_DME_HELP.get(
+                family, AMD_DME_HELP.get(family.replace("amd_", "", 1), family))
+            lines.append("# HELP %s %s" % (family, help_line))
+            lines.append("# TYPE %s gauge" % family)
+        lines.append(sample)
+    return "\n".join(lines) + "\n"
+
+
+AMD_DME_BODY = amd_dme_body()
+
+# La même série relayée par une fédération Prometheus ou un collecteur
+# OpenTelemetry : instance et job ajoutés, puis tri par nom — donc entre
+# hostname et job_id.
+AMD_DME_FEDERATED_BODY = amd_dme_body(samples=[AMD_DME_MI300X.replace(
+    'job_id="",',
+    'instance="10.0.0.4:5000",job="amd-device-metrics-exporter",job_id="",')],
+    nodes_total=False)
+
+# Un Pushgateway : job seul.
+AMD_DME_PUSHED_BODY = amd_dme_body(samples=[AMD_DME_MI300X.replace(
+    'job_id="",', 'job="gpu-batch",job_id="",')], nodes_total=False)
+
+# Verbatim : tools/metricutil/metrics_mini.txt, la sortie d'une toute première
+# publication — deux étiquettes en capitales, aucune de partition.
+AMD_DME_EARLY_BODY = (
+    "# HELP gpu_average_package_power Average package power in Watts\n"
+    "# TYPE gpu_average_package_power gauge\n"
+    'gpu_average_package_power{GPU_UUID="6699c0a8-4200-4242-037f-f97e6cae0f09",'
+    'SERIAL_NUMBER="692247001282"} 41\n'
+    "# HELP gpu_nodes_total Number of nodes with GPUs\n"
+    "# TYPE gpu_nodes_total gauge\n"
+    "gpu_nodes_total 1\n"
+    "# HELP gpu_power_usage power usage in Watts\n"
+    "# TYPE gpu_power_usage gauge\n"
+    'gpu_power_usage{GPU_UUID="6699c0a8-4200-4242-037f-f97e6cae0f09",'
+    'SERIAL_NUMBER="692247001282"} 41\n'
+)
+
+# Une règle d'alerte qui cite la série et sa signature.
+AMD_DME_PROMQL_BODY = (
+    "groups:\n  - name: gpu\n    rules:\n      - alert: InstinctHot\n"
+    '        expr: gpu_junction_temperature{card_model="102-G30211-0C",'
+    'gpu_compute_partition_type="spx",gpu_id="0"} > 95\n'
+)
+
+# La page de documentation servie telle quelle : la ligne est dans une balise.
+AMD_DME_DOC_PAGE_BODY = (
+    "<html><body><pre># TYPE gpu_clock gauge\n<code>%s</code></pre>"
+    "</body></html>" % AMD_DME_DOC)
+
+
+def amd_dme_block():
+    doc = load(AMD_DME_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % AMD_DME_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /metrics"
+    return blocks[0]
+
+
+def amd_dme_fires(body=None, status=200):
+    if body is None:
+        body = AMD_DME_BODY
+    block = amd_dme_block()
+    verdicts = [mcpo_dsl_hits(m, [(status, body)])
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def amd_dme_extracted(body):
+    found = set()
+    for extractor in amd_dme_block().get("extractors") or []:
+        group = extractor.get("group", 0)
+        for pattern in extractor.get("regex") or []:
+            for m in re.finditer(pattern, body):
+                found.add(m.group(group))
+    return sorted(found)
+
+
+def test_amd_dme_probe_reads_only_the_telemetry_route():
+    doc = load(AMD_DME_TEMPLATE)
+    assert request_routes(doc) == {("GET", AMD_DME_ROUTE)}, sorted(request_routes(doc))
+    assert doc["info"]["severity"] == "medium"
+    assert doc["info"]["metadata"]["max-request"] == 1
+    assert doc["info"]["metadata"]["product"] == "device-metrics-exporter"
+    for block in doc.get("http") or []:
+        assert not block.get("body") and not block.get("raw")
+        for path in block.get("path") or []:
+            for route in ("/debug/", "/gpumetrics", "/inbandraserrors", "?"):
+                assert route not in path, (
+                    "le template interroge %s — une lecture suffit, et "
+                    "celle-là n'est pas la route d'exposition" % route)
+
+
+def test_amd_dme_matcher_rests_on_the_partition_label_joined_to_model_and_id():
+    for body, why in (
+        (AMD_DME_BODY, "une MI300X nue, sortie réelle (étiquettes optionnelles)"),
+        (amd_dme_body([AMD_DME_W7900]),
+         "le jeu obligatoire seul, partition « none »"),
+        (amd_dme_body([AMD_DME_VF]),
+         "une VF : card_model vide, virgule dans card_vendor"),
+        (amd_dme_body([AMD_DME_PREFIXED]),
+         "une instance sous MetricsFieldPrefix « amd_ »"),
+        (amd_dme_body([AMD_DME_WORKLOAD]),
+         "un nœud Kubernetes chargé, KFD_PROCESS_ID activée"),
+        (amd_dme_body([AMD_DME_DOC]),
+         "le jeu d'étiquettes ancien que metricslist.md imprime"),
+        (amd_dme_body([AMD_DME_CPX_PCIE,
+                       AMD_DME_CPX_PCIE.replace("pcie_tx{", "gpu_gfx_activity{")]),
+         "un nœud en CPX, séries pcie_ et gpu_ mêlées"),
+        (amd_dme_body([AMD_DME_W7900.replace("gpu_clock{", "gpu_afid_errors{afid_index=\"3\",")
+                       .replace('serial_number=""', 'serial_number="",severity="fatal"')]),
+         "une étiquette propre triée devant card_model"),
+        (amd_dme_body([AMD_DME_W7900.replace(',gpu_id="0"', ',gpu_fleet="a",gpu_id="0"')]),
+         "une étiquette personnalisée triée entre la partition et gpu_id"),
+        (amd_dme_body(nodes_total=False), "un corps sans gpu_nodes_total"),
+        (AMD_DME_BODY.replace("\n", "\r\n"), "un relais qui sert le corps en CRLF"),
+    ):
+        assert amd_dme_fires(body), "le template perd %s" % why
+    assert amd_dme_fires(status=203), "le constat dépend du statut HTTP"
+
+    for body, why in (
+        (dcgm_body(), "DCGM Exporter, produit distinct déjà couvert"),
+        (nge_body(), "nvidia_gpu_exporter, produit distinct déjà couvert"),
+        (DCGM_NODE_EXPORTER_BODY, "un exportateur Prometheus quelconque"),
+        (DCGM_VLLM_BODY, "un serveur d'inférence qui publie ses compteurs"),
+        (AMD_DME_EARLY_BODY,
+         "une toute première publication, sans étiquette de partition"),
+        (amd_dme_body([AMD_DME_W7900.replace("gpu_compute_partition_type",
+                                             "partition_type")]),
+         "une série gpu_ sans l'étiquette de partition"),
+        (amd_dme_body([AMD_DME_W7900.replace("gpu_compute_partition_type",
+                                             "vgpu_compute_partition_type")]),
+         "une étiquette qui finit seulement par le nom de la partition"),
+        (amd_dme_body([AMD_DME_W7900.replace('gpu_compute_partition_type="none"',
+                                             'gpu_compute_partition_type=""')]),
+         "une partition vide, que le produit n'écrit jamais"),
+        (amd_dme_body([AMD_DME_W7900.replace("{card_model=", "{model=")]),
+         "une série sans card_model"),
+        (amd_dme_body([AMD_DME_W7900.replace("{card_model=", "{xcard_model=")]),
+         "une étiquette qui finit seulement par card_model"),
+        (amd_dme_body([AMD_DME_W7900.replace(',gpu_id="0"', "")]),
+         "une série sans gpu_id"),
+        (amd_dme_body([AMD_DME_W7900.replace(',gpu_id="0"', ',vgpu_id="0"')]),
+         "une étiquette qui finit seulement par gpu_id"),
+        (amd_dme_body([AMD_DME_W7900.replace(',gpu_id="0"', ',gpu_id=""')]),
+         "un gpu_id vide"),
+        (amd_dme_body([AMD_DME_W7900.replace("gpu_clock{", "node_accelerator_clock{")],
+                      nodes_total=False),
+         "les trois étiquettes sur une série qui n'est pas gpu_"),
+        ("# HELP gpu_afid_errors x\n# TYPE gpu_afid_errors gauge\n%s\n"
+         % AMD_DME_DOC_HANDWRITTEN,
+         "l'exemple écrit à la main de la documentation"),
+        (amd_dme_body(metadata=False), "la ligne sans # TYPE de famille"),
+        (AMD_DME_FEDERATED_BODY, "une copie republiée par une fédération"),
+        (AMD_DME_PUSHED_BODY, "une copie poussée dans un Pushgateway"),
+        (AMD_DME_PROMQL_BODY, "une règle d'alerte qui cite la série"),
+        (AMD_DME_DOC_PAGE_BODY, "la page de documentation"),
+        ("Unauthorized\n", "le refus de kube-rbac-proxy"),
+        ("404 page not found\n", "un 404"),
+        ("", "une réponse vide"),
+    ):
+        assert not amd_dme_fires(body), "le template conclut sur %s" % why
+
+
+def test_amd_dme_slurm_labels_are_not_read_as_a_republished_copy():
+    """
+    job_id, job_user et job_partition sont obligatoires : toute instance les
+    porte, vides hors Slurm, remplies sous Slurm. Le garde contre les copies
+    republiées cherche « job= » — s'il lisait « job_ », il écarterait toutes
+    les instances réelles.
+    """
+    for sample in (AMD_DME_MI300X, AMD_DME_W7900, AMD_DME_VF, AMD_DME_WORKLOAD):
+        assert 'job_id=""' in sample and 'job_user=""' in sample
+    slurm = AMD_DME_W7900.replace(
+        'job_id="",job_partition="",job_user=""',
+        'job_id="48213",job_partition="gpu",job_user="alice"')
+    assert slurm != AMD_DME_W7900
+    assert amd_dme_fires(amd_dme_body([slurm])), (
+        "le template perd un nœud Slurm dont les étiquettes de travail sont remplies")
+    assert 'job="' in AMD_DME_FEDERATED_BODY and 'instance="' in AMD_DME_FEDERATED_BODY
+    assert not amd_dme_fires(AMD_DME_FEDERATED_BODY)
+
+
+def test_amd_dme_and_the_nvidia_exporters_do_not_answer_each_other():
+    assert not dcgm_fires(AMD_DME_BODY), (
+        "le template DCGM conclut sur AMD Device Metrics Exporter")
+    assert not nge_fires(AMD_DME_BODY), (
+        "le template nvidia_gpu_exporter conclut sur AMD Device Metrics Exporter")
+    assert not amd_dme_fires(DCGM_BODY) and not amd_dme_fires(NGE_BODY)
+
+
+def test_amd_dme_extraction_reports_the_inventory_without_workload_labels():
+    extractors = amd_dme_block().get("extractors") or []
+    assert len(extractors) == 1, "une ligne de résultat par instance"
+    assert amd_dme_extracted(AMD_DME_BODY) == sorted([
+        'card_model="102-G30211-0C"',
+        'card_series="AMD Instinct MI300X OAM"',
+        'driver_version="6.14.14"',
+        'hostname="smc300x-clt-r4c3-18"',
+    ]), amd_dme_extracted(AMD_DME_BODY)
+    assert amd_dme_extracted(amd_dme_body([AMD_DME_VF], nodes_total=False)) == sorted([
+        'card_series="Aqua Vanjaram [Instinct MI300X VF]"',
+        'driver_version="6.12.12"',
+        'hostname="master-1"',
+    ]), "un card_model vide est rapporté, ou une valeur à crochets est tronquée"
+    workload = amd_dme_extracted(amd_dme_body([AMD_DME_WORKLOAD, AMD_DME_MI300X]))
+    for leaked in ("pytorch-resnet50-cifar100", "2912425", "692407004236",
+                   "namespace", "gpu_uuid", "a8ff74a1"):
+        assert not any(leaked in value for value in workload), (
+            "l'extracteur recopie %s dans le rapport — %s" % (leaked, workload))
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_amd_dme_matcher_compiles_and_fires_against_a_live_server():
+    def scan(body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == AMD_DME_ROUTE:
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "text/plain; version=0.0.4; charset=utf-8")
+                else:
+                    payload = b"404 page not found\n"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", AMD_DME_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(amd_dme_body([AMD_DME_MI300X, AMD_DME_WORKLOAD]))
+    assert seen == [AMD_DME_ROUTE], seen
+    assert hits == 1, hits
+    assert extracted == sorted([
+        'card_model="102-G30211-0C"',
+        'card_series="AMD Instinct MI300X OAM"',
+        'driver_version="6.12.12"',
+        'driver_version="6.14.14"',
+        'hostname="mi325x8-110.atl1.do.cpe.ice.amd.com"',
+        'hostname="smc300x-clt-r4c3-18"',
+    ]), extracted
+
+    for body in (amd_dme_body([AMD_DME_PREFIXED]), amd_dme_body([AMD_DME_VF]),
+                 amd_dme_body([AMD_DME_W7900])):
+        _, hits, _ = scan(body)
+        assert hits == 1, body
+
+    for body in (AMD_DME_FEDERATED_BODY, AMD_DME_PUSHED_BODY, AMD_DME_EARLY_BODY,
+                 AMD_DME_DOC_PAGE_BODY, dcgm_body(), nge_body()):
+        _, hits, _ = scan(body)
+        assert hits == 0, body

@@ -1,0 +1,246 @@
+id: amd-device-metrics-exporter-exposed
+
+info:
+  name: AMD Device Metrics Exporter - Unauthenticated GPU Telemetry Exposure
+  author: popy21
+  severity: medium
+  description: |
+    AMD Device Metrics Exporter (ROCm/device-metrics-exporter) est l'exportateur
+    officiel de télémétrie des GPU AMD — son README l'ouvre ainsi : « AMD Device
+    Metrics Exporter enables real-time collection of telemetry data in
+    Prometheus format from AMD GPUs in HPC and AI environments ». C'est le
+    pendant côté AMD de DCGM Exporter : le GPU Operator d'AMD le déploie sur les
+    nœuds Instinct dès que « spec/metricsExporter/enable » est posé dans le
+    DeviceConfig, et il se lance aussi seul, en conteneur ou en paquet Debian.
+    Produit distinct des deux exportateurs NVIDIA du pack : ses séries
+    s'appellent « gpu_… », jamais « DCGM_FI_DEV_… » ni « nvidia_smi_… ».
+    GET /metrics est sa route d'exposition, et elle est montée sans garde :
+    exporter.go la câble en « router.Handle(globals.MetricsHandlerPrefix,
+    promhttp.HandlerFor(reg, …)) » sur un routeur gorilla/mux dont le seul
+    intergiciel, prometheusMiddleware, rafraîchit les mesures avant de servir —
+    il ne vérifie aucun appelant. L'écoute est un http.Server nu lancé par
+    ListenAndServe, donc en clair, sur « 0.0.0.0 » par défaut (main.go, drapeau
+    « bind ») et sur le port 5000 (« "ServerPort": 5000 » dans
+    example/config.json). La commande que docs/configuration/docker.md publie
+    porte « -p 5000:5000 » : le port est mis sur toutes les interfaces de
+    l'hôte.
+    L'absence d'authentification n'est pas ici un réglage oublié : le binaire
+    n'en porte aucun. Le schéma de configuration (exporterconfig.proto) ne
+    contient ni clé TLS, ni basic auth, ni jeton — là où DCGM Exporter et
+    nvidia_gpu_exporter offrent au moins un fichier web-config. La seule garde
+    documentée est extérieure au produit : le sidecar kube-rbac-proxy, que le
+    GPU Operator ne pose devant lui que si « rbacConfig.enable » est mis à true
+    dans le DeviceConfig.
+    Le constat repose sur le jeu d'étiquettes que le produit pose sur chaque
+    série de GPU. gpuagent_gpu_metrics.go en fixe la part obligatoire —
+    GPU_ID, CARD_MODEL, GPU_PARTITION_ID, GPU_COMPUTE_PARTITION_TYPE,
+    GPU_MEMORY_PARTITION_TYPE, DEPLOYMENT_MODE, SERIAL_NUMBER, POD, NAMESPACE,
+    CONTAINER, JOB_ID, JOB_USER, JOB_PARTITION, HOSTNAME —, que configmap.md
+    dit « always set and cannot be removed », et les écrit en minuscules.
+    gpu_compute_partition_type est la signature : c'est le mode de partition de
+    calcul des Instinct (none, spx, dpx, tpx, qpx, cpx), un vocabulaire propre
+    à AMD que ni DCGM Exporter ni nvidia_gpu_exporter n'écrivent. Une ligne
+    relevée sur une instance réelle (pull request 509 de l'amont) :
+    « gpu_clock{card_model="Navi 31 [Radeon Pro W7900 Dual Slot]",clock_index="0",clock_type="system",container="",deployment_mode="baremetal",gpu_compute_partition_type="none",gpu_id="0",gpu_memory_partition_type="none",gpu_partition_id="0",hostname="430b1909be40",job_id="",job_partition="",job_user="",namespace="",pod="",serial_number=""} 2564 ».
+    Les toutes premières publications n'écrivaient pas ce jeu — l'amont en
+    garde une sortie à deux étiquettes en capitales, GPU_UUID et SERIAL_NUMBER,
+    dans tools/metricutil/metrics_mini.txt — et ne sont pas reconnues ;
+    l'étiquette de partition est au schéma depuis la v1.2.1 au moins.
+  impact: |
+    La lecture livre l'inventaire nominatif des accélérateurs AMD, rafraîchi à
+    chaque scrutation : sur chaque série, le modèle de la carte (card_model),
+    son numéro de série (serial_number), le nom de la machine (hostname), le
+    mode de déploiement (baremetal, hypervisor, vm_vf, vm_pf) et le découpage
+    en partitions de calcul et de mémoire — la façon dont chaque Instinct est
+    tranché entre locataires. Les étiquettes activables de example/config.json
+    y joignent card_series, card_vendor, gpu_uuid, vbios_version et
+    driver_version : le niveau de correctif du pilote de l'hôte, en une requête
+    et sans compte.
+    La carte des charges ensuite, et c'est elle qui fait la sévérité. Les
+    étiquettes pod, namespace et container sont obligatoires : en Kubernetes,
+    l'appelant anonyme lit quel pod occupe quel GPU, dans quel namespace — une
+    sortie réelle de l'amont porte « container="pytorch-resnet50-cifar100",
+    … namespace="default",pod="pytorch-resnet50-cifar100" ». Sous Slurm, ce
+    sont job_id, job_user et job_partition : les travaux et leurs
+    propriétaires. « ExtraPodLabels » y recopie en outre des labels de pod
+    choisis par l'exploitant, et l'étiquette optionnelle KFD_PROCESS_ID les PID
+    des processus qui tiennent chaque GPU (« kfd_process_id="31391,1107508,1133485" »).
+    Les mesures jointes — gpu_gfx_activity, gpu_used_vram, gpu_package_power,
+    gpu_junction_temperature — disent ce que chacun consomme et quand : le
+    rythme des campagnes d'entraînement, les cartes inoccupées, les machines en
+    défaut (gpu_health, compteurs ECC). Rien de tout cela n'est attribuable, la
+    route ne réclamant aucune identité.
+  remediation: |
+    Le binaire n'a ni TLS ni authentification à activer : la fermeture se fait
+    devant lui ou par le réseau.
+    En Kubernetes sous le GPU Operator d'AMD, activer le sidecar
+    kube-rbac-proxy : « rbacConfig.enable: true » sous « metricsExporter » dans
+    le DeviceConfig. La documentation de l'opérateur le décrit comme ce qui
+    garantit que « only authorized users (or authorized client certificates)
+    can access the `/metrics` endpoint » — jeton Kubernetes vérifié par
+    TokenReview et SubjectAccessReview, ou mTLS avec « clientCAConfigMap ».
+    Laisser le service en ClusterIP : c'est « serviceType: "NodePort" » et son
+    « nodePort: 32500 », que l'exemple de docs/metrics/exporter.md porte, qui
+    mettent la télémétrie sur chaque nœud. Une NetworkPolicy qui n'admet que le
+    collecteur Prometheus ferme le reste.
+    Hors Kubernetes, restreindre l'écoute : le drapeau « -bind » a pour défaut
+    « 0.0.0.0 », passer « -bind 127.0.0.1 » quand la scrutation est locale. En
+    conteneur, ne pas reprendre le « -p 5000:5000 » de la documentation —
+    préférer « -p 127.0.0.1:5000:5000 » — ou placer un proxy inverse
+    authentifiant devant le port.
+    Laisser « CommonConfig.Debug.EnableAPI » à false (son défaut) : il monte
+    pprof et expvar sur le même port, sans plus de garde.
+    Réduire ce qui est publié tant que la route reste joignable : ne pas
+    activer KFD_PROCESS_ID, et vider « ExtraPodLabels ».
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<hote>:5000/metrics » ne doit plus rendre de ligne portant
+    « gpu_compute_partition_type= ».
+    Après une exposition, tenir l'inventaire pour lu, et il ne se reprend pas :
+    modèles et numéros de série des cartes, noms de machines, découpage en
+    partitions, et les noms de pods, de namespaces, de conteneurs et de travaux
+    Slurm qui occupaient les GPU pendant toute la fenêtre. Chercher la durée de
+    cette fenêtre dans les journaux du proxy ou du pare-feu : l'exportateur,
+    lui, n'a rien journalisé d'attribuable.
+  reference:
+    - https://github.com/ROCm/device-metrics-exporter
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/docs/configuration/metricslist.md
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/docs/configuration/configmap.md
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/docs/configuration/docker.md
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/docs/knownissues.md
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/example/config.json
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/pkg/exporter/exporter.go
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/cmd/exporter/main.go
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/pkg/amdgpu/gpuagent/gpuagent_gpu_metrics.go
+    - https://github.com/ROCm/device-metrics-exporter/blob/main/pkg/exporter/proto/exporterconfig.proto
+    - https://github.com/ROCm/device-metrics-exporter/issues/171
+    - https://github.com/ROCm/device-metrics-exporter/pull/509
+    - https://github.com/ROCm/gpu-operator/blob/main/docs/metrics/exporter.md
+    - https://github.com/ROCm/gpu-operator/blob/main/docs/metrics/kube-rbac-proxy.md
+  metadata:
+    max-request: 1
+    vendor: amd
+    product: device-metrics-exporter
+  tags: ai,ml,gpu,amd,rocm,instinct,device-metrics-exporter,telemetry,prometheus,exposure,unauth,misconfig
+
+http:
+  # Une lecture, celle de la route d'exposition. exporter.go monte deux autres
+  # routes sans condition — « /gpumetrics » (« for daemons like
+  # node-problem-detector that need all the metrics ») et « /inbandraserrors »
+  # (« for querying inband ras errors »), deux lectures JSON qui interrogent
+  # l'agent GPU à chaque appel. Elles ne sont pas interrogées : /metrics porte
+  # déjà la signature et la preuve dans le même corps.
+  #
+  # /debug/pprof/ et /debug/vars n'existent que sous
+  # « CommonConfig.Debug.EnableAPI », faux par défaut ; ils rendent les
+  # entrailles du processus et n'ont rien à faire dans une détection.
+  #
+  # GET sans paramètre : prometheusMiddleware lit « ?debug=qp » pour activer des
+  # mesures de débogage le temps d'une requête, et ce template ne le pose pas.
+  - method: GET
+    path:
+      - "{{BaseURL}}/metrics"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat tient dans cette expression : une ligne d'échantillon
+          # « gpu_… » qui porte, ensemble, card_model, gpu_compute_partition_type
+          # et gpu_id.
+          #
+          # Le nom d'abord, ancré en début de ligne — (?m) et ^ — parce qu'une
+          # ligne d'échantillon du format d'exposition commence par le nom de sa
+          # famille ; une citation dans une phrase, une requête PromQL ou un
+          # tableau de bord ne commence rien. Le préfixe facultatif devant
+          # « gpu_ » n'est pas une tolérance : « CommonConfig.MetricsFieldPrefix »
+          # le pose devant toutes les séries (WrapRegistererWithPrefix), il est
+          # validé contre ^[a-zA-Z_][a-zA-Z0-9_]*$, et example/config.json le
+          # règle à « amd_ » — les sorties réelles de l'amont se partagent entre
+          # « gpu_clock{ » et « amd_gpu_clock{ ».
+          #
+          # L'ordre des trois étiquettes ensuite. Il n'est pas deviné : toutes
+          # les séries sont des GaugeVec de client_golang, dont MakeLabelPairs
+          # trie les étiquettes par nom (« sort.Sort(internal.LabelPairSorter(
+          # labelPairs)) »), donc card_model précède toujours
+          # gpu_compute_partition_type, qui précède gpu_id. Les exiger sur la
+          # même ligne et dans cet ordre écarte un corps qui les citerait
+          # séparément.
+          #
+          # Aucune n'est cherchée à une position fixe. Devant card_model
+          # viennent afid_index sur gpu_afid_errors ou une étiquette de
+          # « CustomLabels » ; entre card_model et la partition, card_series,
+          # card_vendor, clock_index, cluster_name, container, deployment_mode,
+          # driver_version ; et rien n'interdit à une étiquette personnalisée de
+          # se trier entre la partition et gpu_id, d'où le dernier groupe
+          # facultatif. La virgule exigée devant chaque nom écarte une étiquette
+          # qui finirait seulement par lui.
+          #
+          # La valeur de card_model est libre, vide comprise : docs/knownissues.md
+          # écrit « In VM guest mode the follow labels will be empty » et nomme
+          # card_model et serial_number, et l'issue 171 montre « card_model="" »
+          # sur une MI300X en VF. Une instance qui ne sait pas nommer sa carte
+          # est exactement aussi ouverte.
+          #
+          # Celle de gpu_compute_partition_type ne l'est pas : le produit y écrit
+          # le nom de l'énumération GPUComputePartitionType privé de son préfixe
+          # et passé en minuscules (NormalizeStringWithoutPrefix) — none, spx,
+          # dpx, tpx, qpx, cpx —, donc jamais une chaîne vide. L'exiger non vide
+          # écarte un sélecteur qui ne porte aucun périphérique derrière lui.
+          #
+          # gpu_id est l'indice de l'instance, toujours décimal. gpu_partition_id
+          # n'est pas requis : il vaut « NA » quand l'agent ne rend pas
+          # d'identifiant de partition (PartitionId à MaxUint32), un entier
+          # sinon — les sorties réelles portent l'un et l'autre.
+          - 'regex("(?m)^(?:[a-zA-Z_][a-zA-Z0-9_]*)?gpu_[a-z0-9_]+\\{(?:[^\\n]*,)?card_model=\"[^\\n]*,gpu_compute_partition_type=\"[a-z0-9_]+\",(?:[^\\n]*,)?gpu_id=\"[0-9]+\"", body)'
+
+          # Les métadonnées de famille que le format d'exposition impose : le
+          # corps est une scrutation rendue, pas une ligne recopiée dans un
+          # journal ou une page. « gauge » et rien d'autre — toutes les séries
+          # de GPU du produit sont déclarées par prometheus.NewGaugeVec.
+          - 'regex("(?m)^# TYPE (?:[a-zA-Z_][a-zA-Z0-9_]*)?gpu_[a-z0-9_]+ gauge", body)'
+
+          # Pas une copie republiée. Le tri par nom ne sépare pas l'instance de
+          # sa copie — Prometheus trie de la même façon —, donc c'est le jeu
+          # d'étiquettes qui le fait : une fédération, un Pushgateway ou un
+          # collecteur OpenTelemetry ajoutent job et instance, que le produit ne
+          # pose pas. La série republiée porte les mêmes noms ; ce n'est pas
+          # l'exportateur qui répond.
+          #
+          # « =" » immédiatement derrière le nom est ce qui compte : job_id,
+          # job_user et job_partition sont des étiquettes obligatoires du
+          # produit — présentes, vides, sur toute instance hors Slurm — et ne
+          # doivent pas être lues comme un « job ».
+          #
+          # Limite assumée : « CustomLabels » admet des noms libres, donc un
+          # exploitant qui y écrirait lui-même « job » ou « instance » — les
+          # deux noms que Prometheus réserve au collecteur — serait lu comme un
+          # relais.
+          - '!regex("(?m)^(?:[a-zA-Z_][a-zA-Z0-9_]*)?gpu_[a-z0-9_]+\\{(?:[^\\n]*,)?(?:job|instance)=\"", body)'
+
+    extractors:
+      # L'inventaire, pas la version : l'exportateur ne publie aucun numéro de
+      # publication sur cette route. Un seul extracteur, donc une seule ligne de
+      # résultat par instance ; le groupe 1 garde la paire entière —
+      # « card_model="102-G30211-0C" » — sans le séparateur qui la précède, et
+      # nuclei déduplique, de sorte qu'un nœud de huit cartes identiques remonte
+      # un modèle.
+      #
+      #   card_model      le modèle de la carte, obligatoire — mais vide en mode
+      #                   invité, et alors non rapporté.
+      #   card_series     la gamme (« AMD Instinct MI300X OAM »), quand
+      #                   CARD_SERIES est activée.
+      #   driver_version  la version du pilote de l'hôte, quand DRIVER_VERSION
+      #                   est activée.
+      #   hostname        la machine exposée : c'est elle qui dit à l'exploitant
+      #                   quel nœud fermer.
+      #
+      # Aucune ne conditionne le constat. Les numéros de série et les étiquettes
+      # de charge — pod, namespace, container, job_user, kfd_process_id — ne
+      # sont pas extraits, alors que ce sont eux qui font la sévérité : les
+      # rapporter reviendrait à recopier dans le rapport de scrutation ce que
+      # le constat reproche à la cible de publier.
+      - type: regex
+        name: inventory
+        group: 1
+        regex:
+          - '[{,]((?:card_model|card_series|driver_version|hostname)="[^"]+")'
