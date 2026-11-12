@@ -276,6 +276,66 @@ def test_the_endpoint_check_refuses_a_duplicate_and_admits_a_route_in_common():
 
 
 # --------------------------------------------------------------------------
+# Ordre des valeurs extraites : nuclei déduplique ce qu'un extracteur rend dans
+# une map, et l'ordre de `extracted-results` n'est donc pas garanti dès qu'il y
+# a plusieurs valeurs. Une assertion qui les compare dans l'ordre à une liste
+# passe ou échoue d'une exécution à l'autre — KServe le 2026-10-14, ms-swift et
+# Aphrodite le 2026-11-11 — et une suite rouge au hasard ne prouve plus rien.
+# La comparaison passe par sorted().
+
+def ordered_extraction_asserts(source):
+    """Lignes des `assert … extracted-results … == [a, b, …]` sans sorted()."""
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Assert)
+                and isinstance(node.test, ast.Compare)
+                and len(node.test.ops) == 1
+                and isinstance(node.test.ops[0], ast.Eq)):
+            continue
+        left, right = node.test.left, node.test.comparators[0]
+        if not (isinstance(right, ast.List) and len(right.elts) >= 2):
+            continue
+        if "extracted-results" not in ast.unparse(left):
+            continue
+        if (isinstance(left, ast.Call) and isinstance(left.func, ast.Name)
+                and left.func.id == "sorted"):
+            continue
+        lines.append(node.lineno)
+    return sorted(lines)
+
+
+def test_no_assertion_compares_several_extracted_values_in_order():
+    with open(__file__, encoding="utf-8") as f:
+        found = ordered_extraction_asserts(f.read())
+    assert not found, (
+        "extracted-results comparé dans l'ordre à plusieurs valeurs, lignes "
+        f"{found} — nuclei ne garantit pas cet ordre : comparer sorted(...)"
+    )
+
+
+def test_the_extraction_order_check_refuses_an_ordered_comparison():
+    """La vérification ne dit quelque chose que si elle sait refuser."""
+    refused = (
+        'assert results[0].get("extracted-results") == ["a", "b"], results\n'
+        'assert [v for r in results\n'
+        '        for v in (r.get("extracted-results") or [])] == ["a", "b"]\n'
+    )
+    assert ordered_extraction_asserts(refused) == [1, 2], (
+        "une comparaison ordonnée de deux valeurs extraites n'est pas vue"
+    )
+
+    admitted = (
+        'assert sorted(results[0].get("extracted-results") or []) == ["a", "b"]\n'
+        'assert results[0].get("extracted-results") == ["a"]\n'
+        'assert seen == [("GET", "/a"), ("GET", "/b")]\n'
+    )
+    assert ordered_extraction_asserts(admitted) == [], (
+        "la vérification refuse une comparaison triée, une valeur seule, ou "
+        "une liste qui n'est pas celle des valeurs extraites"
+    )
+
+
+# --------------------------------------------------------------------------
 # Endpoint partagé : plusieurs runtimes parlent le protocole OpenAI et servent
 # tous GET /v1/models. Un matcher qui se contente de la forme générique
 # {"object":"list","data":[...]} déclenche sur tous à la fois. Ces deux corps
@@ -46941,8 +47001,10 @@ def test_ms_swift_matcher_compiles_and_fires_against_a_live_server():
     _, results = scan(models=(200, MS_SWIFT_NAMED_MODELS_BODY),
                       openapi=(200, ms_swift_openapi_body(indent=2)))
     assert len(results) == 1, "le scan perd un nom servi derrière un schéma réindenté"
-    assert results[0].get("extracted-results") == ["acme/qwen2.5-7b-sft",
-                                                   "lora-support"], results
+    # nuclei déduplique les valeurs extraites dans une map : leur ordre n'est
+    # pas garanti dès qu'il y en a plusieurs.
+    assert sorted(results[0].get("extracted-results") or []) == [
+        "acme/qwen2.5-7b-sft", "lora-support"], results
 
     for models, openapi, why in (
         ((200, MS_SWIFT_MODELS_BODY), (400, MS_SWIFT_UNAUTHORIZED_BODY),
@@ -47696,7 +47758,10 @@ def test_aphrodite_matcher_compiles_and_fires_against_a_live_server():
 
     _, results = scan(body=json.dumps(json.loads(APHRODITE_LORA_BODY), indent=2))
     assert len(results) == 1, "le scan perd une liste réindentée à deux cartes"
-    assert results[0].get("extracted-results") == ["qwen3", "support-sft"], results
+    # Même réserve que pour ms-swift : l'ordre des valeurs extraites n'est pas
+    # garanti par nuclei.
+    assert sorted(results[0].get("extracted-results") or []) == [
+        "qwen3", "support-sft"], results
 
     for status, body, why in (
         (401, APHRODITE_UNAUTHORIZED_BODY, "une instance lancée avec --api-key"),
