@@ -1,0 +1,247 @@
+id: hami-metrics-exposed
+
+info:
+  name: HAMi - Unauthenticated vGPU Metrics Exposure
+  author: popy21
+  severity: medium
+  description: |
+    HAMi (Project-HAMi/HAMi, « Heterogeneous AI Computing Virtualization
+    Middleware ») est la couche de partage et de virtualisation de GPU pour
+    Kubernetes : son ordonnanceur découpe chaque carte en vGPU, son device
+    plugin les distribue aux pods. Produit distinct des trois exportateurs de
+    GPU du pack : il ne mesure pas seulement les cartes, il dit à qui chacune
+    est allouée.
+    Deux de ses binaires publient leur état au format Prometheus sur
+    GET /metrics. Le moniteur vGPU — conteneur « vgpu-monitor » du DaemonSet du
+    device plugin — écoute sur « :9394 » (drapeau « --metrics-bind-address » de
+    cmd/vGPUmonitor/main.go) ; l'ordonnanceur, sur « :9395 » (même drapeau,
+    cmd/scheduler/main.go). Ni l'un ni l'autre ne garde la route : les deux la
+    câblent par « mux.Handle("/metrics", promhttp.HandlerFor(reg,
+    promhttp.HandlerOpts{})) » sur un http.ServeMux nu, servi par un
+    http.Server sans TLS ni intergiciel. Ce n'est pas un réglage oublié : hors
+    ceux de klog, le moniteur ne déclare que deux drapeaux, l'adresse d'écoute
+    et « --legacy-metrics », et les « cert_file » / « key_file » de
+    l'ordonnanceur ne concernent pas ce port, qu'initMetrics sert par
+    ListenAndServe.
+    Le chart publie le moniteur hors du cluster par défaut : dans
+    charts/hami/values.yaml, « devicePlugin.service.type » vaut « NodePort » et
+    « devicePlugin.service.httpPort », 31992 — un NodePort s'ouvre sur chaque
+    nœud. Le Service de l'ordonnanceur porte « scheduler.service.monitorPort:
+    31993 » ; il est en « ClusterIP » sur master, mais la page de supervision
+    officielle écrit « a NodePort in v2.10.0 » et donne « curl
+    <node-ip>:31993/metrics ».
+    Le constat repose sur les séries propres au produit, et la version déployée
+    décide de leur famille. Depuis la v2.9.0 les noms portent le préfixe
+    « hami_ » et l'étiquette « device_uuid » — sur master, côté moniteur,
+    hami_host_gpu_memory_used_bytes{node,device_index,device_uuid,device_type}
+    et hami_vgpu_memory_used_bytes{namespace,pod,container,vdevice_index,
+    device_uuid} ; côté ordonnanceur, hami_node_gpu_overview{node,device_uuid,
+    device_index,device_cores,device_memory_limit,device_type} et
+    hami_vgpu_memory_allocated_bytes{namespace,node,pod,device_uuid}. Jusqu'à
+    la v2.8.3 seuls les noms hérités existent — HostGPUMemoryUsage,
+    vGPU_device_memory_usage_in_bytes, GPUDeviceMemoryLimit, nodeGPUOverview… —
+    avec l'étiquette « deviceuuid » ; depuis la v2.9.0 ils ne sortent plus
+    qu'avec « --legacy-metrics » (« legacyMetrics: false » dans le chart), à
+    côté des nouveaux. Les deux familles portent l'étiquette constante
+    zone="vGPU", que NewClusterManager pose par prometheus.WrapRegistererWith
+    sur tout ce que le collecteur émet.
+    Une ligne relevée sur une instance v2.9.0 (issue 1891 de l'amont) :
+    « hami_host_gpu_memory_used_bytes{device_index="0",device_type="NVIDIA-NVIDIA H20",device_uuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d",zone="vGPU"} 5.28744448e+08 ».
+    Une autre, sur une instance d'avant le renommage (issue 555) :
+    « Device_utilization_desc_of_container{ctrname="mistral-7b",deviceuuid="GPU-9ef17446-43db-8bfa-b0d5-a9920d8d5ba0",podname="mistral-7b-78c69f7cc4-fz96k",podnamespace="default",vdeviceid="0",zone="vGPU"} 0 ».
+  impact: |
+    Le moniteur livre l'inventaire des GPU du nœud — indice, modèle
+    (device_type), UUID (device_uuid), nom du nœud — avec la mémoire occupée et
+    l'utilisation de chaque carte, puis sa température et sa puissance sur les
+    publications récentes.
+    Il livre surtout la carte nominative des charges, et c'est elle qui fait la
+    sévérité : les séries hami_vgpu_… et hami_container_… portent namespace,
+    pod et container, donc l'appelant anonyme lit quel conteneur de quel pod,
+    dans quel namespace, tient quelle carte, avec la mémoire qu'il consomme
+    (hami_vgpu_memory_used_bytes) et la limite qui lui est allouée
+    (hami_vgpu_memory_limit_bytes). La sortie de l'issue 555 nomme ainsi le
+    conteneur « mistral-7b » dans « default ».
+    L'ordonnanceur livre la même chose à l'échelle du cluster : tous les nœuds
+    à GPU, leurs cartes et leur capacité (hami_node_gpu_overview), puis, pod
+    par pod, la mémoire et les cœurs alloués (hami_vgpu_memory_allocated_bytes,
+    hami_vgpu_core_allocated_ratio), et les quotas de chaque namespace
+    (hami_resource_quota_used).
+    hami_build_info y joint la version, la révision git et la date de
+    construction du binaire : le niveau de correctif, en une requête et sans
+    compte. Rien de tout cela n'est attribuable, la route ne réclamant aucune
+    identité.
+  remediation: |
+    Les binaires n'ont ni TLS ni authentification à activer sur ce port : la
+    fermeture se fait par le Service et par le réseau.
+    Passer le Service du moniteur en ClusterIP — « devicePlugin.service.type:
+    ClusterIP » dans les valeurs du chart, dont le commentaire dit que ce type
+    « exposes metrics only within the cluster ». Faire de même pour
+    l'ordonnanceur (« scheduler.service.type: ClusterIP ») sur les publications
+    du chart où son Service est encore un NodePort.
+    Tant qu'un NodePort subsiste, filtrer 31992 et 31993 au pare-feu des nœuds
+    ou au groupe de sécurité.
+    Restreindre ensuite l'accès interne par une NetworkPolicy qui n'admet que
+    le collecteur Prometheus vers 9394 et 9395. Celle que le chart sait créer
+    pour l'ordonnanceur (« scheduler.networkPolicy.enabled », désactivée par
+    défaut) ne le fait pas : son commentaire précise qu'elle « leaves the
+    metrics port open to all sources ». Et une NetworkPolicy ne couvre pas un
+    pod en réseau d'hôte : laisser « devicePlugin.hostNetwork » à false, son
+    défaut.
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<noeud>:31992/metrics » ne doit plus rendre de ligne portant
+    « device_uuid= » ou « deviceuuid= ».
+    Après une exposition, tenir pour lus l'inventaire des cartes (UUID, modèles,
+    nœuds) et les noms des namespaces, pods et conteneurs qui les occupaient
+    pendant toute la fenêtre. Chercher la durée de cette fenêtre dans les
+    journaux du pare-feu ou de l'équilibreur : le serveur de métriques n'a
+    aucun intergiciel, donc rien journalisé d'attribuable.
+  reference:
+    - https://github.com/Project-HAMi/HAMi
+    - https://github.com/Project-HAMi/HAMi/blob/master/cmd/vGPUmonitor/main.go
+    - https://github.com/Project-HAMi/HAMi/blob/master/cmd/vGPUmonitor/metrics.go
+    - https://github.com/Project-HAMi/HAMi/blob/master/pkg/monitor/metrics/schema.go
+    - https://github.com/Project-HAMi/HAMi/blob/master/cmd/scheduler/main.go
+    - https://github.com/Project-HAMi/HAMi/blob/master/cmd/scheduler/metrics.go
+    - https://github.com/Project-HAMi/HAMi/blob/master/pkg/metrics/metrics.go
+    - https://github.com/Project-HAMi/HAMi/blob/v2.8.3/cmd/vGPUmonitor/metrics.go
+    - https://github.com/Project-HAMi/HAMi/blob/master/charts/hami/values.yaml
+    - https://github.com/Project-HAMi/HAMi/blob/master/charts/hami/templates/device-plugin/monitorservice.yaml
+    - https://github.com/Project-HAMi/HAMi/issues/1891
+    - https://github.com/Project-HAMi/HAMi/issues/555
+    - https://project-hami.io/docs/userguide/monitoring/device-allocation
+  metadata:
+    max-request: 1
+    vendor: project-hami
+    product: hami
+  tags: ai,ml,gpu,kubernetes,hami,vgpu,telemetry,prometheus,exposure,unauth,misconfig
+
+http:
+  # Une lecture, celle de la route d'exposition : les deux binaires ne montent
+  # rien d'autre sur ce port. Le moniteur et l'ordonnanceur répondent sur le
+  # même chemin et se lisent donc par la même requête, chacun sur son port —
+  # 9394 et 9395 dans le pod, 31992 et 31993 par les Services du chart.
+  #
+  # Les « /debug/pprof/… » que cmd/scheduler/main.go déclare vivent sur un
+  # autre serveur, lié à 127.0.0.1:6060 et seulement sous « --profiling » ; ils
+  # rendent les entrailles du processus et n'ont rien à faire dans une
+  # détection.
+  - method: GET
+    path:
+      - "{{BaseURL}}/metrics"
+
+    # Deux familles de séries, une par génération du produit, et il suffit que
+    # l'une réponde. Aucun des deux matchers ne porte de nom : sous « or »,
+    # nuclei écrit une ligne de résultat par matcher nommé, et une v2.9.0
+    # lancée avec « --legacy-metrics » — qui sert les deux familles dans le
+    # même corps, c'est la sortie de l'issue 1891 — remonterait deux fois.
+    matchers-condition: or
+    matchers:
+      # La famille courante, depuis la v2.9.0.
+      - type: dsl
+        condition: and
+        dsl:
+          # Le constat tient dans cette expression : une ligne d'échantillon
+          # « hami_… » qui porte un device_uuid non vide.
+          #
+          # Le nom d'abord, ancré en début de ligne — (?m) et ^ — parce qu'une
+          # ligne d'échantillon du format d'exposition commence par le nom de
+          # sa famille ; une citation dans une phrase, une requête PromQL ou un
+          # tableau de bord ne commence rien. Le préfixe est le nom du produit,
+          # et tous les prometheus.NewDesc des deux binaires le portent.
+          #
+          # L'étiquette ensuite, jamais à une position fixe : les séries sont
+          # des NewConstMetric de client_golang, dont MakeLabelPairs trie les
+          # étiquettes par nom. device_uuid ouvre donc l'accolade sur
+          # hami_host_gpu_unknown_process_count, suit device_type sur les
+          # séries d'hôte, et suit container sur les séries de conteneur. La
+          # virgule exigée devant le nom écarte une étiquette qui finirait
+          # seulement par lui.
+          #
+          # La valeur est libre mais non vide. Ce n'est pas toujours un
+          # « GPU-… » de NVML : l'ordonnanceur publie aussi les cartes d'autres
+          # constructeurs, et la page de supervision imprime
+          # « device_uuid="aio-node74-arm-Ascend310P-0" ». Une valeur vide
+          # serait un sélecteur sans périphérique derrière lui — le moniteur
+          # lui-même saute le conteneur dont l'UUID n'est pas encore
+          # initialisé.
+          #
+          # Ne sont pas lues : hami_build_info, hami_scheduler_is_leader et
+          # hami_vgpumonitor_collect_success. Elles nomment le produit, mais un
+          # binaire qui ne sert qu'elles ne publie aucune carte ni aucune
+          # charge — c'est un ordonnanceur sans nœud à GPU, pas le constat.
+          - 'regex("(?m)^hami_[a-z0-9_]+\\{(?:[^\\n]*,)?device_uuid=\"[^\"\\n]+\"", body)'
+
+          # Les métadonnées de famille que le format d'exposition impose : le
+          # corps est une scrutation rendue, pas une ligne recopiée dans un
+          # journal ou une page. « counter » à côté de « gauge » :
+          # hami_host_gpu_ecc_errors_total et les compteurs d'allocation de
+          # l'ordonnanceur en sont.
+          - 'regex("(?m)^# TYPE hami_[a-z0-9_]+ (?:gauge|counter)", body)'
+
+          # Pas une copie republiée. Une fédération, un Pushgateway ou un
+          # collecteur OpenTelemetry ajoutent job et instance, que le produit
+          # ne pose sur aucune série ; la copie porte les mêmes noms, mais ce
+          # n'est pas HAMi qui répond.
+          #
+          # « =" » immédiatement derrière le nom est ce qui compte :
+          # gpu_instance_id et compute_instance_id, sur hami_mig_device_info,
+          # ne sont pas un « instance ».
+          - '!regex("(?m)^hami_[a-z0-9_]+\\{(?:[^\\n]*,)?(?:job|instance)=\"", body)'
+
+      # La famille héritée : la seule que servent les publications jusqu'à la
+      # v2.8.3, et celle que « --legacy-metrics » ajoute depuis.
+      - type: dsl
+        condition: and
+        dsl:
+          # Ces noms n'ont pas de préfixe — HostGPUMemoryUsage,
+          # vGPU_device_memory_usage_in_bytes, Device_memory_desc_of_container
+          # côté moniteur ; GPUDeviceMemoryLimit, nodeGPUOverview,
+          # vGPUMemoryAllocated côté ordonnanceur — et leur liste a bougé d'une
+          # publication à l'autre. C'est donc le jeu d'étiquettes qui signe,
+          # pas le nom : « deviceuuid », d'un seul mot, joint à zone="vGPU".
+          #
+          # zone est la constante que NewClusterManager("vGPU", …) pose sur
+          # tout le collecteur par WrapRegistererWith ; elle est sur chaque
+          # ligne des sorties réelles, de l'issue 555 à l'issue 1891. Le tri
+          # par nom la place derrière deviceuuid, et d'autres étiquettes
+          # s'intercalent — podname, podnamespace, vdeviceid —, d'où le groupe
+          # facultatif entre les deux.
+          #
+          # Limite assumée : le moniteur de HAMi-DRA (hami-dra-monitor, port
+          # 8080) réemploie ces noms avec « deviceuuid » mais sans zone —
+          # c'est l'exemple que la page de supervision en imprime. Autre
+          # composant, autre port : il n'est pas reconnu.
+          - 'regex("(?m)^[A-Za-z][A-Za-z0-9_]*\\{(?:[^\\n]*,)?deviceuuid=\"[^\"\\n]+\",(?:[^\\n]*,)?zone=\"vGPU\"", body)'
+
+          # Mêmes métadonnées. Le nom est libre ici comme ci-dessus ; les
+          # sorties réelles portent « # TYPE HostGPUMemoryUsage gauge » et
+          # « # TYPE Device_memory_desc_of_container counter ».
+          - 'regex("(?m)^# TYPE [A-Za-z][A-Za-z0-9_]* (?:gauge|counter)", body)'
+
+          # Même garde contre les copies republiées. « instanceid », sur
+          # MigInfo, n'est pas un « instance ».
+          - '!regex("(?m)^[A-Za-z][A-Za-z0-9_]*\\{(?:[^\\n]*,)?(?:job|instance)=\"", body)'
+
+    extractors:
+      # Un seul extracteur, donc une seule ligne de résultat par instance ; le
+      # groupe 1 garde la paire entière sans le séparateur qui la précède, et
+      # nuclei déduplique.
+      #
+      #   version       la publication, lue sur hami_build_info — la virgule
+      #                 exigée devant le nom écarte go_version. La série existe
+      #                 sur les deux binaires ; les plus anciennes publications
+      #                 ne l'ont pas, et ne rapportent alors rien.
+      #   device_type   le modèle des cartes (« NVIDIA-NVIDIA H20 »), sous ses
+      #                 deux écritures.
+      #
+      # Aucune ne conditionne le constat. Les UUID, les nœuds et les étiquettes
+      # de charge — namespace, pod, container — ne sont pas extraits, alors que
+      # ce sont eux qui font la sévérité : les rapporter reviendrait à recopier
+      # dans le rapport de scrutation ce que le constat reproche à la cible de
+      # publier. Un ordonnanceur les porte pour tout le cluster.
+      - type: regex
+        name: inventory
+        group: 1
+        regex:
+          - '(?m)^hami_build_info\{(?:[^\n]*,)?(version="[^"\n]+")'
+          - '[{,]((?:device_type|devicetype)="[^"\n]+")'

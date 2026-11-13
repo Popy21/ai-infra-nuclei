@@ -49787,3 +49787,588 @@ def test_paddlex_matcher_compiles_and_fires_against_a_live_server():
     ):
         _, hits, _ = scan(status, body)
         assert hits == 0, f"le scan conclut sur {why}"
+
+
+# --------------------------------------------------------------------------
+# HAMi (Project-HAMi/HAMi) : la couche de partage et de virtualisation de GPU
+# pour Kubernetes. Son moniteur vGPU (:9394, NodePort 31992 par défaut du
+# chart) et son ordonnanceur (:9395, Service 31993) servent GET /metrics sans
+# garde. Ce n'est pas un quatrième exportateur de cartes : ses séries disent à
+# quel pod chaque carte est allouée.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - la famille dépend de la version. Depuis la v2.9.0 les séries s'appellent
+#     « hami_… » et portent « device_uuid » ; jusqu'à la v2.8.3 seuls les noms
+#     hérités existent, avec « deviceuuid » d'un seul mot, et
+#     « --legacy-metrics » les ajoute depuis. Les fixtures sont des lignes
+#     relevées sur les deux générations — issue 1891 (v2.9.0, les deux
+#     familles dans le même corps) et issue 555 (v2.4.1) ;
+#   - l'ordre : client_golang trie les étiquettes par nom, donc device_uuid
+#     n'est jamais à une position fixe ;
+#   - zone="vGPU", la constante que WrapRegistererWith pose sur tout le
+#     collecteur : c'est elle, jointe à « deviceuuid », qui signe la famille
+#     héritée, dont les noms n'ont pas de préfixe ;
+#   - ce qui nomme le produit sans rien publier — hami_build_info,
+#     hami_scheduler_is_leader — ne suffit pas.
+
+HAMI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                             "hami-metrics-exposed.yaml")
+
+HAMI_ROUTE = "/metrics"
+
+# Verbatim, issue 1891 de l'amont : un moniteur v2.9.0 lancé avec
+# « --legacy-metrics=true », huit H20. Les trois lignes viennent du même corps.
+HAMI_BUILD_INFO = (
+    'hami_build_info{build_date="20260519-09:31:29",compiler="gc",'
+    'go_version="go1.26.2",platform="linux/amd64",revision="3a006c6",'
+    'version="v2.9.0"} 1')
+
+HAMI_HOST_V29 = (
+    'hami_host_gpu_memory_used_bytes{device_index="0",'
+    'device_type="NVIDIA-NVIDIA H20",'
+    'device_uuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d",zone="vGPU"} '
+    '5.28744448e+08')
+
+HAMI_LEGACY_HOST_V29 = (
+    'HostGPUMemoryUsage{deviceidx="0",devicetype="NVIDIA-NVIDIA H20",'
+    'deviceuuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d",zone="vGPU"} '
+    '5.28744448e+08')
+
+# Verbatim, issue 555 : un moniteur v2.4.1 — ni hami_build_info, ni
+# devicetype, et un conteneur qui tient la carte.
+HAMI_LEGACY_HOST_V24 = (
+    'HostGPUMemoryUsage{deviceidx="4",'
+    'deviceuuid="GPU-9ef17446-43db-8bfa-b0d5-a9920d8d5ba0",zone="vGPU"} '
+    '2.0588724224e+10')
+
+HAMI_LEGACY_CTR_V24 = (
+    'vGPU_device_memory_usage_in_bytes{ctrname="mistral-7b",'
+    'deviceuuid="GPU-9ef17446-43db-8bfa-b0d5-a9920d8d5ba0",'
+    'podname="mistral-7b-78c69f7cc4-fz96k",podnamespace="default",'
+    'vdeviceid="0",zone="vGPU"} 1.9876938752e+10')
+
+HAMI_LEGACY_CTR_DESC_V24 = (
+    'Device_memory_desc_of_container{context="266338304",ctrname="mistral-7b",'
+    'data="19610600448",'
+    'deviceuuid="GPU-9ef17446-43db-8bfa-b0d5-a9920d8d5ba0",module="0",'
+    'offset="0",podname="mistral-7b-78c69f7cc4-fz96k",podnamespace="default",'
+    'vdeviceid="0",zone="vGPU"} 1.9876938752e+10')
+
+# Verbatim, page de supervision officielle (device-allocation) : l'exemple de
+# l'ordonnanceur, étiquettes dans l'ordre du rendu.
+HAMI_SCHED_OVERVIEW_DOC = (
+    'hami_node_gpu_overview{device_cores="100",device_index="0",'
+    'device_memory_limit="32768",device_type="NVIDIA-Tesla V100-PCIE-32GB",'
+    'device_uuid="GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec",node="aio-node67",'
+    'zone="vGPU"} 1.073741824e+10')
+
+# Verbatim, même page : l'exemple du moniteur de HAMi-DRA (hami-dra-monitor,
+# port 8080) — les noms hérités, « deviceuuid », mais aucune zone. Autre
+# composant : il n'est pas reconnu.
+HAMI_DRA_DOC = (
+    'GPUDeviceCoreLimit{devicebrand="Tesla",deviceidx="0",'
+    'devicename="hami-gpu-1",deviceproductname="Tesla P4",'
+    'deviceuuid="GPU-3ab1-179d-d6dd",nodeid="k8s-node01"} 100')
+
+# Les aides des prometheus.NewDesc, verbatim — celle de
+# Device_memory_desc_of_container avec la coquille de la v2.4.1.
+HAMI_HELP = {
+    "hami_build_info":
+        "hami build metadata exposed as labels with a constant value of 1.",
+    "hami_host_gpu_memory_used_bytes": "GPU device memory usage in bytes",
+    "hami_vgpu_memory_used_bytes": "vGPU device memory usage in bytes",
+    "hami_node_gpu_overview": "GPU overview on a certain node",
+    "hami_vgpu_memory_allocated_bytes": "vGPU memory allocated from a pod",
+    "hami_scheduler_is_leader":
+        "1 if this scheduler instance is the current leader, 0 otherwise.",
+    "HostGPUMemoryUsage": "GPU device memory usage",
+    "vGPU_device_memory_usage_in_bytes": "vGPU device usage",
+    "Device_memory_desc_of_container": "Container device meory description",
+    "nodeGPUOverview": "GPU overview on a certain node",
+}
+
+# Les familles que le produit envoie en prometheus.CounterValue.
+HAMI_COUNTERS = {"Device_memory_desc_of_container",
+                 "hami_host_gpu_ecc_errors_total"}
+
+HAMI_UUID = "GPU-9ef17446-43db-8bfa-b0d5-a9920d8d5ba0"
+
+
+def hami_sample(name, value, zone="vGPU", **labels):
+    """
+    Une ligne telle que client_golang la rend : MakeLabelPairs trie les
+    étiquettes du NewConstMetric par nom, puis le Registerer enveloppant y
+    joint zone et retrie. Le test des fixtures vérifie que cette aide rend,
+    octet pour octet, les lignes relevées sur les instances réelles — c'est ce
+    qui autorise à composer avec elle celles qu'aucune issue ne porte.
+    """
+    pairs = dict(labels)
+    if zone is not None:
+        pairs["zone"] = zone
+    rendered = ",".join('%s="%s"' % (key, pairs[key]) for key in sorted(pairs))
+    return "%s{%s} %s" % (name, rendered, value)
+
+
+# Composées sur les descripteurs de master (pkg/monitor/metrics/schema.go,
+# cmd/vGPUmonitor/metrics.go, cmd/scheduler/metrics.go) : aucune sortie
+# publiée ne porte ces séries rendues.
+HAMI_HOST_MASTER = hami_sample(
+    "hami_host_gpu_memory_used_bytes", "5.28744448e+08", node="gpu-node-1",
+    device_index="0", device_uuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d",
+    device_type="NVIDIA-NVIDIA H20")
+
+HAMI_CTR_MASTER = hami_sample(
+    "hami_vgpu_memory_used_bytes", "1.9876938752e+10", namespace="default",
+    pod="mistral-7b-78c69f7cc4-fz96k", container="mistral-7b",
+    vdevice_index="0", device_uuid=HAMI_UUID)
+
+HAMI_UNKNOWN_PROCESS = hami_sample(
+    "hami_host_gpu_unknown_process_count", "0", node="gpu-node-1",
+    device_uuid=HAMI_UUID)
+
+HAMI_SCHED_ALLOCATED = hami_sample(
+    "hami_vgpu_memory_allocated_bytes", "3.221225472e+09", namespace="default",
+    node="aio-node67", pod="mistral-7b-78c69f7cc4-fz96k",
+    device_uuid="GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec")
+
+HAMI_SCHED_LEADER = hami_sample("hami_scheduler_is_leader", "1")
+
+HAMI_COLLECT_SUCCESS = hami_sample("hami_vgpumonitor_collect_success", "1",
+                                   node="gpu-node-1")
+
+# L'ordonnanceur d'avant la v2.9.0 : nodeGPUOverview et ses sept étiquettes
+# (cmd/scheduler/metrics.go, v2.8.3).
+HAMI_LEGACY_SCHED_OVERVIEW = hami_sample(
+    "nodeGPUOverview", "1.073741824e+10", nodeid="aio-node67",
+    deviceuuid="GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec", deviceidx="0",
+    devicecores="100", sharedcontainers="1", devicememorylimit="32768",
+    devicetype="NVIDIA-Tesla V100-PCIE-32GB")
+
+
+def hami_body(samples, metadata=True, build_info=HAMI_BUILD_INFO):
+    """
+    Le corps de GET /metrics : les familles dans l'ordre où le registre les
+    rend — par nom, octet par octet, donc les noms hérités en capitales devant
+    « hami_… », comme dans les deux sorties relevées —, chacune précédée des
+    métadonnées que le format d'exposition impose.
+    """
+    families = {}
+    for sample in ([build_info] if build_info else []) + list(samples):
+        families.setdefault(sample.split("{", 1)[0], []).append(sample)
+    lines = []
+    for family in sorted(families):
+        if metadata:
+            lines.append("# HELP %s %s" % (family, HAMI_HELP.get(family, family)))
+            lines.append("# TYPE %s %s" % (
+                family, "counter" if family in HAMI_COUNTERS else "gauge"))
+        lines.extend(families[family])
+    return "\n".join(lines) + "\n"
+
+
+# Un moniteur v2.9.0 sans « --legacy-metrics » : la configuration par défaut.
+HAMI_BODY = hami_body([HAMI_HOST_V29])
+
+# Le corps de l'issue 1891 : les deux familles ensemble.
+HAMI_BOTH_FAMILIES_BODY = hami_body([HAMI_LEGACY_HOST_V29, HAMI_HOST_V29])
+
+# Un moniteur de master sur un nœud chargé.
+HAMI_MONITOR_BODY = hami_body(
+    [HAMI_HOST_MASTER, HAMI_CTR_MASTER, HAMI_UNKNOWN_PROCESS,
+     HAMI_COLLECT_SUCCESS])
+
+# Un ordonnanceur de master.
+HAMI_SCHEDULER_BODY = hami_body(
+    [HAMI_SCHED_OVERVIEW_DOC, HAMI_SCHED_ALLOCATED, HAMI_SCHED_LEADER])
+
+# Le corps de l'issue 555 : la famille héritée seule, sans hami_build_info.
+HAMI_LEGACY_BODY = hami_body(
+    [HAMI_LEGACY_CTR_DESC_V24, HAMI_LEGACY_HOST_V24, HAMI_LEGACY_CTR_V24],
+    build_info=None)
+
+# Un ordonnanceur qui ne connaît encore aucun nœud à GPU, ou un moniteur dont
+# la collecte ne rend rien : le produit est nommé, rien n'est publié.
+HAMI_IDLE_BODY = hami_body([HAMI_SCHED_LEADER, HAMI_COLLECT_SUCCESS])
+
+# Les mêmes séries relayées par une fédération Prometheus ou un collecteur
+# OpenTelemetry — instance et job ajoutés, puis tri par nom —, et par un
+# Pushgateway : job seul.
+HAMI_FEDERATED_BODY = hami_body([hami_sample(
+    "hami_host_gpu_memory_used_bytes", "5.28744448e+08", device_index="0",
+    device_type="NVIDIA-NVIDIA H20", device_uuid=HAMI_UUID,
+    instance="10.0.0.4:9394", job="hami-vgpu-monitor", node="gpu-node-1")],
+    build_info=None)
+
+HAMI_PUSHED_BODY = hami_body([hami_sample(
+    "hami_host_gpu_memory_used_bytes", "5.28744448e+08", device_index="0",
+    device_type="NVIDIA-NVIDIA H20", device_uuid=HAMI_UUID,
+    job="gpu-batch")], build_info=None)
+
+HAMI_LEGACY_FEDERATED_BODY = hami_body([hami_sample(
+    "HostGPUMemoryUsage", "2.0588724224e+10", deviceidx="4",
+    deviceuuid=HAMI_UUID, instance="10.0.0.4:9394",
+    job="hami-vgpu-monitor")], build_info=None)
+
+# Une règle d'alerte qui cite la série et son étiquette.
+HAMI_PROMQL_BODY = (
+    "groups:\n  - name: gpu\n    rules:\n      - alert: VGPUMemoryHigh\n"
+    '        expr: hami_vgpu_memory_used_bytes{device_uuid="%s"} > 2e10\n'
+    % HAMI_UUID)
+
+# La page de supervision servie telle quelle : la ligne est dans une balise.
+HAMI_DOC_PAGE_BODY = (
+    "<html><body><pre># TYPE hami_node_gpu_overview gauge\n"
+    "<code>%s</code></pre></body></html>" % HAMI_SCHED_OVERVIEW_DOC)
+
+
+def hami_block():
+    doc = load(HAMI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % HAMI_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /metrics"
+    return blocks[0]
+
+
+def hami_dsl_matchers():
+    matchers = [m for m in (hami_block().get("matchers") or [])
+                if m.get("type") == "dsl"]
+    assert len(matchers) == 2, (
+        "le template ne porte pas un matcher par famille de séries — %d"
+        % len(matchers))
+    return matchers
+
+
+def hami_fires(body=None, status=200):
+    if body is None:
+        body = HAMI_BODY
+    verdicts = [mcpo_dsl_hits(m, [(status, body)]) for m in hami_dsl_matchers()]
+    if hami_block().get("matchers-condition") == "and":
+        return all(verdicts)
+    return any(verdicts)
+
+
+def hami_family_fires(body):
+    """(famille courante, famille héritée) : le verdict de chaque matcher."""
+    current, legacy = [mcpo_dsl_hits(m, [(200, body)])
+                       for m in hami_dsl_matchers()]
+    return current, legacy
+
+
+def hami_extracted(body):
+    found = set()
+    for extractor in hami_block().get("extractors") or []:
+        group = extractor.get("group", 0)
+        for pattern in extractor.get("regex") or []:
+            for m in re.finditer(pattern, body):
+                found.add(m.group(group))
+    return sorted(found)
+
+
+def test_hami_probe_reads_only_the_metrics_route():
+    doc = load(HAMI_TEMPLATE)
+    assert request_routes(doc) == {("GET", HAMI_ROUTE)}, sorted(request_routes(doc))
+    assert doc["info"]["severity"] == "medium"
+    assert doc["info"]["metadata"]["max-request"] == 1
+    assert doc["info"]["metadata"]["product"] == "hami"
+    for block in doc.get("http") or []:
+        assert not block.get("body") and not block.get("raw")
+        for path in block.get("path") or []:
+            for route in ("/debug/", "/webhook", "/filter", "/bind", "?"):
+                assert route not in path, (
+                    "le template interroge %s — une lecture suffit, et "
+                    "celle-là n'est pas la route d'exposition" % route)
+    for matcher in hami_block().get("matchers") or []:
+        assert matcher.get("type") != "status", "le constat lit le statut HTTP"
+        assert not matcher.get("name"), (
+            "un matcher nommé sous « or » écrit sa propre ligne de résultat : "
+            "une instance qui sert les deux familles remonterait deux fois")
+
+
+def test_hami_fixture_builder_renders_the_lines_real_instances_serve():
+    """
+    L'aide ne vaut que si elle rend ce que le produit rend. Chaque ligne
+    relevée est recomposée depuis son descripteur, dans l'ordre où le code le
+    déclare, et doit ressortir identique.
+    """
+    assert hami_sample(
+        "hami_host_gpu_memory_used_bytes", "5.28744448e+08", device_index="0",
+        device_uuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d",
+        device_type="NVIDIA-NVIDIA H20") == HAMI_HOST_V29
+    assert hami_sample(
+        "HostGPUMemoryUsage", "5.28744448e+08", deviceidx="0",
+        deviceuuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d",
+        devicetype="NVIDIA-NVIDIA H20") == HAMI_LEGACY_HOST_V29
+    assert hami_sample(
+        "vGPU_device_memory_usage_in_bytes", "1.9876938752e+10",
+        podnamespace="default", podname="mistral-7b-78c69f7cc4-fz96k",
+        ctrname="mistral-7b", vdeviceid="0",
+        deviceuuid=HAMI_UUID) == HAMI_LEGACY_CTR_V24
+    assert hami_sample(
+        "hami_node_gpu_overview", "1.073741824e+10", node="aio-node67",
+        device_uuid="GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec",
+        device_index="0", device_cores="100", device_memory_limit="32768",
+        device_type="NVIDIA-Tesla V100-PCIE-32GB") == HAMI_SCHED_OVERVIEW_DOC
+    assert HAMI_BOTH_FAMILIES_BODY.index("HostGPUMemoryUsage{") < \
+        HAMI_BOTH_FAMILIES_BODY.index("hami_build_info{"), (
+            "le registre rend les familles par nom : les capitales d'abord")
+
+
+def test_hami_matcher_rests_on_a_hami_series_joined_to_device_uuid():
+    for body, why in (
+        (HAMI_BODY, "un moniteur v2.9.0, sortie réelle"),
+        (HAMI_MONITOR_BODY, "un moniteur de master sur un nœud chargé"),
+        (hami_body([HAMI_CTR_MASTER]), "les seules séries de conteneur"),
+        (hami_body([HAMI_UNKNOWN_PROCESS]),
+         "une série dont device_uuid ouvre l'accolade"),
+        (HAMI_SCHEDULER_BODY, "un ordonnanceur"),
+        (hami_body([HAMI_SCHED_ALLOCATED.replace(
+            "GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec",
+            "aio-node74-arm-Ascend310P-0")]),
+         "une carte dont l'identifiant n'est pas un UUID NVML"),
+        (hami_body([hami_sample(
+            "hami_host_gpu_ecc_errors_total", "0", node="gpu-node-1",
+            device_index="0", device_uuid=HAMI_UUID,
+            device_type="NVIDIA-NVIDIA H20", error_type="corrected")],
+            build_info=None),
+         "un corps dont la seule famille est un compteur"),
+        (HAMI_BOTH_FAMILIES_BODY, "les deux familles dans le même corps"),
+        (HAMI_BODY.replace("\n", "\r\n"), "un relais qui sert le corps en CRLF"),
+    ):
+        assert hami_fires(body), "le template perd %s" % why
+        assert hami_family_fires(body)[0], (
+            "la famille courante ne reconnaît pas %s" % why)
+    assert hami_fires(status=203), "le constat dépend du statut HTTP"
+
+    for body, why in (
+        (dcgm_body(), "DCGM Exporter, produit distinct déjà couvert"),
+        (nge_body(), "nvidia_gpu_exporter, produit distinct déjà couvert"),
+        (AMD_DME_BODY, "AMD Device Metrics Exporter, produit distinct"),
+        (DCGM_NODE_EXPORTER_BODY, "un exportateur Prometheus quelconque"),
+        (DCGM_VLLM_BODY, "un serveur d'inférence qui publie ses compteurs"),
+        (HAMI_IDLE_BODY,
+         "un binaire qui nomme le produit sans publier ni carte ni charge"),
+        (hami_body([]), "hami_build_info seule"),
+        (hami_body([HAMI_HOST_V29.replace("device_uuid=", "xdevice_uuid=")]),
+         "une étiquette qui finit seulement par device_uuid"),
+        (hami_body([HAMI_HOST_V29.replace(
+            'device_uuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d"',
+            'device_uuid=""')]),
+         "un device_uuid vide"),
+        (hami_body([HAMI_HOST_V29.replace(
+            ',device_uuid="GPU-941e7f9d-762c-d381-6d4b-5e36d33f811d"', "")]),
+         "une série hami_ sans device_uuid"),
+        (hami_body([HAMI_HOST_V29.replace("hami_host_gpu", "node_gpu")],
+                   build_info=None),
+         "un device_uuid sur une série qui n'est pas hami_"),
+        (hami_body([HAMI_HOST_V29.replace("hami_host_gpu", "xhami_host_gpu")],
+                   build_info=None),
+         "une série dont le nom finit seulement par le préfixe"),
+        (hami_body([HAMI_HOST_V29], metadata=False),
+         "la ligne sans # TYPE de famille"),
+        (HAMI_FEDERATED_BODY, "une copie republiée par une fédération"),
+        (HAMI_PUSHED_BODY, "une copie poussée dans un Pushgateway"),
+        (HAMI_PROMQL_BODY, "une règle d'alerte qui cite la série"),
+        (HAMI_DOC_PAGE_BODY, "la page de supervision"),
+        ("Unauthorized\n", "le refus d'un proxy placé devant l'instance"),
+        ("404 page not found\n", "le 404 du ServeMux"),
+        ("", "une réponse vide"),
+    ):
+        assert not hami_fires(body), "le template conclut sur %s" % why
+
+
+def test_hami_legacy_family_is_signed_by_deviceuuid_joined_to_the_vgpu_zone():
+    """
+    Jusqu'à la v2.8.3 le produit ne sert que les noms hérités : un constat qui
+    n'attendrait que « hami_ » perdrait toutes ces instances. Leurs noms n'ont
+    pas de préfixe, donc c'est le couple deviceuuid / zone="vGPU" qui signe.
+    """
+    for body, why in (
+        (HAMI_LEGACY_BODY, "un moniteur v2.4.1, sortie réelle"),
+        (hami_body([HAMI_LEGACY_HOST_V24], build_info=None),
+         "les seules séries d'hôte, sans devicetype"),
+        (hami_body([HAMI_LEGACY_CTR_V24], build_info=None),
+         "les seules séries de conteneur"),
+        (hami_body([HAMI_LEGACY_CTR_DESC_V24], build_info=None),
+         "une famille déclarée counter"),
+        (hami_body([HAMI_LEGACY_SCHED_OVERVIEW], build_info=None),
+         "un ordonnanceur d'avant la v2.9.0"),
+        (hami_body([HAMI_LEGACY_HOST_V29]),
+         "une v2.8 : noms hérités à côté de hami_build_info"),
+        (HAMI_LEGACY_BODY.replace("\n", "\r\n"), "le corps en CRLF"),
+    ):
+        current, legacy = hami_family_fires(body)
+        assert legacy and hami_fires(body), "le template perd %s" % why
+        assert not current, (
+            "la famille courante conclut sur %s, qui ne porte aucune série "
+            "hami_ à device_uuid" % why)
+
+    assert hami_family_fires(HAMI_BOTH_FAMILIES_BODY) == (True, True)
+    assert hami_family_fires(HAMI_BODY) == (True, False), (
+        "la famille héritée conclut sur une v2.9.0 sans --legacy-metrics")
+
+    for body, why in (
+        (hami_body([HAMI_DRA_DOC], build_info=None),
+         "le moniteur de HAMi-DRA, qui ne pose pas de zone"),
+        (hami_body([HAMI_LEGACY_HOST_V24.replace('zone="vGPU"',
+                                                 'zone="eu-west-1"')],
+                   build_info=None),
+         "une zone qui n'est pas la constante du produit"),
+        (hami_body([HAMI_LEGACY_HOST_V24.replace(",zone=", ",azone=")],
+                   build_info=None),
+         "une étiquette qui finit seulement par zone"),
+        (hami_body([HAMI_LEGACY_HOST_V24.replace(",deviceuuid=",
+                                                 ",xdeviceuuid=")],
+                   build_info=None),
+         "une étiquette qui finit seulement par deviceuuid"),
+        (hami_body([HAMI_LEGACY_HOST_V24.replace(
+            'deviceuuid="%s"' % HAMI_UUID, 'deviceuuid=""')], build_info=None),
+         "un deviceuuid vide"),
+        (hami_body([hami_sample("HostGPUMemoryUsage", "0", deviceidx="4")],
+                   build_info=None),
+         "la zone sans deviceuuid"),
+        (hami_body([HAMI_LEGACY_HOST_V24], metadata=False, build_info=None),
+         "la ligne sans # TYPE de famille"),
+        (HAMI_LEGACY_FEDERATED_BODY, "une copie republiée par une fédération"),
+        ("<html><body><pre># TYPE HostGPUMemoryUsage gauge\n<code>%s</code>"
+         "</pre></body></html>" % HAMI_LEGACY_HOST_V24,
+         "une page qui cite la ligne dans une balise"),
+    ):
+        assert not hami_fires(body), "le template conclut sur %s" % why
+
+
+def test_hami_mig_labels_are_not_read_as_a_republished_copy():
+    """
+    Le garde contre les copies republiées cherche « instance= » et « job= ».
+    Les séries MIG du produit portent gpu_instance_id et compute_instance_id
+    (instance_id en v2.9.0, instanceid sous les noms hérités) : s'il les lisait
+    comme un « instance », il écarterait tout nœud en MIG.
+    """
+    mig = dict(namespace="default", pod="mistral-7b-78c69f7cc4-fz96k",
+               container="mistral-7b", vdevice_index="0", device_uuid=HAMI_UUID)
+    for sample, why in (
+        (hami_sample("hami_mig_device_info", "1", mig_uuid="MIG-4a8f3c1e",
+                     profile="1g.10gb", gpu_instance_id="1",
+                     compute_instance_id="0", **mig),
+         "hami_mig_device_info, descripteur de master"),
+        (hami_sample("hami_mig_device_info", "1", instance_id="1", **mig),
+         "hami_mig_device_info, descripteur de la v2.9.0"),
+        (hami_sample("MigInfo", "1", podnamespace="default",
+                     podname="mistral-7b-78c69f7cc4-fz96k",
+                     ctrname="mistral-7b", vdeviceid="0", deviceuuid=HAMI_UUID,
+                     instanceid="1"),
+         "MigInfo, son nom hérité"),
+    ):
+        assert "instance" in sample
+        assert hami_fires(hami_body([sample], build_info=None)), (
+            "le template perd un nœud en MIG — %s" % why)
+    assert 'instance="' in HAMI_FEDERATED_BODY and 'job="' in HAMI_FEDERATED_BODY
+    assert not hami_fires(HAMI_FEDERATED_BODY)
+
+
+def test_hami_and_the_gpu_exporters_do_not_answer_each_other():
+    for body in (HAMI_BODY, HAMI_MONITOR_BODY, HAMI_SCHEDULER_BODY,
+                 HAMI_LEGACY_BODY, HAMI_BOTH_FAMILIES_BODY):
+        assert not dcgm_fires(body), "le template DCGM conclut sur HAMi"
+        assert not nge_fires(body), (
+            "le template nvidia_gpu_exporter conclut sur HAMi")
+        assert not amd_dme_fires(body), (
+            "le template AMD Device Metrics Exporter conclut sur HAMi")
+    for body in (DCGM_BODY, NGE_BODY, AMD_DME_BODY):
+        assert not hami_fires(body)
+
+
+def test_hami_extraction_reports_version_and_model_without_workload_labels():
+    extractors = hami_block().get("extractors") or []
+    assert len(extractors) == 1, "une ligne de résultat par instance"
+    assert hami_extracted(HAMI_BODY) == sorted([
+        'device_type="NVIDIA-NVIDIA H20"',
+        'version="v2.9.0"',
+    ]), "go_version est lu comme la version, ou le modèle est perdu"
+    assert hami_extracted(HAMI_BOTH_FAMILIES_BODY) == sorted([
+        'device_type="NVIDIA-NVIDIA H20"',
+        'devicetype="NVIDIA-NVIDIA H20"',
+        'version="v2.9.0"',
+    ]), hami_extracted(HAMI_BOTH_FAMILIES_BODY)
+    assert hami_extracted(HAMI_LEGACY_BODY) == [], (
+        "une v2.4.1 ne publie ni version ni modèle : rien à rapporter, et "
+        "surtout pas ses étiquettes de charge — %s"
+        % hami_extracted(HAMI_LEGACY_BODY))
+    for body in (HAMI_MONITOR_BODY, HAMI_SCHEDULER_BODY, HAMI_LEGACY_BODY):
+        extracted = hami_extracted(body)
+        for leaked in ("mistral-7b", "default", "GPU-", "gpu-node-1",
+                       "aio-node67", "namespace", "pod", "go1.26.2"):
+            assert not any(leaked in value for value in extracted), (
+                "l'extracteur recopie %s dans le rapport — %s"
+                % (leaked, extracted))
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_hami_matcher_compiles_and_fires_against_a_live_server():
+    def scan(body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == HAMI_ROUTE:
+                    payload = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "text/plain; version=0.0.4; charset=utf-8")
+                else:
+                    payload = b"404 page not found\n"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", HAMI_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    # Les deux familles dans le même corps : une seule ligne de résultat.
+    seen, hits, extracted = scan(HAMI_BOTH_FAMILIES_BODY)
+    assert seen == [HAMI_ROUTE], seen
+    assert hits == 1, hits
+    assert extracted == sorted([
+        'device_type="NVIDIA-NVIDIA H20"',
+        'devicetype="NVIDIA-NVIDIA H20"',
+        'version="v2.9.0"',
+    ]), extracted
+
+    for body in (HAMI_BODY, HAMI_MONITOR_BODY, HAMI_SCHEDULER_BODY):
+        _, hits, _ = scan(body)
+        assert hits == 1, body
+
+    _, hits, extracted = scan(HAMI_LEGACY_BODY)
+    assert hits == 1, "le moteur perd la famille héritée"
+    assert extracted == [], extracted
+
+    for body in (HAMI_IDLE_BODY, HAMI_FEDERATED_BODY, HAMI_PUSHED_BODY,
+                 HAMI_LEGACY_FEDERATED_BODY,
+                 hami_body([HAMI_DRA_DOC], build_info=None),
+                 HAMI_DOC_PAGE_BODY, dcgm_body(), nge_body(), AMD_DME_BODY):
+        _, hits, _ = scan(body)
+        assert hits == 0, body
