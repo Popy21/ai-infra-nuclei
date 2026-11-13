@@ -49197,3 +49197,593 @@ def test_amd_dme_matcher_compiles_and_fires_against_a_live_server():
                  AMD_DME_DOC_PAGE_BODY, dcgm_body(), nge_body()):
         _, hits, _ = scan(body)
         assert hits == 0, body
+
+
+# --------------------------------------------------------------------------
+# PaddleX serving : le serveur de pipelines de PaddlePaddle — OCR, analyse de
+# documents — que « paddlex --serve » lie à 0.0.0.0:8080 et qui n'a aucun
+# réglage d'authentification. Ce que cette section amarre tient en trois points.
+#
+# Le trio d'abord. L'enveloppe logId / errorCode / errorMsg est celle de toute
+# l'application : ses gestionnaires d'exception la rendent sur un 404 comme sur
+# un 422, et ses opérations la rendent avec « result » et "Success". Aucun des
+# trois champs ne désigne donc la route de santé ; c'est leur conjonction —
+# errorCode à 0 nu, errorMsg à "Healthy", et rien d'autre dans le document —
+# qui le fait.
+#
+# La confirmation ensuite. _app.py écrit l'operationId « checkHealth » à la main
+# dans le décorateur, là où FastAPI seul aurait dérivé un nom de la fonction et
+# du chemin : le retrouver sous GET /health dans /openapi.json dit que c'est
+# bien cette application qui a répondu, et que la même origine sert autre chose
+# que sa sonde de santé.
+#
+# Le statut HTTP enfin, qui ne porte rien : aucune expression ne le lit.
+#
+# Les corps sont ceux relevés le 2026-11-13 sur l'application de paddlex 3.7.2
+# construite par create_pipeline_app() et servie par run_server(), pipeline
+# remplacé par un bouchon — pas des exemples recomposés de mémoire.
+
+PADDLEX_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "paddlex-serving-health-exposed.yaml")
+
+PADDLEX_HEALTH_ROUTE = "/health"
+PADDLEX_OPENAPI_ROUTE = "/openapi.json"
+
+# str(uuid.uuid4()), neuf à chaque lecture : celui du relevé.
+PADDLEX_LOG_ID = "8133af92-b18c-4478-becd-905dfb51c451"
+
+
+def paddlex_envelope(code=0, message="Healthy", log_id=PADDLEX_LOG_ID,
+                     first=None, extra=None, indent=None):
+    """
+    AIStudioNoResultResponse tel que FastAPI le sérialise : les trois champs
+    dans l'ordre du modèle, compact.
+
+    `first` déplace une clé en tête, `extra` ajoute des clés après errorMsg,
+    `indent` réindente comme le ferait un intermédiaire.
+    """
+    document = {"logId": log_id, "errorCode": code, "errorMsg": message}
+    if first:
+        document = {first: document[first],
+                    **{k: v for k, v in document.items() if k != first}}
+    if extra:
+        document.update(extra)
+    if indent:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+PADDLEX_HEALTH_BODY = paddlex_envelope()
+
+# Ce que le gestionnaire de HTTPException rend sur une route inconnue.
+PADDLEX_NOT_FOUND_BODY = paddlex_envelope(code=404, message="Not Found")
+
+# Ce que POST /ocr rend à un corps vide : même enveloppe, statut 422, les
+# erreurs de validation sérialisées dans errorMsg.
+PADDLEX_VALIDATION_BODY = paddlex_envelope(
+    code=422,
+    message='[{"type": "missing", "loc": "body.file", "msg": "Field required"}]')
+
+# AIStudioResultResponse : l'enveloppe d'une opération qui a réussi.
+PADDLEX_RESULT_BODY = json.dumps(
+    {"logId": PADDLEX_LOG_ID,
+     "result": {"ocrResults": [], "dataInfo": {"width": 1, "height": 1,
+                                               "type": "image"}},
+     "errorCode": 0, "errorMsg": "Success"}, separators=(",", ":"))
+
+PADDLEX_COMPOSITE_BODY = '{"paddlex":%s,"scraped_at":0}' % PADDLEX_HEALTH_BODY
+
+PADDLEX_ENVELOPE_SCHEMA = {
+    "properties": {"logId": {"type": "string", "title": "Logid"},
+                   "errorCode": {"type": "integer", "title": "Errorcode"},
+                   "errorMsg": {"type": "string", "title": "Errormsg"}},
+    "type": "object",
+    "required": ["logId", "errorCode", "errorMsg"],
+    "title": "AIStudioNoResultResponse",
+}
+
+PADDLEX_ENVELOPE_REF = {"content": {"application/json": {"schema": {
+    "$ref": "#/components/schemas/AIStudioNoResultResponse"}}}}
+
+# (chemin, operationId, résumé) des opérations enregistrées par
+# primary_operation(), dans l'ordre où le module du pipeline les déclare.
+PADDLEX_OCR_OPERATIONS = (("/ocr", "infer", " Infer"),)
+PADDLEX_STRUCTURE_OPERATIONS = (("/layout-parsing", "infer", " Infer"),)
+PADDLEX_CHATOCR_OPERATIONS = (
+    ("/chatocr-visual", "analyzeImages", " Analyze Images"),
+    ("/chatocr-vector", "buildVectorStore", " Build Vector Store"),
+    ("/chatocr-mllm", "invokeMllm", " Invoke Mllm"),
+    ("/chatocr-chat", "chat", " Chat"),
+)
+
+
+def paddlex_openapi_body(operations=PADDLEX_OCR_OPERATIONS,
+                         health_route=PADDLEX_HEALTH_ROUTE,
+                         health_method="get",
+                         health_operation_id="checkHealth",
+                         health_summary=" Check Health",
+                         openapi="3.1.0", indent=None):
+    """
+    Le document de GET /openapi.json : « openapi », « info », puis les routes
+    dans l'ordre d'enregistrement — la santé d'abord, que create_app() déclare
+    avant que le module du pipeline n'ajoute les siennes.
+
+    La route de santé et l'opération sont celles du relevé, à la lettre ;
+    « components » est réduit au modèle de l'enveloppe, le seul que les
+    expressions pourraient croiser.
+    """
+    paths = {health_route: {health_method: {
+        "summary": health_summary,
+        "operationId": health_operation_id,
+        "responses": {"200": {"description": "Successful Response",
+                              **PADDLEX_ENVELOPE_REF}},
+    }}}
+    for route, operation_id, summary in operations:
+        paths[route] = {"post": {
+            "summary": summary,
+            "operationId": operation_id,
+            "requestBody": {"content": {"application/json": {"schema": {
+                "$ref": "#/components/schemas/InferRequest"}}},
+                "required": True},
+            "responses": {
+                "200": {"description": "Successful Response",
+                        "content": {"application/json": {"schema": {
+                            "$ref": "#/components/schemas/"
+                                    "AIStudioResultResponse_InferResult_"}}}},
+                "422": {"description": "Unprocessable Content",
+                        **PADDLEX_ENVELOPE_REF},
+                "500": {"description": "Internal Server Error",
+                        **PADDLEX_ENVELOPE_REF},
+            },
+        }}
+    document = {
+        "openapi": openapi,
+        "info": {"title": "FastAPI", "version": "0.1.0"},
+        "paths": paths,
+        "components": {"schemas": {
+            "AIStudioNoResultResponse": PADDLEX_ENVELOPE_SCHEMA}},
+    }
+    if indent:
+        return json.dumps(document, indent=indent)
+    return json.dumps(document, separators=(",", ":"))
+
+
+PADDLEX_OPENAPI_BODY = paddlex_openapi_body()
+
+# L'ouverture du document relevé, octet pour octet : c'est elle que les deux
+# expressions de la seconde lecture ont à reconnaître.
+PADDLEX_OPENAPI_OBSERVED_OPENING = (
+    '{"openapi":"3.1.0","info":{"title":"FastAPI","version":"0.1.0"},'
+    '"paths":{"/health":{"get":{"summary":" Check Health",'
+    '"operationId":"checkHealth","responses":{"200":{"description":'
+    '"Successful Response","content":{"application/json":{"schema":{"$ref":'
+    '"#/components/schemas/AIStudioNoResultResponse"}}}}}}},"/ocr":{"post":'
+    '{"summary":" Infer","operationId":"infer",'
+)
+
+# La même route dans une application FastAPI qui ne nomme pas ses opérations :
+# generate_unique_id() dérive le nom de la fonction, du chemin et de la méthode.
+PADDLEX_OTHER_FASTAPI_OPENAPI_BODY = paddlex_openapi_body(
+    health_operation_id="check_health_health_get", health_summary="Check Health")
+
+# « checkHealth » existe, mais pas sur la route lue.
+PADDLEX_MOVED_HEALTH_OPENAPI_BODY = paddlex_openapi_body(
+    health_route="/api/v1/healthz")
+
+# La page Swagger UI que la même application sert sur /docs, et une page de
+# documentation qui citerait le document.
+PADDLEX_DOCS_PAGE_BODY = (
+    '<!DOCTYPE html><html><head><title>FastAPI - Swagger UI</title></head>'
+    '<body><pre>"/health":{"get":{"summary":" Check Health",'
+    '"operationId":"checkHealth"</pre></body></html>'
+)
+
+PADDLEX_QUOTED_OPENAPI_BODY = '{"spec":%s,"fetched_at":0}' % PADDLEX_OPENAPI_BODY
+
+PADDLEX_PROXY_DENIED_BODY = '{"message":"Unauthorized"}'
+
+
+def paddlex_block():
+    doc = load(PADDLEX_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % PADDLEX_HEALTH_ROUTE in (b.get("path") or [])]
+    assert blocks, (
+        "le template n'interroge pas GET /health — c'est pourtant la seule "
+        "route qui rend l'enveloppe saine"
+    )
+    return blocks[0]
+
+
+def paddlex_requests():
+    """
+    (méthode, chemin) de chaque requête, dans l'ordre déclaré : c'est cet ordre
+    qui donne son numéro à chaque body_N.
+    """
+    block = paddlex_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def paddlex_expressions():
+    return [expr for matcher in (paddlex_block().get("matchers") or [])
+            for expr in (matcher.get("dsl") or [])]
+
+
+def paddlex_fires(health=(200, PADDLEX_HEALTH_BODY),
+                  openapi=(200, PADDLEX_OPENAPI_BODY)):
+    scenario = {
+        PADDLEX_HEALTH_ROUTE: health,
+        PADDLEX_OPENAPI_ROUTE: openapi,
+    }
+    block = paddlex_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for _, route in paddlex_requests():
+        assert route in scenario, (
+            f"le template interroge un chemin que cette section ne connaît "
+            f"pas : {route}"
+        )
+        responses.append(scenario[route])
+    verdicts = [dsl_matcher_hits(m, responses) for m in matchers
+                if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl : les deux réponses ne sont pas liées"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def test_paddlex_fixtures_hold_the_bodies_read_on_the_real_application():
+    assert PADDLEX_HEALTH_BODY == (
+        '{"logId":"8133af92-b18c-4478-becd-905dfb51c451","errorCode":0,'
+        '"errorMsg":"Healthy"}'
+    ), "l'enveloppe de la fixture n'est plus celle du relevé"
+    assert PADDLEX_OPENAPI_BODY.startswith(PADDLEX_OPENAPI_OBSERVED_OPENING), (
+        "le document de la fixture ne s'ouvre plus comme celui du relevé : "
+        "les cas ci-dessous ne diraient plus rien de l'application réelle"
+    )
+
+
+def test_paddlex_probe_reads_two_routes_and_runs_no_pipeline():
+    """
+    Deux lectures, dans l'ordre, et rien de plus. Toutes les autres routes de
+    l'application sont des POST d'inférence — /ocr, /layout-parsing — qui
+    feraient tourner le pipeline sur le matériel de l'exploitant, ou lui
+    feraient lire l'URL passée dans « file ». Constater l'exposition ne demande
+    d'en toucher aucune.
+    """
+    doc = load(PADDLEX_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", PADDLEX_HEALTH_ROUTE),
+        ("GET", PADDLEX_OPENAPI_ROUTE),
+    }, (
+        "le template n'interroge pas exactement les deux routes de lecture — "
+        f"{sorted(request_routes(doc))}"
+    )
+
+    assert paddlex_requests() == [
+        ("GET", PADDLEX_HEALTH_ROUTE),
+        ("GET", PADDLEX_OPENAPI_ROUTE),
+    ], (
+        "l'ordre des chemins déclarés ne correspond pas à celui que les "
+        "expressions supposent : c'est lui qui donne son numéro à chaque "
+        f"body_N — {paddlex_requests()}"
+    )
+
+    for block in (doc.get("http") or []):
+        assert block.get("method") == "GET", (
+            "la santé est déclarée en @app.get et le document OpenAPI se lit "
+            "en GET : toute autre méthode ne mesurerait que le 405 de "
+            "l'application, ou lancerait une inférence"
+        )
+        assert not block.get("body") and not block.get("raw"), (
+            "le bloc envoie un corps : rien de ce que le template établit ne "
+            "demande d'écrire à l'instance auditée"
+        )
+
+    assert paddlex_block().get("req-condition") is True, (
+        "le template ne lie pas les réponses : sans req-condition, body_N "
+        "n'existe pas, et l'enveloppe de santé conclurait sans que le reste "
+        "de l'application ait répondu"
+    )
+
+    info = doc.get("info") or {}
+    assert info.get("severity") == "medium", info.get("severity")
+    assert (info.get("metadata") or {}).get("max-request") == 2, (
+        "max-request ne compte pas les deux lectures"
+    )
+
+
+def test_paddlex_matcher_rests_on_the_trio_not_on_the_shared_envelope():
+    assert paddlex_fires(), (
+        "le template ne reconnaît pas l'application relevée : l'enveloppe "
+        "saine, puis son document OpenAPI"
+    )
+
+    assert not paddlex_fires(health=(404, PADDLEX_NOT_FOUND_BODY)), (
+        "le template conclut sur le 404 de l'application : logId et errorMsg "
+        "y sont, mais c'est l'enveloppe de n'importe quelle erreur"
+    )
+
+    assert not paddlex_fires(health=(422, PADDLEX_VALIDATION_BODY)), (
+        "le template conclut sur l'enveloppe d'une erreur de validation"
+    )
+
+    assert not paddlex_fires(health=(200, PADDLEX_RESULT_BODY)), (
+        "le template conclut sur le résultat d'une opération : errorCode y "
+        "vaut 0, mais errorMsg vaut \"Success\" et le document porte « result »"
+    )
+
+    assert not paddlex_fires(health=(200, paddlex_envelope(message="Success"))), (
+        "le template admet un errorMsg qui n'est pas celui du handler de santé"
+    )
+
+    assert not paddlex_fires(health=(200, paddlex_envelope(code=500))), (
+        "le template admet \"Healthy\" à côté d'un errorCode qui n'est pas 0"
+    )
+
+    assert not paddlex_fires(health=(200, paddlex_envelope(code="0"))), (
+        "le template admet un errorCode guillemeté : le modèle le déclare "
+        "« errorCode: int », et pydantic l'écrit nu"
+    )
+
+    assert not paddlex_fires(health=(200, paddlex_envelope(log_id=None))), (
+        "le template admet un logId nul : generate_log_id() rend toujours une "
+        "chaîne"
+    )
+
+    assert not paddlex_fires(health=(200, paddlex_envelope(first="errorCode"))), (
+        "le template admet un ordre de clés que pydantic n'émet pas : le "
+        "modèle déclare logId, errorCode, errorMsg"
+    )
+
+    assert not paddlex_fires(health=(200, PADDLEX_COMPOSITE_BODY)), (
+        "le template déclenche sur l'enveloppe republiée au fond du document "
+        "d'une supervision : l'ancrage sur l'ouverture du corps est ce qui "
+        "dit que l'instance a répondu d'elle-même"
+    )
+
+    assert not paddlex_fires(health=(200, paddlex_envelope(
+            extra={"upstream": "10.0.0.4:8080"}))), (
+        "le template déclenche sur une passerelle qui complète l'enveloppe "
+        "d'une clé à elle : le modèle n'a que trois champs"
+    )
+
+    for other in ('{"status":"healthy"}', '{"status":"ok"}', "OK",
+                  MINERU_HEALTH_BODY):
+        assert not paddlex_fires(health=(200, other)), (
+            f"le template déclenche sur la sonde de santé d'un autre produit — "
+            f"{other[:60]}"
+        )
+
+    assert not mineru_fires(body=PADDLEX_HEALTH_BODY), (
+        "le template MinerU, qui lit la même route, conclut sur PaddleX"
+    )
+
+
+def test_paddlex_matcher_survives_what_does_not_change_the_fact():
+    assert paddlex_fires(health=(200, paddlex_envelope(
+            log_id=str(uuid.uuid4())))), (
+        "le template contraint la valeur de logId, neuve à chaque lecture"
+    )
+
+    assert paddlex_fires(health=(200, paddlex_envelope(indent=2)),
+                         openapi=(200, paddlex_openapi_body(indent=2))), (
+        "le template ne survit pas à un intermédiaire qui réindente ce qu'il "
+        "relaie : FastAPI écrit compact, un proxy ne s'y tient pas"
+    )
+
+    assert paddlex_fires(health=(200, PADDLEX_HEALTH_BODY + "\n")), (
+        "le template ne survit pas à un saut de ligne final"
+    )
+
+    for operations in (PADDLEX_STRUCTURE_OPERATIONS, PADDLEX_CHATOCR_OPERATIONS):
+        assert paddlex_fires(
+            openapi=(200, paddlex_openapi_body(operations=operations))), (
+            "le template ne reconnaît qu'un pipeline : la route de santé est "
+            "déclarée par create_app(), donc commune à tous — "
+            f"{[route for route, _, _ in operations]}"
+        )
+
+    assert paddlex_fires(
+        openapi=(200, paddlex_openapi_body(openapi="3.0.2"))), (
+        "le template exige la version d'OpenAPI qu'écrit le FastAPI du jour : "
+        "elle dépend de la publication de FastAPI installée, pas de PaddleX"
+    )
+
+
+def test_paddlex_openapi_arm_proves_the_application_answers_beyond_its_probe():
+    assert not paddlex_fires(openapi=(401, PADDLEX_PROXY_DENIED_BODY)), (
+        "le template conclut sur une instance dont un intermédiaire ne laisse "
+        "passer que la sonde de santé : c'est la seule fermeture possible, "
+        "puisque le produit n'a aucun réglage d'authentification"
+    )
+
+    assert not paddlex_fires(openapi=(404, PADDLEX_NOT_FOUND_BODY)), (
+        "le template conclut sans le document OpenAPI : le 404 de "
+        "l'application n'est pas une confirmation"
+    )
+
+    assert not paddlex_fires(openapi=(200, PADDLEX_HEALTH_BODY)), (
+        "le template conclut sur un serveur qui rend le même document sur "
+        "toutes ses routes : la seconde réponse doit être le document OpenAPI, "
+        "pas l'écho de la première"
+    )
+
+    assert not paddlex_fires(openapi=(200, PADDLEX_OTHER_FASTAPI_OPENAPI_BODY)), (
+        "le template conclut sur une application FastAPI qui ne nomme pas ses "
+        "opérations : « checkHealth » est écrit à la main dans _app.py, et "
+        "c'est lui la confirmation"
+    )
+
+    assert not paddlex_fires(openapi=(200, PADDLEX_MOVED_HEALTH_OPENAPI_BODY)), (
+        "le template admet « checkHealth » sur une autre route que celle "
+        "qu'il lit"
+    )
+
+    assert not paddlex_fires(
+        openapi=(200, paddlex_openapi_body(health_method="post"))), (
+        "le template admet « checkHealth » sous une autre méthode que GET"
+    )
+
+    assert not paddlex_fires(openapi=(200, PADDLEX_DOCS_PAGE_BODY)), (
+        "le template conclut sur une page qui cite le document sans l'être"
+    )
+
+    assert not paddlex_fires(openapi=(200, PADDLEX_QUOTED_OPENAPI_BODY)), (
+        "le template conclut sur un document qui loge le schéma sous une clé "
+        "à lui : get_openapi() pose « openapi » en première clé"
+    )
+
+
+def test_paddlex_conclusion_rests_on_the_bodies_not_on_the_http_status():
+    """
+    Le statut ne porte rien ici : l'enveloppe saine ne sort de l'application
+    que du handler de santé, et le document OpenAPI que de FastAPI. L'exiger
+    n'écarterait rien que les corps n'écartent déjà, et ferait manquer
+    l'instance dont un intermédiaire réécrit le statut.
+    """
+    block = paddlex_block()
+    kinds = {m.get("type") for m in (block.get("matchers") or [])}
+    assert kinds == {"dsl"}, (
+        "le bloc porte un matcher qui n'est pas du DSL : sous req-condition, "
+        "seul le DSL peut lier les deux réponses par leur numéro"
+    )
+    for matcher in block.get("matchers") or []:
+        assert matcher.get("condition") == "and", (
+            "les expressions doivent toutes devoir passer : l'enveloppe seule "
+            "ne dit pas que le reste de l'application répond"
+        )
+
+    expressions = paddlex_expressions()
+    assert not [e for e in expressions if "status_code" in e], (
+        "une expression lit le statut HTTP : le constat est porté par le trio "
+        f"de l'enveloppe et par l'operationId, pas par lui — {expressions}"
+    )
+    for needle in ("logId", "errorCode", "Healthy", "checkHealth"):
+        assert any(needle in e for e in expressions), (
+            f"aucune expression n'exige « {needle} »"
+        )
+
+    assert paddlex_fires(health=(203, PADDLEX_HEALTH_BODY),
+                         openapi=(203, PADDLEX_OPENAPI_BODY)), (
+        "le template se tait quand un intermédiaire réécrit le statut de ce "
+        "qu'il relaie"
+    )
+
+
+def test_paddlex_extractor_reports_the_operations_of_the_served_pipeline():
+    extractors = paddlex_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "le template porte plusieurs extracteurs sous req-condition : le "
+        "moteur les évalue contre chaque réponse, et la même instance serait "
+        "signalée plusieurs fois"
+    )
+
+    extractor = extractors[0]
+    assert extractor.get("type") == "json", (
+        "la réponse est un document JSON : une expression regex n'a pas à "
+        "s'en charger"
+    )
+    assert extractor.get("part") == "body_2", (
+        "l'extracteur n'est pas borné à body_2 — l'enveloppe de santé n'a "
+        "pas de « paths »"
+    )
+    assert extractor.get("json") == ['.paths | keys[] | select(. != "/health")'], (
+        "l'extracteur ne rend pas les opérations du pipeline — c'est pourtant "
+        "ce qui dit ce qu'un tiers peut faire tourner sans identifiant ; la "
+        "route de santé, elle, est le constat"
+    )
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_paddlex_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `nuclei -validate` ne compile ni les expressions DSL ni la requête gojq de
+    l'extracteur, et `dsl_matcher_hits` réévalue les motifs en Python plutôt
+    qu'avec le lexer de nuclei : seul un scan contre un vrai serveur ferme la
+    boucle. Le serveur rend ici une enveloppe au logId neuf à chaque lecture,
+    comme l'application.
+    """
+    def scan(openapi_status, openapi_body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == PADDLEX_HEALTH_ROUTE:
+                    self.reply(200, paddlex_envelope(log_id=str(uuid.uuid4())))
+                elif self.path == PADDLEX_OPENAPI_ROUTE:
+                    self.reply(openapi_status, openapi_body)
+                else:
+                    self.reply(404, paddlex_envelope(
+                        code=404, message="Not Found",
+                        log_id=str(uuid.uuid4())))
+
+            def reply(self, status, body):
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", PADDLEX_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "paddlex-serving-health-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, PADDLEX_OPENAPI_BODY)
+    assert sorted(set(seen)) == sorted([PADDLEX_HEALTH_ROUTE,
+                                        PADDLEX_OPENAPI_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == ["/ocr"], (
+        f"le scan ne remonte pas l'opération du pipeline servi — {extracted}"
+    )
+
+    _, hits, extracted = scan(
+        200, paddlex_openapi_body(operations=PADDLEX_CHATOCR_OPERATIONS))
+    assert hits == 1, hits
+    assert extracted == sorted(route for route, _, _
+                               in PADDLEX_CHATOCR_OPERATIONS), (
+        f"le scan ne remonte pas toutes les opérations du pipeline — "
+        f"{extracted}"
+    )
+
+    for status, body, why in (
+        (401, PADDLEX_PROXY_DENIED_BODY,
+         "une instance dont un intermédiaire ne laisse passer que la sonde"),
+        (404, PADDLEX_NOT_FOUND_BODY,
+         "une application qui ne sert pas son document OpenAPI"),
+        (200, PADDLEX_OTHER_FASTAPI_OPENAPI_BODY,
+         "une application FastAPI qui ne nomme pas ses opérations"),
+        (200, PADDLEX_QUOTED_OPENAPI_BODY,
+         "un document qui loge le schéma sous une clé à lui"),
+    ):
+        _, hits, _ = scan(status, body)
+        assert hits == 0, f"le scan conclut sur {why}"

@@ -1,0 +1,190 @@
+id: paddlex-serving-health-exposed
+
+info:
+  name: PaddleX Serving - Pipeline Inference API Exposed Without Authentication
+  author: popy21
+  severity: medium
+  description: |
+    PaddleX (PaddlePaddle/PaddleX, 6 294 étoiles, dépôt non archivé — branche
+    par défaut release/3.7, commit ffb6490 du 2026-06-25, dernière release
+    v3.7.2 le même jour, dernier push du dépôt le 2026-10-20) est la boîte à
+    outils de pipelines de PaddlePaddle : OCR, analyse de mise en page et de
+    documents, classification, détection. Son « service de base » se lance par
+    « paddlex --install serving » puis « paddlex --serve --pipeline <pipeline> »
+    (docs/pipeline_deploy/serving.en.md), et la documentation en montre la
+    bannière : « Uvicorn running on http://0.0.0.0:8080 ».
+    Ce défaut est celui du code. paddlex/paddlex_cli.py déclare « --host »
+    default="0.0.0.0" et « --port » default=8080, et serve() ne fait que
+    « app = create_pipeline_app(pipeline, pipeline_config) » puis
+    « run_server(app, host=host, port=port) », qui appelle uvicorn.run. Sans
+    aucun drapeau, le processus écoute donc sur toutes les interfaces.
+    L'authentification n'est pas un réglage oublié : elle n'existe pas dans le
+    produit. Le CLI n'a aucun argument de clé ni de jeton, et
+    paddlex/inference/serving/basic_serving/_app.py construit l'application par
+    « fastapi.FastAPI(lifespan=_app_lifespan) » sans rien d'autre. Dans tout le
+    paquet paddlex/inference/serving de la 3.7.2, on ne trouve ni « Depends( »,
+    ni add_middleware, ni « @app.middleware », ni lecture d'un en-tête
+    Authorization, ni openapi_url ou docs_url. Aucune route n'a de garde à
+    contourner : il n'y en a aucune à poser.
+    La route de santé est commune à tous les pipelines, puisque create_app() la
+    déclare avant que le module du pipeline n'ajoute ses opérations :
+    « @app.get("/health", operation_id="checkHealth") », dont le handler rend
+    « AIStudioNoResultResponse(logId=generate_log_id(), errorCode=0,
+    errorMsg="Healthy") ». infra/models.py déclare ce modèle « logId: str »,
+    « errorCode: int », « errorMsg: str », dans cet ordre, et infra/utils.py
+    écrit generate_log_id() comme « str(uuid.uuid4()) ». Le corps est donc
+    « {"logId":"<uuid4>","errorCode":0,"errorMsg":"Healthy"} », compact, un
+    nouvel identifiant à chaque lecture. Cette enveloppe est celle de toute
+    l'application : les trois gestionnaires d'exception de _app.py la rendent
+    aussi, avec le statut HTTP pour errorCode — une route inconnue rend
+    « {"logId":"…","errorCode":404,"errorMsg":"Not Found"} » — et les opérations
+    rendent AIStudioResultResponse, la même enveloppe avec « result » et
+    errorMsg à "Success". Le trio logId + errorCode à 0 + errorMsg à "Healthy"
+    n'appartient donc qu'à la route de santé.
+    Le document OpenAPI nomme le reste. L'application ne pose pas openapi_url,
+    donc FastAPI sert /openapi.json, /docs et /redoc ; le document ouvre sur
+    « "openapi":"3.1.0" » et sa première route est
+    « "/health":{"get":{"summary":" Check Health","operationId":"checkHealth",… ».
+    L'operationId est écrit à la main dans le décorateur : FastAPI seul aurait
+    produit un nom dérivé de la fonction et du chemin. Les routes suivantes sont
+    les opérations du pipeline servi, toutes en POST et enregistrées par
+    primary_operation() — schemas/ocr.py déclare « INFER_ENDPOINT: Final[str] =
+    "/ocr" » pour le pipeline OCR, et PP-StructureV3 sert « /layout-parsing ».
+    Les deux réponses ont été relevées le 2026-11-13 sur l'application réelle de
+    paddlex 3.7.2 (PyPI, fastapi 0.162.5), construite par create_pipeline_app()
+    pour OCR puis PP-StructureV3 et servie par run_server(), le pipeline étant
+    remplacé par un bouchon. Le handler, l'operationId, generate_log_id() et les
+    deux défauts du CLI sont identiques dans v3.0.0, v3.1.0 et v3.4.0.
+    Le template ne conclut que sur la conjonction des deux lectures : l'enveloppe
+    saine, puis le document OpenAPI de la même origine avec « checkHealth » sous
+    GET /health. Une instance dont un intermédiaire ne laisse passer que la
+    sonde de santé ne porte pas ce constat.
+  impact: |
+    L'enveloppe de santé est la preuve, pas le butin. La même application sert
+    sans identifiant les opérations de son pipeline : POST /ocr pour l'OCR, POST
+    /layout-parsing pour l'analyse de documents, et ainsi de suite selon le
+    pipeline lancé. N'importe quel appelant fait donc tourner reconnaissance de
+    caractères et analyse de documents sur le matériel de l'exploitant,
+    accélérateur compris, sans compte à débiter ; les requêtes concurrentes
+    occupent le pipeline et privent les usages légitimes de leur capacité.
+    Le champ « file » des requêtes accepte un fichier encodé en Base64 ou une
+    URL : get_raw_bytes_async() fait alors « session.get(yarl.URL(file,
+    encoded=True)) » depuis le serveur, pour toute URL http ou https. L'appelant
+    anonyme choisit donc une adresse que le serveur ira lire lui-même, réseau
+    interne de l'exploitant compris, et ce qu'il en tire d'analysable lui
+    revient dans le résultat.
+    /openapi.json décrit le tout sans rien demander : le nom de chaque opération
+    dit quel pipeline tourne, et ses schémas donnent chaque paramètre accepté.
+    Rien de cela ne sera attribué : le serveur n'a jamais réclamé d'identité.
+  remediation: |
+    Il n'y a pas de réglage d'authentification à poser : le produit n'en a
+    aucun. La fermeture se fait à la liaison et devant le port.
+    Lancer « paddlex --serve --pipeline <pipeline> --host 127.0.0.1 » tant que
+    le service n'a pas à être joint depuis une autre machine — le défaut écoute
+    sur 0.0.0.0 —, et publier le port d'un conteneur en
+    « -p 127.0.0.1:8080:8080 » : « -p 8080:8080 » le publie sur toutes les
+    interfaces de l'hôte.
+    Quand le service doit être joignable, le placer derrière un intermédiaire
+    qui authentifie et ne rien laisser passer sans identité, /openapi.json,
+    /docs et /redoc compris. Borner aussi les sorties réseau de l'hôte : le
+    champ « file » fait lire au serveur l'URL que l'appelant lui donne.
+    Vérifier depuis l'extérieur du périmètre : « curl -s
+    http://<hote>:8080/openapi.json » ne doit plus rendre le document, ni
+    « curl -s http://<hote>:8080/health » l'enveloppe.
+    Après une exposition, chercher dans le journal d'accès d'uvicorn les POST
+    qu'on ne s'explique pas : chacun est une inférence passée sur le matériel de
+    l'exploitant, et aucune ligne ne portera d'identité d'appelant. Les lectures
+    de /health n'y figurent pas — _server.py pose sur « uvicorn.access » un
+    filtre qui retire tout enregistrement contenant « /health ».
+  reference:
+    - https://github.com/PaddlePaddle/PaddleX
+    - https://github.com/PaddlePaddle/PaddleX/blob/release/3.7/paddlex/inference/serving/basic_serving/_app.py
+    - https://github.com/PaddlePaddle/PaddleX/blob/release/3.7/paddlex/inference/serving/basic_serving/_server.py
+    - https://github.com/PaddlePaddle/PaddleX/blob/release/3.7/paddlex/inference/serving/infra/models.py
+    - https://github.com/PaddlePaddle/PaddleX/blob/release/3.7/paddlex/inference/serving/infra/utils.py
+    - https://github.com/PaddlePaddle/PaddleX/blob/release/3.7/paddlex/inference/serving/schemas/ocr.py
+    - https://github.com/PaddlePaddle/PaddleX/blob/release/3.7/paddlex/paddlex_cli.py
+    - https://github.com/PaddlePaddle/PaddleX/blob/release/3.7/docs/pipeline_deploy/serving.en.md
+  metadata:
+    max-request: 2
+    vendor: paddlepaddle
+    product: paddlex
+  tags: ai,ml,ocr,paddlex,paddlepaddle,document-parsing,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures. La première nomme le produit, la seconde dit que la même
+  # origine sert le reste de l'application à l'anonyme, et nomme ce qu'elle
+  # sert.
+  #
+  # GET /health est la lecture la moins chère : le handler construit un modèle
+  # de trois champs et ne touche pas au pipeline.
+  #
+  # GET /openapi.json est le document que FastAPI tient en mémoire. Il porte
+  # l'operationId que _app.py écrit à la main sur la route de santé, et la liste
+  # des opérations du pipeline — ce qu'un tiers peut faire tourner.
+  #
+  # GET, et rien d'autre. Toutes les autres routes de l'application sont des
+  # POST d'inférence : en appeler une ferait tourner le pipeline sur le matériel
+  # de l'exploitant, ou lui ferait lire une URL. C'est l'abus que le constat
+  # signale, pas ce qu'un scanner a le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/health"
+      - "{{BaseURL}}/openapi.json"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois. Sans lui, chacune conclurait de son côté — or
+    # l'enveloppe seule ne dit pas que le reste de l'application répond, et le
+    # document seul ne dit pas que l'instance sert.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # L'enveloppe entière, ancrée aux deux bouts, dans l'ordre des champs
+          # du modèle : logId, errorCode, errorMsg. Le trio est exigé d'un
+          # bloc — logId en chaîne, errorCode à 0 nu, errorMsg à "Healthy" —
+          # parce que chacun pris seul est banal dans cette application même :
+          # son 404 porte logId et errorMsg, ses résultats portent errorCode à
+          # 0 avec "Success".
+          #
+          # L'ancrage aux deux bouts écarte la même enveloppe retrouvée au fond
+          # du document d'une supervision, et celle qu'une passerelle
+          # complèterait d'une clé à elle.
+          #
+          # Aucune expression ne lit le statut HTTP : le corps dit ce qui est
+          # servi, et un intermédiaire peut réécrire le statut sans rien
+          # changer au fait. La valeur de logId est laissée libre — c'est un
+          # uuid4 neuf à chaque lecture. Les \s* sont là parce que FastAPI
+          # sérialise compact mais qu'un intermédiaire qui réindente ce qu'il
+          # relaie ne s'y tient pas.
+          - 'regex("^\\{\\s*\"logId\"\\s*:\\s*\"[^\"]+\"\\s*,\\s*\"errorCode\"\\s*:\\s*0\\s*,\\s*\"errorMsg\"\\s*:\\s*\"Healthy\"\\s*\\}$", trim_space(body_1))'
+
+          # La seconde réponse est un document OpenAPI, et il ouvre sur sa
+          # version : get_openapi() de FastAPI pose « openapi » en première
+          # clé. C'est ce qui sépare le document servi par l'application d'une
+          # page qui le citerait, et du refus d'un intermédiaire.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3\\.[0-9]", trim_space(body_2))'
+
+          # « checkHealth » sous GET /health, et c'est lui la confirmation.
+          # FastAPI seul aurait nommé l'opération d'après la fonction et le
+          # chemin ; cet identifiant-là est écrit dans le décorateur de
+          # _app.py. Il est tenu à sa place — dans l'objet « get » de la route
+          # « /health », avant toute accolade intérieure — pour qu'un document
+          # qui porterait le mot sur une autre route ne suffise pas.
+          - 'regex("\"/health\"\\s*:\\s*\\{\\s*\"get\"\\s*:\\s*\\{[^{}]*\"operationId\"\\s*:\\s*\"checkHealth\"", body_2)'
+
+    extractors:
+      # Les opérations du pipeline servi — « /ocr », « /layout-parsing »… — donc
+      # ce qu'un tiers peut faire tourner sans identifiant. La route de santé
+      # est retirée : elle est le constat, pas le butin.
+      #
+      # Un seul extracteur, et borné à body_2 — sous req-condition le moteur
+      # évalue les extracteurs contre chaque réponse, et l'enveloppe de santé
+      # n'a pas de « paths ».
+      - type: json
+        part: body_2
+        name: operations
+        json:
+          - '.paths | keys[] | select(. != "/health")'
