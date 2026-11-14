@@ -1,0 +1,119 @@
+id: sdnext-api-version-exposed
+
+info:
+  name: SD.Next - Unauthenticated API (Version Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    SD.Next (vladmandic/sdnext) est une interface de génération d'images
+    dérivée d'AUTOMATIC1111, avec sa propre API — produit distinct, couvert à
+    part. GET /sdapi/v1/version rend le dictionnaire de module « version »
+    d'installer.py, que get_version() complète depuis git :
+    {"app":"sd.next","updated":"<AAAA-MM-JJ>","branch":…,"commit":"<hash
+    court>","url":"<origine>/tree/<branche>","ui":…,"kanvas":…,"sdnq":…}.
+    L'API est montée sans condition : start_ui() (webui.py) appelle
+    create_api(app) puis shared.api.register() sans lire aucun drapeau, --api
+    n'étant plus qu'un drapeau de compatibilité caché (default=True) dans
+    modules/cmd_args.py. Api.add_api_route (modules/api/api.py) n'attache la
+    dépendance d'authentification que « if auth and self.credentials: », et
+    self.credentials n'est rempli que par --auth ou --auth-file, qui valent
+    None par défaut (SD_AUTH, SD_AUTHFILE). Avec l'un d'eux, la route rend 401
+    {"detail":"Unauthorized"} et WWW-Authenticate: Basic : le corps de version
+    prouve à lui seul que le serveur tourne sans --auth.
+    Le serveur écoute sur 127.0.0.1:7860 tant que --listen (SD_LISTEN) n'est
+    pas passé ; les Dockerfile officiels (configs/Dockerfile.*) le passent
+    tous, sans --auth, et la page Docker de la documentation publie
+    --publish 7860:7860.
+  impact: |
+    Toutes les routes de l'API passent par le même add_api_route, donc la
+    même absence de dépendance : register() en déclare 81 sur master — dont
+    cinq (/js, /html, /html/{path}, /manifest, /icon) publiques d'office — et
+    options.register_api(self), entre autres, y ajoute les siennes par la même
+    méthode. Quiconque atteint le port lance POST
+    /sdapi/v1/txt2img, /img2img, /control ou /video sur le GPU de l'hôte, lit
+    GET /sdapi/v1/cmd-flags (la ligne de commande du serveur) et
+    /sdapi/v1/log, réécrit la configuration par POST /sdapi/v1/options, charge
+    ou décharge des checkpoints, supprime des fichiers par DELETE
+    /sdapi/v1/delete-file et arrête le service par POST /sdapi/v1/shutdown —
+    relevé dans le code de master, non exercé ici. La réponse elle-même date la
+    révision déployée : branch, commit et updated la situent dans l'historique
+    du dépôt, url nomme l'origine du clone.
+  remediation: |
+    Lancer SD.Next avec --auth "utilisateur:motdepasse" (ou --auth-file,
+    SD_AUTH, SD_AUTHFILE) : self.credentials se remplit et add_api_route pose
+    alors Depends(self.auth) sur chaque route de l'API, /sdapi/v1/version
+    comprise. L'authentification est HTTP Basic : la couvrir par TLS. Ne pas
+    passer --listen (ni SD_LISTEN) hors d'un réseau de confiance, et ne pas
+    publier le port 7860 d'un conteneur — les images officielles écoutent sur
+    0.0.0.0 — sur une interface publique ; à défaut, placer un reverse proxy
+    authentifiant devant.
+  reference:
+    - https://github.com/vladmandic/sdnext
+    - https://github.com/vladmandic/sdnext/blob/master/modules/api/api.py
+    - https://github.com/vladmandic/sdnext/blob/master/modules/api/server.py
+    - https://github.com/vladmandic/sdnext/blob/master/modules/api/middleware.py
+    - https://github.com/vladmandic/sdnext/blob/master/installer.py
+    - https://github.com/vladmandic/sdnext/blob/master/webui.py
+    - https://github.com/vladmandic/sdnext/blob/master/modules/cmd_args.py
+    - https://github.com/vladmandic/sdnext/blob/master/configs/Dockerfile.cuda
+    - https://vladmandic.github.io/sdnext-docs/API/
+    - https://vladmandic.github.io/sdnext-docs/Docker/
+  metadata:
+    max-request: 1
+    vendor: vladmandic
+    product: sdnext
+  tags: ai,ml,stable-diffusion,sdnext,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /sdapi/v1/version. Elle nomme le produit et prouve
+  # l'ouverture à la fois — c'est une route add_api_route ordinaire, gardée
+  # comme les autres dès que --auth est passé.
+  #
+  # Ne sont pas lus : /js, /html, /manifest et /icon, déclarées auth=False et
+  # publics même avec --auth ; /openapi.json, que FastAPI sert hors
+  # add_api_route dès que cmd_opts.docs est vrai (le défaut, sauf SD_NODOCS) :
+  # aucun ne dit si l'API est gardée. /sdapi/v1/sd-models est la route du
+  # template AUTOMATIC1111.
+  - method: GET
+    path:
+      - "{{BaseURL}}/sdapi/v1/version"
+
+    # --subpath enregistre chaque route deux fois, à la racine et sous le
+    # préfixe, mais le middleware api_preprocess (validate_subpath) rend une
+    # 308 vers le chemin préfixé à toute requête qui n'y est pas. Suivre une
+    # redirection, sur le même hôte seulement, lit la réponse servie sous le
+    # préfixe.
+    host-redirects: true
+    max-redirects: 1
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document entier : un objet plat de chaînes qui s'ouvre sur
+          # « app »: « sd.next ». La clé est la première du dictionnaire de
+          # module d'installer.py, que get_version() complète sans jamais la
+          # réécrire, et la sérialisation garde l'ordre d'insertion. L'ancrage
+          # aux deux bouts écarte le document recopié sous une clé par une
+          # supervision ; les \s* absorbent l'intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"app\"\\s*:\\s*\"sd\\.next\"(\\s*,\\s*\"[a-z_]+\"\\s*:\\s*\"[^\"]*\")+\\s*\\}$", trim_space(body))'
+
+          # Et les clés « commit » et « branch ». « commit » a remplacé
+          # « hash » à la release 2025-12-11, celle-là même où add_api_route
+          # a pris sa garde « if auth and self.credentials » ; avant, elle ne
+          # posait la dépendance qu'en --api-only (2025-04-03), puis plus du
+          # tout (2025-10-18). Sur ces releases, le 200 ne dit rien de --auth :
+          # le template ne les vise pas. Aucune expression ne lit le statut —
+          # le corps dit ce qui est servi, le 401 n'en porte pas.
+          - 'regex("\"commit\"\\s*:", body)'
+          - 'regex("\"branch\"\\s*:", body)'
+
+    extractors:
+      # La révision servie. « url » n'est pas extraite : get_version() ne
+      # normalise que les origines ssh, une origine https y passe telle
+      # qu'elle a été clonée, identifiants inclus s'il y en a.
+      - type: json
+        part: body
+        name: revision
+        json:
+          - '.branch + "@" + .commit + " (" + .updated + ")"'

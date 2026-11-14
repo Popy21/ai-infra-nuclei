@@ -50650,3 +50650,278 @@ def test_smg_matcher_compiles_and_fires_against_a_live_server():
                          (200, SMG_PARTIAL_STATS_BODY)):
         _, hits, _ = scan(status, body)
         assert hits == 0, body
+
+
+# --------------------------------------------------------------------------
+# SD.Next (vladmandic/sdnext) : interface de génération d'images dérivée
+# d'AUTOMATIC1111, avec sa propre API — autre produit qu'AUTOMATIC1111, qui a
+# son template sur /sdapi/v1/sd-models. GET /sdapi/v1/version rend le
+# dictionnaire « version » d'installer.py, et Api.add_api_route ne garde la
+# route que si --auth ou --auth-file a rempli self.credentials.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - le corps relevé est celui qu'une instance réelle a rendu au client web :
+#     ui/monitor.ts lit `${window.api}/version` et le journalise ; l'issue
+#     vladmandic/sdnext#4523 (dev du 2026-01-03) en porte la copie. Un objet
+#     plat de chaînes repasse identique par JSON.parse / JSON.stringify ;
+#   - l'ordre des clés est celui du dictionnaire de module d'installer.py, qui
+#     a changé : commit avant branch et kanvas avant ui au 2025-12-11, branch
+#     avant commit et ui, kanvas, sdnq sur master ;
+#   - « commit » a remplacé « hash » à cette même release 2025-12-11, où
+#     add_api_route a pris la garde « if auth and self.credentials » : le
+#     template ne vise que ces versions-là ;
+#   - --subpath fait rendre une 308 vers le chemin préfixé à la route racine
+#     (validate_subpath, modules/api/middleware.py).
+
+SDNEXT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                               "sdnext-api-version-exposed.yaml")
+
+SDNEXT_ROUTE = "/sdapi/v1/version"
+
+# Verbatim, vladmandic/sdnext#4523 : « monitorConnection: online {…} ».
+SDNEXT_ISSUE_BODY = (
+    '{"app":"sd.next","updated":"2026-01-03","commit":"2fe844333",'
+    '"branch":"dev","url":"https://github.com/vladmandic/sdnext/tree/dev",'
+    '"kanvas":"main","ui":"dev"}')
+
+
+def sdnext_body(pairs):
+    """
+    Le dictionnaire tel que FastAPI le rend : compact, dans l'ordre
+    d'insertion. Le test des fixtures vérifie que cette aide rend, octet pour
+    octet, le corps relevé — c'est ce qui autorise à composer avec elle ceux
+    qu'aucune instance n'a rendus ici.
+    """
+    return json.dumps(dict(pairs), separators=(",", ":"))
+
+
+# Composé dans l'ordre du dictionnaire d'installer.py sur master, avec les
+# valeurs de master au 2026-10-29 : commit court de 9 caractères comme dans le
+# corps relevé, sous-modules à 8 (commit_ui[:8] et ses pareils).
+SDNEXT_MASTER_BODY = sdnext_body([
+    ("app", "sd.next"), ("updated", "2026-10-29"), ("branch", "master"),
+    ("commit", "6657d0611"),
+    ("url", "https://github.com/vladmandic/sdnext/tree/master"),
+    ("ui", "main@fc203a9d"), ("kanvas", "main@6c4a52d7"),
+    ("sdnq", "main@8bf23dff"),
+])
+
+# Une instance sans dépôt git : chaque appel à git échoue, get_version()
+# journalise et laisse le dictionnaire de module tel qu'il est déclaré.
+SDNEXT_NO_GIT_BODY = sdnext_body(
+    [("app", "sd.next")] + [(k, "unknown") for k in (
+        "updated", "branch", "commit", "url", "ui", "kanvas", "sdnq")])
+
+# Le corps relevé réindenté par un intermédiaire.
+SDNEXT_REINDENTED_BODY = json.dumps(json.loads(SDNEXT_ISSUE_BODY), indent=2)
+
+# Ce que rend la route sous --auth : HTTPException(401, "Unauthorized").
+SDNEXT_UNAUTHORIZED_BODY = '{"detail":"Unauthorized"}'
+
+# Les releases antérieures au 2025-12-11 (ici 2025-10-18) : « hash » au lieu
+# de « commit », et une garde d'API qui ne passait pas par self.credentials.
+SDNEXT_HASH_ERA_BODY = sdnext_body([
+    ("app", "sd.next"), ("updated", "2025-10-18"), ("hash", "50e4c208a"),
+    ("branch", "master"),
+    ("url", "https://github.com/vladmandic/sdnext/tree/master"),
+    ("ui", "main"),
+])
+
+# Leur repli quand git échoue.
+SDNEXT_HASH_ERA_FALLBACK_BODY = (
+    '{"app":"sd.next","version":"unknown","branch":"unknown"}')
+
+# Le document recopié sous une clé par une supervision : ce n'est pas SD.Next
+# qui répond.
+SDNEXT_QUOTED_BODY = '{"sdnext":%s,"checked_at":0}' % SDNEXT_MASTER_BODY
+
+# Les mêmes clés, mais pas le même produit.
+SDNEXT_OTHER_APP_BODY = SDNEXT_MASTER_BODY.replace('"sd.next"', '"sd-webui"')
+
+# « app »: « sd.next » ailleurs qu'en tête : get_version() ne le produit pas.
+SDNEXT_APP_NOT_FIRST_BODY = sdnext_body([
+    ("name", "gateway"), ("app", "sd.next"), ("branch", "master"),
+    ("commit", "6657d0611"),
+])
+
+# Un objet qui n'est plus plat : get_version() ne rend que des chaînes.
+SDNEXT_NESTED_BODY = sdnext_body([
+    ("app", "sd.next"), ("branch", "master"), ("commit", "6657d0611"),
+    ("build", {"ci": "1"}),
+])
+
+
+def sdnext_block():
+    doc = load(SDNEXT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % SDNEXT_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /sdapi/v1/version"
+    return blocks[0]
+
+
+def sdnext_fires(status, body):
+    matchers = sdnext_block().get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    return all(dsl_matcher_hits(m, [(status, body)]) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_sdnext_fixtures_hold_the_body_read_on_a_real_instance():
+    assert sdnext_body(json.loads(SDNEXT_ISSUE_BODY).items()) == SDNEXT_ISSUE_BODY, (
+        "l'aide ne rend plus le corps relevé : les corps composés ne diraient "
+        "plus rien du serveur réel"
+    )
+    assert list(json.loads(SDNEXT_MASTER_BODY)) == [
+        "app", "updated", "branch", "commit", "url", "ui", "kanvas", "sdnq"], (
+        "l'ordre du dictionnaire de module d'installer.py sur master"
+    )
+
+
+def test_sdnext_probe_only_reads_the_version_route():
+    doc = load(SDNEXT_TEMPLATE)
+    assert request_routes(doc) == {("GET", SDNEXT_ROUTE)}, (
+        "le template ne lit que GET /sdapi/v1/version : /js, /html, /manifest, "
+        "/icon et /openapi.json répondent même sous --auth, et le reste de "
+        "l'API génère, réécrit la configuration ou arrête le serveur"
+    )
+    block = sdnext_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête, Authorization compris : le constat est l'accès anonyme"
+    )
+    assert block.get("host-redirects") is True and not block.get("redirects"), (
+        "la 308 de --subpath reste sur l'hôte : la suivre, et rien d'autre"
+    )
+    assert block.get("max-redirects") == 1
+    assert (doc["info"].get("metadata") or {}).get("max-request") == 1
+    assert doc["info"]["severity"] == "high"
+
+
+def test_sdnext_matcher_rests_on_the_version_document_not_on_the_status():
+    matchers = sdnext_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "aucun matcher de statut ni de mot : le corps entier dit ce qui est servi"
+    )
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire le réécrit sans rien "
+        "changer au fait"
+    )
+
+    for body, why in (
+        (SDNEXT_ISSUE_BODY, "le corps relevé"),
+        (SDNEXT_MASTER_BODY, "le corps de master"),
+        (SDNEXT_NO_GIT_BODY, "une instance sans dépôt git"),
+        (SDNEXT_REINDENTED_BODY, "le corps réindenté"),
+    ):
+        assert sdnext_fires(200, body), f"le template ne reconnaît pas {why}"
+
+    for status, body, why in (
+        (401, SDNEXT_UNAUTHORIZED_BODY, "le 401 de --auth"),
+        (401, "", "un refus sans corps"),
+        (200, SDNEXT_HASH_ERA_BODY, "une release antérieure au 2025-12-11"),
+        (200, SDNEXT_HASH_ERA_FALLBACK_BODY, "le repli de ces releases"),
+        (200, AUTOMATIC1111_SD_MODELS_BODY, "AUTOMATIC1111, couvert ailleurs"),
+        (200, SDNEXT_QUOTED_BODY, "le document recopié sous une clé"),
+        (200, SDNEXT_OTHER_APP_BODY, "les mêmes clés pour un autre produit"),
+        (200, SDNEXT_APP_NOT_FIRST_BODY, "« app » ailleurs qu'en tête"),
+        (200, SDNEXT_NESTED_BODY, "un objet qui n'est plus plat"),
+        (200, "<html><body>sd.next</body></html>", "une page qui nomme SD.Next"),
+    ):
+        assert not sdnext_fires(status, body), f"le template conclut sur {why}"
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_sdnext_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil, que la requête
+    gojq de l'extracteur tient et que la 308 de --subpath est suivie.
+    """
+    def scan(status, body, subpath=None):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if subpath and not self.path.startswith(subpath):
+                    # validate_subpath : 308 vers le chemin préfixé.
+                    self.send_response(308)
+                    self.send_header("Location", subpath + self.path)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif self.path == (subpath or "") + SDNEXT_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}')
+
+            def reply(self, code, payload):
+                data = payload.encode()
+                self.send_response(code)
+                if data:
+                    self.send_header("Content-Type", "application/json")
+                if code == 401:
+                    self.send_header("WWW-Authenticate", "Basic")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", SDNEXT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "sdnext-api-version-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, SDNEXT_MASTER_BODY)
+    assert seen == [SDNEXT_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == ["master@6657d0611 (2026-10-29)"], extracted
+
+    _, hits, extracted = scan(200, SDNEXT_ISSUE_BODY)
+    assert hits == 1, "le moteur perd le corps relevé"
+    assert extracted == ["dev@2fe844333 (2026-01-03)"], extracted
+
+    _, hits, _ = scan(200, SDNEXT_REINDENTED_BODY)
+    assert hits == 1, "le moteur perd le corps réindenté"
+
+    seen, hits, extracted = scan(200, SDNEXT_MASTER_BODY, subpath="/sdnext")
+    assert seen == [SDNEXT_ROUTE, "/sdnext" + SDNEXT_ROUTE], seen
+    assert hits == 1, "le moteur ne suit pas la 308 de --subpath"
+    assert extracted == ["master@6657d0611 (2026-10-29)"], extracted
+
+    _, hits, _ = scan(401, SDNEXT_UNAUTHORIZED_BODY, subpath="/sdnext")
+    assert hits == 0, "le moteur conclut sur le 401 servi sous le préfixe"
+
+    for status, body in ((401, SDNEXT_UNAUTHORIZED_BODY),
+                         (200, SDNEXT_HASH_ERA_BODY),
+                         (200, SDNEXT_QUOTED_BODY),
+                         (200, SDNEXT_OTHER_APP_BODY)):
+        _, hits, _ = scan(status, body)
+        assert hits == 0, body
