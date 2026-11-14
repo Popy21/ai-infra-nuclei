@@ -50372,3 +50372,281 @@ def test_hami_matcher_compiles_and_fires_against_a_live_server():
                  HAMI_DOC_PAGE_BODY, dcgm_body(), nge_body(), AMD_DME_BODY):
         _, hits, _ = scan(body)
         assert hits == 0, body
+
+
+# --------------------------------------------------------------------------
+# SGLang Model Gateway (sgl-project/sglang, répertoire sgl-model-gateway/) :
+# le routeur Rust qui répartit les requêtes entre des workers SGLang — autre
+# produit que le serveur SGLang, qui a son propre template. GET /workers rend
+# son registre, et le groupe worker_routes n'est gardé que si --api-key est
+# passé.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps sont ceux d'un vrai routeur : sglang-router 0.3.2 (roue PyPI,
+#     macOS arm64) lancé devant un worker factice, puis sans aucun worker ;
+#     lancé sans --host, le processus écoutait sur « *:<port> » ;
+#   - l'ordre workers, total, stats : json! le garde parce que serde_json est
+#     compilé avec « preserve_order » dans le Cargo.toml du gateway ;
+#   - le trio prefill_count, decode_count, regular_count sous « stats » : c'est
+#     lui qui signe, « workers » seul se retrouve dans /get_loads ;
+#   - le routeur à clé rend 401 sans corps sur /workers, mais /health,
+#     /liveness, /readiness et /v1/models restent publics : aucun ne prouve
+#     l'ouverture.
+
+SMG_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "sglang-model-gateway-workers-exposed.yaml")
+
+SMG_ROUTE = "/workers"
+
+SMG_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Verbatim, GET /workers sur le routeur sans --api-key, un worker régulier
+# enregistré par --worker-urls.
+SMG_WORKERS_BODY = (
+    '{"workers":[{"id":"4c606e0e-f51b-4202-9abb-7bb593ab535e",'
+    '"url":"http://127.0.0.1:30124","model_id":"Qwen/Qwen2.5-0.5B-Instruct",'
+    '"priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,'
+    '"load":0,"connection_mode":"HTTP","metadata":{'
+    '"model_path":"Qwen/Qwen2.5-0.5B-Instruct","dp_size":"1","tp_size":"1"},'
+    '"disable_health_check":false}],"total":1,"stats":{"prefill_count":0,'
+    '"decode_count":0,"regular_count":1}}')
+
+# Verbatim, le même routeur lancé sans --worker-urls.
+SMG_EMPTY_BODY = ('{"workers":[],"total":0,"stats":{"prefill_count":0,'
+                  '"decode_count":0,"regular_count":0}}')
+
+# Verbatim, les autres routes du même routeur. /get_loads est gardé comme
+# /workers ; les trois suivantes sont publiques, clé ou pas.
+SMG_LOADS_BODY = '{"workers":[{"worker":"http://127.0.0.1:30124","load":-1}]}'
+SMG_READINESS_BODY = '{"status":"ready","healthy_workers":1,"total_workers":1}'
+SMG_HEALTH_BODY = "OK"
+SMG_MODELS_BODY = ('{"object":"list","data":[{"id":"Qwen/Qwen2.5-0.5B-Instruct",'
+                   '"object":"model","owned_by":"local"}]}')
+
+
+def smg_entry(worker_id, url, model_id):
+    """L'entrée relevée, ses trois champs propres remplacés."""
+    entry = json.loads(SMG_WORKERS_BODY)["workers"][0]
+    entry.update(id=worker_id, url=url, model_id=model_id)
+    entry["metadata"]["model_path"] = model_id
+    return entry
+
+
+def smg_body(entries, prefill=0, decode=0, regular=None):
+    """
+    Le registre tel que ListWorkersResult le rend : axum sérialise compact, et
+    json! garde l'ordre d'insertion. Le test des fixtures vérifie que cette
+    aide rend, octet pour octet, les deux corps relevés — c'est ce qui autorise
+    à composer avec elle ceux qu'aucune instance n'a rendus ici.
+    """
+    if regular is None:
+        regular = len(entries) - prefill - decode
+    return json.dumps(
+        {"workers": entries, "total": len(entries),
+         "stats": {"prefill_count": prefill, "decode_count": decode,
+                   "regular_count": regular}},
+        separators=(",", ":"))
+
+
+# Trois workers, deux sur le même modèle : l'extracteur rend chacun une fois.
+SMG_FLEET_BODY = smg_body([
+    smg_entry("0b6f6f0e-3d2c-4f7c-9a51-0d6c1c3f2a10", "http://10.0.3.11:30000",
+              SMG_MODEL),
+    smg_entry("6a1d4e2b-8f3a-4b0e-b6a2-5e9d7c1f0b22", "http://10.0.3.12:30000",
+              SMG_MODEL),
+    smg_entry("c3e9a7d1-2b4f-4e6a-8c1d-7f0b5a3e9d34", "http://10.0.3.13:30000",
+              "meta-llama/Llama-3.1-8B-Instruct"),
+])
+
+# Le même registre réindenté par un intermédiaire.
+SMG_REINDENTED_BODY = json.dumps(json.loads(SMG_WORKERS_BODY), indent=2)
+
+# Le registre recopié sous une clé par une supervision : ce n'est pas le
+# routeur qui répond.
+SMG_QUOTED_BODY = '{"router":%s,"scraped_at":0}' % SMG_WORKERS_BODY
+
+# Le registre complété d'une clé par une passerelle.
+SMG_EXTENDED_BODY = SMG_WORKERS_BODY[:-1] + ',"proxy":"edge-1"}'
+
+# Une liste paginée de workers d'un autre produit : « workers » et « total »,
+# mais pas le trio.
+SMG_OTHER_WORKERS_BODY = ('{"workers":[{"id":"w-1","hostname":"node-1",'
+                          '"status":"online"}],"total":1}')
+SMG_OTHER_STATS_BODY = ('{"workers":[{"id":"w-1","hostname":"node-1"}],'
+                        '"total":1,"stats":{"online":1,"offline":0}}')
+
+# Le trio amputé : sans regular_count, ce n'est plus ListWorkersResult.
+SMG_PARTIAL_STATS_BODY = SMG_WORKERS_BODY.replace(',"regular_count":1', '')
+
+
+def smg_block():
+    doc = load(SMG_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % SMG_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /workers"
+    return blocks[0]
+
+
+def smg_fires(status, body):
+    matchers = smg_block().get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    return all(dsl_matcher_hits(m, [(status, body)]) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_smg_fixtures_hold_the_bodies_read_on_the_real_router():
+    assert smg_body(json.loads(SMG_WORKERS_BODY)["workers"]) == SMG_WORKERS_BODY, (
+        "l'aide ne rend plus le registre relevé : les corps composés ne "
+        "diraient plus rien du routeur réel"
+    )
+    assert smg_body([]) == SMG_EMPTY_BODY, "l'aide ne rend plus le registre vide"
+    assert (smg_entry("4c606e0e-f51b-4202-9abb-7bb593ab535e",
+                      "http://127.0.0.1:30124", SMG_MODEL)
+            == json.loads(SMG_WORKERS_BODY)["workers"][0])
+
+
+def test_smg_probe_only_reads_the_worker_registry():
+    doc = load(SMG_TEMPLATE)
+    assert request_routes(doc) == {("GET", SMG_ROUTE)}, (
+        "le template ne lit que GET /workers : POST /workers enregistre un "
+        "worker, DELETE /workers/{id} en retire un, POST /flush_cache vide les "
+        "caches — et /health, /readiness ou /v1/models sont publics même avec "
+        "une clé, donc ne prouvent rien"
+    )
+    block = smg_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête, Authorization compris : le constat est l'accès anonyme"
+    )
+    assert (doc["info"].get("metadata") or {}).get("max-request") == 1
+    assert doc["info"]["severity"] == "high"
+
+
+def test_smg_matcher_rests_on_the_stats_trio_not_on_a_worker_list():
+    block = smg_block()
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "aucun matcher de statut ni de mot : le corps entier dit ce qui est servi"
+    )
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire le réécrit sans rien "
+        "changer au fait"
+    )
+
+    for body, why in (
+        (SMG_WORKERS_BODY, "le registre relevé"),
+        (SMG_EMPTY_BODY, "le registre d'un routeur sans worker"),
+        (SMG_FLEET_BODY, "un registre de trois workers"),
+        (smg_body([smg_entry("9d2f", "http://10.0.3.21:30000", SMG_MODEL)],
+                  prefill=1), "un registre en mode prefill / decode"),
+        (SMG_REINDENTED_BODY, "le registre réindenté"),
+    ):
+        assert smg_fires(200, body), f"le template ne reconnaît pas {why}"
+
+    for status, body, why in (
+        (401, "", "le 401 sans corps du routeur à clé"),
+        (200, SMG_LOADS_BODY, "/get_loads, qui porte aussi « workers »"),
+        (200, SMG_READINESS_BODY, "/readiness, public même avec une clé"),
+        (200, SMG_HEALTH_BODY, "/health, public même avec une clé"),
+        (200, SMG_MODELS_BODY, "/v1/models, public même avec une clé"),
+        (200, SGLANG_MODEL_INFO_BODY, "le serveur SGLang, couvert ailleurs"),
+        (200, SMG_QUOTED_BODY, "le registre recopié sous une clé"),
+        (200, SMG_EXTENDED_BODY, "le registre complété par une passerelle"),
+        (200, SMG_OTHER_WORKERS_BODY, "une liste paginée d'un autre produit"),
+        (200, SMG_OTHER_STATS_BODY, "des statistiques qui ne sont pas le trio"),
+        (200, SMG_PARTIAL_STATS_BODY, "le trio amputé de regular_count"),
+    ):
+        assert not smg_fires(status, body), f"le template conclut sur {why}"
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_smg_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil, et que la requête
+    gojq de l'extracteur tient. Le serveur rend sur les autres routes ce que le
+    routeur y rend.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == SMG_ROUTE:
+                    self.reply(status, body)
+                elif self.path == "/get_loads":
+                    self.reply(200, SMG_LOADS_BODY)
+                elif self.path in ("/health", "/liveness"):
+                    self.reply(200, SMG_HEALTH_BODY, "text/plain; charset=utf-8")
+                elif self.path == "/readiness":
+                    self.reply(200, SMG_READINESS_BODY)
+                else:
+                    self.reply(404, "")
+
+            def reply(self, code, payload, content_type="application/json"):
+                data = payload.encode()
+                self.send_response(code)
+                if data:
+                    self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", SMG_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "sglang-model-gateway-workers-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, SMG_WORKERS_BODY)
+    assert seen == [SMG_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == [SMG_MODEL], extracted
+
+    _, hits, extracted = scan(200, SMG_FLEET_BODY)
+    assert hits == 1, hits
+    assert extracted == sorted([SMG_MODEL, "meta-llama/Llama-3.1-8B-Instruct"]), (
+        f"chaque modèle routé, une fois — {extracted}"
+    )
+
+    _, hits, extracted = scan(200, SMG_EMPTY_BODY)
+    assert hits == 1, "le moteur perd le routeur sans worker"
+    assert extracted == [], extracted
+
+    _, hits, _ = scan(200, SMG_REINDENTED_BODY)
+    assert hits == 1, "le moteur perd le registre réindenté"
+
+    for status, body in ((401, ""), (200, SMG_LOADS_BODY),
+                         (200, SMG_QUOTED_BODY), (200, SMG_OTHER_STATS_BODY),
+                         (200, SMG_PARTIAL_STATS_BODY)):
+        _, hits, _ = scan(status, body)
+        assert hits == 0, body

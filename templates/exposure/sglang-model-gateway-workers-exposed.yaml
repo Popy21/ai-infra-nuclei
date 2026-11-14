@@ -1,0 +1,140 @@
+id: sglang-model-gateway-workers-exposed
+
+info:
+  name: SGLang Model Gateway - Unauthenticated Worker Inventory
+  author: popy21
+  severity: high
+  description: |
+    SGLang Model Gateway (sgl-project/sglang, répertoire sgl-model-gateway/ ;
+    binaires « sgl-model-gateway » et « smg », paquet Python sglang_router)
+    est le routeur Rust qui répartit les requêtes d'inférence entre des workers
+    SGLang. Produit distinct du serveur SGLang : il ne sert aucun modèle, il
+    tient le registre des workers et choisit vers lequel envoyer chaque
+    requête.
+    GET /workers rend ce registre :
+    {"workers":[...],"total":<n>,"stats":{"prefill_count":…,"decode_count":…,
+    "regular_count":…}} (ListWorkersResult dans src/core/worker_service.rs).
+    La route appartient au groupe worker_routes de build_app (src/server.rs) —
+    /workers en GET et POST, /workers/{worker_id} en GET, PUT et DELETE — et
+    ce groupe, comme admin_routes (/flush_cache, /get_loads, /v1/loads), passe
+    par apply_control_plane_auth, qui retombe sur auth_middleware faute de clé
+    de plan de contrôle ou de JWT. Or auth_middleware (src/middleware.rs) ne
+    vérifie le Bearer que sous « if let Some(expected_key) =
+    &auth_config.api_key » : sans --api-key, la requête passe. Et --api-key
+    n'a pas de valeur par défaut (« api_key: Option<String> » dans
+    src/main.rs, « api_key: Optional[str] = None » dans router_args.py).
+    L'écoute est publique par défaut : « --host » vaut 0.0.0.0 et « --port »
+    30000 dans src/main.rs comme dans router_args.py. La page de
+    documentation donne 127.0.0.1 pour défaut ; c'est faux — lancé sans
+    --host, le processus (sglang-router 0.3.2) écoute sur « *:<port> ».
+    Sur la même instance, sans clé, GET /workers rend 200 et l'inventaire ;
+    avec --api-key, il rend 401 sans corps, tandis que /health, /liveness,
+    /readiness et /v1/models restent publics.
+  impact: |
+    L'inventaire livre, worker par worker, l'URL interne du serveur GPU qui
+    tient le modèle (« url »), le modèle servi (« model_id »), son rôle
+    (« worker_type » : regular, prefill ou decode), sa santé, sa charge, son
+    mode de connexion et les métadonnées du serveur — chemin du modèle,
+    tp_size, dp_size. C'est la carte du réseau d'inférence derrière le
+    routeur, et les adresses qu'aucun client n'était censé connaître.
+    Le même middleware inerte garde les routes d'inférence
+    (/v1/chat/completions, /generate…) : quiconque atteint le port fait
+    tourner les GPU des workers. Et le groupe worker_routes sert aussi POST
+    /workers, qui met en file l'enregistrement d'un worker à une URL
+    arbitraire — vers lequel le routeur peut ensuite répartir le trafic de
+    ses clients (déduit du rôle du routeur, non testé ici) —, DELETE
+    /workers/{worker_id}, qui retire un worker du service, et POST
+    /flush_cache. Le template s'en tient à la lecture.
+  remediation: |
+    Lancer le routeur avec --api-key : le jeton couvre les routes d'inférence,
+    worker_routes et admin_routes. L'aide de sglang_router 0.3.2 présente
+    cette option comme la clé « used for the authorization with the worker »,
+    mais c'est elle qui ferme le routeur. Pour séparer le plan de contrôle du
+    trafic d'inférence, ajouter --control-plane-api-keys (rôles admin / user)
+    ou une configuration JWT.
+    Lier le routeur à une interface privée (--host 127.0.0.1 ou l'adresse du
+    réseau interne) au lieu du défaut 0.0.0.0, et ne pas publier le port
+    30000 du conteneur. Le port de métriques Prometheus (29000) écoute lui
+    aussi sur 0.0.0.0 par défaut : --prometheus-host le restreint.
+    Après une exposition, relire la liste des workers (GET /workers avec la
+    clé) et retirer toute URL qui n'appartient pas au parc : un tiers a pu en
+    enregistrer une.
+  reference:
+    - https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway
+    - https://github.com/sgl-project/sglang/blob/main/sgl-model-gateway/src/server.rs
+    - https://github.com/sgl-project/sglang/blob/main/sgl-model-gateway/src/middleware.rs
+    - https://github.com/sgl-project/sglang/blob/main/sgl-model-gateway/src/core/worker_service.rs
+    - https://github.com/sgl-project/sglang/blob/main/sgl-model-gateway/src/main.rs
+    - https://github.com/sgl-project/sglang/blob/main/sgl-model-gateway/bindings/python/src/sglang_router/router_args.py
+    - https://docs.sglang.io/advanced_features/sgl_model_gateway.html
+    - https://pypi.org/project/sglang-router/
+  metadata:
+    max-request: 1
+    vendor: sgl-project
+    product: sgl-model-gateway
+  tags: ai,llm,sglang,gateway,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /workers, gardé par le même middleware que le
+  # reste du plan de contrôle. Il nomme le produit et prouve l'ouverture à la
+  # fois — sur un routeur à clé il rend 401 sans corps, jamais le registre.
+  #
+  # Ne sont pas lus : /health et /liveness (« OK » en texte brut), /readiness
+  # et /v1/models. Ils sont dans public_routes et répondent pareil avec ou sans
+  # clé : ils ne prouvent rien. Le /get_model_info que le routeur relaie
+  # appartient au template du serveur SGLang, pas à celui-ci.
+  #
+  # En GET, et strictement. POST /workers enregistrerait un worker, DELETE
+  # /workers/{worker_id} en retirerait un, POST /flush_cache viderait le cache
+  # des workers : c'est l'abus que le constat signale, pas ce qu'un scanner a
+  # le droit de faire pour l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/workers"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document s'ouvre sur « workers » et un tableau. json! garde
+          # l'ordre d'insertion — serde_json est compilé avec
+          # « preserve_order » dans le Cargo.toml du gateway —, donc workers,
+          # total, stats, dans cet ordre, sur toutes les instances.
+          #
+          # Le contenu des entrées n'est pas lu. Leurs clés viennent de
+          # WorkerInfo, qui a déjà changé de crate (openai-protocol) et gagne
+          # des champs facultatifs selon le mode de connexion ; et un routeur
+          # sans worker rend un tableau vide — c'est le même plan de contrôle
+          # ouvert, POST /workers compris.
+          - 'regex("^\\{\\s*\"workers\"\\s*:\\s*\\[", trim_space(body))'
+
+          # La fin du document, ancrée : le tableau se ferme, puis « total »
+          # entier, puis l'objet « stats » avec exactement le trio
+          # prefill_count, decode_count, regular_count, entiers, dans l'ordre
+          # du json! de ListWorkersResult. C'est le trio qui signe : la
+          # répartition prefill / decode est la désagrégation que ce routeur
+          # orchestre, et aucune liste de workers d'un autre produit ne la
+          # compte ainsi. « workers » seul ne suffit pas — /get_loads, sur le
+          # même routeur, rend {"workers":[{"worker":…,"load":…}]}.
+          #
+          # L'ancrage aux deux bouts écarte le registre recopié dans le
+          # document d'une supervision ou complété d'une clé par une
+          # passerelle. Aucune expression ne lit le statut : le corps dit ce
+          # qui est servi, et le 401 du routeur à clé n'a pas de corps. Axum
+          # sérialise compact ; les \s* absorbent l'intermédiaire qui
+          # réindente.
+          - 'regex("\\]\\s*,\\s*\"total\"\\s*:\\s*[0-9]+\\s*,\\s*\"stats\"\\s*:\\s*\\{\\s*\"prefill_count\"\\s*:\\s*[0-9]+\\s*,\\s*\"decode_count\"\\s*:\\s*[0-9]+\\s*,\\s*\"regular_count\"\\s*:\\s*[0-9]+\\s*\\}\\s*\\}$", trim_space(body))'
+
+    extractors:
+      # Les modèles routés, chacun une fois : ce qu'un tiers peut faire tourner
+      # sans clé. Un routeur vide n'en rapporte aucun, et le constat tient.
+      #
+      # Les URL des workers ne sont pas extraites, alors que ce sont elles qui
+      # font la sévérité : les rapporter reviendrait à recopier dans le rapport
+      # de scrutation les adresses internes que le constat reproche à la cible
+      # de publier.
+      - type: json
+        part: body
+        name: models
+        json:
+          - '[.workers[].model_id] | unique | .[]'
