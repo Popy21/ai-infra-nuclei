@@ -51293,3 +51293,331 @@ def test_sdcpp_matcher_compiles_and_fires_against_a_live_server():
                          (200, SDCPP_LIMITS_ELSEWHERE_BODY)):
         _, hits, _ = scan(status, body)
         assert hits == 0, body[:200]
+
+
+# --------------------------------------------------------------------------
+# DocsGPT (arc53/DocsGPT) : assistant RAG auto-hébergé, backend Flask sur le
+# port 7091. GET /api/config (get_config, docsgpt/app.py) rend les réglages
+# que l'interface lit au démarrage, dont « requires_auth » : faux quand
+# AUTH_TYPE n'est pas posé, et handle_auth sert alors tout appelant comme
+# l'utilisateur « local ».
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux du handler get_config de main (9d5fdca,
+#     2026-11-18) servi par Flask 3.1.3 : jsonify trie les clés et sérialise
+#     compact, suivi d'un saut de ligne ; avec FLASK_DEBUG, il indente de deux
+#     espaces ;
+#   - "auth_type" vaut null sans AUTH_TYPE : le réglage est
+#     Optional[Literal[...]] avec default=None ;
+#   - la route répond 200 à l'anonyme sur une instance protégée aussi, avec
+#     "requires_auth":true — et, sous oidc, un objet "oidc" de plus ;
+#   - graphrag_available et hybrid_available sont arrivés dans la 0.18.0
+#     (2026-06-26) ; la 0.17.x ne rendait que auth_type et requires_auth, la
+#     0.21.0 a ajouté tts/stt_available, la 1.0.0 connectors_enabled et
+#     attachment_budget_share, la 1.1.0 le reste.
+
+DOCSGPT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                "docsgpt-config-auth-disabled.yaml")
+
+DOCSGPT_ROUTE = "/api/config"
+
+# Verbatim : configuration par défaut, sans AUTH_TYPE.
+DOCSGPT_OPEN_BODY = (
+    '{"analytics_max_overlapping_topics":20,"analytics_max_topics":15,"attac'
+    'hment_budget_share":0.5,"auth_type":null,"connectors_enabled":true,"dec'
+    'ision_analytics_enabled":false,"decision_available":true,"decision_inje'
+    'ction_enabled":false,"decision_relevance_enabled":false,"graphrag_avail'
+    'able":false,"hybrid_available":false,"requires_auth":false,"stt_availab'
+    'le":true,"tts_available":true,"web_default_pages":100,"web_max_pages":1'
+    '00}\n'
+)
+
+# Verbatim : VECTOR_STORE=pgvector GRAPHRAG_ENABLED=true, sans AUTH_TYPE.
+DOCSGPT_PGVECTOR_BODY = (
+    '{"analytics_max_overlapping_topics":20,"analytics_max_topics":15,"attac'
+    'hment_budget_share":0.5,"auth_type":null,"connectors_enabled":true,"dec'
+    'ision_analytics_enabled":false,"decision_available":true,"decision_inje'
+    'ction_enabled":false,"decision_relevance_enabled":false,"graphrag_avail'
+    'able":true,"hybrid_available":true,"requires_auth":false,"stt_available'
+    '":true,"tts_available":true,"web_default_pages":100,"web_max_pages":100'
+    '}\n'
+)
+
+# Verbatim : FLASK_DEBUG=1, sans AUTH_TYPE.
+DOCSGPT_DEBUG_BODY = (
+    '{\n  "analytics_max_overlapping_topics": 20,\n  "analytics_max_topics": '
+    '15,\n  "attachment_budget_share": 0.5,\n  "auth_type": null,\n  "connec'
+    'tors_enabled": true,\n  "decision_analytics_enabled": false,\n  "decisi'
+    'on_available": true,\n  "decision_injection_enabled": false,\n  "decisi'
+    'on_relevance_enabled": false,\n  "graphrag_available": false,\n  "hybri'
+    'd_available": false,\n  "requires_auth": false,\n  "stt_available": tru'
+    'e,\n  "tts_available": true,\n  "web_default_pages": 100,\n  "web_max_p'
+    'ages": 100\n}\n'
+)
+
+# Verbatim : AUTH_TYPE=simple_jwt, puis session_jwt, puis oidc.
+DOCSGPT_SIMPLE_JWT_BODY = (
+    '{"analytics_max_overlapping_topics":20,"analytics_max_topics":15,"attac'
+    'hment_budget_share":0.5,"auth_type":"simple_jwt","connectors_enabled":t'
+    'rue,"decision_analytics_enabled":false,"decision_available":true,"decis'
+    'ion_injection_enabled":false,"decision_relevance_enabled":false,"graphr'
+    'ag_available":false,"hybrid_available":false,"requires_auth":true,"stt_'
+    'available":true,"tts_available":true,"web_default_pages":100,"web_max_p'
+    'ages":100}\n'
+)
+DOCSGPT_SESSION_JWT_BODY = (
+    '{"analytics_max_overlapping_topics":20,"analytics_max_topics":15,"attac'
+    'hment_budget_share":0.5,"auth_type":"session_jwt","connectors_enabled":'
+    'true,"decision_analytics_enabled":false,"decision_available":true,"deci'
+    'sion_injection_enabled":false,"decision_relevance_enabled":false,"graph'
+    'rag_available":false,"hybrid_available":false,"requires_auth":true,"stt'
+    '_available":true,"tts_available":true,"web_default_pages":100,"web_max_'
+    'pages":100}\n'
+)
+DOCSGPT_OIDC_BODY = (
+    '{"analytics_max_overlapping_topics":20,"analytics_max_topics":15,"attac'
+    'hment_budget_share":0.5,"auth_type":"oidc","connectors_enabled":true,"d'
+    'ecision_analytics_enabled":false,"decision_available":true,"decision_in'
+    'jection_enabled":false,"decision_relevance_enabled":false,"graphrag_ava'
+    'ilable":false,"hybrid_available":false,"oidc":{"login_path":"/api/auth/'
+    'oidc/login","logout_path":"/api/auth/oidc/logout","provider_name":null}'
+    ',"requires_auth":true,"stt_available":true,"tts_available":true,"web_de'
+    'fault_pages":100,"web_max_pages":100}\n'
+)
+
+
+def docsgpt_body(doc, indent=None):
+    """
+    Le document tel que jsonify le rend : clés triées, compact hors debug,
+    indenté de deux espaces en debug, suivi d'un saut de ligne. Le test des
+    fixtures vérifie que cette aide rend, octet pour octet, les corps relevés —
+    c'est ce qui autorise à composer avec elle ceux des versions antérieures.
+    """
+    if indent is not None:
+        return json.dumps(doc, indent=indent, sort_keys=True) + "\n"
+    return json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n"
+
+
+def docsgpt_release_body(*keys):
+    """Le corps relevé réduit aux clés qu'une version antérieure rendait."""
+    doc = json.loads(DOCSGPT_OPEN_BODY)
+    return docsgpt_body({k: doc[k] for k in keys})
+
+
+# 0.18.0 à 0.20.0 : auth_type, requires_auth, graphrag_available,
+# hybrid_available.
+DOCSGPT_V018_KEYS = ("auth_type", "requires_auth", "graphrag_available",
+                     "hybrid_available")
+DOCSGPT_V018_BODY = docsgpt_release_body(*DOCSGPT_V018_KEYS)
+# 0.21.0 : tts_available et stt_available en plus.
+DOCSGPT_V021_BODY = docsgpt_release_body(*DOCSGPT_V018_KEYS, "tts_available",
+                                         "stt_available")
+# 1.0.0 : connectors_enabled et attachment_budget_share en plus.
+DOCSGPT_V100_BODY = docsgpt_release_body(
+    *DOCSGPT_V018_KEYS, "tts_available", "stt_available",
+    "connectors_enabled", "attachment_budget_share")
+
+# 0.17.x et avant : deux clés, rien qui nomme le produit. Pas reconnu, par
+# choix — un « requires_auth » faux n'appartient à personne.
+DOCSGPT_V017_BODY = docsgpt_release_body("auth_type", "requires_auth")
+
+# Ce que authenticate_request rend à un jeton Bearer invalide.
+DOCSGPT_INVALID_TOKEN_BODY = (
+    '{"error":"invalid_token","message":"Authentication error: invalid '
+    'token"}\n')
+
+# Un autre service qui dit lui aussi ne pas demander d'authentification.
+OTHER_REQUIRES_AUTH_FALSE_BODY = (
+    '{"auth_type":null,"requires_auth":false,"version":"2.4.1"}')
+
+# requires_auth en chaîne : pas la valeur que jsonify écrit pour un booléen.
+DOCSGPT_STRING_FALSE_BODY = DOCSGPT_OPEN_BODY.replace(
+    '"requires_auth":false', '"requires_auth":"false"')
+
+# Les deux drapeaux séparés : pas le dictionnaire du handler.
+DOCSGPT_PAIR_SPLIT_BODY = (
+    '{"graphrag_available":false,"requires_auth":false,'
+    '"hybrid_available":false}')
+
+# Une page HTML qui cite le document.
+DOCSGPT_QUOTED_IN_HTML_BODY = (
+    '<html><body><pre>' + DOCSGPT_OPEN_BODY + '</pre></body></html>')
+
+
+def docsgpt_block():
+    doc = load(DOCSGPT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % DOCSGPT_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/config"
+    return blocks[0]
+
+
+def docsgpt_fires(status, body):
+    matchers = docsgpt_block().get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    return all(dsl_matcher_hits(m, [(status, body)]) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_docsgpt_fixtures_hold_the_bodies_read_on_the_real_handler():
+    for body in (DOCSGPT_OPEN_BODY, DOCSGPT_PGVECTOR_BODY,
+                 DOCSGPT_SIMPLE_JWT_BODY, DOCSGPT_SESSION_JWT_BODY,
+                 DOCSGPT_OIDC_BODY):
+        assert docsgpt_body(json.loads(body)) == body, (
+            "l'aide ne rend plus un corps relevé : les corps composés ne "
+            "diraient plus rien du serveur réel"
+        )
+    assert docsgpt_body(json.loads(DOCSGPT_DEBUG_BODY), indent=2) == (
+        DOCSGPT_DEBUG_BODY), "l'aide ne rend plus le corps de FLASK_DEBUG"
+
+    doc = json.loads(DOCSGPT_OPEN_BODY)
+    assert sorted(doc) == [
+        "analytics_max_overlapping_topics", "analytics_max_topics",
+        "attachment_budget_share", "auth_type", "connectors_enabled",
+        "decision_analytics_enabled", "decision_available",
+        "decision_injection_enabled", "decision_relevance_enabled",
+        "graphrag_available", "hybrid_available", "requires_auth",
+        "stt_available", "tts_available", "web_default_pages",
+        "web_max_pages",
+    ], "les clés relevées sur le handler"
+    assert doc["auth_type"] is None and doc["requires_auth"] is False, (
+        "sans AUTH_TYPE : auth_type null, requires_auth faux"
+    )
+    for body, mode in ((DOCSGPT_SIMPLE_JWT_BODY, "simple_jwt"),
+                       (DOCSGPT_SESSION_JWT_BODY, "session_jwt"),
+                       (DOCSGPT_OIDC_BODY, "oidc")):
+        protected = json.loads(body)
+        assert protected["auth_type"] == mode
+        assert protected["requires_auth"] is True
+    assert set(json.loads(DOCSGPT_OIDC_BODY)) - set(doc) == {"oidc"}
+
+
+def test_docsgpt_probe_only_reads_the_config_route():
+    doc = load(DOCSGPT_TEMPLATE)
+    assert request_routes(doc) == {("GET", DOCSGPT_ROUTE)}, (
+        "le template ne lit que GET /api/config : /api/sources et les routes "
+        "voisines rendent le corpus et les conversations de l'exploitant"
+    )
+    block = docsgpt_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête : un Bearer invalide ferait rendre 401, et le constat "
+        "est l'accès anonyme"
+    )
+    assert (doc["info"].get("metadata") or {}).get("max-request") == 1
+    assert (doc["info"].get("metadata") or {}).get("product") == "docsgpt"
+    assert doc["info"]["severity"] == "high"
+
+
+def test_docsgpt_matcher_rests_on_requires_auth_not_on_the_status():
+    matchers = docsgpt_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "aucun matcher de statut ni de mot : la route rend 200 sur une "
+        "instance protégée aussi"
+    )
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : il ne sépare pas l'instance ouverte de la "
+        "protégée"
+    )
+    assert not any("auth_type" in e for e in expressions), (
+        "auth_type n'est pas le constat : requires_auth l'est"
+    )
+
+    for body, why in (
+        (DOCSGPT_OPEN_BODY, "le corps relevé, configuration par défaut"),
+        (DOCSGPT_PGVECTOR_BODY, "une instance pgvector avec GraphRAG"),
+        (DOCSGPT_DEBUG_BODY, "le corps indenté de FLASK_DEBUG"),
+        (DOCSGPT_V018_BODY, "la forme des 0.18.0 à 0.20.0"),
+        (DOCSGPT_V021_BODY, "la forme de la 0.21.0"),
+        (DOCSGPT_V100_BODY, "la forme de la 1.0.0"),
+    ):
+        assert docsgpt_fires(200, body), f"le template ne reconnaît pas {why}"
+
+    for status, body, why in (
+        (200, DOCSGPT_SIMPLE_JWT_BODY, "une instance simple_jwt"),
+        (200, DOCSGPT_SESSION_JWT_BODY, "une instance session_jwt"),
+        (200, DOCSGPT_OIDC_BODY, "une instance oidc"),
+        (200, DOCSGPT_V017_BODY, "la forme à deux clés d'avant la 0.18.0"),
+        (401, DOCSGPT_INVALID_TOKEN_BODY, "le refus d'un jeton invalide"),
+        (200, OTHER_REQUIRES_AUTH_FALSE_BODY, "un autre requires_auth faux"),
+        (200, DOCSGPT_STRING_FALSE_BODY, "un requires_auth en chaîne"),
+        (200, DOCSGPT_PAIR_SPLIT_BODY, "les deux drapeaux séparés"),
+        (200, DOCSGPT_QUOTED_IN_HTML_BODY, "une page HTML qui cite le corps"),
+        (404, "", "une route absente"),
+    ):
+        assert not docsgpt_fires(status, body), f"le template conclut sur {why}"
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_docsgpt_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == DOCSGPT_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, "")
+
+            def reply(self, code, payload):
+                data = payload.encode()
+                self.send_response(code)
+                if data:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", DOCSGPT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "docsgpt-config-auth-disabled"}, r.stdout + r.stderr
+        return seen, len(results)
+
+    seen, hits = scan(200, DOCSGPT_OPEN_BODY)
+    assert seen == [DOCSGPT_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+
+    for body in (DOCSGPT_PGVECTOR_BODY, DOCSGPT_DEBUG_BODY, DOCSGPT_V018_BODY):
+        _, hits = scan(200, body)
+        assert hits == 1, body[:200]
+
+    for status, body in ((200, DOCSGPT_SIMPLE_JWT_BODY),
+                         (200, DOCSGPT_OIDC_BODY),
+                         (200, DOCSGPT_V017_BODY),
+                         (401, DOCSGPT_INVALID_TOKEN_BODY),
+                         (200, DOCSGPT_PAIR_SPLIT_BODY)):
+        _, hits = scan(status, body)
+        assert hits == 0, body[:200]

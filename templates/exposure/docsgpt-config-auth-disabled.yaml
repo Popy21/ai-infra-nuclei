@@ -1,0 +1,120 @@
+id: docsgpt-config-auth-disabled
+
+info:
+  name: DocsGPT - API Served With Authentication Disabled
+  author: popy21
+  severity: high
+  description: |
+    DocsGPT (arc53/DocsGPT) est un assistant RAG et constructeur d'agents
+    auto-hébergé : il indexe des sources (fichiers, sites, connecteurs) et
+    répond par les LLM que l'exploitant a configurés. Son backend Flask est
+    servi par gunicorn sur le port 7091 — docsgpt/Dockerfile lance « gunicorn
+    … --bind 0.0.0.0:7091 … docsgpt.asgi:asgi_app », Flask monté sous
+    Starlette par a2wsgi.
+    GET /api/config est déclaré dans docsgpt/app.py (« @app.route("/api/config")
+    », get_config) et rend par jsonify un dictionnaire qui commence par
+    « "auth_type": settings.AUTH_TYPE », « "requires_auth": settings.AUTH_TYPE
+    in ["simple_jwt", "session_jwt", "oidc"] », « "graphrag_available":
+    graphrag_available() » et « "hybrid_available": settings.VECTOR_STORE ==
+    "pgvector" ». Flask sérialise compact et clés triées. Relevé en servant le
+    handler get_config de main (9d5fdca, 2026-11-18) sous Flask 3.1.3 avec la
+    configuration par défaut : 200, seize clés — analytics_max_overlapping_topics,
+    analytics_max_topics, attachment_budget_share, auth_type, connectors_enabled,
+    decision_analytics_enabled, decision_available, decision_injection_enabled,
+    decision_relevance_enabled, graphrag_available, hybrid_available,
+    requires_auth, stt_available, tts_available, web_default_pages,
+    web_max_pages — dont « "auth_type":null » et « "requires_auth":false » ;
+    avec AUTH_TYPE=oidc, une dix-septième, l'objet « oidc ».
+    L'absence d'authentification est le défaut. docsgpt/core/settings/auth.py
+    déclare AUTH_TYPE avec « default=None » (« unset (None) for no
+    authentication ») ; handle_auth (docsgpt/auth.py) rend alors
+    {"sub": "local"} pour toute requête, et le hook authenticate_request de
+    app.py le pose dans request.decoded_token. Les routes utilisateur ne
+    rejettent qu'un jeton vide (« if not decoded_token: return
+    make_response(jsonify({"success": False}), 401) ») : elles servent tout
+    appelant anonyme comme l'utilisateur local. deployment/docker-compose.yaml
+    publie « ${DOCSGPT_BIND:-127.0.0.1}:7091:7091 » et ne recommande 0.0.0.0
+    qu'« after setting AUTH_TYPE » : l'exposition survient dès
+    DOCSGPT_BIND=0.0.0.0, ou un proxy publié, sans AUTH_TYPE.
+    /api/config répond aussi sur une instance protégée — sans en-tête
+    Authorization, handle_auth rend None, le hook laisse passer et le handler
+    ne lit pas le jeton — avec « "requires_auth":true ». La route nomme donc le
+    produit dans tous les cas, et c'est la valeur de requires_auth qui prouve
+    l'exposition, pas le statut HTTP.
+  impact: |
+    Un appelant anonyme est l'utilisateur local, celui de l'exploitant. GET
+    /api/sources liste les sources indexées — name, location, provider,
+    syncFrequency, retriever, tokens, type… — et les routes voisines, toutes
+    gardées par le seul « if not decoded_token », rendent les conversations
+    (GET /api/get_conversations) et les agents (GET /api/get_agents), leurs
+    prompts et leurs outils compris. Les routes de réponse, enfin, font
+    travailler les LLM configurés sur le corpus indexé, aux frais des clés de
+    fournisseur de l'exploitant, et rien ne nomme l'appelant dans les
+    journaux : sans AUTH_TYPE, toute requête porte le même « sub » local.
+  remediation: |
+    Poser AUTH_TYPE — simple_jwt, session_jwt ou oidc (avec OIDC_ISSUER,
+    OIDC_CLIENT_ID et OIDC_FRONTEND_URL) — et un JWT_SECRET_KEY propre à
+    l'instance, puis redémarrer le backend. Tant que ce n'est pas fait, garder
+    DOCSGPT_BIND à son défaut 127.0.0.1, comme le demande
+    deployment/docker-compose.yaml, ou placer un intermédiaire qui authentifie
+    devant le port 7091 et devant l'interface. Vérifier depuis l'extérieur du
+    périmètre que GET /api/config rend « "requires_auth":true » et que GET
+    /api/sources sans jeton rend 401. Après une exposition, tenir pour lus les
+    sources, les conversations et les agents, et relire la consommation des
+    clés de fournisseur de LLM.
+  reference:
+    - https://github.com/arc53/DocsGPT
+    - https://github.com/arc53/DocsGPT/blob/main/docsgpt/app.py
+    - https://github.com/arc53/DocsGPT/blob/main/docsgpt/auth.py
+    - https://github.com/arc53/DocsGPT/blob/main/docsgpt/core/settings/auth.py
+    - https://github.com/arc53/DocsGPT/blob/main/docsgpt/api/user/sources/routes.py
+    - https://github.com/arc53/DocsGPT/blob/main/docsgpt/Dockerfile
+    - https://github.com/arc53/DocsGPT/blob/main/deployment/docker-compose.yaml
+  metadata:
+    max-request: 1
+    vendor: arc53
+    product: docsgpt
+  tags: ai,llm,rag,docsgpt,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /api/config, qui relit des réglages et ne touche
+  # ni la base ni un fournisseur. GET /api/sources établirait le même fait en
+  # rendant le corpus de l'exploitant ; le template ne le lit pas.
+  #
+  # Aucun en-tête Authorization : c'est l'accès anonyme qui est constaté, et
+  # un jeton invalide ferait rendre 401 par authenticate_request.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/config"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document est un objet JSON : jsonify n'a rien d'autre à rendre,
+          # et l'ancrage écarte une page HTML qui citerait ces clés — la
+          # coquille d'une application monopage, une page de documentation.
+          - 'regex("^\\s*\\{", body)'
+
+          # Le couple qui nomme le produit, exigé adjacent. Les deux clés se
+          # suivent dans le dictionnaire du handler et dans l'ordre trié de
+          # jsonify — aucune clé ne s'écrit entre « graphrag » et « hybrid » —
+          # depuis leur arrivée dans la 0.18.0. Deux booléens, true quand
+          # VECTOR_STORE vaut pgvector (et GRAPHRAG_ENABLED pour le premier).
+          - 'regex("\"graphrag_available\"\\s*:\\s*(?:true|false)\\s*,\\s*\"hybrid_available\"\\s*:\\s*(?:true|false)\\s*[,}]", body)'
+
+          # Le constat : requires_auth faux, c'est-à-dire AUTH_TYPE hors des
+          # trois modes que handle_auth vérifie — et handle_auth rend alors
+          # {"sub": "local"}. Pas auth_type : c'est requires_auth que le
+          # handler dérive du test que fait handle_auth.
+          - 'regex("\"requires_auth\"\\s*:\\s*false\\s*[,}]", body)'
+
+    # Pas de matcher de statut : la route rend 200 sur une instance ouverte
+    # comme sur une instance protégée, seul le corps les sépare.
+    #
+    # Pas d'extracteur : auth_type vaut null quand le constat tient, et les
+    # drapeaux de capacités ne disent rien de l'exposition.
+    #
+    # Avant la 0.18.0, /api/config ne rendait que {"auth_type":null,
+    # "requires_auth":false}, trop générique pour nommer le produit : ces
+    # versions ne sont pas reconnues.

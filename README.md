@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-150 templates, 147 produits.
+151 templates, 148 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -59,6 +59,7 @@ amont.
 | device-metrics-exporter | [`amd-device-metrics-exporter-exposed`](templates/exposure/amd-device-metrics-exporter-exposed.yaml) | medium |
 | dify | [`dify-exposed-console`](templates/exposure/dify-exposed-console.yaml) | high |
 | docling-serve | [`docling-serve-version-exposed`](templates/exposure/docling-serve-version-exposed.yaml) | medium |
+| docsgpt | [`docsgpt-config-auth-disabled`](templates/exposure/docsgpt-config-auth-disabled.yaml) | high |
 | dynamo | [`dynamo-frontend-exposed`](templates/exposure/dynamo-frontend-exposed.yaml) | high |
 | evidently | [`evidently-ui-exposed`](templates/exposure/evidently-ui-exposed.yaml) | medium |
 | exo | [`exo-cluster-state-exposed`](templates/exposure/exo-cluster-state-exposed.yaml) | high |
