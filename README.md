@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-149 templates, 146 produits.
+150 templates, 147 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -159,6 +159,7 @@ amont.
 | sillytavern | [`sillytavern-exposed`](templates/exposure/sillytavern-exposed.yaml) | high |
 | skypilot | [`skypilot-api-server-exposed`](templates/exposure/skypilot-api-server-exposed.yaml) | high |
 | speaches | [`speaches-server-exposed`](templates/exposure/speaches-server-exposed.yaml) | medium |
+| stable-diffusion.cpp | [`stable-diffusion-cpp-server-exposed`](templates/exposure/stable-diffusion-cpp-server-exposed.yaml) | high |
 | steel-browser | [`steel-browser-sessions-exposed`](templates/exposure/steel-browser-sessions-exposed.yaml) | high |
 | swarmui | [`swarmui-new-session-exposed`](templates/exposure/swarmui-new-session-exposed.yaml) | high |
 | tabby | [`tabby-health-exposed`](templates/exposure/tabby-health-exposed.yaml) | medium |

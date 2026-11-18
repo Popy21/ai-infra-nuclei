@@ -1,0 +1,130 @@
+id: stable-diffusion-cpp-server-exposed
+
+info:
+  name: stable-diffusion.cpp sd-server - Unauthenticated API Exposed
+  author: popy21
+  severity: high
+  description: |
+    sd-server est le serveur HTTP de stable-diffusion.cpp
+    (leejet/stable-diffusion.cpp, moteur d'inférence de diffusion en C/C++ sur
+    ggml), bâti depuis examples/server sur cpp-httplib. Un seul port sert la
+    Web UI sur /, l'API native /sdcpp/v1/*, une API compatible OpenAI sous
+    /v1/* et une API compatible AUTOMATIC1111 sous /sdapi/v1/* ; main.cpp les
+    monte sans condition (register_index_endpoints,
+    register_openai_api_endpoints, register_sdapi_endpoints,
+    register_sdcpp_api_endpoints, register_model_endpoints).
+    L'absence d'authentification est une fonctionnalité absente du produit.
+    SDSvrParams (runtime.h) ne déclare que l'adresse et le port d'écoute, la
+    file de travaux, le chemin d'une page HTML, les répertoires de modèles et
+    la journalisation : aucune clé, aucun jeton. Le seul pré-traitement de
+    main.cpp, set_pre_routing_handler, pose des en-têtes CORS
+    (Access-Control-Allow-Origin reflète l'Origin reçu, « * » sans lui,
+    Access-Control-Allow-Credentials: true) et rend 204 aux OPTIONS ; le seul
+    filtre des routes, RuntimeRoutes::protect (routes_models.cpp), rend 503
+    pendant un chargement de modèle, ou faute de modèle sur les routes de
+    génération, et ne lit aucun identifiant. Ce qui sépare l'instance du
+    réseau est la liaison : listen_ip vaut "127.0.0.1" et listen_port 1234
+    dans SDSvrParams, comme dans la table du README du serveur, et
+    --listen-ip 0.0.0.0 suffit à l'ouvrir.
+    GET /sdcpp/v1/capabilities rend make_capabilities_json()
+    (routes_sdcpp.cpp), un objet nlohmann::json sérialisé clés triées. Relevé
+    sur un build local de master (532d2c1), lancé sans modèle : 200, dix-huit
+    clés de premier niveau — current_mode, defaults, defaults_by_mode,
+    features, features_by_mode, generation_features, limits, loras, model,
+    output_formats, output_formats_by_mode, preview_modes, runtime, samplers,
+    schedulers, supported_modes, upscale, upscalers. "model" y vaut
+    {"name":"","path":"","stem":""} — nom, chemin et racine du fichier du
+    modèle quand il y en a un — et "limits" porte "min_width": 64 et
+    "max_queue_size", la valeur de --max-pending-jobs (64 par défaut, 3 avec
+    --max-pending-jobs 3 sur le même build).
+  impact: |
+    La réponse elle-même divulgue model.path, le chemin du fichier du modèle
+    sur le disque de l'hôte tel qu'il a été passé à --model ou
+    --diffusion-model ou résolu par une recette, et, pour chaque LoRA trouvée,
+    son chemin relatif à son répertoire — absolu dans display_path quand deux
+    LoRA portent le même chemin relatif. Elle prouve surtout l'accès à une
+    API dont aucune route ne demande d'identité : POST /sdcpp/v1/img_gen et
+    /sdcpp/v1/vid_gen mettent en file des générations d'images et de vidéos —
+    jusqu'à max_queue_size travaux —, POST /sdapi/v1/txt2img, /sdapi/v1/img2img
+    et /v1/images/generations font de même par les API compatibles, le tout
+    sur le GPU de l'exploitant. POST /sdcpp/v1/models/load détruit le contexte
+    courant et charge la recette et les fichiers choisis par l'appelant parmi
+    ceux que listent /sdcpp/v1/recipes et /sdcpp/v1/model-files, POST
+    /sdcpp/v1/models/unload décharge le modèle, après quoi chaque génération
+    rend 503 « No model is loaded ». Sur le build local, sans aucun
+    identifiant, unload a rendu 200 et l'état du chargeur, load a lu la
+    requête et répondu 400 « unknown recipe », img_gen 503 faute de modèle ;
+    la génération et le chargement réels ne sont pas exercés ici, faute de
+    poids. Les en-têtes CORS qui reflètent toute origine laissent en
+    outre une page web tierce piloter l'API depuis le navigateur d'un
+    utilisateur qui atteint le port, sous réserve des restrictions de réseau
+    privé du navigateur.
+  remediation: |
+    Le produit n'a aucune option d'authentification à activer : le contrôle
+    d'accès se pose devant lui, par un reverse proxy authentifiant (HTTP
+    Basic sous TLS, oauth2-proxy, mTLS) ou par l'isolement réseau. Laisser
+    --listen-ip à son défaut 127.0.0.1 quand l'instance n'a pas à être
+    atteinte depuis une autre machine, et ne publier le port d'un conteneur
+    que sur l'interface locale (-p 127.0.0.1:1234:1234). Si l'instance doit
+    rester joignable, refuser au mandataire les routes /sdcpp/v1/models/* et
+    retirer les en-têtes CORS qui reflètent l'origine. Vérifier depuis
+    l'extérieur du périmètre que GET /sdcpp/v1/capabilities cesse de rendre
+    le document des capacités.
+  reference:
+    - https://github.com/leejet/stable-diffusion.cpp
+    - https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/server/main.cpp
+    - https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/server/runtime.h
+    - https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/server/runtime.cpp
+    - https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/server/routes_sdcpp.cpp
+    - https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/server/routes_models.cpp
+    - https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/server/README.md
+  metadata:
+    max-request: 1
+    vendor: leejet
+    product: stable-diffusion.cpp
+  tags: ai,ml,stable-diffusion,stable-diffusion-cpp,ggml,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /sdcpp/v1/capabilities, la route de l'API native
+  # qui décrit le serveur. Elle ne calcule rien ; elle relit seulement les
+  # répertoires de LoRA et d'upscalers.
+  #
+  # Ne sont pas lus : /sdapi/v1/sd-models et /sdapi/v1/options, de forme
+  # AUTOMATIC1111 et visés par le template de ce produit ; GET /v1/models,
+  # dont "owned_by":"local" appartient aussi à mistral.rs ; GET /, qui rend la
+  # Web UI embarquée, « Stable Diffusion Server is running » sans elle, ou le
+  # fichier de --serve-html-path.
+  - method: GET
+    path:
+      - "{{BaseURL}}/sdcpp/v1/capabilities"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # "model" tel que make_capabilities_json() le construit : trois
+          # chaînes et rien d'autre, dans l'ordre que nlohmann::json donne à un
+          # objet (clés triées — name, path, stem). Vides quand aucun modèle
+          # n'est chargé, présentes quand même. Les chaînes admettent les
+          # échappements JSON : un chemin Windows y arrive en « C:\\… ».
+          - 'regex("\"model\"\\s*:\\s*\\{\\s*\"name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"path\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"stem\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*\\}", body)'
+
+          # Et "limits", lu dans son propre objet — il ne contient que des
+          # entiers, donc [^{}]* ne sort pas de ses accolades : max_queue_size,
+          # la file de --max-pending-jobs (strictement positive, validate()),
+          # et min_width, la constante 64. Les deux y sont depuis l'arrivée de
+          # l'API sdcpp (#1407) ; max_upscale_width et max_upscale_height s'y
+          # sont ajoutées ensuite (#2026), d'où l'absence d'ancrage sur la
+          # liste complète.
+          - 'regex("\"limits\"\\s*:\\s*\\{[^{}]*\"max_queue_size\"\\s*:\\s*[1-9][0-9]*\\s*[,}]", body)'
+          - 'regex("\"limits\"\\s*:\\s*\\{[^{}]*\"min_width\"\\s*:\\s*64\\s*[,}]", body)'
+
+    extractors:
+      # Le chemin du modèle sur l'hôte, quand il y en a un : sans modèle
+      # chargé, make_capabilities_json() rend une chaîne vide, que select()
+      # écarte.
+      - type: json
+        part: body
+        name: model_path
+        json:
+          - '.model.path | select(. != "")'

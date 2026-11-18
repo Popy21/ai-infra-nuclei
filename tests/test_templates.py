@@ -50925,3 +50925,371 @@ def test_sdnext_matcher_compiles_and_fires_against_a_live_server():
                          (200, SDNEXT_OTHER_APP_BODY)):
         _, hits, _ = scan(status, body)
         assert hits == 0, body
+
+
+# --------------------------------------------------------------------------
+# stable-diffusion.cpp (leejet/stable-diffusion.cpp) : sd-server, le serveur
+# HTTP d'examples/server, sert sur un même port la Web UI, l'API native
+# /sdcpp/v1/*, une API compatible OpenAI et une API compatible AUTOMATIC1111,
+# sans qu'aucune route ne lise d'identifiant. GET /sdcpp/v1/capabilities rend
+# make_capabilities_json() (routes_sdcpp.cpp).
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - le corps relevé est celui d'un sd-server bâti ici depuis master
+#     (532d2c15c, 2026-11-15), sans Web UI, lancé sans modèle : "model" y
+#     porte trois chaînes vides, et la route répond quand même 200 ;
+#   - `using json = nlohmann::json` (runtime.h) : les objets sont des
+#     std::map, la sortie a ses clés triées — "model" s'écrit name, path,
+#     stem, pas dans l'ordre où le code les pose ;
+#   - "limits" a changé : six entiers à l'arrivée de l'API sdcpp (#1407,
+#     2026-04-11), huit depuis max_upscale_width et max_upscale_height
+#     (#2026, 2026-09-24) ;
+#   - pendant un chargement de modèle, RuntimeRoutes::protect rend 503
+#     {"code":"model_loading",…} sur cette route comme sur les autres.
+
+SDCPP_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                              "stable-diffusion-cpp-server-exposed.yaml")
+
+SDCPP_ROUTE = "/sdcpp/v1/capabilities"
+
+# Verbatim : GET /sdcpp/v1/capabilities sur ce build, lancé par
+# « sd-server --listen-port <port> » sans --model ni --diffusion-model.
+SDCPP_LIVE_BODY = (
+    '{"current_mode":"","defaults":{},"defaults_by_mode":{},"features":{"canc'
+    'el_generating":true,"cancel_queued":true},"features_by_mode":{},"generat'
+    'ion_features":{"cache":false,"cache_dit":false,"cache_unet":false,"clip_'
+    'skip":false,"control_frames":false,"control_image":false,"controlnet":fa'
+    'lse,"distilled_guidance":false,"end_image":false,"flow_shift":false,"hig'
+    'h_noise":false,"img2img":false,"img_cfg":false,"init_image":false,"ip_ad'
+    'apter":false,"lora":false,"mask_image":false,"preview":false,"preview_ta'
+    'e":false,"ref_audios":false,"ref_images":false,"ref_video_audios":false,'
+    '"ref_videos":false,"shifted_timestep":false,"slg":false,"vace":false,"va'
+    'e_tiling":false},"limits":{"max_batch_count":8,"max_height":4096,"max_qu'
+    'eue_size":64,"max_upscale_height":8192,"max_upscale_width":8192,"max_wid'
+    'th":4096,"min_height":64,"min_width":64},"loras":[],"model":{"name":"","'
+    'path":"","stem":""},"output_formats":[],"output_formats_by_mode":{},"pre'
+    'view_modes":["none","proj","tae","vae"],"runtime":{"error":null,"load_el'
+    'apsed_seconds":null,"models":{},"recipe":null,"state":"empty"},"samplers'
+    '":["euler","euler_a","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","ip'
+    'ndm","ipndm_v","lcm","ddim_trailing","tcd","res_multistep","res_2s","er_'
+    'sde","euler_cfg_pp","euler_a_cfg_pp","euler_ge","dpm++2m_sde","dpm++2m_s'
+    'de_bt","lms"],"schedulers":["discrete","normal","karras","exponential","'
+    'ays","gits","sgm_uniform","simple","smoothstep","kl_optimal","lcm","bong'
+    '_tangent","ltx2","logit_normal","flux2","flux","beta","llada_image"],"su'
+    'pported_modes":[],"upscale":false,"upscalers":[{"image_upscale":false,"m'
+    'odel":false,"name":"None"},{"image_upscale":false,"model":false,"name":"'
+    'Lanczos"},{"image_upscale":false,"model":false,"name":"Nearest"},{"image'
+    '_upscale":false,"model":false,"name":"Latent"},{"image_upscale":false,"m'
+    'odel":false,"name":"Latent (nearest)"},{"image_upscale":false,"model":fa'
+    'lse,"name":"Latent (nearest-exact)"},{"image_upscale":false,"model":fals'
+    'e,"name":"Latent (antialiased)"},{"image_upscale":false,"model":false,"n'
+    'ame":"Latent (bicubic)"},{"image_upscale":false,"model":false,"name":"La'
+    'tent (bicubic antialiased)"}]}'
+)
+
+
+def sdcpp_body(doc, indent=None):
+    """
+    Le document tel que nlohmann::json le rend : compact, clés triées, UTF-8
+    brut. Le test des fixtures vérifie que cette aide rend, octet pour octet,
+    le corps relevé — c'est ce qui autorise à composer avec elle ceux
+    qu'aucune instance n'a rendus ici.
+    """
+    if indent is not None:
+        return json.dumps(doc, indent=indent, sort_keys=True,
+                          ensure_ascii=False)
+    return json.dumps(doc, separators=(",", ":"), sort_keys=True,
+                      ensure_ascii=False)
+
+
+def sdcpp_doc(**changes):
+    doc = json.loads(SDCPP_LIVE_BODY)
+    doc.update(changes)
+    return doc
+
+
+# Un modèle chargé par --model : resolve_display_model_path() rend
+# ctx.model_path, et "model" en porte le nom, la racine et le chemin.
+SDCPP_LOADED_MODEL = {
+    "name": "sd_xl_base_1.0.safetensors",
+    "path": "/srv/sd/models/checkpoints/sd_xl_base_1.0.safetensors",
+    "stem": "sd_xl_base_1.0",
+}
+SDCPP_LOADED_BODY = sdcpp_body(sdcpp_doc(
+    model=SDCPP_LOADED_MODEL, current_mode="img_gen",
+    supported_modes=["img_gen"]))
+
+# Le même sur Windows : le chemin arrive avec ses antislashs échappés.
+SDCPP_WINDOWS_BODY = sdcpp_body(sdcpp_doc(model={
+    "name": "flux1-dev-q8_0.gguf",
+    "path": "D:\\sd\\models\\diffusion_models\\flux1-dev-q8_0.gguf",
+    "stem": "flux1-dev-q8_0",
+}))
+
+# Un nom de fichier qui porte un guillemet : JSON l'échappe en \".
+SDCPP_QUOTED_PATH_BODY = sdcpp_body(sdcpp_doc(model={
+    "name": 'v1-5 "pruned".safetensors',
+    "path": '/models/v1-5 "pruned".safetensors',
+    "stem": 'v1-5 "pruned"',
+}))
+
+# --max-pending-jobs 4 : max_queue_size suit la file configurée.
+SDCPP_SMALL_QUEUE_BODY = sdcpp_body(sdcpp_doc(limits=dict(
+    json.loads(SDCPP_LIVE_BODY)["limits"], max_queue_size=4)))
+
+# Avant #2026 (2026-09-24) : limits n'a que ses six entiers d'origine.
+SDCPP_SIX_LIMITS = {
+    "min_width": 64, "max_width": 4096, "min_height": 64, "max_height": 4096,
+    "max_batch_count": 8, "max_queue_size": 64,
+}
+SDCPP_PRE_UPSCALE_BODY = sdcpp_body(sdcpp_doc(limits=SDCPP_SIX_LIMITS))
+
+# La première forme de la route (#1407, 2026-04-11) : model, defaults,
+# limits, samplers, schedulers, output_formats, features, loras — rien
+# d'autre.
+SDCPP_FIRST_RELEASE_BODY = sdcpp_body({
+    key: value for key, value in sdcpp_doc(limits=SDCPP_SIX_LIMITS).items()
+    if key in ("model", "defaults", "limits", "samplers", "schedulers",
+               "output_formats", "features", "loras")
+})
+
+# Le corps relevé réindenté par un intermédiaire.
+SDCPP_REINDENTED_BODY = sdcpp_body(json.loads(SDCPP_LIVE_BODY), indent=2)
+
+# Ce que rend la route pendant un chargement ou un déchargement :
+# model_error(res, 503, "model_loading", …), clés triées.
+SDCPP_MODEL_LOADING_BODY = (
+    '{"code":"model_loading","error":"Model is loading or unloading"}')
+
+# GET /sdcpp/v1/models/status sur la même instance : l'état du chargeur, pas
+# les capacités.
+SDCPP_MODELS_STATUS_BODY = (
+    '{"error":null,"load_elapsed_seconds":null,"models":{},"recipe":null,'
+    '"state":"empty"}'
+)
+
+# GET /sdapi/v1/sd-models du même serveur, modèle chargé : la forme
+# AUTOMATIC1111, avec les condensats codés en dur de routes_sdapi.cpp.
+SDCPP_SDAPI_SD_MODELS_BODY = (
+    '[{"config":null,"filename":"sd_xl_base_1.0.safetensors",'
+    '"hash":"8888888888","model_name":"sd_xl_base_1.0",'
+    '"sha256":"' + "8" * 64 + '","title":"sd_xl_base_1.0"}]')
+
+# GET /v1/models du même serveur, modèle chargé : "owned_by":"local", que
+# mistral.rs rend aussi.
+SDCPP_OPENAI_MODELS_BODY = (
+    '{"data":[{"id":"sd-cpp-local","object":"model","owned_by":"local"}]}')
+
+# "model" sans "stem" : pas l'objet que construit make_capabilities_json().
+SDCPP_MODEL_WITHOUT_STEM_BODY = sdcpp_body(sdcpp_doc(model={
+    "name": "sd_xl_base_1.0.safetensors",
+    "path": "/srv/sd/models/checkpoints/sd_xl_base_1.0.safetensors",
+}))
+
+# "model" avec une clé de plus : idem.
+SDCPP_MODEL_EXTRA_KEY_BODY = sdcpp_body(sdcpp_doc(model=dict(
+    SDCPP_LOADED_MODEL, size=6938078334)))
+
+# limits sans max_queue_size, ou sans min_width à 64 : une autre API.
+SDCPP_NO_QUEUE_BODY = sdcpp_body(sdcpp_doc(limits={
+    k: v for k, v in json.loads(SDCPP_LIVE_BODY)["limits"].items()
+    if k != "max_queue_size"}))
+SDCPP_OTHER_MIN_WIDTH_BODY = sdcpp_body(sdcpp_doc(limits=dict(
+    json.loads(SDCPP_LIVE_BODY)["limits"], min_width=256)))
+
+# max_queue_size et min_width présents, mais hors de "limits" : le matcher
+# lit l'objet, pas le document.
+SDCPP_LIMITS_ELSEWHERE_BODY = sdcpp_body({
+    "model": SDCPP_LOADED_MODEL,
+    "limits": {"max_batch_count": 8},
+    "queue": {"max_queue_size": 64, "min_width": 64},
+})
+
+
+def sdcpp_block():
+    doc = load(SDCPP_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % SDCPP_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /sdcpp/v1/capabilities"
+    return blocks[0]
+
+
+def sdcpp_fires(status, body):
+    matchers = sdcpp_block().get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    return all(dsl_matcher_hits(m, [(status, body)]) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_sdcpp_fixtures_hold_the_body_read_on_a_real_instance():
+    assert sdcpp_body(json.loads(SDCPP_LIVE_BODY)) == SDCPP_LIVE_BODY, (
+        "l'aide ne rend plus le corps relevé : les corps composés ne diraient "
+        "plus rien du serveur réel"
+    )
+    doc = json.loads(SDCPP_LIVE_BODY)
+    assert sorted(doc) == [
+        "current_mode", "defaults", "defaults_by_mode", "features",
+        "features_by_mode", "generation_features", "limits", "loras", "model",
+        "output_formats", "output_formats_by_mode", "preview_modes", "runtime",
+        "samplers", "schedulers", "supported_modes", "upscale", "upscalers",
+    ], "les clés de premier niveau relevées sur l'instance"
+    assert doc["model"] == {"name": "", "path": "", "stem": ""}, (
+        "sans modèle, model porte trois chaînes vides"
+    )
+    assert doc["limits"]["max_queue_size"] == 64, (
+        "--max-pending-jobs vaut 64 par défaut (SDSvrParams)"
+    )
+    assert doc["limits"]["min_width"] == 64
+
+
+def test_sdcpp_probe_only_reads_the_capabilities_route():
+    doc = load(SDCPP_TEMPLATE)
+    assert request_routes(doc) == {("GET", SDCPP_ROUTE)}, (
+        "le template ne lit que GET /sdcpp/v1/capabilities : le reste de "
+        "l'API génère, charge ou décharge des modèles"
+    )
+    block = sdcpp_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête, Origin ni Authorization : le constat est l'accès "
+        "anonyme"
+    )
+    assert not block.get("redirects") and not block.get("host-redirects"), (
+        "sd-server ne redirige pas cette route"
+    )
+    assert (doc["info"].get("metadata") or {}).get("max-request") == 1
+    assert doc["info"]["severity"] == "high"
+
+
+def test_sdcpp_matcher_rests_on_model_and_limits_not_on_the_status():
+    matchers = sdcpp_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "aucun matcher de statut ni de mot : le corps dit ce qui est servi"
+    )
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire le réécrit sans rien "
+        "changer au fait"
+    )
+
+    for body, why in (
+        (SDCPP_LIVE_BODY, "le corps relevé, sans modèle"),
+        (SDCPP_LOADED_BODY, "une instance avec un modèle chargé"),
+        (SDCPP_WINDOWS_BODY, "un chemin Windows échappé"),
+        (SDCPP_QUOTED_PATH_BODY, "un chemin qui porte un guillemet"),
+        (SDCPP_SMALL_QUEUE_BODY, "une file réglée par --max-pending-jobs"),
+        (SDCPP_PRE_UPSCALE_BODY, "les limites d'avant #2026"),
+        (SDCPP_FIRST_RELEASE_BODY, "la première forme de la route"),
+        (SDCPP_REINDENTED_BODY, "le corps réindenté"),
+    ):
+        assert sdcpp_fires(200, body), f"le template ne reconnaît pas {why}"
+
+    for status, body, why in (
+        (503, SDCPP_MODEL_LOADING_BODY, "le 503 d'un chargement en cours"),
+        (200, SDCPP_MODELS_STATUS_BODY, "l'état du chargeur de modèles"),
+        (200, SDCPP_SDAPI_SD_MODELS_BODY, "la route sd-models du même serveur"),
+        (200, AUTOMATIC1111_SD_MODELS_BODY, "AUTOMATIC1111, couvert ailleurs"),
+        (200, SDCPP_OPENAI_MODELS_BODY, "le /v1/models du même serveur"),
+        (200, SDCPP_MODEL_WITHOUT_STEM_BODY, "un model sans stem"),
+        (200, SDCPP_MODEL_EXTRA_KEY_BODY, "un model à quatre clés"),
+        (200, SDCPP_NO_QUEUE_BODY, "des limites sans max_queue_size"),
+        (200, SDCPP_OTHER_MIN_WIDTH_BODY, "un min_width qui n'est pas 64"),
+        (200, SDCPP_LIMITS_ELSEWHERE_BODY, "les entiers hors de limits"),
+        (200, "Stable Diffusion Server is running", "la page d'accueil"),
+        (404, "", "une route absente"),
+    ):
+        assert not sdcpp_fires(status, body), f"le template conclut sur {why}"
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_sdcpp_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil et que la requête
+    gojq de l'extracteur tient — chemin rendu quand il y en a un, rien quand
+    il est vide.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == SDCPP_ROUTE:
+                    self.reply(status, body)
+                else:
+                    self.reply(404, "")
+
+            def reply(self, code, payload):
+                data = payload.encode()
+                self.send_response(code)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Credentials", "true")
+                if data:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", SDCPP_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "stable-diffusion-cpp-server-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, SDCPP_LOADED_BODY)
+    assert seen == [SDCPP_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == [SDCPP_LOADED_MODEL["path"]], extracted
+
+    _, hits, extracted = scan(200, SDCPP_LIVE_BODY)
+    assert hits == 1, "le moteur perd le corps relevé"
+    assert extracted == [], (
+        f"sans modèle, rien à extraire — pas une chaîne vide : {extracted}"
+    )
+
+    _, hits, extracted = scan(200, SDCPP_WINDOWS_BODY)
+    assert hits == 1, "le moteur perd le chemin Windows échappé"
+    assert extracted == [
+        "D:\\sd\\models\\diffusion_models\\flux1-dev-q8_0.gguf"], extracted
+
+    for body in (SDCPP_QUOTED_PATH_BODY, SDCPP_FIRST_RELEASE_BODY,
+                 SDCPP_REINDENTED_BODY):
+        _, hits, _ = scan(200, body)
+        assert hits == 1, body[:200]
+
+    for status, body in ((503, SDCPP_MODEL_LOADING_BODY),
+                         (200, SDCPP_MODELS_STATUS_BODY),
+                         (200, SDCPP_SDAPI_SD_MODELS_BODY),
+                         (200, SDCPP_MODEL_WITHOUT_STEM_BODY),
+                         (200, SDCPP_NO_QUEUE_BODY),
+                         (200, SDCPP_LIMITS_ELSEWHERE_BODY)):
+        _, hits, _ = scan(status, body)
+        assert hits == 0, body[:200]
