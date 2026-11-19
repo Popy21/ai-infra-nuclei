@@ -1,0 +1,129 @@
+id: unity-catalog-catalogs-exposed
+
+info:
+  name: Unity Catalog OSS - Unauthenticated REST API (Catalog Listing)
+  author: popy21
+  severity: high
+  description: |
+    Unity Catalog OSS (unitycatalog/unitycatalog, projet LF AI & Data) est le
+    catalogue qui gouverne tables, volumes, fonctions et modèles ML
+    enregistrés, servi par Armeria sous /api/2.1/unity-catalog/ sur le port
+    8080 (DEFAULT_PORT de UnityCatalogServer.java). L'absence
+    d'authentification est le défaut livré : etc/conf/server.properties porte
+    server.authorization=disable, et UnityCatalogServer.java n'installe
+    UnityAccessDecorator et AuthDecorator que si isAuthorizationEnabled() —
+    sinon « Authorization disabled. Using AllowingAuthorizer. », et toute
+    requête passe. L'écoute couvre toutes les interfaces : en v0.7.0 un
+    transcodeur Vert.x (URLTranscoderVerticle, server.listen(port)) tient le
+    port client sur *:8080 et relaie vers Armeria sur 127.0.0.1:8081 ; sur
+    main, Armeria écoute lui-même par .http(port) ; compose.yaml publie
+    "8080:8080". Le préfixe
+    /api/2.1/unity-catalog/ est aussi celui de Databricks, qui exige un
+    jeton : c'est le document rendu sans en-tête Authorization qui fait le
+    constat. Deux lectures, exigées ensemble : GET /catalogs
+    (ListCatalogsResponse — {"catalogs":[…],"next_page_token":…}, chaque
+    CatalogInfo portant created_at en epoch ms et un id UUID) et GET
+    /metastore_summary ({"metastore_id":"<uuid>"}, MetastoreService, arrivé
+    en v0.3.0). Relevé sur le serveur v0.7.0 de Maven Central lancé avec le
+    etc/ du tag : la base livrée (etc/db/h2db.mv.db, copiée dans l'image
+    Docker) rend le catalogue « unity », une base vide rend
+    {"catalogs":[],"next_page_token":null}, et sous
+    server.authorization=enable les deux routes rendent 401
+    UNAUTHENTICATED « No authorization found. ». nuclei-templates porte
+    unity-catalog-unauth, qui conclut sur les mots "catalogs": et
+    "next_page_token": avec un statut 200 ; ce template-ci ne lit pas le
+    statut, exige la forme du document et la seconde preuve du metastore,
+    et couvre la base vide. Les v0.2.x, sans /metastore_summary, ne sont pas
+    visées.
+  impact: |
+    Un appelant anonyme énumère les catalogues — noms, commentaires,
+    propriétés, storage_root qui désigne le stockage cloud — et, de là, les
+    schémas, tables, volumes, fonctions et modèles enregistrés.
+    L'AllowingAuthorizer acceptant toute requête, il les crée, les modifie et
+    les supprime : sur la réplique v0.7.0, POST /catalogs {"name":"poc_anon"}
+    sans en-tête a rendu le CatalogInfo créé, et DELETE /catalogs/poc_anon
+    l'a supprimé, tous deux en 200. Les mêmes services montent
+    /temporary-table-credentials, /temporary-volume-credentials et
+    /temporary-path-credentials, qui délivrent des identifiants de stockage
+    cloud quand un stockage est configuré — relevé dans le code, non exercé
+    ici.
+  remediation: |
+    Poser server.authorization=enable dans etc/conf/server.properties, avec
+    server.allowed-issuers et server.audiences renseignés pour le
+    fournisseur d'identité, puis redémarrer ; ne publier le port 8080 que
+    derrière un reverse proxy authentifiant ou sur un réseau de confiance.
+    Une instance restée ouverte a pu être modifiée par un anonyme : relire
+    catalogues, schémas, tables et volumes, et faire tourner les identifiants
+    de stockage configurés. Vérifier depuis l'extérieur du périmètre que GET
+    /api/2.1/unity-catalog/catalogs rend 401 sans jeton.
+  reference:
+    - https://github.com/unitycatalog/unitycatalog
+    - https://github.com/unitycatalog/unitycatalog/blob/main/etc/conf/server.properties
+    - https://github.com/unitycatalog/unitycatalog/blob/main/server/src/main/java/io/unitycatalog/server/UnityCatalogServer.java
+    - https://github.com/unitycatalog/unitycatalog/blob/main/server/src/main/java/io/unitycatalog/server/ArmeriaServerBuilder.java
+    - https://github.com/unitycatalog/unitycatalog/blob/main/server/src/main/java/io/unitycatalog/server/service/CatalogService.java
+    - https://github.com/unitycatalog/unitycatalog/blob/main/server/src/main/java/io/unitycatalog/server/service/MetastoreService.java
+    - https://github.com/unitycatalog/unitycatalog/blob/main/api/all.yaml
+    - https://docs.unitycatalog.io/server/auth/
+  metadata:
+    max-request: 2
+    vendor: unitycatalog
+    product: unity_catalog
+    shodan-query: 'http.html:"Hello, Unity Catalog!"'
+  tags: ai,ml,data-catalog,unity-catalog,unitycatalog,lfai,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, toutes deux en GET sous le préfixe que UnityCatalogServer.java
+  # monte (BASE_PATH = "/api/2.1/unity-catalog/"). listCatalogs() ne fait que
+  # lire la table des catalogues ; getMetastoreSummary() rend l'identifiant du
+  # metastore, que MetastoreRepository crée au premier appel s'il manque.
+  #
+  # Rien d'autre n'est touché : POST /catalogs crée, PATCH et DELETE
+  # /catalogs/{name} modifient et suppriment, et les routes temporary-*
+  # délivrent des identifiants de stockage. Ne sont pas lus non plus GET /, qui
+  # rend « Hello, Unity Catalog! » sans rien dire de l'authentification, ni GET
+  # /catalogs/{name}, qui demande un nom qu'on ne connaît pas.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/2.1/unity-catalog/catalogs"
+      - "{{BaseURL}}/api/2.1/unity-catalog/metastore_summary"
+
+    # req-condition range les deux réponses dans body_1 et body_2 : c'est leur
+    # conjonction qui fait le constat, la liste vide d'une instance neuve ne
+    # suffisant pas seule.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # ListCatalogsResponse s'ouvre sur "catalogs", un tableau : l'ordre
+          # des propriétés est celui de la spécification (catalogs, puis
+          # next_page_token), que le modèle généré sérialise tel quel.
+          # L'ancrage écarte le document recopié sous une clé par une
+          # supervision.
+          - 'regex("^\\{\\s*\"catalogs\"\\s*:\\s*\\[", trim_space(body_1))'
+
+          # Et il se ferme sur next_page_token : null quand la liste est
+          # complète, le nom du dernier catalogue rendu sous max_results.
+          - 'regex("\"next_page_token\"\\s*:\\s*(?:null|\"(?:[^\"\\\\]|\\\\.)*\")\\s*\\}$", trim_space(body_1))'
+
+          # Une base vide rend la liste vide ; sinon chaque CatalogInfo porte
+          # created_at (epoch ms, posé par addCatalog) et un id UUID
+          # (UUID.randomUUID() dans CatalogRepository).
+          - 'regex("^\\{\\s*\"catalogs\"\\s*:\\s*\\[\\s*\\]", trim_space(body_1)) || (regex("\"created_at\"\\s*:\\s*[0-9]{10,}", body_1) && regex("\"id\"\\s*:\\s*\"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\"", body_1))'
+
+          # GetMetastoreSummaryResponse, seul : une clé, un UUID. Son
+          # AuthorizeExpression « #principal != null » n'est évaluée que par
+          # UnityAccessDecorator, absent quand l'autorisation est désactivée —
+          # sous server.authorization=enable, la route rend 401.
+          - 'regex("^\\{\\s*\"metastore_id\"\\s*:\\s*\"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\"\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # Les noms des catalogues. Un seul extracteur, borné à body_1 : sous
+      # req-condition le moteur évalue les extracteurs contre chaque réponse.
+      - type: json
+        part: body_1
+        name: catalogs
+        json:
+          - '.catalogs[].name'

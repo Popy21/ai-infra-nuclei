@@ -51945,3 +51945,391 @@ def test_easydiffusion_matcher_compiles_and_fires_against_a_live_server():
                          (200, EASYDIFFUSION_PANEL_BODY)):
         _, hits, _ = scan(status, body)
         assert hits == 0, body[:200]
+
+
+# --------------------------------------------------------------------------
+# Unity Catalog OSS (unitycatalog/unitycatalog) : le catalogue LF AI & Data de
+# tables, volumes, fonctions et modèles ML, servi par Armeria sous
+# /api/2.1/unity-catalog/. server.authorization=disable est le défaut livré, et
+# UnityCatalogServer.java n'installe alors ni UnityAccessDecorator ni
+# AuthDecorator : l'AllowingAuthorizer laisse tout passer.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux du serveur v0.7.0 de Maven Central
+#     (io.unitycatalog:unitycatalog-server:0.7.0) lancé sous JDK 21 avec le
+#     etc/ du tag : la base livrée (etc/db/h2db.mv.db, copiée dans l'image
+#     Docker), une base vide, et server.authorization=enable ;
+#   - Armeria sérialise par le mapper par défaut : compact, nulls écrits, dans
+#     l'ordre de la spécification — "catalogs" ouvre la liste,
+#     "next_page_token" la ferme ;
+#   - une base vide rend {"catalogs":[],"next_page_token":null} : la liste
+#     seule ne prouve rien, d'où la seconde lecture de /metastore_summary ;
+#   - sous autorisation, les deux routes rendent le même 401 UNAUTHENTICATED.
+
+UNITY_CATALOG_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                      "unity-catalog-catalogs-exposed.yaml")
+
+UNITY_CATALOG_PREFIX = "/api/2.1/unity-catalog"
+UNITY_CATALOG_CATALOGS_ROUTE = UNITY_CATALOG_PREFIX + "/catalogs"
+UNITY_CATALOG_METASTORE_ROUTE = UNITY_CATALOG_PREFIX + "/metastore_summary"
+
+# Verbatim, réplique : la base livrée avec le tag.
+UNITY_CATALOG_SEED_BODY = (
+    '{"catalogs":[{"name":"unity","comment":"Main catalog","properties":{},"o'
+    'wner":null,"created_at":1721234405334,"created_by":null,"updated_at":nul'
+    'l,"updated_by":null,"id":"f029b870-9468-4f10-badc-630b41e5690d","storage'
+    '_root":null,"storage_location":null}],"next_page_token":null}')
+
+# Verbatim, réplique : une base vide, avant toute création.
+UNITY_CATALOG_EMPTY_BODY = '{"catalogs":[],"next_page_token":null}'
+
+# Verbatim, réplique : deux catalogues créés par POST /catalogs, dont l'un
+# porte un commentaire à guillemets et une propriété.
+UNITY_CATALOG_TWO_BODY = (
+    '{"catalogs":[{"name":"ml_models","comment":null,"properties":{},"owner":'
+    'null,"created_at":1795077033057,"created_by":null,"updated_at":179507703'
+    '3057,"updated_by":null,"id":"4b11b01d-4679-4198-b62c-069bc89a1484","stor'
+    'age_root":null,"storage_location":null},{"name":"sales","comment":"Q3 \\'
+    '"finance\\" data","properties":{"team":"fin"},"owner":null,"created_at":'
+    '1795077032928,"created_by":null,"updated_at":1795077032928,"updated_by":'
+    'null,"id":"f976d325-2c22-4494-ba62-0116c2417d77","storage_root":null,"st'
+    'orage_location":null}],"next_page_token":null}')
+
+# Verbatim, réplique : la même base sous ?max_results=1 — next_page_token porte
+# le nom du dernier catalogue rendu.
+UNITY_CATALOG_PAGED_BODY = (
+    '{"catalogs":[{"name":"ml_models","comment":null,"properties":{},"owner":'
+    'null,"created_at":1795077033057,"created_by":null,"updated_at":179507703'
+    '3057,"updated_by":null,"id":"4b11b01d-4679-4198-b62c-069bc89a1484","stor'
+    'age_root":null,"storage_location":null}],"next_page_token":"ml_models"}')
+
+# Verbatim, réplique : GET /metastore_summary.
+UNITY_CATALOG_METASTORE_BODY = (
+    '{"metastore_id":"5e7a5a92-e04b-4537-b310-b92e5272a1d3"}')
+
+# Verbatim, réplique : les deux routes sous server.authorization=enable, sans
+# en-tête Authorization.
+UNITY_CATALOG_UNAUTHENTICATED_BODY = (
+    '{"error_code":"UNAUTHENTICATED","details":[{"reason":"UNAUTHENTICATED","'
+    '@type":"type.googleapis.com/google.rpc.ErrorInfo"}],"message":"No author'
+    'ization found."}')
+
+# Verbatim, réplique : GET / et une route que le serveur ne monte pas.
+UNITY_CATALOG_ROOT_BODY = "Hello, Unity Catalog!"
+UNITY_CATALOG_UNROUTED_BODY = "Status: 404\nDescription: Not Found\n"
+
+
+def unity_catalog_info(name, comment, properties, created_at, updated_at, id_):
+    """
+    Un CatalogInfo tel que le serveur le rend : les champs de la spécification
+    dans leur ordre, les nulls écrits. Le test des fixtures vérifie que cette
+    aide rend, octet pour octet, les corps relevés — c'est ce qui autorise à
+    composer avec elle ceux que la réplique n'a pas rendus.
+    """
+    return {"name": name, "comment": comment, "properties": properties,
+            "owner": None, "created_at": created_at, "created_by": None,
+            "updated_at": updated_at, "updated_by": None, "id": id_,
+            "storage_root": None, "storage_location": None}
+
+
+def unity_catalog_list(catalogs, next_page_token=None):
+    return json.dumps({"catalogs": catalogs,
+                       "next_page_token": next_page_token},
+                      separators=(",", ":"), ensure_ascii=False)
+
+
+UNITY_CATALOG_ML_MODELS = unity_catalog_info(
+    "ml_models", None, {}, 1795077033057, 1795077033057,
+    "4b11b01d-4679-4198-b62c-069bc89a1484")
+UNITY_CATALOG_SALES = unity_catalog_info(
+    "sales", 'Q3 "finance" data', {"team": "fin"}, 1795077032928,
+    1795077032928, "f976d325-2c22-4494-ba62-0116c2417d77")
+
+# Composé : un catalogue sur stockage cloud, avec browse_only en fin d'objet —
+# main déclare ce champ dans CatalogInfo, sa sérialisation n'est pas relevée
+# ici : le matcher ne doit pas dépendre de la dernière clé d'une entrée.
+UNITY_CATALOG_CLOUD_BODY = unity_catalog_list([dict(
+    unity_catalog_info("prod", "Données de production", {"owner_team": "data"},
+                       1795077100000, 1795077100000,
+                       "0d6f2a43-0b9e-4c55-9a1f-3f2f0d0e1a7b"),
+    storage_root="s3://acme-lake/prod", owner="data-admins",
+    browse_only=None)])
+
+# Les corps relevés réindentés par un intermédiaire.
+UNITY_CATALOG_REINDENTED_BODY = json.dumps(
+    json.loads(UNITY_CATALOG_SEED_BODY), indent=2)
+UNITY_CATALOG_REINDENTED_EMPTY_BODY = json.dumps(
+    json.loads(UNITY_CATALOG_EMPTY_BODY), indent=2)
+UNITY_CATALOG_REINDENTED_METASTORE_BODY = json.dumps(
+    json.loads(UNITY_CATALOG_METASTORE_BODY), indent=2)
+
+# La liste recopiée sous une clé par une supervision : ce n'est pas Unity
+# Catalog qui répond.
+UNITY_CATALOG_QUOTED_BODY = (
+    '{"unity_catalog":%s,"checked_at":0}' % UNITY_CATALOG_SEED_BODY)
+
+# Une liste « catalogs » quelconque, sans created_at ni id : le vocabulaire est
+# banal, c'est CatalogInfo qui ne l'est pas.
+UNITY_CATALOG_BARE_NAMES_BODY = (
+    '{"catalogs":[{"name":"main"}],"next_page_token":null}')
+
+# La liste sans next_page_token : ListCatalogsResponse l'écrit toujours.
+UNITY_CATALOG_NO_TOKEN_BODY = '{"catalogs":[{"name":"main"}]}'
+
+# Un metastore_id qui n'est pas un UUID, et un résumé à deux clés.
+UNITY_CATALOG_METASTORE_NOT_UUID_BODY = '{"metastore_id":"metastore-1"}'
+UNITY_CATALOG_METASTORE_EXTRA_BODY = (
+    '{"metastore_id":"5e7a5a92-e04b-4537-b310-b92e5272a1d3","name":"m"}')
+
+
+def unity_catalog_block():
+    doc = load(UNITY_CATALOG_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % UNITY_CATALOG_CATALOGS_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /catalogs"
+    return blocks[0]
+
+
+def unity_catalog_fires(catalogs=(200, UNITY_CATALOG_SEED_BODY),
+                        metastore=(200, UNITY_CATALOG_METASTORE_BODY)):
+    scenario = {UNITY_CATALOG_CATALOGS_ROUTE: catalogs,
+                UNITY_CATALOG_METASTORE_ROUTE: metastore}
+    block = unity_catalog_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for target in block.get("path") or []:
+        route = target.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin non prévu : {route}")
+        responses.append(scenario[route])
+    return all(dsl_matcher_hits(m, responses) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_unity_catalog_fixtures_hold_the_bodies_read_on_the_replica():
+    assert unity_catalog_list([unity_catalog_info(
+        "unity", "Main catalog", {}, 1721234405334, None,
+        "f029b870-9468-4f10-badc-630b41e5690d")]) == UNITY_CATALOG_SEED_BODY, (
+        "l'aide ne rend plus le corps relevé sur la base livrée : les corps "
+        "composés ne diraient plus rien du serveur réel"
+    )
+    assert unity_catalog_list([]) == UNITY_CATALOG_EMPTY_BODY
+    assert unity_catalog_list([UNITY_CATALOG_ML_MODELS, UNITY_CATALOG_SALES]) \
+        == UNITY_CATALOG_TWO_BODY, "l'aide perd l'échappement du commentaire"
+    assert unity_catalog_list([UNITY_CATALOG_ML_MODELS], "ml_models") \
+        == UNITY_CATALOG_PAGED_BODY
+    assert list(json.loads(UNITY_CATALOG_SEED_BODY)) == [
+        "catalogs", "next_page_token"], "l'ordre de ListCatalogsResponse"
+
+
+def test_unity_catalog_probe_only_reads_the_two_routes():
+    doc = load(UNITY_CATALOG_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", UNITY_CATALOG_CATALOGS_ROUTE),
+        ("GET", UNITY_CATALOG_METASTORE_ROUTE),
+    }, (
+        "le template ne lit que /catalogs et /metastore_summary : le reste de "
+        "l'API crée, modifie, supprime ou délivre des identifiants de stockage"
+    )
+    block = unity_catalog_block()
+    assert [p.replace("{{BaseURL}}", "") for p in block.get("path") or []] == [
+        UNITY_CATALOG_CATALOGS_ROUTE, UNITY_CATALOG_METASTORE_ROUTE], (
+        "l'ordre des chemins donne son numéro à chaque body_N"
+    )
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête : le constat est l'accès sans Authorization"
+    )
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 et body_2 n'existent pas : la liste vide "
+        "d'une instance neuve conclurait sans le metastore"
+    )
+    info = doc["info"]
+    assert (info.get("metadata") or {}).get("max-request") == 2
+    assert (info.get("metadata") or {}).get("product") == "unity_catalog"
+    assert info["severity"] == "high"
+
+
+def test_unity_catalog_matcher_rests_on_both_documents_not_on_status():
+    matchers = unity_catalog_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "aucun matcher de statut ni de mot : sous req-condition, seul le DSL "
+        "lie les deux réponses"
+    )
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire le réécrit sans rien "
+        "changer au fait"
+    )
+    for key in ("created_at", "\\\"id\\\"", "next_page_token", "metastore_id"):
+        assert any(key in e for e in expressions), f"le matcher perd {key}"
+    assert any("body_1" in e for e in expressions)
+    assert any("body_2" in e for e in expressions)
+
+    for catalogs, metastore, why in (
+        (UNITY_CATALOG_SEED_BODY, UNITY_CATALOG_METASTORE_BODY,
+         "la base livrée"),
+        (UNITY_CATALOG_EMPTY_BODY, UNITY_CATALOG_METASTORE_BODY,
+         "la base vide"),
+        (UNITY_CATALOG_TWO_BODY, UNITY_CATALOG_METASTORE_BODY,
+         "deux catalogues, commentaire échappé"),
+        (UNITY_CATALOG_PAGED_BODY, UNITY_CATALOG_METASTORE_BODY,
+         "un next_page_token non nul"),
+        (UNITY_CATALOG_CLOUD_BODY, UNITY_CATALOG_METASTORE_BODY,
+         "un catalogue sur stockage cloud, browse_only en fin d'objet"),
+        (UNITY_CATALOG_REINDENTED_BODY, UNITY_CATALOG_REINDENTED_METASTORE_BODY,
+         "les corps réindentés"),
+        (UNITY_CATALOG_REINDENTED_EMPTY_BODY, UNITY_CATALOG_METASTORE_BODY,
+         "la liste vide réindentée"),
+    ):
+        assert unity_catalog_fires((200, catalogs), (200, metastore)), (
+            f"le template ne reconnaît pas {why}")
+
+    for catalogs, metastore, why in (
+        ((401, UNITY_CATALOG_UNAUTHENTICATED_BODY),
+         (401, UNITY_CATALOG_UNAUTHENTICATED_BODY),
+         "l'instance sous server.authorization=enable"),
+        ((200, UNITY_CATALOG_SEED_BODY),
+         (401, UNITY_CATALOG_UNAUTHENTICATED_BODY),
+         "une liste servie sans le metastore"),
+        ((200, UNITY_CATALOG_EMPTY_BODY),
+         (404, UNITY_CATALOG_UNROUTED_BODY),
+         "la liste vide sans /metastore_summary"),
+        ((401, UNITY_CATALOG_UNAUTHENTICATED_BODY),
+         (200, UNITY_CATALOG_METASTORE_BODY),
+         "le metastore sans la liste"),
+        ((200, UNITY_CATALOG_QUOTED_BODY), (200, UNITY_CATALOG_METASTORE_BODY),
+         "la liste recopiée sous une clé"),
+        ((200, UNITY_CATALOG_BARE_NAMES_BODY),
+         (200, UNITY_CATALOG_METASTORE_BODY),
+         "une liste sans created_at ni id"),
+        ((200, UNITY_CATALOG_NO_TOKEN_BODY), (200, UNITY_CATALOG_METASTORE_BODY),
+         "une liste sans next_page_token"),
+        ((200, UNITY_CATALOG_SEED_BODY),
+         (200, UNITY_CATALOG_METASTORE_NOT_UUID_BODY),
+         "un metastore_id qui n'est pas un UUID"),
+        ((200, UNITY_CATALOG_SEED_BODY),
+         (200, UNITY_CATALOG_METASTORE_EXTRA_BODY),
+         "un résumé de metastore à deux clés"),
+        ((200, UNITY_CATALOG_ROOT_BODY), (200, UNITY_CATALOG_ROOT_BODY),
+         "la page d'accueil du serveur"),
+        ((404, ""), (404, ""), "deux routes absentes"),
+    ):
+        assert not unity_catalog_fires(catalogs, metastore), (
+            f"le template conclut sur {why}")
+
+
+def test_unity_catalog_extractor_names_the_catalogs():
+    extractors = unity_catalog_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "sous req-condition, chaque extracteur est évalué contre chaque "
+        "réponse : un second signalerait l'instance deux fois"
+    )
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("part") == "body_1", (
+        "les noms ne sont que dans la liste, pas dans le résumé du metastore"
+    )
+    assert extractors[0].get("json") == [".catalogs[].name"]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_unity_catalog_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil, que req-condition
+    numérote les réponses dans l'ordre des chemins et que l'extracteur rend
+    les noms de catalogues.
+    """
+    def scan(catalogs, metastore):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == UNITY_CATALOG_CATALOGS_ROUTE:
+                    self.reply(*catalogs)
+                elif self.path == UNITY_CATALOG_METASTORE_ROUTE:
+                    self.reply(*metastore)
+                elif self.path == "/":
+                    self.reply(200, UNITY_CATALOG_ROOT_BODY)
+                else:
+                    self.reply(404, UNITY_CATALOG_UNROUTED_BODY)
+
+            def reply(self, code, payload):
+                data = payload.encode()
+                self.send_response(code)
+                self.send_header("Server", "Armeria/1.41.1")
+                if data:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", UNITY_CATALOG_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "unity-catalog-catalogs-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan((200, UNITY_CATALOG_SEED_BODY),
+                                 (200, UNITY_CATALOG_METASTORE_BODY))
+    assert sorted(set(seen)) == sorted([UNITY_CATALOG_CATALOGS_ROUTE,
+                                        UNITY_CATALOG_METASTORE_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == ["unity"], extracted
+
+    _, hits, extracted = scan((200, UNITY_CATALOG_EMPTY_BODY),
+                              (200, UNITY_CATALOG_METASTORE_BODY))
+    assert hits == 1, "le moteur perd l'instance à base vide"
+    assert extracted == [], extracted
+
+    _, hits, extracted = scan((200, UNITY_CATALOG_TWO_BODY),
+                              (200, UNITY_CATALOG_METASTORE_BODY))
+    assert hits == 1, "le moteur perd le commentaire échappé"
+    assert extracted == ["ml_models", "sales"], extracted
+
+    _, hits, _ = scan((200, UNITY_CATALOG_REINDENTED_BODY),
+                      (200, UNITY_CATALOG_REINDENTED_METASTORE_BODY))
+    assert hits == 1, "le moteur perd les corps réindentés"
+
+    for catalogs, metastore in (
+            ((401, UNITY_CATALOG_UNAUTHENTICATED_BODY),
+             (401, UNITY_CATALOG_UNAUTHENTICATED_BODY)),
+            ((200, UNITY_CATALOG_SEED_BODY), (404, UNITY_CATALOG_UNROUTED_BODY)),
+            ((200, UNITY_CATALOG_QUOTED_BODY),
+             (200, UNITY_CATALOG_METASTORE_BODY)),
+            ((200, UNITY_CATALOG_BARE_NAMES_BODY),
+             (200, UNITY_CATALOG_METASTORE_BODY)),
+            ((200, UNITY_CATALOG_SEED_BODY),
+             (200, UNITY_CATALOG_METASTORE_NOT_UUID_BODY))):
+        _, hits, _ = scan(catalogs, metastore)
+        assert hits == 0, (catalogs[1][:120], metastore[1][:120])
