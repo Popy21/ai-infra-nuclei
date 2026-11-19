@@ -1,0 +1,114 @@
+id: easydiffusion-system-info-exposed
+
+info:
+  name: Easy Diffusion - Unauthenticated API (System Info Disclosure)
+  author: popy21
+  severity: high
+  description: |
+    Easy Diffusion (easydiffusion/easydiffusion) est une interface Stable
+    Diffusion « one-click » auto-hébergée, servie par FastAPI sur le port
+    9000 — produit distinct d'AUTOMATIC1111, SD.Next, InvokeAI et SwarmUI,
+    couverts à part. GET /get/system_info passe par la route
+    @server_api.get("/get/{key:path}") d'ui/easydiffusion/server.py, dont la
+    branche system_info rend {"devices":{…},"hosts":[…],
+    "default_output_dir":…,"enforce_output_dir":…,
+    "enforce_output_metadata":…,"backend_url":…}. Le produit n'a aucune
+    authentification : server.py crée server_api = FastAPI() sans middleware
+    ni Depends, et ni server.py ni app.py ne vérifient clé, jeton ou mot de
+    passe — ce corps prouve donc l'API entière ouverte à qui atteint le port.
+    Sans clé, la même route lève 418 « StableDiffusion is drawing a
+    teapot! ». L'écoute est fixée par launch_uvicorn() (scripts/
+    check_modules.py), qui part de 127.0.0.1:9000 et ne passe sur 0.0.0.0
+    que si config.yaml porte net.listen_to_network: true. Relevé en
+    exécutant les fonctions de main : une installation neuve, sans
+    config.yaml, écoute sur 127.0.0.1, et sa première écriture de
+    config.yaml repart de config.yaml.sample (listen_to_network: false) ; un
+    config.yaml sans « net » écoute aussi sur 127.0.0.1, mais le
+    listen_to_network = True qu'app.py y pose en mémoire est écrit à la
+    première écriture de config.yaml, et le démarrage suivant écoute sur
+    0.0.0.0. La case de l'interface et POST /app_config écrivent la même clé.
+    nuclei-templates n'en porte que easydiffusion-panel, qui lit le titre de
+    la page ; ce template-ci prouve l'API ouverte.
+  impact: |
+    Le corps livre le nom des processeurs et GPU de l'hôte avec leur mémoire
+    libre et totale, ses adresses IP et son nom d'hôte (getIPConfig()), et le
+    répertoire de sortie — sous le dossier personnel, donc le nom du compte
+    système, quand force_save_path n'est pas posé. Les autres routes du même
+    serveur sont aussi ouvertes : POST /render génère des images sur le GPU
+    de l'opérateur ; POST /app_config réécrit config.yaml, seule block_nsfw
+    figurant dans PROTECTED_CONFIG_KEYS — sur la réplique, un appel anonyme
+    {"listen_to_network": true} a rendu {"status":"OK"}, écrit la clé, et le
+    redémarrage suivant a écouté sur 0.0.0.0 ; POST /package/tensorrt avec
+    "command": "install" ou "uninstall" lance pip sur l'hôte (tensorrt est le
+    seul paquet du manifest de package_manager) ; POST
+    /tunnel/cloudflare/start ouvre un tunnel Cloudflare public vers
+    l'instance. Hormis /app_config, ces routes sont relevées dans le code de
+    main, non exercées ici.
+  remediation: |
+    Le produit n'a aucune option d'authentification à activer : le contrôle
+    d'accès se pose devant lui, par un reverse proxy authentifiant (HTTP
+    Basic sous TLS, oauth2-proxy, mTLS) ou par l'isolement réseau. Laisser
+    net.listen_to_network à false dans config.yaml (le défaut de
+    config.yaml.sample, bind 127.0.0.1) quand l'instance n'a pas à être
+    atteinte depuis une autre machine, ou poser net.bind_ip sur une
+    interface de confiance, et ne pas démarrer de tunnel Cloudflare. Un
+    appelant anonyme pouvant réécrire config.yaml par POST /app_config,
+    relire le fichier avant tout redémarrage d'une instance qui a été
+    exposée. Vérifier depuis l'extérieur du périmètre que GET
+    /get/system_info cesse de rendre ce document.
+  reference:
+    - https://github.com/easydiffusion/easydiffusion
+    - https://github.com/easydiffusion/easydiffusion/blob/main/ui/easydiffusion/server.py
+    - https://github.com/easydiffusion/easydiffusion/blob/main/ui/easydiffusion/app.py
+    - https://github.com/easydiffusion/easydiffusion/blob/main/ui/easydiffusion/package_manager.py
+    - https://github.com/easydiffusion/easydiffusion/blob/main/scripts/check_modules.py
+    - https://github.com/easydiffusion/easydiffusion/blob/main/scripts/config.yaml.sample
+    - https://github.com/easydiffusion/easydiffusion/blob/main/kb/configuration.md
+  metadata:
+    max-request: 1
+    vendor: easydiffusion
+    product: easydiffusion
+    shodan-query: 'http.title:"Easy Diffusion"'
+  tags: ai,ml,stable-diffusion,easydiffusion,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture : GET /get/system_info. Elle ne calcule rien — elle relit
+  # config.yaml et l'état des render threads — et répond sur tout serveur
+  # démarré, backend installé ou non.
+  #
+  # Ne sont pas lus : GET /, la page que lit easydiffusion-panel ; GET /ping,
+  # dont "status","devices","packages_installed" ne disent rien de plus et qui
+  # rend 500 dès qu'aucun render thread ne vit ; GET /get/app_config, qui rend
+  # config.yaml tel qu'il est écrit ; GET /get/, le 418 de la route sans clé.
+  - method: GET
+    path:
+      - "{{BaseURL}}/get/system_info"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Le document s'ouvre sur "devices", un objet : la première clé du
+          # dictionnaire de server.py, que JSONResponse sérialise dans l'ordre
+          # d'insertion. L'ancrage écarte le document recopié sous une clé par
+          # une supervision.
+          - 'regex("^\\{\\s*\"devices\"\\s*:\\s*\\{", trim_space(body))'
+
+          # Et il se ferme sur le trio, dans l'ordre du code : le chemin de
+          # sortie (une chaîne JSON, échappements admis — un chemin Windows y
+          # arrive en « D:\\… »), les deux booléens enforce_*, puis
+          # backend_url — null sous ed_diffusers et ed_classic, dont get_url()
+          # ne rend rien, chaîne sous webui. "hosts", liste de chaînes sans
+          # crochet, précède. backend_url est arrivé avec les backends
+          # dynamiques (9a12a8618, 2024-10-01) : les releases v3.0.x, qui ne
+          # le rendent pas, ne sont pas visées.
+          - 'regex("\"hosts\"\\s*:\\s*\\[[^\\]]*\\]\\s*,\\s*\"default_output_dir\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"enforce_output_dir\"\\s*:\\s*(?:true|false)\\s*,\\s*\"enforce_output_metadata\"\\s*:\\s*(?:true|false)\\s*,\\s*\"backend_url\"\\s*:\\s*(?:null|\"(?:[^\"\\\\]|\\\\.)*\")\\s*\\}$", trim_space(body))'
+
+    extractors:
+      # Le répertoire de sortie : sous le dossier personnel, il nomme le compte
+      # système qui fait tourner le serveur.
+      - type: json
+        part: body
+        name: output_dir
+        json:
+          - '.default_output_dir'

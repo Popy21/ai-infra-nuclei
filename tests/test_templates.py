@@ -51621,3 +51621,327 @@ def test_docsgpt_matcher_compiles_and_fires_against_a_live_server():
                          (200, DOCSGPT_PAIR_SPLIT_BODY)):
         _, hits = scan(status, body)
         assert hits == 0, body[:200]
+
+
+# --------------------------------------------------------------------------
+# Easy Diffusion (easydiffusion/easydiffusion) : interface Stable Diffusion
+# « one-click » servie par FastAPI sur le port 9000 — autre produit
+# qu'AUTOMATIC1111, SD.Next, InvokeAI et SwarmUI. GET /get/system_info passe
+# par la route /get/{key:path} d'ui/easydiffusion/server.py, et rien dans
+# server.py ni dans app.py ne lit d'identifiant.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux du vrai server.py et du vrai app.py de main
+#     (7caaf64ac, 2026-10-15), servis par ui/main.py sous uvicorn, sur une
+#     réplique où seules les fonctions feuilles sont remplacées :
+#     task_manager.get_devices (une machine CPU seule, dans la structure du
+#     vrai), backend.get_url (le `pass` de sdkit_common sous ed_diffusers, la
+#     chaîne de webui_common sous webui) et socket.gethostname /
+#     gethostbyname_ex, que lit le vrai getIPConfig() ;
+#   - JSONResponse sérialise compact et dans l'ordre d'insertion : "devices"
+#     ouvre le document, "backend_url" le ferme, et "config" — posé après
+#     coup par la route — ferme "devices" ;
+#   - "backend_url" est arrivé avec les backends dynamiques (9a12a8618,
+#     2024-10-01) : la v3.0.9 (2024-09-09) rend les mêmes clés sans lui ;
+#   - /get sans barre rend une 307 vers /get/, qui rend le 418 ; une clé
+#     inconnue rend 404 « Request for unknown <clé> ».
+
+EASYDIFFUSION_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                      "easydiffusion-system-info-exposed.yaml")
+
+EASYDIFFUSION_ROUTE = "/get/system_info"
+
+EASYDIFFUSION_CPU = {"name": "Intel(R) Xeon(R) CPU @ 2.20GHz"}
+EASYDIFFUSION_HOSTS = ["10.0.0.12", "gpu-box"]
+
+# Verbatim, réplique : installation neuve, sans config.yaml, HOME=/home/alice.
+EASYDIFFUSION_FRESH_BODY = (
+    '{"devices":{"all":{"cpu":{"name":"Intel(R) Xeon(R) CPU @ 2.20GHz"}},"act'
+    'ive":{"cpu":{"name":"Intel(R) Xeon(R) CPU @ 2.20GHz"}},"enable_trt":fals'
+    'e,"config":"auto"},"hosts":["10.0.0.12","gpu-box"],"default_output_dir":'
+    '"/home/alice/Stable Diffusion UI","enforce_output_dir":false,"enforce_ou'
+    'tput_metadata":false,"backend_url":null}')
+
+# Verbatim, réplique : config.yaml avec force_save_path: D:\SD\output,
+# force_save_metadata: txt, render_devices: [cuda:0] et backend: webui.
+EASYDIFFUSION_ENFORCED_BODY = (
+    r'{"devices":{"all":{"cpu":{"name":"Intel(R) Xeon(R) CPU @ 2.20GHz"}},"ac'
+    r'tive":{"cpu":{"name":"Intel(R) Xeon(R) CPU @ 2.20GHz"}},"enable_trt":fa'
+    r'lse,"config":["cuda:0"]},"hosts":["10.0.0.12","gpu-box"],"default_outp'
+    r'ut_dir":"D:\\SD\\output","enforce_output_dir":true,"enforce_output_meta'
+    r'data":true,"backend_url":"//localhost:7860/?__theme=dark"}')
+
+
+def easydiffusion_body(devices, hosts, output_dir, enforce_dir, enforce_meta,
+                       backend_url, config="auto"):
+    """
+    Le dictionnaire de la branche system_info tel que JSONResponse le rend :
+    compact, ensure_ascii=False, dans l'ordre d'insertion, "config" ajouté à
+    "devices" après coup. Le test des fixtures vérifie que cette aide rend,
+    octet pour octet, les deux corps relevés — c'est ce qui autorise à composer
+    avec elle ceux que la réplique n'a pas rendus.
+    """
+    devices = dict(devices, config=config)
+    return json.dumps({
+        "devices": devices,
+        "hosts": hosts,
+        "default_output_dir": output_dir,
+        "enforce_output_dir": enforce_dir,
+        "enforce_output_metadata": enforce_meta,
+        "backend_url": backend_url,
+    }, separators=(",", ":"), ensure_ascii=False)
+
+
+def easydiffusion_devices(all_devices, active_devices):
+    return {"all": all_devices, "active": active_devices, "enable_trt": False}
+
+
+# Composé : un GPU CUDA seul (device_count == 1, donc l'identifiant « cuda »),
+# get_device_info() complet, et un dossier personnel Windows à accent.
+EASYDIFFUSION_GPU = {"name": "NVIDIA GeForce RTX 3060", "mem_free": 11.3,
+                     "mem_total": 12.884901888, "max_vram_usage_level": "high"}
+EASYDIFFUSION_GPU_BODY = easydiffusion_body(
+    easydiffusion_devices({"cuda": EASYDIFFUSION_GPU, "cpu": EASYDIFFUSION_CPU},
+                          {"cuda": EASYDIFFUSION_GPU}),
+    ["192.168.1.20", "DESKTOP-4F2K9"], "C:\\Users\\Hélène\\Stable Diffusion UI",
+    False, False, None)
+
+# Le corps relevé réindenté par un intermédiaire.
+EASYDIFFUSION_REINDENTED_BODY = json.dumps(
+    json.loads(EASYDIFFUSION_FRESH_BODY), indent=2)
+
+# Verbatim, réplique : GET /get/, la route sans clé.
+EASYDIFFUSION_TEAPOT_BODY = '{"detail":"StableDiffusion is drawing a teapot!"}'
+
+# Verbatim, réplique : GET /get/nope.
+EASYDIFFUSION_UNKNOWN_KEY_BODY = '{"detail":"Request for unknown nope"}'
+
+# Verbatim, réplique : GET /ping sur l'installation neuve.
+EASYDIFFUSION_PING_BODY = (
+    '{"status":"Online","devices":{"all":{"cpu":{"name":"Intel(R) Xeon(R) CPU'
+    ' @ 2.20GHz"}},"active":{"cpu":{"name":"Intel(R) Xeon(R) CPU @ 2.20GHz"}}'
+    ',"enable_trt":false},"packages_installed":{},"packages_installing":[]}')
+
+# La branche system_info de la v3.0.9 : les mêmes clés, sans backend_url.
+EASYDIFFUSION_V309_BODY = json.dumps({
+    "devices": dict(easydiffusion_devices({"cpu": EASYDIFFUSION_CPU},
+                                          {"cpu": EASYDIFFUSION_CPU}),
+                    config="auto"),
+    "hosts": EASYDIFFUSION_HOSTS,
+    "default_output_dir": "/home/alice/Stable Diffusion UI",
+    "enforce_output_dir": False,
+    "enforce_output_metadata": False,
+}, separators=(",", ":"))
+
+# Le document recopié sous une clé par une supervision : ce n'est pas Easy
+# Diffusion qui répond.
+EASYDIFFUSION_QUOTED_BODY = (
+    '{"easydiffusion":%s,"checked_at":0}' % EASYDIFFUSION_FRESH_BODY)
+
+# Le trio sans enforce_output_metadata : server.py le pose toujours.
+EASYDIFFUSION_NO_METADATA_BODY = EASYDIFFUSION_FRESH_BODY.replace(
+    ',"enforce_output_metadata":false', '')
+
+# Le trio, mais enforce_output_metadata rendu en chaîne : server.py y met le
+# booléen ("force_save_metadata" in config), jamais la valeur de la clé.
+EASYDIFFUSION_STRING_METADATA_BODY = EASYDIFFUSION_FRESH_BODY.replace(
+    '"enforce_output_metadata":false', '"enforce_output_metadata":"txt"')
+
+# Une clé de plus après backend_url : ce n'est plus le dictionnaire de main.
+EASYDIFFUSION_EXTRA_KEY_BODY = EASYDIFFUSION_FRESH_BODY[:-1] + ',"user":"alice"}'
+
+# La page que lit easydiffusion-panel.
+EASYDIFFUSION_PANEL_BODY = (
+    '<!DOCTYPE html><html><head><title>Easy Diffusion</title></head>'
+    '<body></body></html>')
+
+
+def easydiffusion_block():
+    doc = load(EASYDIFFUSION_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % EASYDIFFUSION_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /get/system_info"
+    return blocks[0]
+
+
+def easydiffusion_fires(status, body):
+    matchers = easydiffusion_block().get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    return all(dsl_matcher_hits(m, [(status, body)]) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_easydiffusion_fixtures_hold_the_bodies_read_on_the_replica():
+    assert easydiffusion_body(
+        easydiffusion_devices({"cpu": EASYDIFFUSION_CPU},
+                              {"cpu": EASYDIFFUSION_CPU}),
+        EASYDIFFUSION_HOSTS, "/home/alice/Stable Diffusion UI",
+        False, False, None) == EASYDIFFUSION_FRESH_BODY, (
+        "l'aide ne rend plus le corps relevé sur l'installation neuve : les "
+        "corps composés ne diraient plus rien du serveur réel"
+    )
+    assert easydiffusion_body(
+        easydiffusion_devices({"cpu": EASYDIFFUSION_CPU},
+                              {"cpu": EASYDIFFUSION_CPU}),
+        EASYDIFFUSION_HOSTS, "D:\\SD\\output", True, True,
+        "//localhost:7860/?__theme=dark",
+        config=["cuda:0"]) == EASYDIFFUSION_ENFORCED_BODY, (
+        "l'aide ne rend plus le corps relevé sous force_save_path et webui"
+    )
+    assert list(json.loads(EASYDIFFUSION_FRESH_BODY)) == [
+        "devices", "hosts", "default_output_dir", "enforce_output_dir",
+        "enforce_output_metadata", "backend_url"], (
+        "l'ordre du dictionnaire de la branche system_info sur main"
+    )
+    assert json.loads(EASYDIFFUSION_ENFORCED_BODY)["default_output_dir"] == (
+        "D:\\SD\\output")
+
+
+def test_easydiffusion_probe_only_reads_the_system_info_route():
+    doc = load(EASYDIFFUSION_TEMPLATE)
+    assert request_routes(doc) == {("GET", EASYDIFFUSION_ROUTE)}, (
+        "le template ne lit que GET /get/system_info : le reste de l'API "
+        "génère, réécrit config.yaml, lance pip ou ouvre un tunnel"
+    )
+    block = easydiffusion_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête : le constat est l'accès anonyme"
+    )
+    assert (doc["info"].get("metadata") or {}).get("max-request") == 1
+    assert (doc["info"].get("metadata") or {}).get("product") == "easydiffusion"
+    assert doc["info"]["severity"] == "high"
+
+
+def test_easydiffusion_matcher_rests_on_the_system_info_document():
+    matchers = easydiffusion_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "aucun matcher de statut ni de mot : le corps entier dit ce qui est servi"
+    )
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire le réécrit sans rien "
+        "changer au fait"
+    )
+    assert not any("Easy Diffusion" in e for e in expressions), (
+        "le titre de la page est le constat d'easydiffusion-panel"
+    )
+    for key in ("default_output_dir", "enforce_output_metadata", "backend_url"):
+        assert any(key in e for e in expressions), f"le trio perd {key}"
+
+    for body, why in (
+        (EASYDIFFUSION_FRESH_BODY, "le corps de l'installation neuve"),
+        (EASYDIFFUSION_ENFORCED_BODY, "force_save_path Windows et webui"),
+        (EASYDIFFUSION_GPU_BODY, "un hôte CUDA au dossier accentué"),
+        (EASYDIFFUSION_REINDENTED_BODY, "le corps réindenté"),
+    ):
+        assert easydiffusion_fires(200, body), (
+            f"le template ne reconnaît pas {why}")
+
+    for status, body, why in (
+        (418, EASYDIFFUSION_TEAPOT_BODY, "le 418 de la route sans clé"),
+        (404, EASYDIFFUSION_UNKNOWN_KEY_BODY, "une clé inconnue"),
+        (200, EASYDIFFUSION_PING_BODY, "le /ping du même serveur"),
+        (200, EASYDIFFUSION_V309_BODY, "la v3.0.9, sans backend_url"),
+        (200, EASYDIFFUSION_QUOTED_BODY, "le document recopié sous une clé"),
+        (200, EASYDIFFUSION_NO_METADATA_BODY, "un trio sans enforce_*_metadata"),
+        (200, EASYDIFFUSION_STRING_METADATA_BODY, "un enforce_* qui n'est pas "
+                                                  "un booléen"),
+        (200, EASYDIFFUSION_EXTRA_KEY_BODY, "une clé après backend_url"),
+        (200, EASYDIFFUSION_PANEL_BODY, "la page de l'interface"),
+        (404, "", "une route absente"),
+    ):
+        assert not easydiffusion_fires(status, body), (
+            f"le template conclut sur {why}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_easydiffusion_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil et que l'extracteur
+    rend le chemin désechappé.
+    """
+    def scan(status, body):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == EASYDIFFUSION_ROUTE:
+                    self.reply(status, body)
+                elif self.path == "/get/":
+                    self.reply(418, EASYDIFFUSION_TEAPOT_BODY)
+                elif self.path == "/ping":
+                    self.reply(200, EASYDIFFUSION_PING_BODY)
+                else:
+                    self.reply(404, '{"detail":"Not Found"}')
+
+            def reply(self, code, payload):
+                data = payload.encode()
+                self.send_response(code)
+                self.send_header("Server", "uvicorn")
+                if data:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", EASYDIFFUSION_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "easydiffusion-system-info-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(200, EASYDIFFUSION_FRESH_BODY)
+    assert seen == [EASYDIFFUSION_ROUTE], (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == ["/home/alice/Stable Diffusion UI"], extracted
+
+    _, hits, extracted = scan(200, EASYDIFFUSION_ENFORCED_BODY)
+    assert hits == 1, "le moteur perd le chemin Windows échappé"
+    assert extracted == ["D:\\SD\\output"], extracted
+
+    _, hits, extracted = scan(200, EASYDIFFUSION_GPU_BODY)
+    assert hits == 1, "le moteur perd l'hôte CUDA"
+    assert extracted == ["C:\\Users\\Hélène\\Stable Diffusion UI"], extracted
+
+    _, hits, _ = scan(200, EASYDIFFUSION_REINDENTED_BODY)
+    assert hits == 1, "le moteur perd le corps réindenté"
+
+    for status, body in ((418, EASYDIFFUSION_TEAPOT_BODY),
+                         (200, EASYDIFFUSION_PING_BODY),
+                         (200, EASYDIFFUSION_V309_BODY),
+                         (200, EASYDIFFUSION_QUOTED_BODY),
+                         (200, EASYDIFFUSION_STRING_METADATA_BODY),
+                         (200, EASYDIFFUSION_EXTRA_KEY_BODY),
+                         (200, EASYDIFFUSION_PANEL_BODY)):
+        _, hits, _ = scan(status, body)
+        assert hits == 0, body[:200]
