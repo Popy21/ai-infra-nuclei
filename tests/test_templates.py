@@ -52715,3 +52715,736 @@ def test_lightllm_matcher_compiles_and_fires_against_a_live_server():
             ((404, LIGHTLLM_NOT_FOUND_BODY), (404, LIGHTLLM_NOT_FOUND_BODY))):
         _, hits, _ = scan(token_load, models)
         assert hits == 0, (token_load[1][:120], models[1][:120])
+
+
+# --------------------------------------------------------------------------
+# Easy Dataset (ConardLi/easy-dataset) : application Next.js de construction
+# de jeux de données de fine-tuning, lancée par « next start -p 1717 ». Aucun
+# middleware.js, aucun handler qui lise une session, un jeton ou un mot de
+# passe.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux des vrais route.js de /api/projects,
+#     /api/projects/[projectId], /api/projects/[projectId]/model-config et
+#     /api/check-update de main (4002b09d, 2026-05-01, package.json 1.7.3),
+#     avec lib/db, lib/util/providerLogo.js, constant/ et prisma/schema.prisma,
+#     servis par next start sous Next 14.2.29 et Prisma 6.9.0 — les versions
+#     du package-lock — sur SQLite. Projets et configuration ont été posés par
+#     les routes de l'application elle-même : POST /api/projects, POST
+#     …/model-config, PUT /api/projects/{id} pour le modèle par défaut. La clé
+#     est factice ;
+#   - le premier GET …/model-config d'un projet sans configuration en écrit
+#     une par fournisseur — douze lignes sur la réplique ; le second n'écrit
+#     plus rien. Pour un projet inconnu, l'insertion échoue sur la clé
+#     étrangère et la route rend 500 sans rien écrire ;
+#   - sortProvidersByPriority trie une copie du tableau : apiKey sort en clair ;
+#   - sous next start, /api/check-update est prérendu au build (○ Static,
+#     x-nextjs-cache: HIT à la lecture). Ses trois formes viennent de trois
+#     builds : à jour ; package.json ramené à 1.7.2 sous la release 1.7.3 ; et
+#     l'API GitHub rendue injoignable au build par un fetch remplacé ;
+#   - sur nuclei 3, une variable non résolue arrête la chaîne : ni la requête
+#     qui la porte ni aucune des suivantes ne part. Et quand l'extracteur
+#     interne rend plusieurs valeurs, le chemin en reçoit une, pas toujours la
+#     même, mais le DSL voit la liste : d'où un extracteur ancré, à une
+#     seule valeur ;
+#   - une route absente rend la page 404 HTML de Next.
+
+EASY_DATASET_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                     "easy-dataset-model-config-exposed.yaml")
+
+EASY_DATASET_PROJECTS_ROUTE = "/api/projects"
+EASY_DATASET_CHECK_UPDATE_ROUTE = "/api/check-update"
+EASY_DATASET_MODEL_CONFIG_ROUTE = "/api/projects/%s/model-config"
+
+# Le projet à modèle par défaut de la réplique, sa configuration par défaut,
+# et la clé factice enregistrée sur elle.
+EASY_DATASET_PROJECT_ID = "JkL9h6W244Qv"
+EASY_DATASET_DEFAULT_CONFIG_ID = "iryhxiz0nB5EhzS7JxEYM"
+EASY_DATASET_FAKE_API_KEY = "sk-replica-not-a-real-key-0000"
+
+# Verbatim, réplique : une instance sans projet.
+EASY_DATASET_EMPTY_PROJECTS_BODY = "[]"
+
+# Verbatim, réplique : le projet tout juste créé — aucun modèle par défaut.
+EASY_DATASET_NEW_PROJECT_BODY = (
+    '[{"id":"JkL9h6W244Qv","name":"Corpus juridique",'
+    '"description":"Questions-réponses sur le code civil","globalPrompt":"",'
+    '"questionPrompt":"","answerPrompt":"","labelPrompt":"",'
+    '"domainTreePrompt":"","cleanPrompt":"","defaultModelConfigId":null,'
+    '"test":"","createAt":"2026-11-20T07:55:25.275Z",'
+    '"updateAt":"2026-11-20T07:55:25.275Z","_count":{"Datasets":0,'
+    '"Questions":0,"ImageDatasets":0,"EvalDatasets":0},"totalTokens":0}]')
+
+# Verbatim, réplique : deux projets, le plus récent en tête (orderBy createAt
+# desc). Le premier, sans défaut, porte une invite qui cite _count et
+# EvalDatasets — JSON y échappe les guillemets ; le second a un modèle par
+# défaut, celui qui porte la clé factice.
+EASY_DATASET_PROJECTS_BODY = (
+    '[{"id":"svv7s6mfab6S","name":"Support client",'
+    '"description":"FAQ produit",'
+    '"globalPrompt":"Réponds en français. Ne recopie jamais '
+    '\\"_count\\":{\\"EvalDatasets\\":1}.",'
+    '"questionPrompt":"","answerPrompt":"","labelPrompt":"",'
+    '"domainTreePrompt":"","cleanPrompt":"","defaultModelConfigId":null,'
+    '"test":"","createAt":"2026-11-20T07:57:30.043Z",'
+    '"updateAt":"2026-11-20T07:57:30.170Z","_count":{"Datasets":0,'
+    '"Questions":0,"ImageDatasets":0,"EvalDatasets":0},"totalTokens":0},'
+    '{"id":"JkL9h6W244Qv","name":"Corpus juridique",'
+    '"description":"Questions-réponses sur le code civil","globalPrompt":"",'
+    '"questionPrompt":"","answerPrompt":"","labelPrompt":"",'
+    '"domainTreePrompt":"","cleanPrompt":"",'
+    '"defaultModelConfigId":"iryhxiz0nB5EhzS7JxEYM","test":"",'
+    '"createAt":"2026-11-20T07:55:25.275Z",'
+    '"updateAt":"2026-11-20T07:57:11.303Z","_count":{"Datasets":0,'
+    '"Questions":0,"ImageDatasets":0,"EvalDatasets":0},"totalTokens":0}]')
+
+# Verbatim, réplique : GET /api/projects/JkL9h6W244Qv/model-config — douze
+# fournisseurs triés par sortProvidersByPriority, OpenRouter en tête, la clé
+# factice sur OpenAI.
+EASY_DATASET_MODEL_CONFIG_BODY = (
+    '{"data":[{"id":"vzdNjHrKhnfQeiVKUWrEQ","projectId":"JkL9h6W244Qv",'
+    '"providerId":"OpenRouter","providerName":"OpenRouter",'
+    '"endpoint":"https://openrouter.ai/api/v1/","apiKey":"","modelId":"",'
+    '"modelName":"","type":"text","temperature":0.7,"maxTokens":8192,'
+    '"topP":0.9,"topK":0,"status":1,"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"6Hc8PpTl7Y6iv151Bp9jf",'
+    '"projectId":"JkL9h6W244Qv","providerId":"302ai","providerName":"302.AI",'
+    '"endpoint":"https://api.302.ai/v1/","apiKey":"","modelId":"",'
+    '"modelName":"","type":"text","temperature":0.7,"maxTokens":8192,'
+    '"topP":0.9,"topK":0,"status":1,"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"9n1Gn4jZKZ8ms_SIFVoHx",'
+    '"projectId":"JkL9h6W244Qv","providerId":"deepseek",'
+    '"providerName":"DeepSeek","endpoint":"https://api.deepseek.com/v1/",'
+    '"apiKey":"","modelId":"","modelName":"","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"wZARUaQbfgAGpNd0KwRjU",'
+    '"projectId":"JkL9h6W244Qv","providerId":"grok","providerName":"Grok",'
+    '"endpoint":"https://api.x.ai/v1","apiKey":"","modelId":"",'
+    '"modelName":"","type":"text","temperature":0.7,"maxTokens":8192,'
+    '"topP":0.9,"topK":0,"status":1,"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"uqfGWFeLsCdMvIO3iLg-O",'
+    '"projectId":"JkL9h6W244Qv","providerId":"groq","providerName":"Groq",'
+    '"endpoint":"https://api.groq.com/openai","apiKey":"","modelId":"",'
+    '"modelName":"","type":"text","temperature":0.7,"maxTokens":8192,'
+    '"topP":0.9,"topK":0,"status":1,"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"vjXe1iLdqigFos19Ue7Un",'
+    '"projectId":"JkL9h6W244Qv","providerId":"minimax",'
+    '"providerName":"MiniMax","endpoint":"https://api.minimax.io/v1",'
+    '"apiKey":"","modelId":"","modelName":"","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"nT8adsdmGhiyOBpPPFEYN",'
+    '"projectId":"JkL9h6W244Qv","providerId":"ollama",'
+    '"providerName":"Ollama","endpoint":"http://127.0.0.1:11434/api",'
+    '"apiKey":"","modelId":"","modelName":"","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"iryhxiz0nB5EhzS7JxEYM",'
+    '"projectId":"JkL9h6W244Qv","providerId":"openai",'
+    '"providerName":"OpenAI","endpoint":"https://api.openai.com/v1",'
+    '"apiKey":"sk-replica-not-a-real-key-0000","modelId":"gpt-4o-mini",'
+    '"modelName":"gpt-4o-mini","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:57:11.216Z"},{"id":"9wvDjxDtqDMceZ2ZIbHEI",'
+    '"projectId":"JkL9h6W244Qv","providerId":"zhipu","providerName":"智谱AI",'
+    '"endpoint":"https://open.bigmodel.cn/api/paas/v4/","apiKey":"",'
+    '"modelId":"","modelName":"","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"w0U2LV2sVl4jyOO0qQE7d",'
+    '"projectId":"JkL9h6W244Qv","providerId":"Doubao","providerName":"火山引擎",'
+    '"endpoint":"https://ark.cn-beijing.volces.com/api/v3/","apiKey":"",'
+    '"modelId":"","modelName":"","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"UXfyUw2gkHESy6zsJB7_H",'
+    '"projectId":"JkL9h6W244Qv","providerId":"siliconcloud",'
+    '"providerName":"硅基流动","endpoint":"https://api.siliconflow.cn/v1/",'
+    '"apiKey":"","modelId":"","modelName":"","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"},{"id":"gSzhkb-0ebjipnveJWkhz",'
+    '"projectId":"JkL9h6W244Qv","providerId":"alibailian",'
+    '"providerName":"阿里云百炼",'
+    '"endpoint":"https://dashscope.aliyuncs.com/compatible-mode/v1",'
+    '"apiKey":"","modelId":"","modelName":"","type":"text","temperature":0.7,'
+    '"maxTokens":8192,"topP":0.9,"topK":0,"status":1,'
+    '"createAt":"2026-11-20T07:55:31.783Z",'
+    '"updateAt":"2026-11-20T07:55:31.783Z"}],'
+    '"defaultModelConfigId":"iryhxiz0nB5EhzS7JxEYM"}')
+
+# Verbatim, réplique : GET /api/check-update, les trois builds.
+EASY_DATASET_CHECK_UPDATE_BODY = (
+    '{"hasUpdate":false,"currentVersion":"1.7.3","latestVersion":"1.7.3",'
+    '"releaseUrl":null}')
+EASY_DATASET_UPDATE_AVAILABLE_BODY = (
+    '{"hasUpdate":true,"currentVersion":"1.7.2","latestVersion":"1.7.3",'
+    '"releaseUrl":"https://github.com/ConardLi/easy-dataset/releases/tag/'
+    'v1.7.3"}')
+EASY_DATASET_GITHUB_UNREACHABLE_BODY = (
+    '{"hasUpdate":false,"currentVersion":"1.7.3","latestVersion":null,'
+    '"error":"Failed to fetch latest version"}')
+
+# Verbatim, réplique : …/model-config pour un projet inconnu.
+EASY_DATASET_MODEL_CONFIG_ERROR_BODY = (
+    '{"error":"Failed to obtain model configuration"}')
+
+# Le début de la page 404 de Next, relevée sur la réplique ; la suite porte
+# les hachages des chunks du build.
+EASY_DATASET_NOT_FOUND_BODY = (
+    '<!DOCTYPE html><html><head><meta charSet="utf-8"/><meta name="viewport" '
+    'content="width=device-width"/><title>404: This page could not be found'
+    '</title>')
+
+
+def easy_dataset_json(value):
+    """JSON.stringify tel que Response.json l'appelle : compact, sans ASCII forcé."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def easy_dataset_projects(defaults):
+    """
+    Les deux projets relevés, defaultModelConfigId posé projet par projet —
+    l'aide rend les corps relevés octet pour octet, le test des fixtures le
+    vérifie.
+    """
+    projects = json.loads(EASY_DATASET_PROJECTS_BODY)
+    for project, default in zip(projects, defaults):
+        project["defaultModelConfigId"] = default
+    return easy_dataset_json(projects)
+
+
+def easy_dataset_model_config(project_id=EASY_DATASET_PROJECT_ID,
+                              default=EASY_DATASET_DEFAULT_CONFIG_ID,
+                              keyed=True, drop=()):
+    doc = json.loads(EASY_DATASET_MODEL_CONFIG_BODY)
+    for row in doc["data"]:
+        row["projectId"] = project_id
+        if not keyed:
+            row["apiKey"] = ""
+        for field in drop:
+            row.pop(field, None)
+    doc["defaultModelConfigId"] = default
+    return easy_dataset_json(doc)
+
+
+# Composé : aucun des deux projets n'a de modèle par défaut.
+EASY_DATASET_NO_DEFAULT_PROJECTS_BODY = easy_dataset_projects((None, None))
+
+# Composé : les deux en ont un — seul le premier de la liste est lu.
+EASY_DATASET_SECOND_PROJECT_ID = "svv7s6mfab6S"
+EASY_DATASET_TWO_DEFAULTS_PROJECTS_BODY = easy_dataset_projects(
+    ("Ab3_dEf-ghIjKLmnOPqrs", EASY_DATASET_DEFAULT_CONFIG_ID))
+
+# Composé : le défaut est l'Ollama local, et aucune clé n'est enregistrée.
+EASY_DATASET_OLLAMA_CONFIG_ID = "nT8adsdmGhiyOBpPPFEYN"
+EASY_DATASET_OLLAMA_PROJECTS_BODY = easy_dataset_projects(
+    (None, EASY_DATASET_OLLAMA_CONFIG_ID))
+EASY_DATASET_KEYLESS_MODEL_CONFIG_BODY = easy_dataset_model_config(
+    default=EASY_DATASET_OLLAMA_CONFIG_ID, keyed=False)
+
+# Composé : les deux documents réindentés par un intermédiaire.
+EASY_DATASET_REINDENTED_PROJECTS_BODY = json.dumps(
+    json.loads(EASY_DATASET_PROJECTS_BODY), indent=2, ensure_ascii=False)
+EASY_DATASET_REINDENTED_MODEL_CONFIG_BODY = json.dumps(
+    json.loads(EASY_DATASET_MODEL_CONFIG_BODY), indent=2, ensure_ascii=False)
+
+# Les configurations sans colonne apiKey : un intermédiaire ou une variante
+# qui la retire ne livre plus de clé, et ce n'est plus le constat.
+EASY_DATASET_STRIPPED_MODEL_CONFIG_BODY = easy_dataset_model_config(
+    drop=("apiKey",))
+
+# Les configurations d'un autre projet que celui de la liste.
+EASY_DATASET_FOREIGN_MODEL_CONFIG_BODY = easy_dataset_model_config(
+    project_id="ZZZZZZZZZZZZ")
+
+# La liste recopiée sous une clé par une supervision.
+EASY_DATASET_QUOTED_PROJECTS_BODY = (
+    '{"projects":%s,"checked_at":0}' % EASY_DATASET_NEW_PROJECT_BODY)
+
+# Un _count sans EvalDatasets : ce n'est plus l'include de getProjects().
+EASY_DATASET_SHORT_COUNT_PROJECTS_BODY = EASY_DATASET_NEW_PROJECT_BODY.replace(
+    ',"EvalDatasets":0', "")
+
+# Un autre produit qui rend lui aussi « hasUpdate » : trois clés, pas quatre.
+EASY_DATASET_FOREIGN_CHECK_UPDATE_BODY = (
+    '{"hasUpdate":false,"currentVersion":"2.1.0","latestVersion":"2.1.0"}')
+
+# La forme d'Easy Dataset, mais une page de release d'un autre dépôt.
+EASY_DATASET_FORK_CHECK_UPDATE_BODY = EASY_DATASET_UPDATE_AVAILABLE_BODY.replace(
+    "ConardLi/easy-dataset", "someone/other-app")
+
+EASY_DATASET_PROXY_401_BODY = '{"error":"Unauthorized"}'
+
+
+def easy_dataset_block():
+    doc = load(EASY_DATASET_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % EASY_DATASET_PROJECTS_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/projects"
+    return blocks[0]
+
+
+def easy_dataset_project_extractor():
+    extractors = [e for e in (easy_dataset_block().get("extractors") or [])
+                  if e.get("internal")]
+    assert len(extractors) == 1, (
+        "le template ne porte pas exactement un extracteur interne : c'est "
+        "lui qui désigne le projet dont la configuration est lue"
+    )
+    return extractors[0]
+
+
+def easy_dataset_extracted_projects(projects_body):
+    """
+    Ce que l'extracteur interne rend sur la liste : le premier groupe de
+    chaque correspondance. Sans valeur, la variable reste non résolue et la
+    requête de model-config ne part pas.
+    """
+    extractor = easy_dataset_project_extractor()
+    assert extractor.get("part") == "body_1"
+    found = []
+    for pattern in extractor.get("regex") or []:
+        found += [m.group(extractor.get("group", 0))
+                  for m in re.finditer(pattern, projects_body)]
+    return found
+
+
+def easy_dataset_expression_hits(expr, responses, project):
+    """
+    Une expression du matcher contre les réponses déjà reçues. La variable
+    interne est lue comme le moteur la lit, par sa valeur ; une réponse pas
+    encore reçue rend l'expression fausse, comme nuclei, qui n'en évalue pas
+    moins les autres.
+    """
+    if project is not None:
+        expr = expr.replace("+ project +", "+ %s +" % json.dumps(project))
+    try:
+        return mcpo_dsl_hits({"dsl": [expr]}, responses)
+    except NameError:
+        return False
+
+
+def easy_dataset_scan(projects=(200, EASY_DATASET_PROJECTS_BODY),
+                      check_update=(200, EASY_DATASET_CHECK_UPDATE_BODY),
+                      model_configs=None):
+    """
+    Rejoue le bloc sous stop-at-first-match : le matcher est relu après
+    chaque réponse et la marche s'arrête dès qu'il conclut. `model_configs`
+    associe une route …/model-config à sa réponse ; un projet absent rend le
+    500 relevé. Rend (routes envoyées, verdict).
+    """
+    if model_configs is None:
+        model_configs = {
+            EASY_DATASET_MODEL_CONFIG_ROUTE % EASY_DATASET_PROJECT_ID:
+                (200, EASY_DATASET_MODEL_CONFIG_BODY)}
+    block = easy_dataset_block()
+    matchers = [m for m in block.get("matchers") or []]
+    assert [m.get("type") for m in matchers] == ["dsl"]
+    expressions = matchers[0].get("dsl") or []
+    assert matchers[0].get("condition", "or") == "or"
+    paths = [p.replace("{{BaseURL}}", "") for p in block.get("path") or []]
+    sent, responses, project = [], [], None
+    for index, path in enumerate(paths):
+        if "{{project}}" in path:
+            values = easy_dataset_extracted_projects(responses[0][1])
+            if not values:
+                return sent, False
+            project = values[0]
+            path = path.replace("{{project}}", project)
+        sent.append(path)
+        if index == 0:
+            responses.append(projects)
+        elif path == EASY_DATASET_CHECK_UPDATE_ROUTE:
+            responses.append(check_update)
+        else:
+            responses.append(model_configs.get(
+                path, (500, EASY_DATASET_MODEL_CONFIG_ERROR_BODY)))
+        if any(easy_dataset_expression_hits(e, responses, project)
+               for e in expressions):
+            return sent, True
+    return sent, False
+
+
+def easy_dataset_fires(**scenario):
+    return easy_dataset_scan(**scenario)[1]
+
+
+def test_easy_dataset_fixtures_hold_the_bodies_read_on_the_replica():
+    for body in (EASY_DATASET_NEW_PROJECT_BODY, EASY_DATASET_PROJECTS_BODY,
+                 EASY_DATASET_MODEL_CONFIG_BODY, EASY_DATASET_CHECK_UPDATE_BODY,
+                 EASY_DATASET_UPDATE_AVAILABLE_BODY,
+                 EASY_DATASET_GITHUB_UNREACHABLE_BODY):
+        assert easy_dataset_json(json.loads(body)) == body, (
+            "Response.json sérialise compact et garde l'UTF-8 brut : un corps "
+            "relevé ne se relit plus à l'identique"
+        )
+    assert easy_dataset_projects((None, EASY_DATASET_DEFAULT_CONFIG_ID)) == (
+        EASY_DATASET_PROJECTS_BODY), "l'aide ne rend plus la liste relevée"
+    assert easy_dataset_model_config() == EASY_DATASET_MODEL_CONFIG_BODY, (
+        "l'aide ne rend plus les configurations relevées"
+    )
+
+    projects = json.loads(EASY_DATASET_PROJECTS_BODY)
+    assert list(projects[1]) == [
+        "id", "name", "description", "globalPrompt", "questionPrompt",
+        "answerPrompt", "labelPrompt", "domainTreePrompt", "cleanPrompt",
+        "defaultModelConfigId", "test", "createAt", "updateAt", "_count",
+        "totalTokens"], "l'ordre des colonnes de Projects, puis _count et totalTokens"
+    assert list(projects[1]["_count"]) == [
+        "Datasets", "Questions", "ImageDatasets", "EvalDatasets"]
+    assert [p["id"] for p in projects] == [EASY_DATASET_SECOND_PROJECT_ID,
+                                           EASY_DATASET_PROJECT_ID]
+    assert '"_count":{"EvalDatasets":1}' in projects[0]["globalPrompt"], (
+        "l'invite piège cite la clé, guillemets compris")
+    assert '\\"_count\\":{\\"EvalDatasets\\":1}' in EASY_DATASET_PROJECTS_BODY, (
+        "et la liste la rend échappée")
+
+    configs = json.loads(EASY_DATASET_MODEL_CONFIG_BODY)
+    assert list(configs) == ["data", "defaultModelConfigId"]
+    assert list(configs["data"][0]) == [
+        "id", "projectId", "providerId", "providerName", "endpoint", "apiKey",
+        "modelId", "modelName", "type", "temperature", "maxTokens", "topP",
+        "topK", "status", "createAt", "updateAt"], (
+        "l'ordre des colonnes de ModelConfig dans le schéma Prisma"
+    )
+    assert len(configs["data"]) == 12
+    assert configs["data"][0]["providerId"] == "OpenRouter", (
+        "sortProvidersByPriority met OpenRouter en tête"
+    )
+    assert [c["providerName"] for c in configs["data"] if c["apiKey"]] == [
+        "OpenAI"]
+    assert configs["defaultModelConfigId"] == EASY_DATASET_DEFAULT_CONFIG_ID
+    assert EASY_DATASET_FAKE_API_KEY in EASY_DATASET_MODEL_CONFIG_BODY
+
+    assert [list(json.loads(b)) for b in (
+        EASY_DATASET_CHECK_UPDATE_BODY, EASY_DATASET_UPDATE_AVAILABLE_BODY,
+        EASY_DATASET_GITHUB_UNREACHABLE_BODY)] == [
+        ["hasUpdate", "currentVersion", "latestVersion", "releaseUrl"],
+        ["hasUpdate", "currentVersion", "latestVersion", "releaseUrl"],
+        ["hasUpdate", "currentVersion", "latestVersion", "error"]]
+
+
+def test_easy_dataset_probe_reads_three_routes_and_writes_nothing():
+    doc = load(EASY_DATASET_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", EASY_DATASET_PROJECTS_ROUTE),
+        ("GET", EASY_DATASET_CHECK_UPDATE_ROUTE),
+        ("GET", EASY_DATASET_MODEL_CONFIG_ROUTE % "{{project}}"),
+    }, (
+        "le template ne lit que la liste des projets, check-update et les "
+        "configurations d'un projet : POST sur model-config les réécrit, "
+        "DELETE sur model-config/{id} en supprime une"
+    )
+    block = easy_dataset_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête : le constat est l'accès anonyme")
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1, body_2 et body_3 n'existent pas")
+    assert block.get("stop-at-first-match") is True, (
+        "sans stop-at-first-match, l'instance remonte deux fois")
+    assert [p.replace("{{BaseURL}}", "") for p in block["path"]] == [
+        EASY_DATASET_PROJECTS_ROUTE, EASY_DATASET_CHECK_UPDATE_ROUTE,
+        EASY_DATASET_MODEL_CONFIG_ROUTE % "{{project}}"], (
+        "check-update précède model-config : après une variable non "
+        "résolue, nuclei n'envoie plus rien"
+    )
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 3
+    assert meta.get("product") == "easy-dataset"
+    assert doc["info"]["severity"] == "high"
+
+
+def test_easy_dataset_model_config_is_only_read_for_a_project_with_a_default():
+    """
+    Un GET …/model-config sur un projet sans configuration écrit douze lignes
+    en base. Le template ne le lit que pour un projet dont le modèle par
+    défaut est posé — l'interface a alors déjà initialisé ses configurations.
+    """
+    assert easy_dataset_extracted_projects(EASY_DATASET_PROJECTS_BODY) == [
+        EASY_DATASET_PROJECT_ID], (
+        "le projet sans défaut, malgré l'invite qui cite _count, est pris pour "
+        "cible — ou le projet à défaut est manqué"
+    )
+    assert easy_dataset_extracted_projects(
+        EASY_DATASET_REINDENTED_PROJECTS_BODY) == [EASY_DATASET_PROJECT_ID]
+    assert easy_dataset_extracted_projects(
+        EASY_DATASET_TWO_DEFAULTS_PROJECTS_BODY) == [
+        EASY_DATASET_SECOND_PROJECT_ID], (
+        "deux projets à défaut : une seule valeur, celle du premier — sans "
+        "quoi le DSL de nuclei reçoit une liste"
+    )
+    assert easy_dataset_extracted_projects(
+        EASY_DATASET_QUOTED_PROJECTS_BODY) == [], (
+        "l'extracteur est ancré au début du tableau")
+    for body in (EASY_DATASET_NEW_PROJECT_BODY,
+                 EASY_DATASET_NO_DEFAULT_PROJECTS_BODY,
+                 EASY_DATASET_EMPTY_PROJECTS_BODY):
+        assert easy_dataset_extracted_projects(body) == [], body[:120]
+
+    sent, hit = easy_dataset_scan()
+    assert sent == [EASY_DATASET_PROJECTS_ROUTE,
+                    EASY_DATASET_CHECK_UPDATE_ROUTE,
+                    EASY_DATASET_MODEL_CONFIG_ROUTE % EASY_DATASET_PROJECT_ID]
+    assert hit
+
+    for projects in (EASY_DATASET_NEW_PROJECT_BODY,
+                     EASY_DATASET_NO_DEFAULT_PROJECTS_BODY,
+                     EASY_DATASET_EMPTY_PROJECTS_BODY):
+        sent, hit = easy_dataset_scan(projects=(200, projects))
+        assert sent == [EASY_DATASET_PROJECTS_ROUTE,
+                        EASY_DATASET_CHECK_UPDATE_ROUTE], (
+            "le template lit model-config d'un projet sans défaut — et y "
+            "écrirait la configuration initiale"
+        )
+        assert hit, projects[:120]
+
+
+def test_easy_dataset_matcher_rests_on_bodies_not_on_status():
+    block = easy_dataset_block()
+    matchers = block.get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : seul le corps sépare"
+    )
+    assert all("EvalDatasets" in e and "_count" in e for e in expressions), (
+        "chaque branche qui lit la liste la reconnaît à son _count"
+    )
+    assert any('\\"apiKey\\"' in e and "body_3" in e for e in expressions), (
+        "la présence du champ apiKey n'est pas prouvée"
+    )
+    assert any("+ project +" in e for e in expressions), (
+        "les configurations lues ne sont pas liées au projet de la liste"
+    )
+    assert not any(re.search(r'apiKey[^(]*\((?!\?:)', e) for e in expressions), (
+        "un groupe capturant suit apiKey : la clé n'a pas à être capturée"
+    )
+
+    for scenario, why in (
+        ({}, "la liste et les configurations relevées"),
+        ({"projects": (200, EASY_DATASET_REINDENTED_PROJECTS_BODY),
+          "model_configs": {
+              EASY_DATASET_MODEL_CONFIG_ROUTE % EASY_DATASET_PROJECT_ID:
+                  (200, EASY_DATASET_REINDENTED_MODEL_CONFIG_BODY)}},
+         "deux documents réindentés"),
+        ({"projects": (200, EASY_DATASET_OLLAMA_PROJECTS_BODY),
+          "model_configs": {
+              EASY_DATASET_MODEL_CONFIG_ROUTE % EASY_DATASET_PROJECT_ID:
+                  (200, EASY_DATASET_KEYLESS_MODEL_CONFIG_BODY)}},
+         "un défaut Ollama, sans clé enregistrée"),
+        ({"check_update": (404, EASY_DATASET_NOT_FOUND_BODY)},
+         "les configurations, check-update absent"),
+        ({"projects": (200, EASY_DATASET_NEW_PROJECT_BODY)},
+         "un projet sans défaut et check-update"),
+        ({"projects": (200, EASY_DATASET_NO_DEFAULT_PROJECTS_BODY)},
+         "deux projets sans défaut et check-update"),
+        ({"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY)},
+         "une instance sans projet et check-update"),
+        ({"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+          "check_update": (200, EASY_DATASET_UPDATE_AVAILABLE_BODY)},
+         "une mise à jour disponible"),
+        ({"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+          "check_update": (200, EASY_DATASET_GITHUB_UNREACHABLE_BODY)},
+         "GitHub injoignable au build"),
+    ):
+        assert easy_dataset_fires(**scenario), (
+            f"le template ne reconnaît pas {why}")
+
+    mc = EASY_DATASET_MODEL_CONFIG_ROUTE % EASY_DATASET_PROJECT_ID
+    for scenario, why in (
+        ({"model_configs": {mc: (500, EASY_DATASET_MODEL_CONFIG_ERROR_BODY)}},
+         "le 500 de model-config"),
+        ({"model_configs": {mc: (401, EASY_DATASET_PROXY_401_BODY)}},
+         "un intermédiaire qui garde model-config"),
+        ({"model_configs": {mc: (200, EASY_DATASET_STRIPPED_MODEL_CONFIG_BODY)}},
+         "des configurations sans apiKey"),
+        ({"model_configs": {mc: (200, EASY_DATASET_FOREIGN_MODEL_CONFIG_BODY)}},
+         "les configurations d'un autre projet"),
+        ({"projects": (200, EASY_DATASET_QUOTED_PROJECTS_BODY)},
+         "la liste recopiée sous une clé"),
+        ({"projects": (200, EASY_DATASET_SHORT_COUNT_PROJECTS_BODY)},
+         "un _count sans EvalDatasets"),
+        ({"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+          "check_update": (200, EASY_DATASET_FOREIGN_CHECK_UPDATE_BODY)},
+         "« [] » et le hasUpdate d'un autre produit"),
+        ({"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+          "check_update": (200, EASY_DATASET_FORK_CHECK_UPDATE_BODY)},
+         "« [] » et la release d'un autre dépôt"),
+        ({"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+          "check_update": (200, PROMPTFOO_VERSION_BODY)},
+         "« [] » et le document de version de promptfoo"),
+        ({"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+          "check_update": (404, EASY_DATASET_NOT_FOUND_BODY)},
+         "« [] » sans check-update"),
+        ({"projects": (200, '{"data":[]}')}, "la liste vide d'une autre API"),
+        ({"projects": (401, EASY_DATASET_PROXY_401_BODY),
+          "check_update": (401, EASY_DATASET_PROXY_401_BODY)},
+         "un intermédiaire qui garde tout"),
+        ({"projects": (404, EASY_DATASET_NOT_FOUND_BODY),
+          "check_update": (404, EASY_DATASET_NOT_FOUND_BODY)},
+         "une autre application Next.js"),
+    ):
+        assert not easy_dataset_fires(**scenario), (
+            f"le template conclut sur {why}")
+
+
+def test_easy_dataset_extractors_never_carry_the_key():
+    extractors = easy_dataset_block().get("extractors") or []
+    public = [e for e in extractors if not e.get("internal")]
+    assert {e.get("name"): e.get("part") for e in public} == {
+        "provider_with_key": "body_3", "version": "body_2"}, (
+        "sous req-condition, un extracteur non borné lit chaque réponse"
+    )
+    for extractor in public:
+        assert extractor.get("type") == "json"
+        for expression in extractor.get("json") or []:
+            assert not expression.rstrip().endswith(".apiKey"), (
+                "un extracteur rend la clé elle-même"
+            )
+    provider = [e for e in public if e["name"] == "provider_with_key"][0]
+    assert provider["json"] == [
+        '.data[] | select((.apiKey | type) == "string" and .apiKey != "") '
+        '| .providerName'], "le fournisseur dont la clé est lisible, son nom seul"
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_easy_dataset_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `easy_dataset_scan` rejoue le bloc en Python : seul un scan contre un vrai
+    serveur dit que le lexer de nuclei lit les motifs pareil, qu'il lit la
+    variable interne dans le DSL, qu'il n'envoie model-config que pour un
+    projet à défaut, et que rien de ce qu'il produit ne porte la clé.
+    """
+    def scan(projects=(200, EASY_DATASET_PROJECTS_BODY),
+             check_update=(200, EASY_DATASET_CHECK_UPDATE_BODY),
+             model_config=None):
+        """
+        Sans `model_config`, …/model-config rend les configurations relevées
+        rattachées au projet demandé — le corps relevé lui-même pour
+        JkL9h6W244Qv.
+        """
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == EASY_DATASET_PROJECTS_ROUTE:
+                    self.reply(*projects)
+                elif self.path == EASY_DATASET_CHECK_UPDATE_ROUTE:
+                    self.reply(*check_update)
+                elif re.fullmatch(r"/api/projects/[^/]+/model-config",
+                                  self.path):
+                    self.reply(*(model_config or (200, easy_dataset_model_config(
+                        project_id=self.path.split("/")[3]))))
+                else:
+                    self.reply(404, EASY_DATASET_NOT_FOUND_BODY, "text/html")
+
+            def reply(self, code, payload, kind="application/json"):
+                data = payload.encode()
+                self.send_response(code)
+                self.send_header("Vary", "RSC, Next-Router-State-Tree, "
+                                         "Next-Router-Prefetch")
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", EASY_DATASET_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "easy-dataset-model-config-exposed"}, r.stdout + r.stderr
+        # `request` et `response` sont l'écho brut de l'échange, que nuclei
+        # joint par défaut et que -omit-raw retire : c'est au moteur. Le reste
+        # de la ligne, lui, est ce que le template produit.
+        for item in lines:
+            produced = {k: v for k, v in item.items()
+                        if k not in ("request", "response")}
+            assert EASY_DATASET_FAKE_API_KEY not in json.dumps(produced), (
+                "le scan recopie la clé dans son résultat — %s" % produced
+            )
+        results = {item.get("extractor-name"): item.get("extracted-results")
+                   for item in lines}
+        assert len(results) == len(lines), lines
+        return seen, results
+
+    mc = EASY_DATASET_MODEL_CONFIG_ROUTE % EASY_DATASET_PROJECT_ID
+    seen, results = scan()
+    assert seen == [EASY_DATASET_PROJECTS_ROUTE,
+                    EASY_DATASET_CHECK_UPDATE_ROUTE, mc], seen
+    assert results == {"provider_with_key": ["OpenAI"],
+                       "version": ["1.7.3"]}, results
+
+    seen, results = scan(
+        projects=(200, EASY_DATASET_REINDENTED_PROJECTS_BODY),
+        model_config=(200, EASY_DATASET_REINDENTED_MODEL_CONFIG_BODY))
+    assert seen[-1] == mc and results.get("provider_with_key") == ["OpenAI"], (
+        "le moteur perd les documents réindentés")
+
+    seen, results = scan(projects=(200, EASY_DATASET_OLLAMA_PROJECTS_BODY),
+                         model_config=(200, EASY_DATASET_KEYLESS_MODEL_CONFIG_BODY))
+    assert seen[-1] == mc and results == {"version": ["1.7.3"]}, (
+        "un défaut Ollama sans clé : le constat, sans fournisseur à révoquer"
+    )
+
+    seen, results = scan(projects=(200, EASY_DATASET_TWO_DEFAULTS_PROJECTS_BODY))
+    reads = [p for p in seen if p.endswith("/model-config")]
+    assert reads == [
+        EASY_DATASET_MODEL_CONFIG_ROUTE % EASY_DATASET_SECOND_PROJECT_ID], (
+        f"deux projets à défaut : une seule lecture, sur le premier — {seen}")
+    assert results.get("provider_with_key") == ["OpenAI"], results
+
+    for projects, check_update, version in (
+            (EASY_DATASET_NEW_PROJECT_BODY, EASY_DATASET_CHECK_UPDATE_BODY,
+             "1.7.3"),
+            (EASY_DATASET_EMPTY_PROJECTS_BODY,
+             EASY_DATASET_UPDATE_AVAILABLE_BODY, "1.7.2"),
+            (EASY_DATASET_EMPTY_PROJECTS_BODY,
+             EASY_DATASET_GITHUB_UNREACHABLE_BODY, "1.7.3")):
+        seen, results = scan(projects=(200, projects),
+                             check_update=(200, check_update))
+        assert seen == [EASY_DATASET_PROJECTS_ROUTE,
+                        EASY_DATASET_CHECK_UPDATE_ROUTE], (
+            f"model-config lu sans projet à défaut — {seen}")
+        assert results == {"version": [version]}, results
+
+    for scenario in (
+            {"model_config": (500, EASY_DATASET_MODEL_CONFIG_ERROR_BODY)},
+            {"model_config": (200, EASY_DATASET_STRIPPED_MODEL_CONFIG_BODY)},
+            {"model_config": (200, EASY_DATASET_FOREIGN_MODEL_CONFIG_BODY)},
+            {"projects": (200, EASY_DATASET_QUOTED_PROJECTS_BODY)},
+            {"projects": (200, EASY_DATASET_SHORT_COUNT_PROJECTS_BODY)},
+            {"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+             "check_update": (200, EASY_DATASET_FOREIGN_CHECK_UPDATE_BODY)},
+            {"projects": (200, EASY_DATASET_EMPTY_PROJECTS_BODY),
+             "check_update": (200, EASY_DATASET_FORK_CHECK_UPDATE_BODY)},
+            {"projects": (404, EASY_DATASET_NOT_FOUND_BODY),
+             "check_update": (404, EASY_DATASET_NOT_FOUND_BODY)}):
+        _, results = scan(**scenario)
+        assert results == {}, (scenario, results)

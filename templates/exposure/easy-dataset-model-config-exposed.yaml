@@ -1,0 +1,187 @@
+id: easy-dataset-model-config-exposed
+
+info:
+  name: Easy Dataset - Unauthenticated Project List & Model Configuration (LLM API Keys)
+  author: popy21
+  severity: high
+  description: |
+    Easy Dataset (ConardLi/easy-dataset) est une application Next.js qui
+    construit des jeux de données de fine-tuning à partir de documents, en
+    appelant elle-même les LLM configurés par projet. Le script start vaut
+    « next start -p 1717 » et le docker-compose.yml livré publie '1717:1717'
+    sans bloc environment ni réglage d'accès. L'authentification est une
+    fonctionnalité absente du produit, pas un réglage : aucun middleware.js
+    n'existe, ni à la racine ni dans app/, et aucun des handlers lus ne
+    vérifie de session, de jeton ni de mot de passe. GET /api/projects rend
+    Response.json(getProjects()) : chaque projet, invites de génération
+    comprises (globalPrompt, questionPrompt, answerPrompt…), suivi de l'objet
+    Prisma _count — Datasets, Questions, ImageDatasets, EvalDatasets — et
+    d'un totalTokens calculé, couple propre au produit. GET
+    /api/projects/{projectId}/model-config rend {"data":[…],
+    "defaultModelConfigId":…} : db.modelConfig.findMany sans select ni
+    masquage, apiKey compris — le schéma Prisma le déclare « apiKey String »,
+    en clair dans une base SQLite. La liste passe par sortProvidersByPriority,
+    qui ne fait que trier une copie du tableau : la clé n'en est pas retirée,
+    relevé sur la réplique avec une clé factice. Relevé sur une réplique : les
+    vrais route.js de /api/projects, /api/projects/[projectId],
+    /api/projects/[projectId]/model-config et /api/check-update, lib/db,
+    lib/util/providerLogo.js, constant/ et prisma/schema.prisma de main
+    (4002b09d, 2026-05-01, package.json 1.7.3), servis par next start sous
+    Next 14.2.29 et Prisma 6.9.0, les versions du package-lock, sur SQLite.
+    nuclei-templates n'a aucun template Easy Dataset.
+  impact: |
+    Un appelant anonyme lit, projet par projet, les clés d'API des
+    fournisseurs LLM configurés — OpenAI, DeepSeek, OpenRouter, SiliconFlow et
+    les autres de constant/model.js — avec leur endpoint et le modèle choisi :
+    de quoi consommer ces comptes aux frais de l'exploitant. Il lit aussi les
+    invites de génération de chaque projet et ses volumes (questions, jeux de
+    données, évaluations, tokens consommés). La même route accepte un POST
+    sans contrôle qui réécrit ou ajoute une configuration de modèle, et
+    DELETE /api/projects/{projectId}/model-config/{id} en supprime une. Les
+    clients de lib/llm/core/providers prennent endpoint pour baseURL et
+    apiKey pour clé : un endpoint détourné vers un serveur de l'attaquant
+    reçoit, à chaque génération, la clé et les extraits de documents que le
+    projet soumet au modèle — relevé dans le code ; ni l'écriture ni la
+    suppression n'ont été exercées.
+  remediation: |
+    Easy Dataset n'a aucune option d'authentification à activer : ne pas
+    publier le port 1717 hors de la machine (remplacer '1717:1717' par
+    '127.0.0.1:1717:1717' dans docker-compose.yml), et sinon poser devant
+    l'application un reverse proxy qui exige une authentification sur toutes
+    les routes, /api/ comprise, ou l'isoler sur un réseau de confiance par
+    pare-feu. Une instance qui a été exposée doit faire révoquer chez chaque
+    fournisseur les clés enregistrées dans ses configurations de modèles, et
+    relire ces configurations — endpoint compris — avant de s'en resservir.
+    Vérifier depuis l'extérieur du périmètre que GET /api/projects cesse de
+    rendre la liste des projets.
+  reference:
+    - https://github.com/ConardLi/easy-dataset
+    - https://github.com/ConardLi/easy-dataset/blob/main/app/api/projects/route.js
+    - https://github.com/ConardLi/easy-dataset/blob/main/app/api/projects/%5BprojectId%5D/model-config/route.js
+    - https://github.com/ConardLi/easy-dataset/blob/main/app/api/check-update/route.js
+    - https://github.com/ConardLi/easy-dataset/blob/main/lib/db/projects.js
+    - https://github.com/ConardLi/easy-dataset/blob/main/lib/db/model-config.js
+    - https://github.com/ConardLi/easy-dataset/blob/main/prisma/schema.prisma
+    - https://github.com/ConardLi/easy-dataset/blob/main/docker-compose.yml
+  metadata:
+    max-request: 3
+    vendor: conardli
+    product: easy-dataset
+  tags: ai,llm,easy-dataset,conardli,dataset,exposure,unauth,misconfig
+
+http:
+  # Trois lectures au plus, en GET, sans corps ni en-tête — dans cet ordre,
+  # et l'ordre n'est pas libre.
+  #
+  # GET /api/projects d'abord : la liste des projets, qui nomme le produit.
+  # GET /api/check-update ensuite : sous next start la route est prérendue au
+  # build (○ Static au build de la réplique, x-nextjs-cache: HIT à la
+  # lecture) — le corps est figé dans l'image et la lecture n'interroge pas
+  # l'API GitHub. Elle tranche quand la liste ne suffit pas : une instance
+  # sans projet rend « [] », que n'importe quelle API peut écrire.
+  #
+  # GET /api/projects/{project}/model-config enfin, et seulement pour un
+  # projet dont defaultModelConfigId est posé. La précaution n'est pas de
+  # style : quand un projet n'a encore aucune configuration, ce GET en crée
+  # une par fournisseur (createInitModelConfig) — douze lignes écrites en base
+  # sur la réplique, au premier appel. Un défaut posé dit que l'interface a
+  # déjà chargé ces configurations pour en choisir une : la lecture n'écrit
+  # plus rien, le compte de lignes de la réplique est resté le même. Sans
+  # projet à défaut, la variable reste non résolue et le moteur n'envoie pas
+  # la requête — ni, relevé sur nuclei, aucune de celles qui la suivraient :
+  # c'est pourquoi /api/check-update la précède.
+  #
+  # Rien d'autre n'est envoyé : POST sur model-config réécrit une
+  # configuration, DELETE sur model-config/{id} en supprime une — l'abus que
+  # le constat signale, pas ce qu'un scanner a le droit de faire pour
+  # l'établir.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/projects"
+      - "{{BaseURL}}/api/check-update"
+      - "{{BaseURL}}/api/projects/{{project}}/model-config"
+
+    # req-condition range les réponses dans body_1, body_2 et body_3 ;
+    # stop-at-first-match ferme la marche dès qu'une branche conclut — une
+    # instance sans projet à défaut s'arrête à /api/check-update, et ne
+    # remonte qu'une fois.
+    stop-at-first-match: true
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        dsl:
+          # Branche configurations : la liste des projets, puis les
+          # configurations de modèles de l'un d'eux, champ apiKey compris.
+          #
+          # La liste est un tableau ouvert sur l'id d'un projet et clos sur
+          # le _count que getProjects() inclut — Datasets, Questions,
+          # ImageDatasets puis EvalDatasets, dans l'ordre du select, rendu tel
+          # quel par Prisma — suivi du totalTokens qu'il ajoute. Une valeur de
+          # chaîne ne peut pas imiter ces clés : JSON y échappe le guillemet.
+          #
+          # Les configurations sont l'enveloppe du handler, ancrée aux deux
+          # bouts : data, dont la première ligne porte les colonnes de
+          # ModelConfig dans l'ordre du schéma — id, projectId, providerId,
+          # providerName, endpoint, apiKey puis modelId —, et le
+          # defaultModelConfigId du projet, une chaîne puisque seul un projet
+          # à défaut est lu. apiKey est une chaîne, vide ou non : c'est la
+          # présence du champ qui fait le constat, et le motif ne la capture
+          # pas. Le projectId est celui que l'extracteur a tiré de la liste.
+          # Les \s* absorbent l'intermédiaire qui réindente.
+          - 'regex("^\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"", trim_space(body_1)) && regex("\"_count\"\\s*:\\s*\\{\\s*\"Datasets\"\\s*:\\s*[0-9]+\\s*,\\s*\"Questions\"\\s*:\\s*[0-9]+\\s*,\\s*\"ImageDatasets\"\\s*:\\s*[0-9]+\\s*,\\s*\"EvalDatasets\"\\s*:\\s*[0-9]+\\s*\\}\\s*,\\s*\"totalTokens\"\\s*:\\s*[0-9]+\\s*\\}\\s*\\]$", trim_space(body_1)) && regex("^\\{\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"projectId\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"providerId\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"providerName\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"endpoint\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"apiKey\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"modelId\"\\s*:\\s*\"", trim_space(body_3)) && regex("\\}\\s*\\]\\s*,\\s*\"defaultModelConfigId\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)+\"\\s*\\}$", trim_space(body_3)) && regex("\"projectId\"\\s*:\\s*\"" + project + "\"", body_3)'
+
+          # Branche de repli : aucune configuration à lire sans écrire. Soit
+          # la liste vide, ancrée aux deux bouts ; soit la liste des projets,
+          # lue comme plus haut, dont aucun n'a de defaultModelConfigId en
+          # chaîne. Avec, dans les deux cas, le document de /api/check-update,
+          # ancré, dans l'ordre du handler : hasUpdate, currentVersion — lu
+          # dans package.json —, latestVersion, puis releaseUrl, null ou la
+          # page de release du dépôt, ou l'erreur que le handler rend quand
+          # GitHub n'a pas répondu au build.
+          #
+          # Aucune des deux branches ne lit le statut : le corps dit ce qui
+          # est servi, quoi qu'un intermédiaire fasse du code.
+          - '(regex("^\\[\\s*\\]$", trim_space(body_1)) || (regex("^\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"", trim_space(body_1)) && regex("\"_count\"\\s*:\\s*\\{\\s*\"Datasets\"\\s*:\\s*[0-9]+\\s*,\\s*\"Questions\"\\s*:\\s*[0-9]+\\s*,\\s*\"ImageDatasets\"\\s*:\\s*[0-9]+\\s*,\\s*\"EvalDatasets\"\\s*:\\s*[0-9]+\\s*\\}\\s*,\\s*\"totalTokens\"\\s*:\\s*[0-9]+\\s*\\}\\s*\\]$", trim_space(body_1)) && !regex("\"defaultModelConfigId\"\\s*:\\s*\"[^\"\\\\]", body_1))) && regex("^\\{\\s*\"hasUpdate\"\\s*:\\s*(?:true|false)\\s*,\\s*\"currentVersion\"\\s*:\\s*\"[^\"\\\\]+\"\\s*,\\s*\"latestVersion\"\\s*:\\s*(?:null|\"[^\"\\\\]+\")\\s*,\\s*(?:\"releaseUrl\"\\s*:\\s*(?:null|\"https://github\\.com/ConardLi/easy-dataset/releases/tag/v[^\"\\\\]+\")|\"error\"\\s*:\\s*\"Failed to fetch latest version\")\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # L'id du premier projet de la liste — le plus récent, getProjects()
+      # triant sur createAt décroissant — dont defaultModelConfigId est une
+      # chaîne non vide. Le motif est ancré au début du tableau et enjambe,
+      # objet entier par objet entier, les projets qui précèdent : chaînes
+      # lues comme des chaînes, accolades d'une invite comprises, et _count
+      # comme seul objet imbriqué. Puis l'objet visé, ouvert sur son id —
+      # l'alphabet de nanoid, ce que createProject pose —, et des champs à
+      # valeur chaîne ou null jusqu'au défaut ; le _count de l'objet arrête
+      # cette marche-là, qui ne déborde donc pas sur le projet suivant.
+      #
+      # Une seule valeur, et ce n'est pas de la coquetterie : quand
+      # l'extracteur en rend plusieurs, nuclei met l'une dans le chemin mais
+      # expose la liste au DSL, et le lien projectId de la branche
+      # configurations ne tient plus — relevé sur nuclei avec deux projets à
+      # défaut.
+      - type: regex
+        name: project
+        internal: true
+        part: body_1
+        group: 1
+        regex:
+          - '^\s*\[\s*(?:\{(?:[^{}"]|"(?:[^"\\]|\\.)*"|\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\})*\}\s*,\s*)*?\{\s*"id"\s*:\s*"([A-Za-z0-9_-]+)"\s*,(?:\s*"[A-Za-z0-9_]+"\s*:\s*(?:"(?:[^"\\]|\\.)*"|null)\s*,)*?\s*"defaultModelConfigId"\s*:\s*"[^"\\]+"'
+
+      # Les fournisseurs dont la clé est enregistrée — leur nom, jamais la
+      # clé : ce qu'il faut faire révoquer. Rien quand le défaut est un
+      # Ollama local, sans clé. Les lignes request et response que nuclei
+      # joint par défaut au JSONL portent, elles, le corps entier : -omit-raw
+      # les retire, et c'est au moteur, pas au template.
+      - type: json
+        part: body_3
+        name: provider_with_key
+        json:
+          - '.data[] | select((.apiKey | type) == "string" and .apiKey != "") | .providerName'
+
+      # La version servie, celle du package.json de l'image.
+      - type: json
+        part: body_2
+        name: version
+        json:
+          - '.currentVersion'
