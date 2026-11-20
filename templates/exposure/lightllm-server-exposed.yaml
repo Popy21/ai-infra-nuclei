@@ -1,0 +1,120 @@
+id: lightllm-server-exposed
+
+info:
+  name: LightLLM - Unauthenticated Inference Server (Token Load & Model List)
+  author: popy21
+  severity: high
+  description: |
+    LightLLM (ModelTC/lightllm) est un framework Python d'inférence et de
+    service de LLM. python -m lightllm.server.api_server lance Hypercorn sur
+    lightllm.server.api_http:app, lié à {--host}:{get_shm_port_args().port}
+    (api_start.py) — et ShmPortArgs.port ne fait que relire --port dans les
+    arguments de démarrage (_get_user_set_port, aucune allocation). api_cli.py
+    pose --host 127.0.0.1 et --port 8000 par défaut : l'exposition survient
+    dès --host 0.0.0.0. L'authentification est une fonctionnalité absente du
+    produit, pas un réglage : api_http.py ne déclare aucune dépendance ni
+    vérification de clé ou de Bearer — son seul middleware,
+    _AccessLogMiddleware, journalise méthode, chemin et statut — et api_cli.py
+    n'offre aucun argument de clé d'API ; le seul drapeau d'authentification,
+    --enable_monitor_auth, concerne le push gateway des métriques. Deux
+    lectures, exigées ensemble. GET /token_load rend le trio current_load,
+    logical_max_load, dynamic_max_load — la part du pool de tokens occupée,
+    une liste par rang DP ramenée à un scalaire quand --dp vaut 1 —, propre au
+    produit. GET /v1/models rend la ModelListResponse d'api_models.py : une
+    seule ModelCard id, object, created, owned_by, max_model_len, sans les
+    root, parent et permission de vLLM ; owned_by vaut --model_owner ou
+    « lightllm », id vaut --model_name ou le nom de base de model_dir. C'est
+    la seconde qui fait le constat d'inférence : elle est servie par le même
+    routeur que POST /v1/chat/completions, et un intermédiaire qui garderait
+    /v1/ en laissant /token_load ouvert n'est pas signalé. Relevé sur une
+    réplique : le vrai api_http.py, api_models.py et api_cli.py de main
+    (38793654, 2026-11-19) servis par Hypercorn, seules les feuilles qui
+    parlent aux autres processus remplacées (HttpServerManager, MetricClient,
+    TokenLoad en mémoire partagée) et torch absent. Le mode pd_master, qui ne
+    crée pas de TokenLoad, fait échouer /token_load et n'est pas visé — relevé
+    dans le code, non exercé. nuclei-templates n'a aucun template LightLLM.
+  impact: |
+    Qui atteint le port fait tourner le modèle aux frais de l'exploitant : POST
+    /v1/chat/completions, /v1/completions, /v1/messages, /v1/responses et
+    /generate sont enregistrés sur le même routeur sans dépendance
+    d'authentification. Sur la réplique, sans aucun en-tête, ces requêtes
+    sont allées jusqu'à la construction du prompt — 400 « Failed to build
+    prompt » faute de tokenizer, 417 sur /generate faute de générateur —,
+    jamais un 401 ni un 403 ; la génération elle-même, qui demande un GPU,
+    n'a pas été exercée. GET /get_server_info rend asdict(args), l'intégralité
+    des arguments de démarrage — 161 clés sur la réplique, model_dir, host,
+    port et les adresses NCCL et PD comprises —, et /get_model_name le nom
+    interne du modèle.
+  remediation: |
+    LightLLM n'a aucune option d'authentification à activer : laisser --host
+    à 127.0.0.1 (le défaut) quand le serveur n'a pas à être atteint d'une
+    autre machine, et sinon poser devant lui un reverse proxy qui exige une
+    clé ou un jeton sur toutes les routes, /token_load et /get_server_info
+    comprises, ou l'isoler sur un réseau de confiance par pare-feu. Vérifier
+    depuis l'extérieur du périmètre que GET /v1/models et GET /token_load
+    cessent de rendre ces documents.
+  reference:
+    - https://github.com/ModelTC/lightllm
+    - https://github.com/ModelTC/lightllm/blob/main/lightllm/server/api_http.py
+    - https://github.com/ModelTC/lightllm/blob/main/lightllm/server/api_models.py
+    - https://github.com/ModelTC/lightllm/blob/main/lightllm/server/api_cli.py
+    - https://github.com/ModelTC/lightllm/blob/main/lightllm/server/api_start.py
+    - https://github.com/ModelTC/lightllm/blob/main/lightllm/utils/shm_port_args.py
+  metadata:
+    max-request: 2
+    vendor: modeltc
+    product: lightllm
+  tags: ai,llm,lightllm,modeltc,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures en GET, sans corps ni en-tête. token_load() relit trois
+  # flottants en mémoire partagée par rang DP ; get_models() relit les
+  # arguments de démarrage et la longueur maximale de requête. Ni l'une ni
+  # l'autre ne touche au modèle.
+  #
+  # Rien d'autre n'est envoyé : POST /v1/chat/completions, /v1/completions,
+  # /v1/messages, /v1/responses et /generate font tourner le modèle sur le GPU
+  # de l'exploitant — l'abus que le constat signale, pas ce qu'un scanner a le
+  # droit de faire pour l'établir. Ne sont pas lus non plus GET /get_server_info,
+  # qui livre la configuration entière, /health et /healthz ({"message":"Ok"}),
+  # /liveness et /readiness ({"status":"ok"}), génériques.
+  - method: GET
+    path:
+      - "{{BaseURL}}/token_load"
+      - "{{BaseURL}}/v1/models"
+
+    # req-condition range les deux réponses dans body_1 et body_2 : c'est leur
+    # conjonction qui fait le constat.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # /token_load : le trio entier, ancré aux deux bouts, dans l'ordre du
+          # dictionnaire de token_load(). Chaque valeur est un flottant Python
+          # (float(…), donc « 0.0 », « 0.0123 » ou « 1e-05 ») sous --dp 1, une
+          # liste de flottants, un par rang, au-delà. JSONResponse sérialise
+          # compact ; les \s* absorbent l'intermédiaire qui réindente, et
+          # l'ancrage écarte le trio recopié sous une clé par une supervision.
+          # Aucune expression ne lit le statut.
+          - 'regex("^\\{\\s*\"current_load\"\\s*:\\s*(?:-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|\\[\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?(?:\\s*,\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)*\\s*\\])\\s*,\\s*\"logical_max_load\"\\s*:\\s*(?:-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|\\[\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?(?:\\s*,\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)*\\s*\\])\\s*,\\s*\"dynamic_max_load\"\\s*:\\s*(?:-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|\\[\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?(?:\\s*,\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)*\\s*\\])\\s*\\}$", trim_space(body_1))'
+
+          # /v1/models : la ModelListResponse entière, dans l'ordre des champs
+          # pydantic — object puis data, et l'unique ModelCard que get_models()
+          # construit : id, object, created, owned_by, max_model_len, rien
+          # d'autre. owned_by n'est pas lu : --model_owner le remplace. C'est
+          # l'absence de root, parent et permission qui écarte vLLM et ses
+          # dérivés, et la carte unique qui écarte une passerelle agrégeant
+          # plusieurs modèles.
+          - 'regex("^\\{\\s*\"object\"\\s*:\\s*\"list\"\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"created\"\\s*:\\s*[0-9]+\\s*,\\s*\"owned_by\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"max_model_len\"\\s*:\\s*(?:[0-9]+|null)\\s*\\}\\s*\\]\\s*\\}$", trim_space(body_2))'
+
+    extractors:
+      # Le modèle servi — --model_name, ou le nom de base de --model_dir : ce
+      # qu'un tiers peut faire tourner sans clé. Borné à body_2 : sous
+      # req-condition le moteur évalue les extracteurs contre chaque réponse.
+      - type: json
+        part: body_2
+        name: model
+        json:
+          - '.data[].id'

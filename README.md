@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-153 templates, 150 produits.
+154 templates, 151 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -99,6 +99,7 @@ amont.
 | lemonade | [`lemonade-server-exposed`](templates/exposure/lemonade-server-exposed.yaml) | high |
 | letta | [`letta-server-unauthenticated`](templates/exposure/letta-server-unauthenticated.yaml) | high |
 | librechat | [`librechat-open-registration`](templates/exposure/librechat-open-registration.yaml) | medium |
+| lightllm | [`lightllm-server-exposed`](templates/exposure/lightllm-server-exposed.yaml) | high |
 | lightpanda | [`lightpanda-cdp-exposed`](templates/exposure/lightpanda-cdp-exposed.yaml) | high |
 | lightrag | [`lightrag-server-exposed`](templates/exposure/lightrag-server-exposed.yaml) | high |
 | litellm | [`litellm-proxy-no-master-key`](templates/exposure/litellm-proxy-no-master-key.yaml) | high |

@@ -52333,3 +52333,385 @@ def test_unity_catalog_matcher_compiles_and_fires_against_a_live_server():
              (200, UNITY_CATALOG_METASTORE_NOT_UUID_BODY))):
         _, hits, _ = scan(catalogs, metastore)
         assert hits == 0, (catalogs[1][:120], metastore[1][:120])
+
+
+# --------------------------------------------------------------------------
+# LightLLM (ModelTC/lightllm) : framework Python d'inférence de LLM, lancé par
+# python -m lightllm.server.api_server, qui démarre Hypercorn sur
+# lightllm.server.api_http:app. Aucune route de ce routeur ne lit de clé ni de
+# Bearer, et api_cli.py n'en propose aucune.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux du vrai api_http.py, api_models.py et
+#     api_cli.py de main (38793654, 2026-11-19), servis par Hypercorn, sur une
+#     réplique où seules les feuilles qui parlent aux autres processus sont
+#     remplacées : HttpServerManager (longueur maximale 32768), MetricClient
+#     et TokenLoad, dont les trois colonnes float64 par rang DP sont posées à
+#     la main ; torch est absent ;
+#   - le vrai api_cli.py rend --host 127.0.0.1 et --port 8000 par défaut, et
+#     api_start.py lie Hypercorn à {host}:{get_shm_port_args().port}, qui relit
+#     --port sans rien allouer ;
+#   - JSONResponse sérialise compact et dans l'ordre d'insertion : le trio de
+#     /token_load est scalaire sous --dp 1, en listes au-delà, et un float
+#     Python s'y écrit « 1e-05 » aussi bien que « 0.0 » ;
+#   - la ModelCard de LightLLM n'a que id, object, created, owned_by,
+#     max_model_len — pas les root, parent et permission de vLLM — et owned_by
+#     vaut --model_owner quand il est posé ;
+#   - /health et /healthz rendent {"message":"Ok"}, /liveness et /readiness
+#     {"status":"ok"} : rien de propre au produit. Une erreur non rattrapée
+#     rend le 500 texte de Starlette, « Internal Server Error » — ce que rend
+#     /token_load en mode pd_master, qui ne crée pas de TokenLoad.
+
+LIGHTLLM_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                 "lightllm-server-exposed.yaml")
+
+LIGHTLLM_TOKEN_LOAD_ROUTE = "/token_load"
+LIGHTLLM_MODELS_ROUTE = "/v1/models"
+
+# Verbatim, réplique : --dp 1, serveur au repos.
+LIGHTLLM_IDLE_LOAD_BODY = (
+    '{"current_load":0.0,"logical_max_load":0.0,"dynamic_max_load":0.0}')
+
+# Verbatim, réplique : --dp 2, au repos — une liste par rang.
+LIGHTLLM_DP2_IDLE_LOAD_BODY = (
+    '{"current_load":[0.0,0.0],"logical_max_load":[0.0,0.0],'
+    '"dynamic_max_load":[0.0,0.0]}')
+
+# Verbatim, réplique : --dp 1, pool de tokens en partie occupé.
+LIGHTLLM_BUSY_LOAD_BODY = (
+    '{"current_load":0.0478515625,"logical_max_load":0.31201171875,'
+    '"dynamic_max_load":0.31201171875}')
+
+# Verbatim, réplique : --dp 4, un rang à 1e-05, un autre au-delà de 1.
+LIGHTLLM_DP4_LOAD_BODY = (
+    '{"current_load":[1e-05,0.125,0.0,0.25],"logical_max_load":[0.0,0.5,0.0,'
+    '1.0625],"dynamic_max_load":[0.0,0.5,0.0,1.0625]}')
+
+# Verbatim, réplique : --model_dir /models/Qwen2.5-7B-Instruct/, sans
+# --model_name ni --model_owner — l'id est le nom de base du répertoire.
+LIGHTLLM_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"Qwen2.5-7B-Instruct","object":"model",'
+    '"created":1763600000,"owned_by":"lightllm","max_model_len":32768}]}')
+
+# Verbatim, réplique : --model_owner acme.
+LIGHTLLM_OWNER_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"DeepSeek-V2-Lite-Chat","object":"model",'
+    '"created":1763600000,"owned_by":"acme","max_model_len":32768}]}')
+
+# Verbatim, réplique : --model_name meta-llama/Meta-Llama-3-8B-Instruct.
+LIGHTLLM_NAMED_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"meta-llama/Meta-Llama-3-8B-Instruct","ob'
+    'ject":"model","created":1763600000,"owned_by":"lightllm","max_model_len"'
+    ':32768}]}')
+
+# Verbatim, réplique : GET /health ailleurs que sur la réplique, GET /liveness
+# et une route absente.
+LIGHTLLM_HEALTH_BODY = '{"message":"Ok"}'
+LIGHTLLM_LIVENESS_BODY = '{"status":"ok"}'
+LIGHTLLM_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+LIGHTLLM_SERVER_ERROR_BODY = "Internal Server Error"
+
+
+def lightllm_token_load_body(rows):
+    """
+    Le dictionnaire de token_load() tel que JSONResponse le rend : une liste
+    par clé, un flottant par rang, ramenée à son seul élément sous --dp 1. Le
+    test des fixtures vérifie que cette aide rend, octet pour octet, les corps
+    relevés — c'est ce qui autorise à composer avec elle.
+    """
+    ans = {
+        "current_load": [float(r[0]) for r in rows],
+        "logical_max_load": [float(r[1]) for r in rows],
+        "dynamic_max_load": [float(r[2]) for r in rows],
+    }
+    if len(rows) == 1:
+        ans = {k: v[0] for k, v in ans.items()}
+    return json.dumps(ans, separators=(",", ":"), ensure_ascii=False)
+
+
+def lightllm_models_body(model_id, owner="lightllm", max_len=32768,
+                         created=1763600000):
+    return json.dumps({"object": "list", "data": [{
+        "id": model_id, "object": "model", "created": created,
+        "owned_by": owner, "max_model_len": max_len}]},
+        separators=(",", ":"), ensure_ascii=False)
+
+
+# Composé : le trio réindenté par un intermédiaire.
+LIGHTLLM_REINDENTED_LOAD_BODY = json.dumps(
+    json.loads(LIGHTLLM_BUSY_LOAD_BODY), indent=2)
+
+# Composé : un id à guillemet échappé et accent, servi sous un owner maison.
+LIGHTLLM_ESCAPED_MODELS_BODY = lightllm_models_body(
+    'qwen-"prod"-é', owner="équipe-ia")
+
+# Le trio recopié sous une clé par une supervision : ce n'est pas LightLLM qui
+# répond.
+LIGHTLLM_QUOTED_LOAD_BODY = (
+    '{"lightllm":%s,"checked_at":0}' % LIGHTLLM_IDLE_LOAD_BODY)
+
+# Le trio amputé de dynamic_max_load : token_load() pose toujours les trois.
+LIGHTLLM_TWO_KEYS_LOAD_BODY = (
+    '{"current_load":0.0,"logical_max_load":0.0}')
+
+# Le trio en chaînes : token_load() y met float(…), jamais du texte.
+LIGHTLLM_STRING_LOAD_BODY = (
+    '{"current_load":"0.0","logical_max_load":"0.0","dynamic_max_load":"0.0"}')
+
+# Une clé de plus après dynamic_max_load : ce n'est plus le dictionnaire de main.
+LIGHTLLM_EXTRA_KEY_LOAD_BODY = LIGHTLLM_IDLE_LOAD_BODY[:-1] + ',"queue":3}'
+
+# Une passerelle qui agrège deux cartes à la forme de LightLLM : get_models()
+# n'en construit jamais qu'une.
+LIGHTLLM_TWO_CARDS_MODELS_BODY = json.dumps({
+    "object": "list",
+    "data": (json.loads(LIGHTLLM_MODELS_BODY)["data"]
+             + json.loads(LIGHTLLM_OWNER_MODELS_BODY)["data"])},
+    separators=(",", ":"))
+
+# Le 401 d'un intermédiaire qui garde /v1/ et laisse /token_load ouvert.
+LIGHTLLM_PROXY_401_BODY = '{"error":"Unauthorized"}'
+
+
+def lightllm_block():
+    doc = load(LIGHTLLM_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LIGHTLLM_TOKEN_LOAD_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /token_load"
+    return blocks[0]
+
+
+def lightllm_fires(token_load=(200, LIGHTLLM_IDLE_LOAD_BODY),
+                   models=(200, LIGHTLLM_MODELS_BODY)):
+    scenario = {LIGHTLLM_TOKEN_LOAD_ROUTE: token_load,
+                LIGHTLLM_MODELS_ROUTE: models}
+    block = lightllm_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for target in block.get("path") or []:
+        route = target.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin non prévu : {route}")
+        responses.append(scenario[route])
+    return all(dsl_matcher_hits(m, responses) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_lightllm_fixtures_hold_the_bodies_read_on_the_replica():
+    assert lightllm_token_load_body([(0, 0, 0)]) == LIGHTLLM_IDLE_LOAD_BODY
+    assert lightllm_token_load_body([(0, 0, 0)] * 2) == (
+        LIGHTLLM_DP2_IDLE_LOAD_BODY)
+    assert lightllm_token_load_body(
+        [(0.0478515625, 0.31201171875, 0.31201171875)]) == (
+        LIGHTLLM_BUSY_LOAD_BODY)
+    assert lightllm_token_load_body(
+        [(1e-05, 0, 0), (0.125, 0.5, 0.5), (0, 0, 0),
+         (0.25, 1.0625, 1.0625)]) == LIGHTLLM_DP4_LOAD_BODY, (
+        "l'aide ne rend plus le trio relevé sous --dp 4 : les corps composés "
+        "ne diraient plus rien du serveur réel"
+    )
+    assert lightllm_models_body("Qwen2.5-7B-Instruct") == LIGHTLLM_MODELS_BODY
+    assert lightllm_models_body("DeepSeek-V2-Lite-Chat", owner="acme") == (
+        LIGHTLLM_OWNER_MODELS_BODY)
+    assert lightllm_models_body("meta-llama/Meta-Llama-3-8B-Instruct") == (
+        LIGHTLLM_NAMED_MODELS_BODY)
+    assert list(json.loads(LIGHTLLM_IDLE_LOAD_BODY)) == [
+        "current_load", "logical_max_load", "dynamic_max_load"]
+    assert list(json.loads(LIGHTLLM_MODELS_BODY)["data"][0]) == [
+        "id", "object", "created", "owned_by", "max_model_len"], (
+        "l'ordre des champs de la ModelCard d'api_models.py"
+    )
+    cards = json.loads(LIGHTLLM_TWO_CARDS_MODELS_BODY)["data"]
+    assert [c["id"] for c in cards] == ["Qwen2.5-7B-Instruct",
+                                        "DeepSeek-V2-Lite-Chat"]
+
+
+def test_lightllm_probe_only_reads_the_two_routes():
+    doc = load(LIGHTLLM_TEMPLATE)
+    assert request_routes(doc) == {("GET", LIGHTLLM_TOKEN_LOAD_ROUTE),
+                                   ("GET", LIGHTLLM_MODELS_ROUTE)}, (
+        "le template ne lit que GET /token_load et GET /v1/models : les "
+        "routes POST font tourner le modèle, /get_server_info livre la "
+        "configuration entière"
+    )
+    block = lightllm_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête : le constat est l'accès anonyme"
+    )
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 et body_2 n'existent pas"
+    )
+    assert [p.replace("{{BaseURL}}", "") for p in block["path"]] == [
+        LIGHTLLM_TOKEN_LOAD_ROUTE, LIGHTLLM_MODELS_ROUTE], (
+        "l'ordre des chemins donne son numéro à chaque body_N"
+    )
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 2
+    assert meta.get("product") == "lightllm"
+    assert doc["info"]["severity"] == "high"
+
+
+def test_lightllm_matcher_rests_on_both_documents_not_on_status():
+    matchers = lightllm_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}, (
+        "aucun matcher de statut ni de mot : les corps disent ce qui est servi"
+    )
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire le réécrit sans rien "
+        "changer au fait"
+    )
+    for key in ("current_load", "logical_max_load", "dynamic_max_load"):
+        assert any(key in e and "body_1" in e for e in expressions), (
+            f"le trio perd {key}")
+    assert any("max_model_len" in e and "body_2" in e for e in expressions)
+    assert not any('\\"lightllm\\"' in e for e in expressions), (
+        "owned_by n'est pas lu : --model_owner le remplace"
+    )
+    assert not any('message' in e or '\\"status\\"' in e
+                   for e in expressions), (
+        "/health et /liveness ne disent rien du produit"
+    )
+
+    for token_load, models, why in (
+        (LIGHTLLM_IDLE_LOAD_BODY, LIGHTLLM_MODELS_BODY, "--dp 1 au repos"),
+        (LIGHTLLM_DP2_IDLE_LOAD_BODY, LIGHTLLM_OWNER_MODELS_BODY,
+         "--dp 2 et --model_owner"),
+        (LIGHTLLM_BUSY_LOAD_BODY, LIGHTLLM_NAMED_MODELS_BODY,
+         "un pool occupé et --model_name"),
+        (LIGHTLLM_DP4_LOAD_BODY, LIGHTLLM_MODELS_BODY, "--dp 4 et 1e-05"),
+        (LIGHTLLM_REINDENTED_LOAD_BODY, LIGHTLLM_MODELS_BODY,
+         "le trio réindenté"),
+        (LIGHTLLM_IDLE_LOAD_BODY, LIGHTLLM_ESCAPED_MODELS_BODY,
+         "un id échappé sous un owner accentué"),
+    ):
+        assert lightllm_fires((200, token_load), (200, models)), (
+            f"le template ne reconnaît pas {why}")
+
+    for token_load, models, why in (
+        ((500, LIGHTLLM_SERVER_ERROR_BODY), (200, LIGHTLLM_MODELS_BODY),
+         "le 500 de /token_load — pd_master"),
+        ((200, LIGHTLLM_IDLE_LOAD_BODY), (401, LIGHTLLM_PROXY_401_BODY),
+         "un intermédiaire qui garde /v1/"),
+        ((200, LIGHTLLM_QUOTED_LOAD_BODY), (200, LIGHTLLM_MODELS_BODY),
+         "le trio recopié sous une clé"),
+        ((200, LIGHTLLM_TWO_KEYS_LOAD_BODY), (200, LIGHTLLM_MODELS_BODY),
+         "un trio amputé"),
+        ((200, LIGHTLLM_STRING_LOAD_BODY), (200, LIGHTLLM_MODELS_BODY),
+         "un trio en chaînes"),
+        ((200, LIGHTLLM_EXTRA_KEY_LOAD_BODY), (200, LIGHTLLM_MODELS_BODY),
+         "une clé après dynamic_max_load"),
+        ((200, LIGHTLLM_IDLE_LOAD_BODY), (200, VLLM_MODELS_BODY),
+         "la carte de vLLM, à root, parent et permission"),
+        ((200, LIGHTLLM_IDLE_LOAD_BODY), (200, OTHER_OPENAI_API_BODY),
+         "une carte sans max_model_len"),
+        ((200, LIGHTLLM_IDLE_LOAD_BODY), (200, LIGHTLLM_TWO_CARDS_MODELS_BODY),
+         "une passerelle à deux cartes"),
+        ((200, LIGHTLLM_HEALTH_BODY), (200, LIGHTLLM_LIVENESS_BODY),
+         "/health et /liveness"),
+        ((404, LIGHTLLM_NOT_FOUND_BODY), (404, LIGHTLLM_NOT_FOUND_BODY),
+         "un autre service FastAPI"),
+        ((404, ""), (404, ""), "des routes absentes"),
+    ):
+        assert not lightllm_fires(token_load, models), (
+            f"le template conclut sur {why}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_lightllm_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil, que req-condition
+    ne rend qu'une ligne et que l'extracteur borné à body_2 rend le modèle.
+    """
+    def scan(token_load, models):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == LIGHTLLM_TOKEN_LOAD_ROUTE:
+                    self.reply(*token_load)
+                elif self.path == LIGHTLLM_MODELS_ROUTE:
+                    self.reply(*models)
+                elif self.path in ("/health", "/healthz"):
+                    self.reply(200, LIGHTLLM_HEALTH_BODY)
+                elif self.path in ("/liveness", "/readiness"):
+                    self.reply(200, LIGHTLLM_LIVENESS_BODY)
+                else:
+                    self.reply(404, LIGHTLLM_NOT_FOUND_BODY)
+
+            def reply(self, code, payload):
+                data = payload.encode()
+                self.send_response(code)
+                self.send_header("Server", "hypercorn-h11")
+                if data:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LIGHTLLM_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "lightllm-server-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan((200, LIGHTLLM_IDLE_LOAD_BODY),
+                                 (200, LIGHTLLM_MODELS_BODY))
+    assert sorted(set(seen)) == sorted([LIGHTLLM_TOKEN_LOAD_ROUTE,
+                                        LIGHTLLM_MODELS_ROUTE]), (
+        f"le scan a touché une route que le template ne déclare pas — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == ["Qwen2.5-7B-Instruct"], extracted
+
+    _, hits, extracted = scan((200, LIGHTLLM_DP4_LOAD_BODY),
+                              (200, LIGHTLLM_NAMED_MODELS_BODY))
+    assert hits == 1, "le moteur perd le trio en listes ou 1e-05"
+    assert extracted == ["meta-llama/Meta-Llama-3-8B-Instruct"], extracted
+
+    _, hits, extracted = scan((200, LIGHTLLM_REINDENTED_LOAD_BODY),
+                              (200, LIGHTLLM_ESCAPED_MODELS_BODY))
+    assert hits == 1, "le moteur perd le trio réindenté ou l'id échappé"
+    assert extracted == ['qwen-"prod"-é'], extracted
+
+    for token_load, models in (
+            ((500, LIGHTLLM_SERVER_ERROR_BODY), (200, LIGHTLLM_MODELS_BODY)),
+            ((200, LIGHTLLM_IDLE_LOAD_BODY), (401, LIGHTLLM_PROXY_401_BODY)),
+            ((200, LIGHTLLM_QUOTED_LOAD_BODY), (200, LIGHTLLM_MODELS_BODY)),
+            ((200, LIGHTLLM_STRING_LOAD_BODY), (200, LIGHTLLM_MODELS_BODY)),
+            ((200, LIGHTLLM_IDLE_LOAD_BODY), (200, VLLM_MODELS_BODY)),
+            ((200, LIGHTLLM_IDLE_LOAD_BODY),
+             (200, LIGHTLLM_TWO_CARDS_MODELS_BODY)),
+            ((404, LIGHTLLM_NOT_FOUND_BODY), (404, LIGHTLLM_NOT_FOUND_BODY))):
+        _, hits, _ = scan(token_load, models)
+        assert hits == 0, (token_load[1][:120], models[1][:120])
