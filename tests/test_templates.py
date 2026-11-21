@@ -53448,3 +53448,411 @@ def test_easy_dataset_matcher_compiles_and_fires_against_a_live_server():
              "check_update": (404, EASY_DATASET_NOT_FOUND_BODY)}):
         _, results = scan(**scenario)
         assert results == {}, (scenario, results)
+
+
+# --------------------------------------------------------------------------
+# HolmesGPT (HolmesGPT/holmesgpt, anciennement robusta-dev/holmesgpt) : agent
+# IA d'investigation d'incidents Kubernetes servi en API HTTP par server.py,
+# sous uvicorn, sur 0.0.0.0:5050 par défaut (holmes/common/env_vars.py). La
+# seule authentification est le middleware api_key_auth, enregistré seulement
+# « if HOLMES_API_KEY: » ; sans la variable, aucune route n'est gardée.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux des vrais InfoResponse, get_info, get_model,
+#     health_check, readiness_check et du bloc api_key_auth de server.py de
+#     master (2154132, 2026-11-18), avec holmes/utils/auth.py, servis sous
+#     FastAPI 0.136.3, Starlette 1.3.1, pydantic 2.13.4 et uvicorn 0.40.0 — les
+#     versions du poetry.lock ; seuls la configuration, les toolsets et
+#     get_version sont remplacés ;
+#   - /api/info sérialise compact, dans l'ordre du modèle, les champs à None
+#     omis (response_model_exclude_none) : sans ?detail=full le document se
+#     ferme sur runbooks_count ;
+#   - auth_enabled vaut bool(os.environ.get("HOLMES_API_KEY", "")) mais le
+#     middleware lit la variable strip()ée : une clé faite d'espaces rend
+#     "auth_enabled":true sans qu'aucune route soit gardée, relevé sur la
+#     réplique — /api/model répond alors à l'anonyme ;
+#   - avec la clé posée, /api/info, /api/model et /api/chat rendent 401
+#     {"detail":"Invalid or missing API key"} ; /healthz et /readyz répondent
+#     toujours ;
+#   - /api/info est arrivé dans la 0.36.0 (2026-07-13), la forme
+#     d'InfoResponse n'a pas changé depuis ; /api/model rend la liste encodée
+#     par json.dumps depuis la 0.15.0 au plus tard, config.model en 0.10.0.
+
+HOLMESGPT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "holmesgpt-api-info-exposed.yaml")
+
+HOLMESGPT_INFO_ROUTE = "/api/info"
+HOLMESGPT_MODEL_ROUTE = "/api/model"
+
+# Verbatim, réplique : sans HOLMES_API_KEY, les toolsets du chart (six, dont un
+# en échec et un désactivé), deux runbooks, un modèle.
+HOLMESGPT_OPEN_BODY = (
+    '{"version":"0.46.0","uptime_seconds":3725.6,"auth_enabled":false,"model'
+    's":["gpt-4.1"],"toolsets_summary":{"total":6,"enabled":4,"failed":1,"di'
+    'sabled":1},"runbooks_count":2}')
+
+# Verbatim, réplique : sans modèle ni toolset.
+HOLMESGPT_EMPTY_BODY = (
+    '{"version":"0.46.0","uptime_seconds":3725.7,"auth_enabled":false,"model'
+    's":[],"toolsets_summary":{"total":0,"enabled":0,"failed":0,"disabled":0'
+    '},"runbooks_count":0}')
+
+# Verbatim, réplique : trois modèles dans model_list.yaml.
+HOLMESGPT_MULTI_BODY = (
+    '{"version":"0.46.0","uptime_seconds":3725.7,"auth_enabled":false,"model'
+    's":["azure-gpt-4o","bedrock-claude-sonnet","gpt-4.1"],"toolsets_summary'
+    '":{"total":1,"enabled":1,"failed":0,"disabled":0},"runbooks_count":0}')
+
+# Verbatim, réplique : ?detail=full sur l'instance du chart — ce que le
+# template ne lit pas.
+HOLMESGPT_FULL_BODY = (
+    '{"version":"0.46.0","uptime_seconds":3725.6,"auth_enabled":false,"model'
+    's":["gpt-4.1"],"toolsets_summary":{"total":6,"enabled":4,"failed":1,"di'
+    'sabled":1},"runbooks_count":2,"config_path":"/etc/holmes/config/config.'
+    'yaml","model_list_path":"/etc/holmes/config/model_list.yaml","toolsets"'
+    ':[{"name":"kubernetes/core","enabled":true,"status":"enabled","type":"b'
+    'uilt-in","tool_count":12},{"name":"kubernetes/logs","enabled":true,"sta'
+    'tus":"enabled","type":"built-in","tool_count":6},{"name":"bash","enable'
+    'd":true,"status":"enabled","type":"built-in","tool_count":1},{"name":"r'
+    'unbook","enabled":true,"status":"enabled","type":"built-in","tool_count'
+    '":1},{"name":"prometheus/metrics","enabled":true,"status":"failed","typ'
+    'e":"built-in","error":"Failed to connect to Prometheus","tool_count":5}'
+    ',{"name":"grafana/loki","enabled":false,"status":"disabled","type":"bui'
+    'lt-in","tool_count":3}],"runbooks":["dns_troubleshooting_instructions.m'
+    'd","upgrade_troubleshooting_instructions.md"],"mcp_servers":["github"]}')
+
+# Verbatim, réplique : HOLMES_API_KEY posée, requête portant X-API-Key.
+HOLMESGPT_KEYED_BODY = (
+    '{"version":"0.46.0","uptime_seconds":3726.3,"auth_enabled":true,"models'
+    '":["gpt-4.1"],"toolsets_summary":{"total":6,"enabled":4,"failed":1,"dis'
+    'abled":1},"runbooks_count":2}')
+
+# Verbatim, réplique : HOLMES_API_KEY posée, requête anonyme.
+HOLMESGPT_UNAUTHORIZED_BODY = '{"detail":"Invalid or missing API key"}'
+
+# Verbatim, réplique : /api/model sur les mêmes instances.
+HOLMESGPT_MODEL_BODY = '{"model_name":"[\\"gpt-4.1\\"]"}'
+HOLMESGPT_MODEL_MULTI_BODY = (
+    '{"model_name":"[\\"azure-gpt-4o\\", \\"bedrock-claude-sonnet\\", \\"gpt'
+    '-4.1\\"]"}')
+HOLMESGPT_MODEL_EMPTY_BODY = '{"model_name":"[]"}'
+
+# Verbatim, réplique : les sondes, servies avec ou sans clé.
+HOLMESGPT_HEALTHZ_BODY = '{"status":"healthy"}'
+HOLMESGPT_READYZ_BODY = '{"status":"ready","models":["gpt-4.1"]}'
+
+# Verbatim, réplique : une route absente, sous FastAPI.
+HOLMESGPT_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+
+def holmesgpt_info(version="0.46.0", uptime=3725.6, auth_enabled=False,
+                   models=("gpt-4.1",), summary=(6, 4, 1, 1), runbooks=2,
+                   indent=None):
+    """
+    Le document InfoResponse tel que FastAPI le rend : compact, dans l'ordre
+    du modèle. Le test des fixtures vérifie que cette aide rend, octet pour
+    octet, les corps relevés — c'est ce qui autorise à composer avec elle.
+    """
+    total, enabled, failed, disabled = summary
+    doc = {"version": version, "uptime_seconds": uptime,
+           "auth_enabled": auth_enabled, "models": list(models),
+           "toolsets_summary": {"total": total, "enabled": enabled,
+                                "failed": failed, "disabled": disabled},
+           "runbooks_count": runbooks}
+    if indent is not None:
+        return json.dumps(doc, indent=indent, ensure_ascii=False)
+    return json.dumps(doc, separators=(",", ":"), ensure_ascii=False)
+
+
+def holmesgpt_model(models):
+    """Le document de get_model : la liste passée par json.dumps, en chaîne."""
+    return json.dumps({"model_name": json.dumps(list(models))},
+                      separators=(",", ":"))
+
+
+# Hors release, get_version rend « dev-<tag>-<branche> ».
+HOLMESGPT_DEV_BODY = holmesgpt_info(version="dev-0.46.0-master")
+# Uptime arrondi à une valeur entière : pydantic écrit toujours la décimale.
+HOLMESGPT_JUST_STARTED_BODY = holmesgpt_info(uptime=4.0)
+# Un intermédiaire qui réindente.
+HOLMESGPT_REINDENTED_BODY = "\n" + holmesgpt_info(indent=2) + "\n"
+
+# auth_enabled en chaîne : pas la valeur que pydantic écrit pour un booléen.
+HOLMESGPT_STRING_FALSE_BODY = HOLMESGPT_OPEN_BODY.replace(
+    '"auth_enabled":false', '"auth_enabled":"false"')
+# Un autre service qui dit lui aussi ne pas demander d'authentification.
+OTHER_AUTH_ENABLED_FALSE_BODY = (
+    '{"version":"2.4.1","uptime_seconds":12.5,"auth_enabled":false,'
+    '"models":["llama3"]}')
+# Le résumé des toolsets sans runbooks_count derrière lui.
+HOLMESGPT_NO_RUNBOOKS_BODY = (
+    '{"version":"0.46.0","uptime_seconds":3725.6,"auth_enabled":false,"model'
+    's":["gpt-4.1"],"toolsets_summary":{"total":6,"enabled":4,"failed":1,"di'
+    'sabled":1}}')
+# Le résumé amputé d'un compteur.
+HOLMESGPT_SHORT_SUMMARY_BODY = HOLMESGPT_OPEN_BODY.replace(
+    ',"disabled":1', '')
+# Le document entier cité dans une valeur de chaîne d'un autre document.
+HOLMESGPT_QUOTED_IN_JSON_BODY = json.dumps(
+    {"auth_enabled": True, "example": HOLMESGPT_OPEN_BODY},
+    separators=(",", ":"))
+# Une page HTML qui cite le document — la documentation, une page d'aide.
+HOLMESGPT_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>" + HOLMESGPT_OPEN_BODY + "</pre></body></html>")
+
+# /api/model de la 0.10.0 : config.model en chaîne nue, rien qui nomme le
+# produit.
+HOLMESGPT_MODEL_V010_BODY = '{"model_name":"gpt-4o"}'
+# Une clé de plus : pas le document de get_model.
+HOLMESGPT_MODEL_EXTRA_KEY_BODY = (
+    '{"model_name":"[\\"gpt-4.1\\"]","provider":"openai"}')
+# La liste en tableau JSON et non en chaîne : pas ce que json.dumps encode.
+HOLMESGPT_MODEL_ARRAY_BODY = '{"model_name":["gpt-4.1"]}'
+
+
+def holmesgpt_block():
+    doc = load(HOLMESGPT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % HOLMESGPT_INFO_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/info"
+    return blocks[0]
+
+
+def holmesgpt_matcher(name):
+    found = [m for m in holmesgpt_block().get("matchers") or []
+             if m.get("name") == name]
+    assert len(found) == 1, f"matcher {name!r} absent ou en double"
+    return found[0]
+
+
+def holmesgpt_fires(name, status, body):
+    """
+    Sans req-condition, chaque réponse est jugée seule : `body` est celle que
+    le moteur vient de recevoir.
+    """
+    return dsl_matcher_hits(holmesgpt_matcher(name), [(status, body)])
+
+
+def holmesgpt_scan(info, model):
+    """
+    Le bloc rejoué : /api/info puis /api/model, matchers en `or`, arrêt au
+    premier constat. Rend le nom du matcher qui conclut, ou None.
+    """
+    block = holmesgpt_block()
+    assert block.get("matchers-condition") == "or"
+    assert block.get("stop-at-first-match") is True
+    responses = {HOLMESGPT_INFO_ROUTE: info, HOLMESGPT_MODEL_ROUTE: model}
+    for path in block.get("path") or []:
+        status, body = responses[path.replace("{{BaseURL}}", "")]
+        for m in block.get("matchers") or []:
+            if dsl_matcher_hits(m, [(status, body)]):
+                return m.get("name")
+    return None
+
+
+def test_holmesgpt_fixtures_hold_the_bodies_read_on_the_replica():
+    assert holmesgpt_info() == HOLMESGPT_OPEN_BODY
+    assert holmesgpt_info(uptime=3725.7, models=(), summary=(0, 0, 0, 0),
+                          runbooks=0) == HOLMESGPT_EMPTY_BODY
+    assert holmesgpt_info(
+        uptime=3725.7, models=("azure-gpt-4o", "bedrock-claude-sonnet",
+                               "gpt-4.1"),
+        summary=(1, 1, 0, 0), runbooks=0) == HOLMESGPT_MULTI_BODY
+    assert holmesgpt_info(uptime=3726.3, auth_enabled=True) == (
+        HOLMESGPT_KEYED_BODY)
+    assert holmesgpt_model(["gpt-4.1"]) == HOLMESGPT_MODEL_BODY
+    assert holmesgpt_model(["azure-gpt-4o", "bedrock-claude-sonnet",
+                            "gpt-4.1"]) == HOLMESGPT_MODEL_MULTI_BODY
+    assert holmesgpt_model([]) == HOLMESGPT_MODEL_EMPTY_BODY
+
+    doc = json.loads(HOLMESGPT_OPEN_BODY)
+    assert list(doc) == ["version", "uptime_seconds", "auth_enabled",
+                         "models", "toolsets_summary", "runbooks_count"], (
+        "les champs non nuls d'InfoResponse, dans l'ordre du modèle")
+    assert list(doc["toolsets_summary"]) == ["total", "enabled", "failed",
+                                             "disabled"]
+    assert doc["auth_enabled"] is False
+    full = json.loads(HOLMESGPT_FULL_BODY)
+    assert list(full)[:6] == list(doc) and list(full)[6:] == [
+        "config_path", "model_list_path", "toolsets", "runbooks",
+        "mcp_servers"], "?detail=full ajoute ses clés après runbooks_count"
+    assert json.loads(json.loads(HOLMESGPT_MODEL_BODY)["model_name"]) == [
+        "gpt-4.1"]
+
+
+def test_holmesgpt_probe_reads_info_then_model_and_nothing_else():
+    doc = load(HOLMESGPT_TEMPLATE)
+    assert request_routes(doc) == {("GET", HOLMESGPT_INFO_ROUTE),
+                                   ("GET", HOLMESGPT_MODEL_ROUTE)}, (
+        "le template ne lit que /api/info et /api/model : ?detail=full rend "
+        "les chemins et les intégrations, POST /api/chat fait travailler "
+        "l'agent, /healthz et /readyz répondent même avec une clé"
+    )
+    block = holmesgpt_block()
+    assert block.get("path") == ["{{BaseURL}}" + HOLMESGPT_INFO_ROUTE,
+                                 "{{BaseURL}}" + HOLMESGPT_MODEL_ROUTE], (
+        "/api/info d'abord : le repli ne sert qu'aux versions qui ne la "
+        "servent pas")
+    assert block.get("stop-at-first-match") is True
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête : c'est l'accès anonyme qui est constaté")
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 2
+    assert meta.get("product") == "holmesgpt"
+    assert doc["info"]["severity"] == "high"
+
+
+def test_holmesgpt_matcher_rests_on_auth_enabled_not_on_the_status():
+    matchers = holmesgpt_block().get("matchers") or []
+    assert {m.get("type") for m in matchers} == {"dsl"}
+    assert {m.get("name") for m in matchers} == {"api-info", "api-model"}
+    expressions = [e for m in matchers for e in (m.get("dsl") or [])]
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire peut rendre 200 sur tout")
+    assert holmesgpt_matcher("api-info").get("condition") == "and"
+
+    for body, why in (
+            (HOLMESGPT_OPEN_BODY, "le corps relevé, instance du chart"),
+            (HOLMESGPT_EMPTY_BODY, "une instance sans modèle ni toolset"),
+            (HOLMESGPT_MULTI_BODY, "une instance à trois modèles"),
+            (HOLMESGPT_FULL_BODY, "le corps de ?detail=full"),
+            (HOLMESGPT_DEV_BODY, "une version hors release"),
+            (HOLMESGPT_JUST_STARTED_BODY, "un uptime entier"),
+            (HOLMESGPT_REINDENTED_BODY, "le document réindenté")):
+        assert holmesgpt_fires("api-info", 200, body), (
+            f"le template ne reconnaît pas {why}")
+
+    for status, body, why in (
+            (200, HOLMESGPT_KEYED_BODY, "une instance à clé"),
+            (401, HOLMESGPT_UNAUTHORIZED_BODY, "le refus du middleware"),
+            (200, HOLMESGPT_HEALTHZ_BODY, "la sonde /healthz"),
+            (200, HOLMESGPT_READYZ_BODY, "la sonde /readyz"),
+            (200, HOLMESGPT_STRING_FALSE_BODY, "un auth_enabled en chaîne"),
+            (200, OTHER_AUTH_ENABLED_FALSE_BODY, "un autre auth_enabled faux"),
+            (200, HOLMESGPT_NO_RUNBOOKS_BODY, "un résumé sans runbooks_count"),
+            (200, HOLMESGPT_SHORT_SUMMARY_BODY, "un résumé amputé"),
+            (200, HOLMESGPT_QUOTED_IN_JSON_BODY, "le document cité en chaîne"),
+            (200, HOLMESGPT_QUOTED_IN_HTML_BODY, "une page HTML qui le cite"),
+            (200, HOLMESGPT_MODEL_BODY, "le corps de /api/model"),
+            (404, HOLMESGPT_NOT_FOUND_BODY, "une route absente")):
+        assert not holmesgpt_fires("api-info", status, body), (
+            f"le template conclut sur {why}")
+
+    for body in (HOLMESGPT_MODEL_BODY, HOLMESGPT_MODEL_MULTI_BODY,
+                 "\n" + HOLMESGPT_MODEL_BODY + "\n"):
+        assert holmesgpt_fires("api-model", 200, body), body
+    for status, body, why in (
+            (200, HOLMESGPT_MODEL_EMPTY_BODY, "une liste vide, qui ne nomme "
+                                              "personne"),
+            (200, HOLMESGPT_MODEL_V010_BODY, "la chaîne nue de la 0.10.0"),
+            (200, HOLMESGPT_MODEL_EXTRA_KEY_BODY, "une clé de plus"),
+            (200, HOLMESGPT_MODEL_ARRAY_BODY, "la liste en tableau"),
+            (401, HOLMESGPT_UNAUTHORIZED_BODY, "le refus du middleware"),
+            (200, HOLMESGPT_READYZ_BODY, "la sonde /readyz"),
+            (200, HOLMESGPT_OPEN_BODY, "le corps de /api/info")):
+        assert not holmesgpt_fires("api-model", status, body), (
+            f"le repli conclut sur {why}")
+
+    gone = (404, HOLMESGPT_NOT_FOUND_BODY)
+    denied = (401, HOLMESGPT_UNAUTHORIZED_BODY)
+    for info, model, expected, why in (
+            ((200, HOLMESGPT_OPEN_BODY), (200, HOLMESGPT_MODEL_BODY),
+             "api-info", "une instance récente et ouverte"),
+            (gone, (200, HOLMESGPT_MODEL_BODY), "api-model",
+             "une version d'avant /api/info"),
+            ((200, HOLMESGPT_KEYED_BODY), (200, HOLMESGPT_MODEL_BODY),
+             "api-model", "une clé faite d'espaces : rien n'est gardé"),
+            (denied, denied, None, "une instance à clé"),
+            (gone, (200, HOLMESGPT_MODEL_EMPTY_BODY), None,
+             "une version ancienne sans modèle"),
+            (gone, gone, None, "un serveur qui n'est pas HolmesGPT")):
+        assert holmesgpt_scan(info, model) == expected, why
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_holmesgpt_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `holmesgpt_scan` rejoue le bloc en Python : seul un scan contre un vrai
+    serveur dit que le lexer de nuclei lit les motifs pareil, qu'il s'arrête
+    après /api/info quand elle conclut, et ce que les extracteurs rendent.
+    """
+    def scan(info, model):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == HOLMESGPT_INFO_ROUTE:
+                    self.reply(*info)
+                elif self.path == HOLMESGPT_MODEL_ROUTE:
+                    self.reply(*model)
+                else:
+                    self.reply(404, HOLMESGPT_NOT_FOUND_BODY)
+
+            def reply(self, code, payload):
+                data = payload.encode()
+                self.send_response(code)
+                self.send_header("Server", "uvicorn")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", HOLMESGPT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "holmesgpt-api-info-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       item.get("extracted-results")) for item in lines]
+
+    gone = (404, HOLMESGPT_NOT_FOUND_BODY)
+    denied = (401, HOLMESGPT_UNAUTHORIZED_BODY)
+
+    seen, hits = scan((200, HOLMESGPT_OPEN_BODY), (200, HOLMESGPT_MODEL_BODY))
+    assert seen == [HOLMESGPT_INFO_ROUTE], (
+        f"/api/info conclut : le repli n'est pas lu — {seen}")
+    assert hits == [("api-info", ["0.46.0", "gpt-4.1"])], hits
+
+    for body in (HOLMESGPT_MULTI_BODY, HOLMESGPT_REINDENTED_BODY,
+                 HOLMESGPT_EMPTY_BODY):
+        _, hits = scan((200, body), (200, HOLMESGPT_MODEL_BODY))
+        assert [name for name, _ in hits] == ["api-info"], (body[:120], hits)
+
+    seen, hits = scan(gone, (200, HOLMESGPT_MODEL_MULTI_BODY))
+    assert seen == [HOLMESGPT_INFO_ROUTE, HOLMESGPT_MODEL_ROUTE], seen
+    assert hits == [("api-model", None)], (
+        f"le repli conclut, sans valeur vide extraite — {hits}")
+
+    for info, model in ((denied, denied),
+                        ((200, HOLMESGPT_KEYED_BODY), denied),
+                        ((200, HOLMESGPT_QUOTED_IN_HTML_BODY), gone),
+                        ((200, HOLMESGPT_STRING_FALSE_BODY), gone),
+                        (gone, (200, HOLMESGPT_MODEL_EMPTY_BODY)),
+                        (gone, (200, HOLMESGPT_MODEL_V010_BODY)),
+                        ((200, HOLMESGPT_HEALTHZ_BODY),
+                         (200, HOLMESGPT_READYZ_BODY))):
+        _, hits = scan(info, model)
+        assert hits == [], (info, model, hits)

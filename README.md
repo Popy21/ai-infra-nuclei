@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-155 templates, 152 produits.
+156 templates, 153 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -77,6 +77,7 @@ amont.
 | h2o-3 | [`h2o-cluster-status-exposed`](templates/exposure/h2o-cluster-status-exposed.yaml) | high |
 | hami | [`hami-metrics-exposed`](templates/exposure/hami-metrics-exposed.yaml) | medium |
 | hayhooks | [`hayhooks-status-exposed`](templates/exposure/hayhooks-status-exposed.yaml) | high |
+| holmesgpt | [`holmesgpt-api-info-exposed`](templates/exposure/holmesgpt-api-info-exposed.yaml) | high |
 | infinity | [`infinity-embedding-server-exposed`](templates/exposure/infinity-embedding-server-exposed.yaml) | medium |
 | infinity-db | [`infinity-db-databases-exposed`](templates/exposure/infinity-db-databases-exposed.yaml) | high |
 | inspect-ai | [`inspect-ai-view-exposed`](templates/exposure/inspect-ai-view-exposed.yaml) | medium |

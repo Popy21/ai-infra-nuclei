@@ -1,0 +1,152 @@
+id: holmesgpt-api-info-exposed
+
+info:
+  name: HolmesGPT - API Server Served Without API Key
+  author: popy21
+  severity: high
+  description: |
+    HolmesGPT (HolmesGPT/holmesgpt, anciennement robusta-dev/holmesgpt) est un
+    agent IA d'investigation d'incidents Kubernetes et cloud : server.py le
+    sert en API HTTP sous FastAPI et uvicorn, sur HOLMES_HOST et HOLMES_PORT,
+    dont holmes/common/env_vars.py fixe les défauts à 0.0.0.0 et 5050. Le
+    chart (helm/holmes/templates/holmes.yaml) lance « python3 -u server.py »,
+    déclare « containerPort: 5050 » et le publie derrière un Service
+    « port: 80 ».
+    La seule authentification du serveur est un middleware : « if
+    HOLMES_API_KEY: » enregistre api_key_auth, qui rend 401 {"detail":
+    "Invalid or missing API key"} à toute requête sans X-API-Key ni Bearer
+    valide, /healthz et /readyz exceptés (AUTH_EXEMPT_PATHS). Sans la
+    variable, aucune route n'est protégée — « Default: not set
+    (authentication disabled) », dit la référence des variables
+    d'environnement de la documentation.
+    GET /api/info (« @app.get("/api/info", response_model=InfoResponse,
+    response_model_exclude_none=True) ») rend l'objet InfoResponse, dans
+    l'ordre du modèle : version, uptime_seconds, auth_enabled, models,
+    toolsets_summary — total, enabled, failed, disabled — et runbooks_count ;
+    auth_enabled vaut « bool(os.environ.get("HOLMES_API_KEY", "")) », donc
+    false sur une instance ouverte. La route existe depuis la 0.36.0
+    (2026-07-13) ; avant elle, GET /api/model rend {"model_name":
+    json.dumps(config.get_models_list())}, une liste de modèles encodée dans
+    une chaîne. Relevé sur une réplique : les vrais InfoResponse, get_info,
+    get_model, health_check, readiness_check et le bloc api_key_auth de
+    server.py de master (2154132, 2026-11-18 — à l'identique dans la release
+    0.46.0 du 2026-11-04 ; la 0.36.0 ne diffère que par l'appel qui crée
+    l'exécuteur des toolsets), avec holmes/utils/auth.py, servis sous
+    FastAPI 0.136.3, Starlette 1.3.1,
+    pydantic 2.13.4 et uvicorn 0.40.0, les versions du poetry.lock ; seuls la
+    configuration, les toolsets et la version sont remplacés. nuclei-templates
+    n'a aucun template HolmesGPT.
+  impact: |
+    Un appelant anonyme a l'usage complet de l'agent. POST /api/chat fait
+    travailler les modèles configurés, aux frais de l'exploitant, avec les
+    toolsets du serveur — le values.yaml du chart active par défaut, entre
+    autres, kubernetes/core, kubernetes/logs, prometheus/metrics, internet et
+    bash, ce dernier réglé sur « builtin_allowlist: "extended" » : l'agent lit
+    le cluster, ses journaux et ses métriques sous le compte de service du
+    pod, et lance des commandes shell. GET
+    /api/info?detail=full ajoute config_path, model_list_path, toolsets — nom,
+    état, erreur, nombre d'outils —, runbooks et mcp_servers : les chemins
+    locaux et l'inventaire des intégrations. Relevé dans le code ; le
+    template n'envoie aucune requête à /api/chat.
+  remediation: |
+    Poser HOLMES_API_KEY à une valeur longue et aléatoire, puis redémarrer le
+    serveur : le middleware api_key_auth n'est enregistré qu'au démarrage.
+    Tant que ce n'est pas fait, ne publier ni le port 5050 ni le Service hors
+    du cluster — pas d'Ingress, de LoadBalancer ni de NodePort —, ou placer
+    devant un intermédiaire qui authentifie toutes les routes, /api/
+    comprise. Réduire les toolsets à ce qui sert et restreindre les droits du
+    compte de service du pod. Vérifier depuis l'extérieur du périmètre que
+    GET /api/info rend 401 ; /healthz et /readyz restent servis, ils ne
+    disent rien. Après une exposition, relire la consommation des clés de
+    fournisseur de LLM.
+  reference:
+    - https://github.com/HolmesGPT/holmesgpt
+    - https://github.com/HolmesGPT/holmesgpt/blob/master/server.py
+    - https://github.com/HolmesGPT/holmesgpt/blob/master/holmes/utils/auth.py
+    - https://github.com/HolmesGPT/holmesgpt/blob/master/holmes/common/env_vars.py
+    - https://github.com/HolmesGPT/holmesgpt/blob/master/helm/holmes/templates/holmes.yaml
+    - https://github.com/HolmesGPT/holmesgpt/blob/master/helm/holmes/values.yaml
+    - https://holmesgpt.dev/latest/reference/environment-variables/
+    - https://holmesgpt.dev/latest/reference/http-api/
+  metadata:
+    max-request: 2
+    vendor: holmesgpt
+    product: holmesgpt
+  tags: ai,llm,agent,holmesgpt,kubernetes,exposure,unauth,misconfig
+
+http:
+  # Deux lectures au plus, en GET, sans corps ni en-tête. GET /api/info
+  # d'abord, qui compte les toolsets et ne lance aucun outil ; GET /api/model
+  # ensuite, pour les versions d'avant la 0.36.0, qui ne servent pas encore
+  # /api/info. stop-at-first-match ferme la marche dès que /api/info conclut :
+  # une instance récente et ouverte ne voit qu'une requête, et ne remonte
+  # qu'une fois.
+  #
+  # Rien d'autre n'est lu. /api/info?detail=full rend les chemins locaux et
+  # l'inventaire des intégrations, POST /api/chat fait travailler l'agent :
+  # ce que le constat signale, pas ce qu'un scanner a besoin de lire pour
+  # l'établir. /healthz et /readyz répondent même avec une clé posée : ils
+  # ne prouvent rien.
+  #
+  # Aucun en-tête X-API-Key ni Authorization : c'est l'accès anonyme qui est
+  # constaté.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/info"
+      - "{{BaseURL}}/api/model"
+
+    stop-at-first-match: true
+    matchers-condition: or
+
+    matchers:
+      # La réponse de /api/info. Le document s'ouvre sur version, puis
+      # uptime_seconds, auth_enabled et la liste models, dans l'ordre du
+      # modèle pydantic ; et auth_enabled est false — HOLMES_API_KEY vide,
+      # donc pas de middleware. Ancré au début du corps : une page HTML qui
+      # citerait le document n'est pas lue.
+      #
+      # Puis le couple qui nomme le produit : l'objet toolsets_summary et
+      # ses quatre compteurs, dans l'ordre de ToolsetsSummary, suivi de
+      # runbooks_count. Une valeur de chaîne ne peut pas imiter ces clés :
+      # JSON y échappe le guillemet. Les \s* absorbent l'intermédiaire qui
+      # réindente.
+      - type: dsl
+        name: api-info
+        condition: and
+        dsl:
+          - 'regex("^\\{\\s*\"version\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"uptime_seconds\"\\s*:\\s*[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\\s*,\\s*\"auth_enabled\"\\s*:\\s*false\\s*,\\s*\"models\"\\s*:\\s*\\[", trim_space(body))'
+          - 'regex("\"toolsets_summary\"\\s*:\\s*\\{\\s*\"total\"\\s*:\\s*[0-9]+\\s*,\\s*\"enabled\"\\s*:\\s*[0-9]+\\s*,\\s*\"failed\"\\s*:\\s*[0-9]+\\s*,\\s*\"disabled\"\\s*:\\s*[0-9]+\\s*\\}\\s*,\\s*\"runbooks_count\"\\s*:\\s*[0-9]+\\s*[,}]", body)'
+
+      # Le repli, pour une version d'avant /api/info : le document entier de
+      # get_model, ancré aux deux bouts — une seule clé, model_name, dont la
+      # valeur est la liste que json.dumps écrit, crochets, guillemets
+      # échappés et séparateur « , » compris. Signature plus faible que la
+      # première : au moins un modèle est exigé, {"model_name":"[]"} ne
+      # nommant personne. La réponse vaut constat, la clé posée faisant
+      # rendre 401 par le middleware à cette route aussi.
+      #
+      # La 0.10.0 rendait dans model_name config.model, une chaîne nue : ces
+      # versions-là ne sont pas reconnues.
+      - type: dsl
+        name: api-model
+        dsl:
+          - 'regex("^\\{\\s*\"model_name\"\\s*:\\s*\"\\[\\\\\"[^\"\\\\]+\\\\\"(?:, \\\\\"[^\"\\\\]+\\\\\")*\\]\"\\s*\\}$", trim_space(body))'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout,
+    # seul le corps dit ce qui est servi.
+
+    extractors:
+      # La version servie — celle que la CI écrit dans holmes/__init__.py, ou
+      # « dev-… » hors release — et les modèles que /api/chat ferait payer.
+      # Seul le corps de /api/info porte ces clés ; « strings » écarte le null
+      # que .version rendrait sur celui de /api/model, et qui remonterait en
+      # valeur vide.
+      - type: json
+        name: version
+        json:
+          - '.version | strings'
+
+      - type: json
+        name: models
+        json:
+          - '.models[]? | strings'
