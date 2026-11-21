@@ -1,0 +1,119 @@
+id: voltagent-agents-exposed
+
+info:
+  name: VoltAgent - Agent Inventory and System Prompts Exposed via /agents
+  author: popy21
+  severity: high
+  description: |
+    VoltAgent (VoltAgent/voltagent) est un framework TypeScript d'agents IA
+    dont le serveur HTTP, @voltagent/server-hono, sert les agents et les
+    workflows déclarés dans « new VoltAgent({ agents, server: honoServer() }) ».
+    hono-server-provider.ts écoute sur « hostname: this.honoConfig.hostname ||
+    "0.0.0.0" » — toutes les interfaces sans réglage — et le port est alloué
+    depuis preferredPorts de server-core, 3141 d'abord (bannière « HTTP
+    Server: http://localhost:3141 »).
+    L'authentification est optionnelle : app-factory.ts ne monte un
+    middleware que « if (config.authNext) » ou « if (config.auth) » ; sans
+    l'un ni l'autre, aucune route n'est gardée — « Option 1: No
+    Authentication (Default) », « All endpoints are publicly accessible. »,
+    dit la documentation.
+    GET /agents (handleGetAgents, agent.handlers.ts) rend l'enveloppe
+    {"success":true,"data":[...]} ; chaque agent y porte, dans cet ordre, id,
+    name, description, status, model, tools, subAgents, memory et
+    isTelemetryEnabled — description reçoit fullState.instructions, le prompt
+    système de l'agent, ou « Dynamic instructions » s'il est calculé.
+    Limite : sous l'ancien mode auth, GET /agents figure parmi les routes
+    publiques par défaut (DEFAULT_LEGACY_PUBLIC_ROUTES de auth/defaults.ts,
+    avec GET /doc, GET /ui et GET /) alors que POST /agents/:id/text et
+    /stream y restent protégées. Le constat prouve donc l'exposition de
+    l'inventaire et des prompts système, pas à lui seul l'exécution. Sous
+    authNext, la même route rend 401 « Console access required ».
+    Relevé sur une réplique : @voltagent/core 2.11.1, @voltagent/server-hono
+    2.0.14, @voltagent/server-core 2.1.20, hono 4.13.19, @hono/node-server
+    2.1.11, sans authentification, puis sous auth et sous authNext.
+    nuclei-templates n'a aucun template VoltAgent.
+  impact: |
+    Un appelant anonyme lit les instructions, le modèle et les outils —
+    nom, description, schéma des paramètres — de chaque agent et de ses
+    sous-agents : la logique métier et les consignes que l'opérateur croyait
+    internes. Sans authentification configurée, POST /agents/:id/text
+    (agent.generateText(input, options)), /agents/:id/stream et POST
+    /workflows/:id/execute exécutent agents et workflows, outils compris, aux
+    frais de l'opérateur et sous ses clés de fournisseur de LLM. Relevé dans
+    le code ; le template n'envoie aucune requête d'exécution.
+  remediation: |
+    Configurer authNext dans honoServer({ authNext: { provider: jwtAuth(...)
+    } }) : toutes les routes sont alors protégées par défaut, GET /agents
+    compris, qui exige la clé de console (VOLTAGENT_CONSOLE_ACCESS_KEY). Ne
+    pas s'en tenir à l'ancien auth, qui laisse GET /agents public. Lancer le
+    serveur avec NODE_ENV=production : hors production, l'en-tête
+    x-voltagent-dev: true ou ?dev=true contourne l'authentification. Sinon,
+    lier le serveur à 127.0.0.1 (hostname) et ne pas publier le port 3141.
+    Vérifier depuis l'extérieur que GET /agents rend 401. Après une
+    exposition, relire la consommation des clés de fournisseur de LLM.
+  reference:
+    - https://github.com/VoltAgent/voltagent
+    - https://github.com/VoltAgent/voltagent/blob/main/packages/server-core/src/handlers/agent.handlers.ts
+    - https://github.com/VoltAgent/voltagent/blob/main/packages/server-core/src/routes/definitions.ts
+    - https://github.com/VoltAgent/voltagent/blob/main/packages/server-core/src/auth/defaults.ts
+    - https://github.com/VoltAgent/voltagent/blob/main/packages/server-hono/src/app-factory.ts
+    - https://github.com/VoltAgent/voltagent/blob/main/packages/server-hono/src/hono-server-provider.ts
+    - https://voltagent.dev/docs/api/authentication/
+  metadata:
+    max-request: 1
+    vendor: voltagent
+    product: voltagent
+  tags: ai,llm,agent,voltagent,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, en GET, sans corps ni en-tête : GET /agents, qui liste
+  # et ne lance rien. GET / n'est pas lu — c'est la page d'accueil HTML de
+  # getLandingPageHTML(), servie aussi sous l'ancien auth et qui ne dit rien
+  # des agents. POST /agents/:id/text, /stream et /workflows/:id/execute font
+  # travailler les modèles : ce que le constat signale, pas ce qu'un scanner a
+  # besoin d'appeler pour l'établir.
+  #
+  # Aucun en-tête x-voltagent-dev, x-console-access-key ni Authorization :
+  # c'est l'accès anonyme qui est constaté.
+  - method: GET
+    path:
+      - "{{BaseURL}}/agents"
+
+    matchers:
+      # L'enveloppe de handleGetAgents, ancrée au début du corps : success
+      # vrai, puis data, une liste dont le premier agent s'ouvre sur id, name
+      # et description, dans l'ordre de l'objet que le handler construit. Une
+      # page HTML ou un document JSON qui citerait la réponse n'est pas lu.
+      #
+      # Puis les deux clés qui nomment le produit : subAgents, une liste —
+      # vide quand l'agent n'en a pas —, et isTelemetryEnabled, booléen qui
+      # ferme l'objet de chaque agent. Une valeur de chaîne ne peut pas imiter
+      # ces clés : JSON y échappe le guillemet. Les \s* absorbent
+      # l'intermédiaire qui réindente.
+      #
+      # Une instance sans agent rend {"success":true,"data":[]} : rien à lire,
+      # pas de constat.
+      - type: dsl
+        name: agents
+        condition: and
+        dsl:
+          - 'regex("^\\{\\s*\"success\"\\s*:\\s*true\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"description\"\\s*:\\s*\"", trim_space(body))'
+          - 'regex("\"subAgents\"\\s*:\\s*\\[", body)'
+          - 'regex("\"isTelemetryEnabled\"\\s*:\\s*(?:true|false)\\s*\\}", body)'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout,
+    # seul le corps dit ce qui est servi.
+
+    extractors:
+      # Les identifiants d'agent — ceux que POST /agents/:id/text prend dans
+      # son chemin — et les modèles qu'ils feraient payer. « strings » écarte
+      # un modèle qui ne serait pas une chaîne.
+      - type: json
+        name: agents
+        json:
+          - '.data[]?.id | strings'
+
+      - type: json
+        name: models
+        json:
+          - '.data[]?.model | strings'

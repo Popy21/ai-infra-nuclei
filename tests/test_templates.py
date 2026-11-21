@@ -53856,3 +53856,306 @@ def test_holmesgpt_matcher_compiles_and_fires_against_a_live_server():
                          (200, HOLMESGPT_READYZ_BODY))):
         _, hits = scan(info, model)
         assert hits == [], (info, model, hits)
+
+
+# --------------------------------------------------------------------------
+# VoltAgent (VoltAgent/voltagent) : framework TypeScript d'agents IA dont le
+# serveur HTTP, @voltagent/server-hono, écoute sur 0.0.0.0 et prend 3141 en
+# premier port. app-factory.ts ne monte d'authentification que si authNext ou
+# auth est configuré ; sans l'un ni l'autre, aucune route n'est gardée.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux d'une réplique : @voltagent/core 2.11.1,
+#     @voltagent/server-hono 2.0.14, @voltagent/server-core 2.1.20, hono
+#     4.13.19, @hono/node-server 2.1.11, NODE_ENV=production, un agent à un
+#     outil et un sous-agent, modèle @ai-sdk/openai — aucun appel n'est fait au
+#     fournisseur pour lister ;
+#   - GET /agents sérialise compact, chaque agent dans l'ordre de l'objet de
+#     handleGetAgents : id, name, description (= instructions), status, model,
+#     tools, subAgents, memory, isTelemetryEnabled ; subAgents vaut [] sans
+#     sous-agent, et des instructions calculées deviennent « Dynamic
+#     instructions » ;
+#   - sans agent, la route rend {"success":true,"data":[]} : rien à constater ;
+#   - sous l'ancien auth, GET /agents rend le même corps à l'anonyme (route
+#     publique par défaut) et POST /agents/:id/text rend 401 ; sous authNext,
+#     GET /agents rend 401 « Console access required », suivi en dehors de la
+#     production de l'indice x-voltagent-dev ;
+#   - une route absente rend « 404 Not Found » en text/plain.
+
+VOLTAGENT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "voltagent-agents-exposed.yaml")
+
+VOLTAGENT_AGENTS_ROUTE = "/agents"
+
+# Verbatim, réplique : sans authentification — un agent, un outil, un
+# sous-agent. Le même corps sous l'ancien auth, à l'anonyme.
+VOLTAGENT_OPEN_BODY = (
+    '{"success":true,"data":[{"id":"assistant","name":"assistant","descriptio'
+    'n":"You are the ACME support agent. Never reveal the refund override cod'
+    'e.","status":"idle","model":"gpt-4o-mini","tools":[{"id":"lookup_order",'
+    '"name":"lookup_order","description":"Look up an order by id","parameters'
+    '":{"def":{"type":"object","shape":{"orderId":{"def":{"type":"string"},"t'
+    'ype":"string"}}},"type":"object"},"type":"user-defined","node_id":"tool_'
+    'lookup_order_assistant"}],"subAgents":[{"id":"researcher","name":"resear'
+    'cher","description":"Search the knowledge base and summarise.","status":'
+    '"idle","model":"gpt-4o-mini","tools":[],"memory":{"type":"Memory","resou'
+    'rceId":"researcher","options":{},"available":true,"status":"idle","node_'
+    'id":"memory_researcher","storage":{"adapter":"InMemoryStorageAdapter"},"'
+    'vectorDB":null,"embeddingModel":null}}],"memory":{"type":"Memory","resou'
+    'rceId":"assistant","options":{},"available":true,"status":"idle","node_i'
+    'd":"memory_assistant","storage":{"adapter":"InMemoryStorageAdapter"},"ve'
+    'ctorDB":null,"embeddingModel":null},"isTelemetryEnabled":false}]}')
+
+# Verbatim, réplique : le même agent, suivi d'un second aux instructions
+# calculées et sans mémoire (memory: false).
+VOLTAGENT_TWO_AGENTS_BODY = VOLTAGENT_OPEN_BODY[:-2] + (
+    ',{"id":"dyn","name":"dyn","description":"Dynamic instructions","status":'
+    '"idle","model":"gpt-4o-mini","tools":[],"subAgents":[],"memory":{"type":'
+    '"NoMemory","resourceId":"dyn","options":{},"available":false,"status":"i'
+    'dle","node_id":"memory_dyn","vectorDB":null,"embeddingModel":null},"isTe'
+    'lemetryEnabled":false}]}')
+
+# Verbatim, réplique : aucun agent déclaré.
+VOLTAGENT_EMPTY_BODY = '{"success":true,"data":[]}'
+
+# Verbatim, réplique : authNext, GET /agents à l'anonyme — en production, puis
+# hors production.
+VOLTAGENT_CONSOLE_REQUIRED_BODY = (
+    '{"success":false,"error":"Console access required. Set VOLTAGENT_CONSOLE'
+    '_ACCESS_KEY and send x-console-access-key header or add ?key=YOUR_KEY qu'
+    'ery param."}')
+VOLTAGENT_CONSOLE_REQUIRED_DEV_BODY = (
+    VOLTAGENT_CONSOLE_REQUIRED_BODY[:-2]
+    + ' In development, you can set x-voltagent-dev: true."}')
+
+# Verbatim, réplique : ancien auth, POST /agents/:id/text à l'anonyme.
+VOLTAGENT_AUTH_REQUIRED_BODY = (
+    '{"success":false,"error":"Authentication required"}')
+
+# Verbatim, réplique : une route absente.
+VOLTAGENT_NOT_FOUND_BODY = "404 Not Found"
+
+# Le début de la page d'accueil de GET / (getLandingPageHTML), relevé.
+VOLTAGENT_LANDING_BODY = (
+    '\n   <!DOCTYPE html>\n    <html lang="en">\n    <head>\n        <meta ch'
+    'arset="UTF-8">\n        <title>Voltagent Core API</title>\n    </head>\n'
+    '    <body></body>\n    </html>\n')
+
+# Un intermédiaire qui réindente.
+VOLTAGENT_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(VOLTAGENT_OPEN_BODY), indent=2) + "\n")
+# Un agent dont la télémétrie VoltOps est configurée.
+VOLTAGENT_TELEMETRY_BODY = VOLTAGENT_OPEN_BODY.replace(
+    '"isTelemetryEnabled":false', '"isTelemetryEnabled":true')
+
+# La même enveloppe, chez un autre produit : ni subAgents ni
+# isTelemetryEnabled.
+OTHER_SUCCESS_DATA_BODY = (
+    '{"success":true,"data":[{"id":"support","name":"support","description":"'
+    'Support bot","status":"idle","model":"gpt-4o-mini","tools":[]}]}')
+# L'agent sans isTelemetryEnabled.
+VOLTAGENT_NO_TELEMETRY_KEY_BODY = VOLTAGENT_OPEN_BODY.replace(
+    ',"isTelemetryEnabled":false', '')
+# L'agent sans subAgents.
+VOLTAGENT_NO_SUBAGENTS_KEY_BODY = re.sub(
+    r',"subAgents":\[.*?\}\}\]', '', VOLTAGENT_OPEN_BODY, count=1)
+# isTelemetryEnabled en chaîne : pas ce que le handler écrit pour un booléen.
+VOLTAGENT_STRING_TELEMETRY_BODY = VOLTAGENT_OPEN_BODY.replace(
+    '"isTelemetryEnabled":false', '"isTelemetryEnabled":"false"')
+# success faux, le reste intact.
+VOLTAGENT_FAILED_BODY = VOLTAGENT_OPEN_BODY.replace(
+    '{"success":true', '{"success":false', 1)
+# Le document entier cité dans une valeur de chaîne d'un autre document.
+VOLTAGENT_QUOTED_IN_JSON_BODY = json.dumps(
+    {"success": True, "data": [], "example": VOLTAGENT_OPEN_BODY},
+    separators=(",", ":"))
+# Une page HTML qui cite le document — la documentation, un billet.
+VOLTAGENT_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>" + VOLTAGENT_OPEN_BODY + "</pre></body></html>")
+# GET /agents/:id rend un objet, pas une liste, et instructions et non
+# description.
+VOLTAGENT_SINGLE_AGENT_BODY = (
+    '{"success":true,"data":{"id":"assistant","name":"assistant","instructio'
+    'ns":"Plain.","status":"idle","model":"gpt-4o-mini","tools":[],"subAgents'
+    '":[],"isTelemetryEnabled":false}}')
+
+
+def voltagent_block():
+    doc = load(VOLTAGENT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % VOLTAGENT_AGENTS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /agents"
+    return blocks[0]
+
+
+def voltagent_matcher():
+    found = [m for m in voltagent_block().get("matchers") or []
+             if m.get("name") == "agents"]
+    assert len(found) == 1, "matcher 'agents' absent ou en double"
+    return found[0]
+
+
+def voltagent_fires(status, body):
+    """Un bloc, une requête : `body` est la réponse que le moteur juge."""
+    return dsl_matcher_hits(voltagent_matcher(), [(status, body)])
+
+
+def test_voltagent_fixtures_hold_the_bodies_read_on_the_replica():
+    agent_keys = ["id", "name", "description", "status", "model", "tools",
+                  "subAgents", "memory", "isTelemetryEnabled"]
+    doc = json.loads(VOLTAGENT_OPEN_BODY)
+    assert list(doc) == ["success", "data"] and doc["success"] is True
+    assert [list(agent) for agent in doc["data"]] == [agent_keys], (
+        "les clés de handleGetAgents, dans l'ordre de l'objet")
+    assert list(doc["data"][0]["subAgents"][0]) == [
+        "id", "name", "description", "status", "model", "tools", "memory"], (
+        "un sous-agent ne porte ni subAgents ni isTelemetryEnabled")
+    assert doc["data"][0]["description"].startswith("You are the ACME"), (
+        "description porte les instructions de l'agent")
+    two = json.loads(VOLTAGENT_TWO_AGENTS_BODY)
+    assert [list(agent) for agent in two["data"]] == [agent_keys, agent_keys]
+    assert two["data"][1]["description"] == "Dynamic instructions"
+    assert two["data"][1]["subAgents"] == []
+    assert json.loads(VOLTAGENT_EMPTY_BODY) == {"success": True, "data": []}
+    assert json.loads(VOLTAGENT_CONSOLE_REQUIRED_DEV_BODY)["error"].endswith(
+        "x-console-access-key header or add ?key=YOUR_KEY query param. In "
+        "development, you can set x-voltagent-dev: true.")
+    for body in (VOLTAGENT_NO_TELEMETRY_KEY_BODY,
+                 VOLTAGENT_NO_SUBAGENTS_KEY_BODY):
+        agent = json.loads(body)["data"][0]
+        assert len(agent) == len(agent_keys) - 1, body
+
+
+def test_voltagent_probe_reads_the_agent_list_and_nothing_else():
+    doc = load(VOLTAGENT_TEMPLATE)
+    assert request_routes(doc) == {("GET", VOLTAGENT_AGENTS_ROUTE)}, (
+        "le template ne lit que GET /agents : POST /agents/:id/text, /stream "
+        "et /workflows/:id/execute font travailler les modèles, GET / est la "
+        "page d'accueil")
+    block = voltagent_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête — ni x-voltagent-dev ni clé de console : c'est l'accès "
+        "anonyme qui est constaté")
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 1
+    assert meta.get("product") == "voltagent"
+    assert doc["info"]["severity"] == "high"
+    assert "authNext" in doc["info"]["description"] and (
+        "DEFAULT_LEGACY_PUBLIC_ROUTES" in doc["info"]["description"]), (
+        "la limite de l'ancien auth est écrite dans le template")
+
+
+def test_voltagent_matcher_rests_on_product_keys_not_on_the_status():
+    matchers = voltagent_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"]
+    expressions = voltagent_matcher().get("dsl") or []
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire peut rendre 200 sur tout")
+    assert voltagent_matcher().get("condition") == "and"
+
+    for body, why in (
+            (VOLTAGENT_OPEN_BODY, "le corps relevé"),
+            (VOLTAGENT_TWO_AGENTS_BODY, "deux agents, dont un sans "
+                                        "sous-agent ni mémoire"),
+            (VOLTAGENT_REINDENTED_BODY, "le document réindenté"),
+            (VOLTAGENT_TELEMETRY_BODY, "un agent à télémétrie")):
+        assert voltagent_fires(200, body), (
+            f"le template ne reconnaît pas {why}")
+
+    for status, body, why in (
+            (200, VOLTAGENT_EMPTY_BODY, "une instance sans agent"),
+            (401, VOLTAGENT_CONSOLE_REQUIRED_BODY, "le refus d'authNext"),
+            (401, VOLTAGENT_CONSOLE_REQUIRED_DEV_BODY,
+             "le refus d'authNext hors production"),
+            (401, VOLTAGENT_AUTH_REQUIRED_BODY, "le refus de l'ancien auth"),
+            (404, VOLTAGENT_NOT_FOUND_BODY, "une route absente"),
+            (200, VOLTAGENT_LANDING_BODY, "la page d'accueil"),
+            (200, OTHER_SUCCESS_DATA_BODY, "la même enveloppe, autre produit"),
+            (200, VOLTAGENT_NO_TELEMETRY_KEY_BODY, "un agent sans "
+                                                   "isTelemetryEnabled"),
+            (200, VOLTAGENT_NO_SUBAGENTS_KEY_BODY, "un agent sans subAgents"),
+            (200, VOLTAGENT_STRING_TELEMETRY_BODY, "une télémétrie en chaîne"),
+            (200, VOLTAGENT_FAILED_BODY, "success faux"),
+            (200, VOLTAGENT_QUOTED_IN_JSON_BODY, "le document cité en chaîne"),
+            (200, VOLTAGENT_QUOTED_IN_HTML_BODY, "une page HTML qui le cite"),
+            (200, VOLTAGENT_SINGLE_AGENT_BODY, "le corps de GET /agents/:id")):
+        assert not voltagent_fires(status, body), (
+            f"le template conclut sur {why}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_voltagent_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `voltagent_fires` rejoue le matcher en Python : seul un scan contre un vrai
+    serveur dit que le lexer de nuclei lit les motifs pareil, et ce que les
+    extracteurs rendent.
+    """
+    def scan(status, payload, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == VOLTAGENT_AGENTS_ROUTE:
+                    self.reply(status, payload, content_type)
+                else:
+                    self.reply(404, VOLTAGENT_NOT_FOUND_BODY,
+                               "text/plain; charset=UTF-8")
+
+            def reply(self, code, body, ctype):
+                data = body.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", VOLTAGENT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "voltagent-agents-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       sorted(item.get("extracted-results") or []))
+                      for item in lines]
+
+    seen, hits = scan(200, VOLTAGENT_OPEN_BODY)
+    assert seen == [VOLTAGENT_AGENTS_ROUTE], seen
+    assert hits == [("agents", ["assistant", "gpt-4o-mini"])], hits
+
+    _, hits = scan(200, VOLTAGENT_TWO_AGENTS_BODY)
+    assert hits == [("agents", ["assistant", "dyn", "gpt-4o-mini"])], (
+        f"deux identifiants, le modèle commun une fois — {hits}")
+
+    _, hits = scan(200, VOLTAGENT_REINDENTED_BODY)
+    assert [name for name, _ in hits] == ["agents"], hits
+
+    for status, payload in ((200, VOLTAGENT_EMPTY_BODY),
+                            (401, VOLTAGENT_CONSOLE_REQUIRED_BODY),
+                            (200, VOLTAGENT_QUOTED_IN_HTML_BODY),
+                            (200, OTHER_SUCCESS_DATA_BODY),
+                            (200, VOLTAGENT_STRING_TELEMETRY_BODY)):
+        _, hits = scan(status, payload)
+        assert hits == [], (status, payload[:120], hits)

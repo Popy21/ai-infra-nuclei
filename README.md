@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-156 templates, 153 produits.
+157 templates, 154 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -184,6 +184,7 @@ amont.
 | verba | [`verba-health-exposed`](templates/exposure/verba-health-exposed.yaml) | medium |
 | vespa | [`vespa-config-server-exposed`](templates/exposure/vespa-config-server-exposed.yaml) | critical |
 | vllm | [`vllm-unauthenticated-api`](templates/exposure/vllm-unauthenticated-api.yaml) | high |
+| voltagent | [`voltagent-agents-exposed`](templates/exposure/voltagent-agents-exposed.yaml) | high |
 | weaviate | [`weaviate-anonymous-access`](templates/exposure/weaviate-anonymous-access.yaml) | high |
 | whisper-asr-webservice | [`whisper-asr-webservice-exposed`](templates/exposure/whisper-asr-webservice-exposed.yaml) | medium |
 | whisper.cpp | [`whispercpp-server-exposed`](templates/exposure/whispercpp-server-exposed.yaml) | medium |
