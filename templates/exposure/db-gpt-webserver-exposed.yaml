@@ -1,0 +1,127 @@
+id: db-gpt-webserver-exposed
+
+info:
+  name: DB-GPT - Unauthenticated Webserver Database Connections Exposed
+  author: popy21
+  severity: high
+  description: |
+    DB-GPT (eosphoros-ai/DB-GPT) est un framework d'applications de données
+    « AI-native » : text-to-SQL, agents et RAG branchés sur les bases de
+    l'organisation. Son webserver FastAPI, titré « DB-GPT Open API », monte le
+    routeur api_v1 sous /api. config.py donne host "0.0.0.0", port 5670 et
+    cors_allowed_origins "*" par défaut, et les configs/*.toml livrés écrivent
+    host = "0.0.0.0" et port = 5670 : toutes les interfaces, sans drapeau.
+    Le produit n'a pas d'authentification : get_user_from_headers
+    (dbgpt_serve/utils/auth.py, « # Mock User Info ») rend, sans en-tête,
+    l'utilisateur "001" au rôle "admin", et pour un en-tête user-id
+    quelconque, cet utilisateur-là, admin lui aussi, sans rien vérifier.
+    Les routes /api/v1 répondent dans l'enveloppe Result du produit :
+    success, err_code, err_msg, data, host_name, dans cet ordre — host_name
+    vaut socket.gethostname() du serveur. GET /api/v1/chat/db/list rend dans
+    data les lignes de la table connect_config telles quelles (SELECT *) :
+    id, db_type, db_name en tête, puis db_host, db_port, db_user et db_pwd,
+    le mot de passe de la base en clair. Ne remontent que les connexions de
+    l'utilisateur nommé — "001" sans en-tête — et celles sans propriétaire :
+    une liste vide ne dit pas qu'il n'y en a aucune.
+    GET /api/v1/chat/db/support/type rend la liste, jamais vide, des types de
+    bases pris en charge, {"db_type","is_file_db"}.
+    Limite : host_name est absent de Result en v0.5.10 et présent dès la
+    v0.6.0 ; les versions antérieures à la 0.6.0 ne sont pas reconnues.
+    Relevé sur une réplique : dbgpt, dbgpt-app, dbgpt-serve et dbgpt-ext
+    0.8.2 de PyPI, dépendances aux versions du uv.lock, lancés avec le
+    configs/dbgpt-proxy-openai.toml de la v0.8.2 (api_keys = []), le nom
+    d'hôte fixé à dbgpt-replica.
+  impact: |
+    Un appelant anonyme lit les connexions de bases de données configurées —
+    type, nom, hôte, port, utilisateur et mot de passe en clair — et atteint
+    donc directement les bases que DB-GPT interroge. Les mêmes routes, sans
+    contrôle, ajoutent une connexion (POST /api/v1/chat/db/add) ou la
+    suppriment (POST /api/v1/chat/db/delete). Avec le api_keys = [] des
+    configs livrés, POST /api/v2/chat/completions répond sans clé et avec une
+    clé fausse : inférence LLM aux frais de l'opérateur. Chaque réponse livre
+    le nom d'hôte interne du serveur. Relevé sur la réplique ; le template
+    n'envoie que les deux lectures en GET.
+  remediation: |
+    Ne pas publier le port du webserver (5670 par défaut) : écrire
+    host = "127.0.0.1" dans [service.web], ou le lier à un réseau interne.
+    Placer devant un intermédiaire qui authentifie toutes les routes — /api/v1
+    n'a aucun contrôle, et api_keys ne protège que /api/v2 —, renseigner
+    api_keys et restreindre cors_allowed_origins. Vérifier depuis l'extérieur
+    que GET /api/v1/chat/db/list ne répond plus. Après une exposition, changer
+    les mots de passe des bases enregistrées dans DB-GPT et renouveler les clés
+    des fournisseurs LLM configurés.
+  reference:
+    - https://github.com/eosphoros-ai/DB-GPT
+    - https://github.com/eosphoros-ai/DB-GPT/blob/main/packages/dbgpt-app/src/dbgpt_app/openapi/api_view_model.py
+    - https://github.com/eosphoros-ai/DB-GPT/blob/main/packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/api_v1.py
+    - https://github.com/eosphoros-ai/DB-GPT/blob/main/packages/dbgpt-serve/src/dbgpt_serve/utils/auth.py
+    - https://github.com/eosphoros-ai/DB-GPT/blob/main/packages/dbgpt-serve/src/dbgpt_serve/datasource/manages/connect_config_db.py
+    - https://github.com/eosphoros-ai/DB-GPT/blob/main/packages/dbgpt-app/src/dbgpt_app/config.py
+    - https://github.com/eosphoros-ai/DB-GPT/blob/main/configs/dbgpt-proxy-openai.toml
+  metadata:
+    max-request: 2
+    vendor: eosphoros
+    product: db-gpt
+  tags: ai,llm,rag,text-to-sql,dbgpt,db-gpt,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, en GET, sans corps ni en-tête : l'accès anonyme est ce qui
+  # est constaté. GET /api/v1/chat/db/list porte le constat, GET
+  # /api/v1/chat/db/support/type le confirme. GET /api/v1/test n'est pas lu :
+  # il rend la chaîne JSON "service status is UP", qui ne dit rien du produit.
+  # POST /api/v1/chat/db/add, /chat/db/delete et /api/v2/chat/completions
+  # écrivent ou consomment : ce que le constat signale, pas ce qu'un scanner
+  # a besoin d'appeler pour l'établir.
+  #
+  # Le port n'est pas forcé : 5670 par défaut, à donner dans la cible.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/v1/chat/db/list"
+      - "{{BaseURL}}/api/v1/chat/db/support/type"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        name: db-connections
+        condition: and
+        dsl:
+          # Le document entier de GET /api/v1/chat/db/list, ancré aux deux
+          # bouts : l'enveloppe Result réussie — success true, err_code et
+          # err_msg null, dans l'ordre des champs du modèle —, data, une
+          # liste de lignes de connect_config, puis host_name. Chaque ligne
+          # est un objet plat qui commence par id, db_type, db_name — l'ordre
+          # des colonnes, côté ORM comme dans le schéma MySQL livré — suivis
+          # de paires dont la valeur est une chaîne, un nombre, un booléen ou
+          # null. La liste peut être vide : les connexions d'un autre
+          # utilisateur ne remontent pas, et la route a quand même répondu à
+          # l'administrateur fictif. Une page HTML ou un document JSON qui
+          # citerait la réponse n'est pas lu ; les \s* absorbent
+          # l'intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"success\"\\s*:\\s*true\\s*,\\s*\"err_code\"\\s*:\\s*null\\s*,\\s*\"err_msg\"\\s*:\\s*null\\s*,\\s*\"data\"\\s*:\\s*\\[(?:\\s*\\{\\s*\"id\"\\s*:\\s*[0-9]+\\s*,\\s*\"db_type\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"db_name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"(?:\\s*,\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null))*\\s*\\}(?:\\s*,\\s*\\{\\s*\"id\"\\s*:\\s*[0-9]+\\s*,\\s*\"db_type\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"db_name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"(?:\\s*,\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*:\\s*(?:\"(?:[^\"\\\\]|\\\\.)*\"|-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null))*\\s*\\})*)?\\s*\\]\\s*,\\s*\"host_name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*\\}$", trim_space(body_1))'
+
+          # Le document entier de GET /api/v1/chat/db/support/type, dans la
+          # même enveloppe : data est une liste non vide de DbTypeInfo,
+          # {"db_type": chaîne, "is_file_db": booléen} — sqlite est toujours
+          # pris en charge. Un serveur qui rendrait le même document sur
+          # toutes ses routes échoue ici ou au-dessus : les lignes de
+          # connect_config et les DbTypeInfo n'ont pas la même forme.
+          - 'regex("^\\{\\s*\"success\"\\s*:\\s*true\\s*,\\s*\"err_code\"\\s*:\\s*null\\s*,\\s*\"err_msg\"\\s*:\\s*null\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"db_type\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"is_file_db\"\\s*:\\s*(?:true|false)\\s*\\}(?:\\s*,\\s*\\{\\s*\"db_type\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"is_file_db\"\\s*:\\s*(?:true|false)\\s*\\})*\\s*\\]\\s*,\\s*\"host_name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*\\}$", trim_space(body_2))'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout, et
+    # le produit lui-même rend 200 sur ses erreurs (success false) — seul le
+    # corps dit ce qui est servi.
+
+    extractors:
+      # Les noms des connexions exposées. Un seul extracteur, borné à body_1 :
+      # sous req-condition le moteur évalue les extracteurs contre chaque
+      # réponse et émet un résultat par extracteur qui rend quelque chose ; un
+      # second ferait remonter deux fois la même instance. db_pwd n'est pas
+      # extrait : le rapport n'a pas à recopier un secret.
+      - type: json
+        part: body_1
+        name: connections
+        json:
+          - '.data[]?.db_name | strings'

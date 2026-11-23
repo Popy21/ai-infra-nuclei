@@ -54495,3 +54495,379 @@ def test_ten_matcher_compiles_and_fires_against_a_live_server():
                              (200, TEN_LIST_IDLE_BODY))):
         _, hits = scan(graphs=graphs, listing=listing)
         assert hits == [], (graphs[1][:80], listing[1][:80], hits)
+
+
+# --------------------------------------------------------------------------
+# DB-GPT (eosphoros-ai/DB-GPT) : le webserver FastAPI « DB-GPT Open API »
+# monte api_v1 sous /api, écoute sur 0.0.0.0:5670 par défaut et n'a pas
+# d'authentification — get_user_from_headers rend un administrateur fictif,
+# "001" sans en-tête, celui que nomme l'en-tête user-id sinon.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux d'une réplique : dbgpt, dbgpt-app,
+#     dbgpt-serve et dbgpt-ext 0.8.2 de PyPI, dépendances aux versions du
+#     uv.lock, configs/dbgpt-proxy-openai.toml de la v0.8.2, nom d'hôte fixé
+#     à dbgpt-replica — host_name recopie socket.gethostname() ;
+#   - l'enveloppe Result sérialise success, err_code, err_msg, data,
+#     host_name dans cet ordre, et le produit rend 200 sur ses erreurs, avec
+#     success false ;
+#   - GET /api/v1/chat/db/list rend les lignes de connect_config telles
+#     quelles : id, db_type, db_name en tête, db_pwd en clair ;
+#   - seules remontent les connexions de l'utilisateur nommé et celles sans
+#     propriétaire : une connexion ajoutée sous user-id: alice laisse la
+#     liste vide sans en-tête ;
+#   - GET /api/v1/chat/db/support/type rend une liste jamais vide de
+#     {"db_type","is_file_db"} ; GET /api/v1/model/types rend data [] sans
+#     modèle sain ; GET /api/v1/test rend la chaîne JSON "service status is UP" ;
+#   - une route absente rend 404 et la page d'erreur Next.js de l'interface ;
+#   - host_name est absent de Result en v0.5.10, présent dès la v0.6.0.
+
+DBGPT_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                              "db-gpt-webserver-exposed.yaml")
+
+DBGPT_DB_LIST_ROUTE = "/api/v1/chat/db/list"
+DBGPT_SUPPORT_TYPE_ROUTE = "/api/v1/chat/db/support/type"
+
+# Verbatim, réplique : une connexion MySQL ajoutée par POST
+# /api/v1/chat/db/add sans en-tête, et la base d'exemple livrée.
+DBGPT_DB_LIST_BODY = (
+    '{"success":true,"err_code":null,"err_msg":null,"data":[{"id":2,"db_type"'
+    ':"mysql","db_name":"crm_prod","db_path":"","db_host":"10.0.4.12","db_por'
+    't":"3306","db_user":"dbgpt_ro","db_pwd":"replica-Secret-42","comment":"C'
+    'RM production replica","sys_code":null,"user_id":"001","user_name":null,'
+    '"gmt_created":null,"gmt_modified":null,"ext_config":null},{"id":1,"db_ty'
+    'pe":"sqlite","db_name":"Walmart_Sales","db_path":"/tmp/dbgpt-rep/home/.d'
+    'bgpt/workspace/pilot/examples/Walmart_Sales.db","db_host":"","db_port":"'
+    '0","db_user":"","db_pwd":"","comment":"Default Walmart Sales example dat'
+    'abase","sys_code":null,"user_id":"","user_name":null,"gmt_created":null,'
+    '"gmt_modified":null,"ext_config":null}],"host_name":"dbgpt-replica"}')
+DBGPT_DB_NAMES = ["crm_prod", "Walmart_Sales"]
+
+# Verbatim, réplique : la seule base d'exemple, après suppression de l'autre.
+DBGPT_DB_LIST_DEFAULT_BODY = (
+    '{"success":true,"err_code":null,"err_msg":null,"data":[{"id":1,"db_type"'
+    ':"sqlite","db_name":"Walmart_Sales","db_path":"/tmp/dbgpt-rep/home/.dbgp'
+    't/workspace/pilot/examples/Walmart_Sales.db","db_host":"","db_port":"0",'
+    '"db_user":"","db_pwd":"","comment":"Default Walmart Sales example databa'
+    'se","sys_code":null,"user_id":"","user_name":null,"gmt_created":null,"gm'
+    't_modified":null,"ext_config":null}],"host_name":"dbgpt-replica"}')
+
+# Verbatim, réplique : aucune connexion visible — toutes supprimées, ou
+# ajoutées sous un autre user-id.
+DBGPT_DB_LIST_EMPTY_BODY = (
+    '{"success":true,"err_code":null,"err_msg":null,"data":[],"host_name":"db'
+    'gpt-replica"}')
+
+# Verbatim, réplique.
+DBGPT_SUPPORT_TYPE_BODY = (
+    '{"success":true,"err_code":null,"err_msg":null,"data":[{"db_type":"tugra'
+    'ph","is_file_db":false},{"db_type":"neo4j","is_file_db":false},{"db_type'
+    '":"spark","is_file_db":true},{"db_type":"sqlite","is_file_db":true},{"db'
+    '_type":"clickhouse","is_file_db":false},{"db_type":"doris","is_file_db":'
+    'false},{"db_type":"duckdb","is_file_db":true},{"db_type":"gaussdb","is_f'
+    'ile_db":false},{"db_type":"hive","is_file_db":false},{"db_type":"maxcomp'
+    'ute","is_file_db":false},{"db_type":"mssql","is_file_db":false},{"db_typ'
+    'e":"mysql","is_file_db":false},{"db_type":"oceanbase","is_file_db":false'
+    '},{"db_type":"oracle","is_file_db":false},{"db_type":"postgresql","is_fi'
+    'le_db":false},{"db_type":"starrocks","is_file_db":false},{"db_type":"ver'
+    'tica","is_file_db":false},{"db_type":"openGauss","is_file_db":false}],"h'
+    'ost_name":"dbgpt-replica"}')
+
+# Verbatim, réplique : GET /api/v1/model/types, GET /api/v1/test.
+DBGPT_MODEL_TYPES_BODY = DBGPT_DB_LIST_EMPTY_BODY
+DBGPT_STATUS_BODY = '"service status is UP"'
+
+# Verbatim, réplique : POST /api/v1/chat/db/test/connect sur un type inconnu,
+# servi en 200.
+DBGPT_FAILED_BODY = (
+    '{"success":false,"err_code":"E1001","err_msg":"x Test connect Failure!Un'
+    'supported Db Type！nosuchdb","data":null,"host_name":"dbgpt-replica"}')
+
+# Abrégée, réplique : la page 404 de l'interface Next.js, scripts et feuilles
+# de style retirés.
+DBGPT_NOT_FOUND_BODY = (
+    '<!DOCTYPE html><html lang="en"><head><meta charSet="utf-8"/><meta name="'
+    'viewport" content="width=device-width"/><meta name="next-head-count" con'
+    'tent="2"/><link rel="icon" href="/favicon.ico"/><meta name="description"'
+    ' content="Revolutionizing Database Interactions with Private LLM Technol'
+    'ogy"/><meta property="og:description" content="eosphoros-ai"/><meta prop'
+    'erty="og:title" content="DB-GPT"/></head><body><div id="__next"><div></d'
+    'iv></div></body></html>')
+
+# Une ligne venue d'un méta-schéma MySQL : dates en chaînes, ext_config, du
+# JSON rangé dans une chaîne, avec ses accolades et ses crochets.
+DBGPT_DB_LIST_MYSQL_ROW_BODY = DBGPT_DB_LIST_DEFAULT_BODY.replace(
+    '"gmt_created":null,"gmt_modified":null,"ext_config":null',
+    '"gmt_created":"2026-11-23T18:06:07","gmt_modified":"2026-11-23T18:06:07"'
+    ',"ext_config":"{\\"schemas\\": [\\"public\\"]}"', 1)
+
+# Un intermédiaire qui réindente.
+DBGPT_DB_LIST_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(DBGPT_DB_LIST_BODY), indent=2) + "\n")
+DBGPT_SUPPORT_TYPE_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(DBGPT_SUPPORT_TYPE_BODY), indent=2) + "\n")
+
+# Result avant la v0.6.0, écrit d'après le modèle de la v0.5.10 : pas de
+# host_name.
+DBGPT_LEGACY_DB_LIST_BODY = json.dumps(
+    {key: value for key, value in json.loads(DBGPT_DB_LIST_BODY).items()
+     if key != "host_name"}, separators=(",", ":"), ensure_ascii=False)
+DBGPT_LEGACY_SUPPORT_TYPE_BODY = json.dumps(
+    {key: value for key, value in json.loads(DBGPT_SUPPORT_TYPE_BODY).items()
+     if key != "host_name"}, separators=(",", ":"), ensure_ascii=False)
+
+# Le même quatuor chez un autre produit, sur des objets d'une autre forme.
+DBGPT_OTHER_ENVELOPE_BODY = (
+    '{"success":true,"err_code":null,"err_msg":null,"data":[{"id":1,"name":"m'
+    'ain"}],"host_name":"web-1"}')
+# is_file_db en chaîne : pas ce que DbTypeInfo, un booléen, sérialise.
+DBGPT_STRING_FILE_DB_BODY = DBGPT_SUPPORT_TYPE_BODY.replace(
+    '"is_file_db":false', '"is_file_db":"false"', 1)
+# Le document entier cité dans une valeur de chaîne d'un autre document.
+DBGPT_QUOTED_IN_JSON_BODY = json.dumps(
+    {"success": True, "err_code": None, "err_msg": None, "data": [],
+     "host_name": "docs", "example": DBGPT_DB_LIST_BODY},
+    separators=(",", ":"))
+# Une page HTML qui cite le document — la documentation, un billet.
+DBGPT_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>" + DBGPT_DB_LIST_BODY + "</pre></body></html>")
+
+
+def dbgpt_block():
+    doc = load(DBGPT_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % DBGPT_DB_LIST_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/v1/chat/db/list"
+    return blocks[0]
+
+
+def dbgpt_requests():
+    """(méthode, chemin) dans l'ordre déclaré : il numérote les body_N."""
+    block = dbgpt_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def dbgpt_matcher():
+    found = [m for m in dbgpt_block().get("matchers") or []
+             if m.get("name") == "db-connections"]
+    assert len(found) == 1, "matcher 'db-connections' absent ou en double"
+    return found[0]
+
+
+def dbgpt_fires(listing=(200, DBGPT_DB_LIST_BODY),
+                types=(200, DBGPT_SUPPORT_TYPE_BODY)):
+    scenario = {normalise_route("GET", DBGPT_DB_LIST_ROUTE): listing,
+                normalise_route("GET", DBGPT_SUPPORT_TYPE_ROUTE): types}
+    responses = []
+    for request in dbgpt_requests():
+        assert request in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{request}")
+        responses.append(scenario[request])
+    return dsl_matcher_hits(dbgpt_matcher(), responses)
+
+
+def test_dbgpt_fixtures_hold_the_bodies_read_on_the_replica():
+    doc = json.loads(DBGPT_DB_LIST_BODY)
+    assert list(doc) == ["success", "err_code", "err_msg", "data",
+                         "host_name"], "l'ordre des champs de Result"
+    assert doc["success"] is True and doc["err_code"] is None
+    assert doc["host_name"] == "dbgpt-replica"
+    assert [row["db_name"] for row in doc["data"]] == DBGPT_DB_NAMES
+    assert all(list(row)[:3] == ["id", "db_type", "db_name"]
+               for row in doc["data"]), "id, db_type, db_name en tête"
+    assert doc["data"][0]["db_pwd"] == "replica-Secret-42", (
+        "le mot de passe de la connexion sort en clair")
+    assert all(not isinstance(value, (dict, list))
+               for row in doc["data"] for value in row.values()), (
+        "une ligne de connect_config est un objet plat")
+    assert json.loads(DBGPT_DB_LIST_EMPTY_BODY)["data"] == []
+    types = json.loads(DBGPT_SUPPORT_TYPE_BODY)["data"]
+    assert [list(t) for t in types] == [["db_type", "is_file_db"]] * len(types)
+    assert {"db_type": "sqlite", "is_file_db": True} in types
+    failed = json.loads(DBGPT_FAILED_BODY)
+    assert failed["success"] is False and failed["data"] is None
+    assert json.loads(DBGPT_STATUS_BODY) == "service status is UP"
+    assert "host_name" not in json.loads(DBGPT_LEGACY_DB_LIST_BODY)
+    assert json.loads(DBGPT_DB_LIST_MYSQL_ROW_BODY)["data"][0][
+        "ext_config"] == '{"schemas": ["public"]}'
+
+
+def test_dbgpt_probe_reads_two_lists_and_writes_nothing():
+    doc = load(DBGPT_TEMPLATE)
+    expected = [("GET", DBGPT_DB_LIST_ROUTE), ("GET", DBGPT_SUPPORT_TYPE_ROUTE)]
+    assert request_routes(doc) == set(expected), (
+        "le template ne lit que les deux listes : /chat/db/add et "
+        "/chat/db/delete écrivent, /api/v2/chat/completions consomme, "
+        "/api/v1/test ne dit rien du produit")
+    assert dbgpt_requests() == expected, (
+        "l'ordre des chemins numérote body_1 et body_2 — %s" % dbgpt_requests())
+    block = dbgpt_block()
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 et body_2 n'existent pas")
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête, user-id compris : c'est l'accès anonyme qui est "
+        "constaté")
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 2
+    assert meta.get("product") == "db-gpt"
+    assert doc["info"]["severity"] == "high"
+    description = doc["info"]["description"]
+    assert "5670" in description and '"0.0.0.0"' in description, (
+        "l'écoute par défaut est relevée, pas devinée")
+    assert "v0.6.0" in description, (
+        "la limite des versions sans host_name est écrite dans le template")
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1 and extractors[0].get("part") == "body_1", (
+        "un seul extracteur, borné à body_1 : sous req-condition un second "
+        "ferait remonter deux fois la même instance")
+    assert not any("db_pwd" in query for query in extractors[0].get("json")), (
+        "le rapport ne recopie pas les mots de passe")
+
+
+def test_dbgpt_matcher_rests_on_both_envelopes_not_on_the_status():
+    matchers = dbgpt_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"]
+    expressions = dbgpt_matcher().get("dsl") or []
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : le produit rend 200 sur ses erreurs")
+    assert dbgpt_matcher().get("condition") == "and"
+    assert any("body_1" in e for e in expressions) and any(
+        "body_2" in e for e in expressions), "les deux réponses sont jugées"
+
+    for listing, types, why in (
+            (DBGPT_DB_LIST_BODY, DBGPT_SUPPORT_TYPE_BODY, "les corps relevés"),
+            (DBGPT_DB_LIST_DEFAULT_BODY, DBGPT_SUPPORT_TYPE_BODY,
+             "la seule base d'exemple"),
+            (DBGPT_DB_LIST_EMPTY_BODY, DBGPT_SUPPORT_TYPE_BODY,
+             "une liste vide pour l'administrateur fictif"),
+            (DBGPT_DB_LIST_MYSQL_ROW_BODY, DBGPT_SUPPORT_TYPE_BODY,
+             "une ligne à dates et ext_config en chaînes"),
+            (DBGPT_DB_LIST_REINDENTED_BODY, DBGPT_SUPPORT_TYPE_REINDENTED_BODY,
+             "les documents réindentés")):
+        assert dbgpt_fires(listing=(200, listing), types=(200, types)), (
+            f"le template ne reconnaît pas {why}")
+
+    for listing, types, why in (
+            ((200, DBGPT_DB_LIST_BODY), (200, DBGPT_DB_LIST_BODY),
+             "le même document sur toutes les routes"),
+            ((200, DBGPT_SUPPORT_TYPE_BODY), (200, DBGPT_SUPPORT_TYPE_BODY),
+             "le corps de support/type sur toutes les routes"),
+            ((200, DBGPT_MODEL_TYPES_BODY), (200, DBGPT_MODEL_TYPES_BODY),
+             "le corps de model/types sur toutes les routes"),
+            ((200, DBGPT_FAILED_BODY), (200, DBGPT_SUPPORT_TYPE_BODY),
+             "une enveloppe en échec"),
+            ((200, DBGPT_DB_LIST_BODY), (200, DBGPT_FAILED_BODY),
+             "support/type en échec"),
+            ((200, DBGPT_STATUS_BODY), (200, DBGPT_STATUS_BODY),
+             "le corps de /api/v1/test"),
+            ((404, DBGPT_NOT_FOUND_BODY), (200, DBGPT_SUPPORT_TYPE_BODY),
+             "support/type sans la liste des connexions"),
+            ((200, DBGPT_DB_LIST_BODY), (404, DBGPT_NOT_FOUND_BODY),
+             "la liste des connexions sans support/type"),
+            ((200, DBGPT_LEGACY_DB_LIST_BODY),
+             (200, DBGPT_LEGACY_SUPPORT_TYPE_BODY),
+             "l'enveloppe d'avant la v0.6.0"),
+            ((200, DBGPT_OTHER_ENVELOPE_BODY), (200, DBGPT_SUPPORT_TYPE_BODY),
+             "le même quatuor, autre forme de données"),
+            ((200, DBGPT_DB_LIST_BODY), (200, DBGPT_STRING_FILE_DB_BODY),
+             "is_file_db en chaîne"),
+            ((200, DBGPT_QUOTED_IN_JSON_BODY), (200, DBGPT_SUPPORT_TYPE_BODY),
+             "le document cité en chaîne"),
+            ((200, DBGPT_QUOTED_IN_HTML_BODY), (200, DBGPT_SUPPORT_TYPE_BODY),
+             "une page HTML qui le cite")):
+        assert not dbgpt_fires(listing=listing, types=types), (
+            f"le template conclut sur {why}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_dbgpt_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dbgpt_fires` rejoue le matcher en Python : seul un scan contre un vrai
+    serveur dit que le lexer de nuclei lit les motifs pareil, et ce que
+    l'extracteur rend sous req-condition.
+    """
+    def scan(listing=(200, DBGPT_DB_LIST_BODY),
+             types=(200, DBGPT_SUPPORT_TYPE_BODY)):
+        seen = []
+        routes = {DBGPT_DB_LIST_ROUTE: listing,
+                  DBGPT_SUPPORT_TYPE_ROUTE: types}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in routes:
+                    status, body = routes[self.path]
+                    ctype = ("application/json" if status == 200
+                             else "text/html; charset=utf-8")
+                    self.reply(status, body, ctype)
+                else:
+                    self.reply(404, DBGPT_NOT_FOUND_BODY,
+                               "text/html; charset=utf-8")
+
+            def reply(self, code, body, ctype):
+                data = body.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", DBGPT_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "db-gpt-webserver-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       sorted(item.get("extracted-results") or []))
+                      for item in lines]
+
+    seen, hits = scan()
+    assert seen == [DBGPT_DB_LIST_ROUTE, DBGPT_SUPPORT_TYPE_ROUTE], seen
+    assert hits == [("db-connections", sorted(DBGPT_DB_NAMES))], hits
+
+    _, hits = scan(listing=(200, DBGPT_DB_LIST_EMPTY_BODY))
+    assert hits == [("db-connections", [])], hits
+
+    _, hits = scan(listing=(200, DBGPT_DB_LIST_MYSQL_ROW_BODY))
+    assert hits == [("db-connections", ["Walmart_Sales"])], hits
+
+    _, hits = scan(listing=(200, DBGPT_DB_LIST_REINDENTED_BODY),
+                   types=(200, DBGPT_SUPPORT_TYPE_REINDENTED_BODY))
+    assert [name for name, _ in hits] == ["db-connections"], hits
+
+    for listing, types in (((200, DBGPT_DB_LIST_BODY),
+                            (200, DBGPT_DB_LIST_BODY)),
+                           ((200, DBGPT_MODEL_TYPES_BODY),
+                            (200, DBGPT_MODEL_TYPES_BODY)),
+                           ((200, DBGPT_FAILED_BODY),
+                            (200, DBGPT_SUPPORT_TYPE_BODY)),
+                           ((200, DBGPT_LEGACY_DB_LIST_BODY),
+                            (200, DBGPT_LEGACY_SUPPORT_TYPE_BODY)),
+                           ((200, DBGPT_QUOTED_IN_HTML_BODY),
+                            (200, DBGPT_SUPPORT_TYPE_BODY))):
+        _, hits = scan(listing=listing, types=types)
+        assert hits == [], (listing[1][:80], types[1][:80], hits)
