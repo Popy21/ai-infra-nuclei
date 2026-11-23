@@ -54159,3 +54159,339 @@ def test_voltagent_matcher_compiles_and_fires_against_a_live_server():
                             (200, VOLTAGENT_STRING_TELEMETRY_BODY)):
         _, hits = scan(status, payload)
         assert hits == [], (status, payload[:120], hits)
+
+
+# --------------------------------------------------------------------------
+# TEN Framework (TEN-framework/ten-framework) : le serveur d'agents Go de
+# ai_agents/server lance un worker par canal Agora à partir des graphes du
+# property.json de l'application. Il n'a aucune authentification — seul
+# corsMiddleware() est monté — et écoute sur toutes les interfaces, sur
+# SERVER_PORT : 8080 dans .env.example et le Dockerfile officiels.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux d'une réplique : ai_agents/server de la
+#     release 0.11.76, gin 1.9.1, le property.json de
+#     agents/examples/voice-assistant, un tman simulé pour ouvrir des sessions ;
+#   - gin.H est une map : encoding/json en trie les clés, d'où code, data, msg
+#     dans l'enveloppe et auto_start, graph_id, name dans chaque graphe ;
+#   - GET /list alloue sa liste à la longueur de la table des workers puis la
+#     complète par append : chaque session est précédée d'un null, et sans
+#     session data vaut [] ;
+#   - un graphe sans auto_start rend "auto_start":null, un property.json sans
+#     graphe rend "data":null ;
+#   - les erreurs passent le statut HTTP en place de data : 200 et
+#     {"code":"10106","data":500,"msg":"read file failed"} ;
+#   - GET / et GET /health rendent {"code":"0","data":null,"msg":"ok"} ;
+#   - avant le commit c8495009 (2025-09-24), handleGraphs rendait uuid et non
+#     graph_id ;
+#   - une route absente rend « 404 page not found » en text/plain.
+
+TEN_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                            "ten-agent-server-graphs-exposed.yaml")
+
+TEN_GRAPHS_ROUTE = "/graphs"
+TEN_LIST_ROUTE = "/list"
+
+# Verbatim, réplique : les dix graphes du property.json de voice-assistant.
+TEN_GRAPHS_BODY = (
+    '{"code":"0","data":[{"auto_start":true,"graph_id":"voice_assistant","nam'
+    'e":"voice_assistant"},{"auto_start":false,"graph_id":"voice_assistant_xa'
+    'i_asr","name":"voice_assistant_xai_asr"},{"auto_start":false,"graph_id":'
+    '"voice_assistant_xai_tts","name":"voice_assistant_xai_tts"},{"auto_start'
+    '":false,"graph_id":"voice_assistant_xai_full","name":"voice_assistant_xa'
+    'i_full"},{"auto_start":false,"graph_id":"voice_assistant_deepgram_tts","'
+    'name":"voice_assistant_deepgram_tts"},{"auto_start":false,"graph_id":"vo'
+    'ice_assistant_gradium","name":"voice_assistant_gradium"},{"auto_start":f'
+    'alse,"graph_id":"voice_assistant_oracle","name":"voice_assistant_oracle"'
+    '},{"auto_start":false,"graph_id":"voice_assistant_smallest","name":"voic'
+    'e_assistant_smallest"},{"auto_start":false,"graph_id":"voice_assistant_a'
+    'nthropic","name":"voice_assistant_anthropic"},{"auto_start":false,"graph'
+    '_id":"voice_assistant_jev_router","name":"voice_assistant_jev_router"}],'
+    '"msg":"success"}')
+TEN_GRAPH_IDS = ["voice_assistant", "voice_assistant_xai_asr",
+                 "voice_assistant_xai_tts", "voice_assistant_xai_full",
+                 "voice_assistant_deepgram_tts", "voice_assistant_gradium",
+                 "voice_assistant_oracle", "voice_assistant_smallest",
+                 "voice_assistant_anthropic", "voice_assistant_jev_router"]
+
+# Verbatim, réplique : deux graphes, le second sans auto_start.
+TEN_GRAPHS_NULL_AUTO_START_BODY = (
+    '{"code":"0","data":[{"auto_start":true,"graph_id":"voice_assistant","nam'
+    'e":"voice_assistant"},{"auto_start":null,"graph_id":"voice_assistant_xai'
+    '_asr","name":"voice_assistant_xai_asr"}],"msg":"success"}')
+
+# Verbatim, réplique : predefined_graphs vide.
+TEN_GRAPHS_NONE_BODY = '{"code":"0","data":null,"msg":"success"}'
+
+# Verbatim, réplique : property.json illisible — servi en 200.
+TEN_READ_FILE_FAILED_BODY = (
+    '{"code":"10106","data":500,"msg":"read file failed"}')
+
+# Verbatim, réplique : GET /list sans session, avec une, puis avec deux.
+TEN_LIST_IDLE_BODY = '{"code":"0","data":[],"msg":"success"}'
+TEN_LIST_ONE_SESSION_BODY = (
+    '{"code":"0","data":[null,{"channelName":"support_call_42","createTs":179'
+    '5451354}],"msg":"success"}')
+TEN_LIST_TWO_SESSIONS_BODY = (
+    '{"code":"0","data":[null,null,{"channelName":"support_call_42","createTs'
+    '":1795451354},{"channelName":"agent_demo","createTs":1795451363}],"msg":'
+    '"success"}')
+
+# Verbatim, réplique : GET / et GET /health.
+TEN_HEALTH_BODY = '{"code":"0","data":null,"msg":"ok"}'
+
+# Verbatim, réplique : une route absente.
+TEN_NOT_FOUND_BODY = "404 page not found"
+
+# GET /graphs avant le commit c8495009, écrit d'après le handler de 2b884e49 :
+# uuid à la place de graph_id.
+TEN_LEGACY_UUID_GRAPHS_BODY = (
+    '{"code":"0","data":[{"auto_start":true,"name":"voice_assistant","uuid":"'
+    'voice_assistant"}],"msg":"success"}')
+
+# Un intermédiaire qui réindente.
+TEN_GRAPHS_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(TEN_GRAPHS_BODY), indent=2) + "\n")
+TEN_LIST_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(TEN_LIST_ONE_SESSION_BODY), indent=2) + "\n")
+
+# La même enveloppe, chez un autre produit.
+OTHER_CODE_ZERO_ENVELOPE_BODY = (
+    '{"code":"0","data":[{"id":"default","name":"default"}],"msg":"success"}')
+# code en nombre : pas ce que Code.code, une chaîne, écrit.
+TEN_NUMERIC_CODE_BODY = TEN_GRAPHS_BODY.replace('{"code":"0"', '{"code":0', 1)
+# auto_start en chaîne : pas une valeur que le property.json livre.
+TEN_STRING_AUTO_START_BODY = TEN_GRAPHS_BODY.replace(
+    '"auto_start":true', '"auto_start":"true"', 1)
+# Le document entier cité dans une valeur de chaîne d'un autre document.
+TEN_QUOTED_IN_JSON_BODY = json.dumps(
+    {"code": "0", "data": [], "msg": "success", "example": TEN_GRAPHS_BODY},
+    separators=(",", ":"))
+# Une page HTML qui cite le document — la documentation, un billet.
+TEN_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>" + TEN_GRAPHS_BODY + "</pre></body></html>")
+
+
+def ten_block():
+    doc = load(TEN_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % TEN_GRAPHS_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /graphs"
+    return blocks[0]
+
+
+def ten_requests():
+    """(méthode, chemin) dans l'ordre déclaré : il numérote les body_N."""
+    block = ten_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def ten_matcher():
+    found = [m for m in ten_block().get("matchers") or []
+             if m.get("name") == "graphs"]
+    assert len(found) == 1, "matcher 'graphs' absent ou en double"
+    return found[0]
+
+
+def ten_fires(graphs=(200, TEN_GRAPHS_BODY), listing=(200, TEN_LIST_IDLE_BODY)):
+    scenario = {normalise_route("GET", TEN_GRAPHS_ROUTE): graphs,
+                normalise_route("GET", TEN_LIST_ROUTE): listing}
+    responses = []
+    for request in ten_requests():
+        assert request in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{request}")
+        responses.append(scenario[request])
+    return dsl_matcher_hits(ten_matcher(), responses)
+
+
+def test_ten_fixtures_hold_the_bodies_read_on_the_replica():
+    doc = json.loads(TEN_GRAPHS_BODY)
+    assert list(doc) == ["code", "data", "msg"], (
+        "gin.H sérialisé par encoding/json : clés triées")
+    assert doc["code"] == "0" and doc["msg"] == "success"
+    assert [list(graph) for graph in doc["data"]] == (
+        [["auto_start", "graph_id", "name"]] * len(TEN_GRAPH_IDS))
+    assert [graph["graph_id"] for graph in doc["data"]] == TEN_GRAPH_IDS
+    assert all(graph["graph_id"] == graph["name"] for graph in doc["data"]), (
+        "graph_id et name recopient tous deux graphMap[\"name\"]")
+    assert [graph["auto_start"] for graph in doc["data"]].count(True) == 1
+    assert json.loads(TEN_GRAPHS_NULL_AUTO_START_BODY)["data"][1][
+        "auto_start"] is None
+    assert json.loads(TEN_GRAPHS_NONE_BODY)["data"] is None
+    assert json.loads(TEN_READ_FILE_FAILED_BODY)["data"] == 500, (
+        "l'erreur passe le statut en place de data")
+    assert json.loads(TEN_LIST_IDLE_BODY)["data"] == []
+    one = json.loads(TEN_LIST_ONE_SESSION_BODY)["data"]
+    assert one[0] is None and list(one[1]) == ["channelName", "createTs"]
+    two = json.loads(TEN_LIST_TWO_SESSIONS_BODY)["data"]
+    assert two[:2] == [None, None] and len(two) == 4, (
+        "autant de null que de sessions, puis les sessions")
+    assert json.loads(TEN_HEALTH_BODY) == {"code": "0", "data": None,
+                                           "msg": "ok"}
+
+
+def test_ten_probe_reads_graphs_then_list_and_starts_nothing():
+    doc = load(TEN_TEMPLATE)
+    expected = [("GET", TEN_GRAPHS_ROUTE), ("GET", TEN_LIST_ROUTE)]
+    assert request_routes(doc) == set(expected), (
+        "le template ne lit que GET /graphs et GET /list : POST /start lance "
+        "un worker, POST /token/generate signe un jeton Agora, GET /health ne "
+        "dit rien du produit")
+    assert ten_requests() == expected, (
+        "l'ordre des chemins numérote body_1 et body_2 — %s" % ten_requests())
+    block = ten_block()
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 et body_2 n'existent pas")
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête : c'est l'accès anonyme qui est constaté")
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 2
+    assert meta.get("product") == "ten-framework"
+    assert doc["info"]["severity"] == "high"
+    description = doc["info"]["description"]
+    assert "SERVER_PORT=8080" in description and "EXPOSE 8080" in description, (
+        "le port des déploiements officiels est relevé, pas deviné")
+    assert "c8495009" in description, (
+        "la limite des versions à uuid est écrite dans le template")
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1 and extractors[0].get("part") == "body_1", (
+        "un seul extracteur, borné à body_1 : sous req-condition un second "
+        "ferait remonter deux fois la même instance")
+
+
+def test_ten_matcher_rests_on_both_documents_not_on_the_status():
+    matchers = ten_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"]
+    expressions = ten_matcher().get("dsl") or []
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : le produit rend 200 sur ses erreurs")
+    assert ten_matcher().get("condition") == "and"
+    assert any("body_1" in e for e in expressions) and any(
+        "body_2" in e for e in expressions), "les deux réponses sont jugées"
+
+    for graphs, listing, why in (
+            (TEN_GRAPHS_BODY, TEN_LIST_IDLE_BODY, "les corps relevés"),
+            (TEN_GRAPHS_BODY, TEN_LIST_ONE_SESSION_BODY, "une session ouverte"),
+            (TEN_GRAPHS_BODY, TEN_LIST_TWO_SESSIONS_BODY, "deux sessions"),
+            (TEN_GRAPHS_NULL_AUTO_START_BODY, TEN_LIST_IDLE_BODY,
+             "un graphe sans auto_start"),
+            (TEN_GRAPHS_REINDENTED_BODY, TEN_LIST_REINDENTED_BODY,
+             "les documents réindentés")):
+        assert ten_fires(graphs=(200, graphs), listing=(200, listing)), (
+            f"le template ne reconnaît pas {why}")
+
+    for graphs, listing, why in (
+            ((200, TEN_GRAPHS_NONE_BODY), (200, TEN_LIST_IDLE_BODY),
+             "une instance sans graphe"),
+            ((200, TEN_READ_FILE_FAILED_BODY), (200, TEN_LIST_IDLE_BODY),
+             "l'erreur de lecture du property.json"),
+            ((200, TEN_HEALTH_BODY), (200, TEN_HEALTH_BODY),
+             "le corps de /health sur toutes les routes"),
+            ((200, TEN_GRAPHS_BODY), (200, TEN_GRAPHS_BODY),
+             "le même document sur toutes les routes"),
+            ((200, TEN_GRAPHS_BODY), (404, TEN_NOT_FOUND_BODY),
+             "/graphs sans /list"),
+            ((200, TEN_LIST_IDLE_BODY), (200, TEN_LIST_IDLE_BODY),
+             "le corps de /list sur toutes les routes"),
+            ((404, TEN_NOT_FOUND_BODY), (200, TEN_LIST_IDLE_BODY),
+             "/list sans /graphs"),
+            ((200, TEN_LEGACY_UUID_GRAPHS_BODY), (200, TEN_LIST_IDLE_BODY),
+             "l'ancienne réponse à uuid"),
+            ((200, OTHER_CODE_ZERO_ENVELOPE_BODY), (200, TEN_LIST_IDLE_BODY),
+             "la même enveloppe, autre produit"),
+            ((200, TEN_NUMERIC_CODE_BODY), (200, TEN_LIST_IDLE_BODY),
+             "code en nombre"),
+            ((200, TEN_STRING_AUTO_START_BODY), (200, TEN_LIST_IDLE_BODY),
+             "auto_start en chaîne"),
+            ((200, TEN_QUOTED_IN_JSON_BODY), (200, TEN_LIST_IDLE_BODY),
+             "le document cité en chaîne"),
+            ((200, TEN_QUOTED_IN_HTML_BODY), (200, TEN_LIST_IDLE_BODY),
+             "une page HTML qui le cite")):
+        assert not ten_fires(graphs=graphs, listing=listing), (
+            f"le template conclut sur {why}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_ten_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `ten_fires` rejoue le matcher en Python : seul un scan contre un vrai
+    serveur dit que le lexer de nuclei lit les motifs pareil, et ce que
+    l'extracteur rend sous req-condition.
+    """
+    def scan(graphs=(200, TEN_GRAPHS_BODY), listing=(200, TEN_LIST_IDLE_BODY)):
+        seen = []
+        routes = {TEN_GRAPHS_ROUTE: graphs, TEN_LIST_ROUTE: listing}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in routes:
+                    status, body = routes[self.path]
+                    ctype = ("application/json; charset=utf-8" if status == 200
+                             else "text/plain")
+                    self.reply(status, body, ctype)
+                else:
+                    self.reply(404, TEN_NOT_FOUND_BODY, "text/plain")
+
+            def reply(self, code, body, ctype):
+                data = body.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", TEN_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "ten-agent-server-graphs-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       sorted(item.get("extracted-results") or []))
+                      for item in lines]
+
+    seen, hits = scan()
+    assert seen == [TEN_GRAPHS_ROUTE, TEN_LIST_ROUTE], seen
+    assert hits == [("graphs", sorted(TEN_GRAPH_IDS))], hits
+
+    _, hits = scan(listing=(200, TEN_LIST_TWO_SESSIONS_BODY))
+    assert hits == [("graphs", sorted(TEN_GRAPH_IDS))], hits
+
+    _, hits = scan(graphs=(200, TEN_GRAPHS_REINDENTED_BODY),
+                   listing=(200, TEN_LIST_REINDENTED_BODY))
+    assert [name for name, _ in hits] == ["graphs"], hits
+
+    for graphs, listing in (((200, TEN_GRAPHS_NONE_BODY),
+                             (200, TEN_LIST_IDLE_BODY)),
+                            ((200, TEN_GRAPHS_BODY), (200, TEN_GRAPHS_BODY)),
+                            ((200, TEN_GRAPHS_BODY), (404, TEN_NOT_FOUND_BODY)),
+                            ((200, TEN_LEGACY_UUID_GRAPHS_BODY),
+                             (200, TEN_LIST_IDLE_BODY)),
+                            ((200, TEN_QUOTED_IN_HTML_BODY),
+                             (200, TEN_LIST_IDLE_BODY))):
+        _, hits = scan(graphs=graphs, listing=listing)
+        assert hits == [], (graphs[1][:80], listing[1][:80], hits)

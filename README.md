@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-157 templates, 154 produits.
+158 templates, 155 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -168,6 +168,7 @@ amont.
 | steel-browser | [`steel-browser-sessions-exposed`](templates/exposure/steel-browser-sessions-exposed.yaml) | high |
 | swarmui | [`swarmui-new-session-exposed`](templates/exposure/swarmui-new-session-exposed.yaml) | high |
 | tabby | [`tabby-health-exposed`](templates/exposure/tabby-health-exposed.yaml) | medium |
+| ten-framework | [`ten-agent-server-graphs-exposed`](templates/exposure/ten-agent-server-graphs-exposed.yaml) | high |
 | tensorboard | [`tensorboard-exposed`](templates/exposure/tensorboard-exposed.yaml) | medium |
 | tensorflow-serving | [`tensorflow-serving-model-status-exposed`](templates/exposure/tensorflow-serving-model-status-exposed.yaml) | high |
 | tensorrt_llm | [`tensorrt-llm-serve-exposed`](templates/exposure/tensorrt-llm-serve-exposed.yaml) | high |

@@ -1,0 +1,128 @@
+id: ten-agent-server-graphs-exposed
+
+info:
+  name: TEN Framework - Agent Server Graph Inventory and Sessions Exposed
+  author: popy21
+  severity: high
+  description: |
+    TEN Framework (TEN-framework/ten-framework) est un framework d'agents IA
+    conversationnels temps réel, voix et vidéo. Son serveur d'agents, le
+    binaire Go de ai_agents/server, lance un worker par canal Agora à partir
+    des graphes du property.json de l'application (-tenapp_dir). main.go lit
+    le port dans SERVER_PORT, sans défaut dans le code, puis
+    http_server.go appelle « r.Run(fmt.Sprintf(":%s", s.config.Port)) » :
+    toutes les interfaces. Le port des déploiements officiels est 8080 —
+    « SERVER_PORT=8080 » dans ai_agents/.env.example, « EXPOSE 8080 » dans
+    ai_agents/Dockerfile, et la plage « 8000-9001:8000-9001 » publiée par
+    ai_agents/docker-compose.yml.
+    Le serveur n'a aucune authentification : le seul middleware est
+    « r.Use(corsMiddleware()) », qui pose « Access-Control-Allow-Origin: * »,
+    et aucun handler ne contrôle d'identifiant.
+    Toute réponse passe par « c.JSON(httpStatus[0], gin.H{"code": code.code,
+    "msg": code.msg, "data": data}) » ; gin.H est une map, que encoding/json
+    sérialise clés triées — code, data, msg. GET /graphs (handleGraphs) rend
+    code "0", msg "success" et, dans data, un objet par graphe de
+    predefined_graphs : auto_start, graph_id, name. GET /list (handlerList)
+    rend les sessions actives, {"channelName","createTs"}, précédées d'autant
+    de null — la liste est allouée à sa longueur, puis complétée par append.
+    Limite : avant le commit c8495009 du 2025-09-24, handleGraphs rendait
+    uuid au lieu de graph_id ; ces versions ne sont pas reconnues. Ne pas
+    confondre avec tman designer (port 49483), composant distinct.
+    Relevé sur une réplique : ai_agents/server de la release 0.11.76
+    (2026-11-23, http_server.go identique à la 0.11.75), gin 1.9.1 du go.mod,
+    le property.json de agents/examples/voice-assistant et un tman simulé
+    pour ouvrir des sessions.
+  impact: |
+    Un appelant anonyme lit les graphes d'agents déployés et les canaux des
+    sessions vocales en cours. POST /token/generate signe, avec
+    l'AGORA_APP_CERTIFICATE du serveur, un jeton Agora RTC + RTM au rôle
+    RolePublisher (rtctokenbuilder.BuildTokenWithRtm) pour le canal demandé :
+    joint aux noms de canaux de /list, il permet de rejoindre une
+    conversation en cours, de l'écouter et d'y parler. POST /start lance un
+    worker d'agent sur le graphe demandé en fusionnant les properties
+    fournies par l'appelant dans celles des nœuds : consommation des clés
+    LLM, STT et TTS de l'opérateur jusqu'à WORKERS_MAX sessions. Relevé dans
+    le code ; le template n'envoie ni /token/generate ni /start.
+  remediation: |
+    Ne pas publier le port du serveur d'agents (SERVER_PORT, 8080 dans les
+    déploiements officiels) : le lier à l'interface locale ou à un réseau
+    interne, et ne l'exposer qu'à l'application web qui l'appelle. Placer
+    devant un intermédiaire qui authentifie toutes les routes, /graphs,
+    /list, /start et /token/generate comprises — le serveur n'en a aucune.
+    Vérifier depuis l'extérieur que GET /graphs ne rend pas la liste des
+    graphes. Après une exposition, renouveler l'AGORA_APP_CERTIFICATE et
+    relire la consommation des clés de fournisseurs LLM, STT et TTS.
+  reference:
+    - https://github.com/TEN-framework/ten-framework
+    - https://github.com/TEN-framework/ten-framework/blob/main/ai_agents/server/internal/http_server.go
+    - https://github.com/TEN-framework/ten-framework/blob/main/ai_agents/server/internal/code.go
+    - https://github.com/TEN-framework/ten-framework/blob/main/ai_agents/server/internal/middleware.go
+    - https://github.com/TEN-framework/ten-framework/blob/main/ai_agents/server/main.go
+    - https://github.com/TEN-framework/ten-framework/blob/main/ai_agents/.env.example
+    - https://github.com/TEN-framework/ten-framework/blob/main/ai_agents/Dockerfile
+  metadata:
+    max-request: 2
+    vendor: ten-framework
+    product: ten-framework
+  tags: ai,llm,agent,voice,ten-framework,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, en GET, sans corps ni en-tête. GET /graphs nomme le
+  # produit, GET /list le confirme. GET / et GET /health ne sont pas lus :
+  # tous deux rendent {"code":"0","data":null,"msg":"ok"}, trop générique.
+  # POST /token/generate signe un jeton avec le certificat de l'opérateur et
+  # POST /start lance un worker : ce que le constat signale, pas ce qu'un
+  # scanner a besoin d'appeler pour l'établir.
+  #
+  # Le port n'est pas forcé : 8080 dans les déploiements officiels, à donner
+  # dans la cible.
+  - method: GET
+    path:
+      - "{{BaseURL}}/graphs"
+      - "{{BaseURL}}/list"
+
+    # req-condition accumule body_N pour que la preuve porte sur les deux
+    # réponses à la fois.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        name: graphs
+        condition: and
+        dsl:
+          # Le document entier de GET /graphs, ancré aux deux bouts : code
+          # "0" en chaîne, puis data, une liste non vide d'objets aux trois
+          # clés que handleGraphs pose — dans l'ordre trié que encoding/json
+          # donne à une map —, puis msg "success". auto_start recopie la
+          # valeur du property.json : true, false, ou null quand le graphe
+          # n'en porte pas. Une page HTML ou un document JSON qui citerait la
+          # réponse n'est pas lu ; les \s* absorbent l'intermédiaire qui
+          # réindente.
+          #
+          # Sans graphe, data vaut null : rien à lire, pas de constat. Une
+          # erreur de lecture du property.json rend 200 et
+          # {"code":"10106","data":500,"msg":"read file failed"} : écartée.
+          - 'regex("^\\{\\s*\"code\"\\s*:\\s*\"0\"\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"auto_start\"\\s*:\\s*(?:true|false|null)\\s*,\\s*\"graph_id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*\\}(?:\\s*,\\s*\\{\\s*\"auto_start\"\\s*:\\s*(?:true|false|null)\\s*,\\s*\"graph_id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"name\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*\\})*\\s*\\]\\s*,\\s*\"msg\"\\s*:\\s*\"success\"\\s*\\}$", trim_space(body_1))'
+
+          # Le document entier de GET /list, dans la même enveloppe : data
+          # est une liste, vide sans session, dont chaque élément vaut null
+          # ou {"channelName":…,"createTs":…} — CreateTs est un int64, des
+          # secondes Unix. Un serveur qui rendrait le même document sur toutes
+          # ses routes échoue ici : le corps de /graphs n'a pas cette forme.
+          - 'regex("^\\{\\s*\"code\"\\s*:\\s*\"0\"\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*(?:(?:null|\\{\\s*\"channelName\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"createTs\"\\s*:\\s*[0-9]+\\s*\\})(?:\\s*,\\s*(?:null|\\{\\s*\"channelName\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"createTs\"\\s*:\\s*[0-9]+\\s*\\}))*)?\\s*\\]\\s*,\\s*\"msg\"\\s*:\\s*\"success\"\\s*\\}$", trim_space(body_2))'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout, et
+    # le produit lui-même rend 200 sur ses erreurs — seul le corps dit ce
+    # qui est servi.
+
+    extractors:
+      # Les graphes que POST /start accepte dans graph_name. Un seul
+      # extracteur, borné à body_1 : sous req-condition le moteur évalue les
+      # extracteurs contre chaque réponse et émet un résultat par extracteur
+      # qui rend quelque chose ; un second ferait remonter deux fois la même
+      # instance. « strings » écarte un nom qui ne serait pas une chaîne.
+      - type: json
+        part: body_1
+        name: graphs
+        json:
+          - '.data[]?.graph_id | strings'
