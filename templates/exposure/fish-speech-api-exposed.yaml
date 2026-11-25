@@ -1,0 +1,118 @@
+id: fish-speech-api-exposed
+
+info:
+  name: Fish Speech - Unauthenticated TTS API Server Exposed
+  author: popy21
+  severity: high
+  description: |
+    Fish Speech (fishaudio/fish-speech) est le moteur de synthèse et de
+    clonage vocal de Fish Audio (modèles S2-Pro et Drama 3). Son serveur HTTP,
+    tools/api_server.py, est une application Kui (ASGI) servie par uvicorn,
+    au document OpenAPI titré « Fish Speech API », version « 3.0.0 ».
+    L'authentification est optionnelle et absente par défaut. Le middleware
+    api_auth de tools/api_server.py rend verify — qui compare le jeton Bearer
+    à la clé — seulement « if self.args.api_key is not None », et passthrough
+    sinon ; parse_args (tools/server/api_utils.py) déclare
+    « --api-key », « default=None ». Sans ce drapeau, toutes les routes du
+    routeur répondent sans jeton.
+    L'écoute par défaut est « --listen », "127.0.0.1:8080" ; API_FLAGS.txt et
+    la documentation écrivent « --listen 0.0.0.0:8080 », et l'image Docker du
+    serveur démarre sur API_SERVER_NAME="0.0.0.0", port 8080, que compose.yml
+    publie, sans passer « --api-key ».
+    GET /v1/tts/defaults (tools/server/views.py) rend
+    JSONResponse(engine.sampling_defaults()) : model_family — "s2" ou
+    "drama3", les deux seules valeurs que le moteur admet —, chunk_length,
+    puis les réglages d'échantillonnage de la famille, max_new_tokens, top_p,
+    top_k, repetition_penalty et temperature. Rien n'est calculé ni écrit.
+    Avec « --api-key », la même route rend 401,
+    {"statusCode":401,"message":null,"error":"Unauthorized"} et
+    « WWW-Authenticate: Bearer » : le template ne conclut pas.
+    Limite : la route date de la v3.0.0-beta (« Update for Drama-3 », octobre
+    2026) ; la v2.0.0-beta et les précédentes ne la servent pas et ne sont pas
+    reconnues. Une famille de modèles ajoutée en amont devra l'être ici.
+    Relevé sur une réplique : tools/api_server.py, tools/server/views.py,
+    api_utils.py, exception_handler.py, fish_speech/utils/schema.py et
+    models/text2semantic/sampling.py du commit 0f8a12e de main,
+    sampling_defaults() et SAMPLING_DEFAULTS repris tels quels de
+    fish_speech/inference_engine/__init__.py, sous kui 1.15.0, baize 0.23.1
+    et uvicorn 0.41.0, sans clé puis avec « --api-key ». torch et le
+    chargement des modèles y sont remplacés par des bouchons : aucune
+    synthèse n'a été relevée.
+  impact: |
+    Un appelant anonyme atteint tout le routeur. POST /v1/tts synthétise le
+    texte qu'il envoie, dans la voix des enregistrements de référence qu'il
+    joint : synthèse et clonage vocal sur le GPU de l'opérateur, sans compte
+    ni limite. POST /v1/vqgan/encode et /v1/vqgan/decode encodent et décodent
+    des tokens audio. GET /v1/references/list nomme les voix de référence
+    enregistrées, POST /v1/references/add en dépose une sur le disque du
+    serveur, POST /v1/references/update la renomme et DELETE
+    /v1/references/delete la supprime. Relevé dans le code ; le template
+    n'envoie que la lecture GET /v1/tts/defaults.
+  remediation: |
+    Lancer le serveur avec « --api-key <secret> » : toutes les routes du
+    routeur, /v1/health compris, exigent alors « Authorization: Bearer
+    <secret> ». Laisser « --listen » à 127.0.0.1:8080 quand l'instance n'a pas
+    à être jointe depuis une autre machine ; sous Docker, publier le port sur
+    l'interface locale seulement (« -p 127.0.0.1:8080:8080 ») ou placer
+    devant un intermédiaire qui authentifie. Vérifier depuis l'extérieur que
+    GET /v1/tts/defaults rend 401. Après une exposition, relire le répertoire
+    references/ : des voix ont pu y être ajoutées, renommées ou supprimées.
+  reference:
+    - https://github.com/fishaudio/fish-speech
+    - https://github.com/fishaudio/fish-speech/blob/main/tools/api_server.py
+    - https://github.com/fishaudio/fish-speech/blob/main/tools/server/views.py
+    - https://github.com/fishaudio/fish-speech/blob/main/tools/server/api_utils.py
+    - https://github.com/fishaudio/fish-speech/blob/main/fish_speech/inference_engine/__init__.py
+    - https://github.com/fishaudio/fish-speech/blob/main/API_FLAGS.txt
+    - https://github.com/fishaudio/fish-speech/blob/main/docker/Dockerfile
+  metadata:
+    max-request: 1
+    vendor: fishaudio
+    product: fish-speech
+  tags: ai,ml,tts,voice-cloning,speech,fish-speech,fish-audio,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, en GET, sans corps ni en-tête : GET /v1/tts/defaults,
+  # qui rend un dictionnaire de constantes et ne touche ni au modèle ni au
+  # disque. GET /v1/health n'est pas lu : {"status":"ok"} n'appartient à
+  # personne. GET /v1/references/list non plus : sans en-tête Accept, la
+  # réponse est du msgpack. POST /v1/tts, /v1/vqgan/* et /v1/references/add,
+  # /update, DELETE /v1/references/delete calculent ou écrivent : ce que le
+  # constat signale, pas ce qu'un scanner a besoin d'appeler pour l'établir.
+  #
+  # Aucun en-tête Authorization : c'est l'accès anonyme qui est constaté.
+  # Le port n'est pas forcé : 8080 par défaut, à donner dans la cible.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/tts/defaults"
+
+    matchers:
+      - type: dsl
+        name: tts-defaults
+        condition: and
+        dsl:
+          # Le document entier de sampling_defaults(), ancré aux deux bouts :
+          # un objet plat qui s'ouvre sur model_family — "s2" ou "drama3", le
+          # Literal ModelFamily du moteur — puis chunk_length, un entier, les
+          # deux clés que la fonction écrit elle-même, dans cet ordre. Suivent
+          # les réglages de SAMPLING_DEFAULTS, des paires dont la valeur est
+          # un nombre : la table peut gagner un réglage sans que le constat
+          # tombe. Une page HTML ou un document JSON qui citerait la réponse
+          # n'est pas lu ; les \s* absorbent l'intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"model_family\"\\s*:\\s*\"(?:s2|drama3)\"\\s*,\\s*\"chunk_length\"\\s*:\\s*[0-9]+(?:\\s*,\\s*\"[a-z0-9_]+\"\\s*:\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)+\\s*\\}$", trim_space(body))'
+
+          # repetition_penalty, la troisième clé qui nomme le produit, parmi
+          # ces réglages. L'expression du dessus ne laisse passer que des
+          # valeurs numériques : le nom ne peut être ici qu'une clé.
+          - 'regex("\"repetition_penalty\"\\s*:\\s*-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?\\s*[,}]", body)'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout,
+    # seul le corps dit ce qui est servi. Une instance lancée avec --api-key
+    # rend {"statusCode":401,...} : le corps ne passe pas.
+
+    extractors:
+      # La famille du modèle chargé : "s2" (S2-Pro) ou "drama3" (Drama 3).
+      - type: json
+        name: model-family
+        json:
+          - '.model_family | strings'

@@ -54871,3 +54871,333 @@ def test_dbgpt_matcher_compiles_and_fires_against_a_live_server():
                             (200, DBGPT_SUPPORT_TYPE_BODY))):
         _, hits = scan(listing=listing, types=types)
         assert hits == [], (listing[1][:80], types[1][:80], hits)
+
+
+# --------------------------------------------------------------------------
+# Fish Speech (fishaudio/fish-speech) : le moteur de synthèse et de clonage
+# vocal de Fish Audio. Son serveur HTTP, tools/api_server.py, est une
+# application Kui servie par uvicorn ; le middleware api_auth n'exige un jeton
+# Bearer que si --api-key est donné, et parse_args le déclare default=None.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux d'une réplique : tools/api_server.py,
+#     tools/server/views.py, api_utils.py, exception_handler.py,
+#     fish_speech/utils/schema.py et models/text2semantic/sampling.py du
+#     commit 0f8a12e de main, sampling_defaults() et SAMPLING_DEFAULTS repris
+#     tels quels de fish_speech/inference_engine/__init__.py, kui 1.15.0,
+#     baize 0.23.1, uvicorn 0.41.0 ; torch et le chargement des modèles
+#     remplacés par des bouchons — aucune synthèse n'a été relevée ;
+#   - GET /v1/tts/defaults sérialise compact, dans l'ordre du dictionnaire de
+#     sampling_defaults() : model_family, chunk_length, puis les réglages de
+#     SAMPLING_DEFAULTS — les mêmes pour "s2" et "drama3" ;
+#   - avec --api-key, toutes les routes du routeur, /v1/health compris,
+#     rendent 401 : message null et « WWW-Authenticate: Bearer » sans jeton,
+#     message « Invalid token » sur un jeton faux ; GET / (la page Swagger de
+#     Kui) et GET /json (le document OpenAPI) restent servis ;
+#   - GET /v1/references/list rend du msgpack sans « Accept:
+#     application/json » ;
+#   - une route absente rend 404 et {"statusCode":404,...} ; la v2.0.0-beta
+#     n'a pas de route /v1/tts/defaults.
+
+FISH_SPEECH_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                    "fish-speech-api-exposed.yaml")
+
+FISH_SPEECH_DEFAULTS_ROUTE = "/v1/tts/defaults"
+
+# Verbatim, réplique : sans --api-key, checkpoint S2-Pro. 128 octets.
+FISH_SPEECH_DEFAULTS_BODY = (
+    '{"model_family":"s2","chunk_length":200,"max_new_tokens":1024,"top_p":0.'
+    '7,"top_k":30,"repetition_penalty":1.2,"temperature":0.7}')
+
+# Verbatim, réplique : la famille drama3 — le bouchon du gestionnaire de
+# modèles la pose là où l'amont lit le config.json du checkpoint.
+FISH_SPEECH_DRAMA3_BODY = (
+    '{"model_family":"drama3","chunk_length":200,"max_new_tokens":1024,"top_p'
+    '":0.7,"top_k":30,"repetition_penalty":1.2,"temperature":0.7}')
+
+# Verbatim, réplique : --api-key, sans jeton puis avec un jeton faux.
+FISH_SPEECH_UNAUTHORIZED_BODY = (
+    '{"statusCode":401,"message":null,"error":"Unauthorized"}')
+FISH_SPEECH_INVALID_TOKEN_BODY = (
+    '{"statusCode":401,"message":"Invalid token","error":"Unauthorized"}')
+
+# Verbatim, réplique : une route absente, GET /v1/health, GET
+# /v1/references/list sous « Accept: application/json ».
+FISH_SPEECH_NOT_FOUND_BODY = (
+    '{"statusCode":404,"message":null,"error":"Not Found"}')
+FISH_SPEECH_HEALTH_BODY = '{"status":"ok"}'
+FISH_SPEECH_REFERENCES_BODY = (
+    '{"success":true,"reference_ids":[],"message":"Found 0 reference voices"}')
+
+# Abrégés, réplique : la page Swagger de GET / et le document de GET /json,
+# réduit à la route du constat.
+FISH_SPEECH_SWAGGER_BODY = (
+    '<!DOCTYPE html>\n<html>\n\n<head>\n    <title>OpenAPI power by Kuí</titl'
+    'e>\n</head>\n\n<body>\n    <div id="swagger-ui"></div>\n</body>\n\n</htm'
+    'l>')
+FISH_SPEECH_OPENAPI_BODY = (
+    '{"openapi":"3.1.0","info":{"title":"Fish Speech API","version":"3.0.0"},'
+    '"paths":{"/v1/tts/defaults":{"get":{"summary":"Sampling defaults of the '
+    'loaded model, used for fields a request leaves unset.","responses":{}}}}'
+    '}')
+
+# Un intermédiaire qui réindente.
+FISH_SPEECH_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(FISH_SPEECH_DEFAULTS_BODY), indent=2) + "\n")
+# Écrit, pas relevé : SAMPLING_DEFAULTS avec un réglage de plus, et dans un
+# autre ordre.
+FISH_SPEECH_EXTRA_SETTING_BODY = (
+    '{"model_family":"drama3","chunk_length":300,"temperature":1.0,"top_p":1.'
+    '0,"top_k":0,"repetition_penalty":1.2,"max_new_tokens":2048,"epsilon_cuto'
+    'ff":1e-3}')
+
+# Une famille que le moteur n'admet pas.
+FISH_SPEECH_OTHER_FAMILY_BODY = FISH_SPEECH_DEFAULTS_BODY.replace(
+    '"model_family":"s2"', '"model_family":"llama"')
+# Sans repetition_penalty.
+FISH_SPEECH_NO_PENALTY_BODY = FISH_SPEECH_DEFAULTS_BODY.replace(
+    ',"repetition_penalty":1.2', '')
+# Sans chunk_length.
+FISH_SPEECH_NO_CHUNK_LENGTH_BODY = FISH_SPEECH_DEFAULTS_BODY.replace(
+    ',"chunk_length":200', '')
+# chunk_length avant model_family : pas l'ordre du dictionnaire de la fonction.
+FISH_SPEECH_REORDERED_HEAD_BODY = (
+    '{"chunk_length":200,"model_family":"s2"'
+    + FISH_SPEECH_DEFAULTS_BODY[len('{"model_family":"s2","chunk_length":200'):])
+# chunk_length puis repetition_penalty en chaînes : pas ce que le serveur
+# écrit pour un entier et un flottant.
+FISH_SPEECH_STRING_CHUNK_LENGTH_BODY = FISH_SPEECH_DEFAULTS_BODY.replace(
+    '"chunk_length":200', '"chunk_length":"200"')
+FISH_SPEECH_STRING_PENALTY_BODY = FISH_SPEECH_DEFAULTS_BODY.replace(
+    '"repetition_penalty":1.2', '"repetition_penalty":"1.2"')
+# Le dictionnaire rangé dans une enveloppe, puis dans une liste.
+FISH_SPEECH_ENVELOPED_BODY = '{"data":' + FISH_SPEECH_DEFAULTS_BODY + '}'
+FISH_SPEECH_LISTED_BODY = '[' + FISH_SPEECH_DEFAULTS_BODY + ']'
+# Le document entier cité dans une valeur de chaîne d'un autre document.
+FISH_SPEECH_QUOTED_IN_JSON_BODY = json.dumps(
+    {"model_family": "s2", "chunk_length": 200,
+     "example": FISH_SPEECH_DEFAULTS_BODY}, separators=(",", ":"))
+# Une page HTML qui cite le document — la documentation, un billet.
+FISH_SPEECH_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>" + FISH_SPEECH_DEFAULTS_BODY + "</pre></body></html>")
+
+
+def fish_speech_block():
+    doc = load(FISH_SPEECH_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % FISH_SPEECH_DEFAULTS_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /v1/tts/defaults"
+    return blocks[0]
+
+
+def fish_speech_matcher():
+    found = [m for m in fish_speech_block().get("matchers") or []
+             if m.get("name") == "tts-defaults"]
+    assert len(found) == 1, "matcher 'tts-defaults' absent ou en double"
+    return found[0]
+
+
+def fish_speech_fires(status, body):
+    """Un bloc, une requête : `body` est la réponse que le moteur juge."""
+    return dsl_matcher_hits(fish_speech_matcher(), [(status, body)])
+
+
+def test_fish_speech_fixtures_hold_the_bodies_read_on_the_replica():
+    keys = ["model_family", "chunk_length", "max_new_tokens", "top_p",
+            "top_k", "repetition_penalty", "temperature"]
+    doc = json.loads(FISH_SPEECH_DEFAULTS_BODY)
+    assert list(doc) == keys, "l'ordre du dictionnaire de sampling_defaults()"
+    assert doc == {"model_family": "s2", "chunk_length": 200,
+                   "max_new_tokens": 1024, "top_p": 0.7, "top_k": 30,
+                   "repetition_penalty": 1.2, "temperature": 0.7}
+    assert len(FISH_SPEECH_DEFAULTS_BODY.encode()) == 128
+    assert hashlib.sha256(FISH_SPEECH_DEFAULTS_BODY.encode()).hexdigest() == (
+        "f5febcaf5b8ff8d6cf218addb627b48eda7352d343eb73864831e51f679d9184"), (
+        "le corps relevé, à l'octet près")
+    drama3 = json.loads(FISH_SPEECH_DRAMA3_BODY)
+    assert list(drama3) == keys and drama3["model_family"] == "drama3"
+    assert {k: v for k, v in drama3.items() if k != "model_family"} == {
+        k: v for k, v in doc.items() if k != "model_family"}, (
+        "les deux familles partagent les réglages par défaut")
+    assert json.loads(FISH_SPEECH_UNAUTHORIZED_BODY) == {
+        "statusCode": 401, "message": None, "error": "Unauthorized"}
+    assert json.loads(FISH_SPEECH_INVALID_TOKEN_BODY)["message"] == (
+        "Invalid token")
+    assert json.loads(FISH_SPEECH_NOT_FOUND_BODY)["statusCode"] == 404
+    assert json.loads(FISH_SPEECH_HEALTH_BODY) == {"status": "ok"}
+    openapi = json.loads(FISH_SPEECH_OPENAPI_BODY)
+    assert openapi["info"] == {"title": "Fish Speech API", "version": "3.0.0"}
+    assert FISH_SPEECH_DEFAULTS_ROUTE in openapi["paths"]
+    extra = json.loads(FISH_SPEECH_EXTRA_SETTING_BODY)
+    assert list(extra)[:2] == keys[:2] and set(keys) < set(extra)
+    for body, missing in ((FISH_SPEECH_NO_PENALTY_BODY, "repetition_penalty"),
+                          (FISH_SPEECH_NO_CHUNK_LENGTH_BODY, "chunk_length")):
+        assert list(json.loads(body)) == [k for k in keys if k != missing]
+    assert list(json.loads(FISH_SPEECH_REORDERED_HEAD_BODY)) == (
+        ["chunk_length", "model_family"] + keys[2:])
+    assert json.loads(FISH_SPEECH_QUOTED_IN_JSON_BODY)["example"] == (
+        FISH_SPEECH_DEFAULTS_BODY)
+
+
+def test_fish_speech_probe_reads_the_sampling_defaults_and_nothing_else():
+    doc = load(FISH_SPEECH_TEMPLATE)
+    assert request_routes(doc) == {("GET", FISH_SPEECH_DEFAULTS_ROUTE)}, (
+        "le template ne lit que GET /v1/tts/defaults : POST /v1/tts et "
+        "/v1/vqgan/* calculent, /v1/references/add, /update et /delete "
+        "écrivent, /v1/health ne dit rien du produit")
+    block = fish_speech_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête Authorization : c'est l'accès anonyme qui est constaté")
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 1
+    assert meta.get("product") == "fish-speech"
+    assert doc["info"]["severity"] == "high"
+    description = doc["info"]["description"]
+    assert "default=None" in description and "api_auth" in description, (
+        "l'absence de clé par défaut est relevée dans le code, pas devinée")
+    assert '"127.0.0.1:8080"' in description and "0.0.0.0:8080" in description, (
+        "l'écoute par défaut et celle que la documentation écrit")
+    assert "v3.0.0-beta" in description, (
+        "la limite des versions sans /v1/tts/defaults est écrite dans le "
+        "template")
+    extractors = block.get("extractors") or []
+    assert [e.get("name") for e in extractors] == ["model-family"]
+
+
+def test_fish_speech_matcher_rests_on_product_keys_not_on_the_status():
+    matchers = fish_speech_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"]
+    expressions = fish_speech_matcher().get("dsl") or []
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire peut rendre 200 sur tout")
+    assert fish_speech_matcher().get("condition") == "and"
+    for key in ("model_family", "chunk_length", "repetition_penalty"):
+        assert any(key in e for e in expressions), (
+            f"{key} est l'une des trois clés qui nomment le produit")
+
+    for body, why in (
+            (FISH_SPEECH_DEFAULTS_BODY, "le corps relevé"),
+            (FISH_SPEECH_DRAMA3_BODY, "la famille drama3"),
+            (FISH_SPEECH_REINDENTED_BODY, "le document réindenté"),
+            (FISH_SPEECH_EXTRA_SETTING_BODY,
+             "une table de réglages qui a gagné une clé")):
+        assert fish_speech_fires(200, body), (
+            f"le template ne reconnaît pas {why}")
+
+    for status, body, why in (
+            (401, FISH_SPEECH_UNAUTHORIZED_BODY, "le refus sous --api-key"),
+            (401, FISH_SPEECH_INVALID_TOKEN_BODY, "un jeton faux"),
+            (404, FISH_SPEECH_NOT_FOUND_BODY,
+             "une version sans la route"),
+            (200, FISH_SPEECH_HEALTH_BODY, "le corps de /v1/health"),
+            (200, FISH_SPEECH_REFERENCES_BODY,
+             "le corps de /v1/references/list"),
+            (200, FISH_SPEECH_SWAGGER_BODY, "la page Swagger de Kui"),
+            (200, FISH_SPEECH_OPENAPI_BODY,
+             "le document OpenAPI, qui nomme la route"),
+            (200, FISH_SPEECH_OTHER_FAMILY_BODY,
+             "une famille que le moteur n'admet pas"),
+            (200, FISH_SPEECH_NO_PENALTY_BODY, "l'absence de "
+                                               "repetition_penalty"),
+            (200, FISH_SPEECH_NO_CHUNK_LENGTH_BODY,
+             "l'absence de chunk_length"),
+            (200, FISH_SPEECH_REORDERED_HEAD_BODY,
+             "chunk_length avant model_family"),
+            (200, FISH_SPEECH_STRING_CHUNK_LENGTH_BODY,
+             "chunk_length en chaîne"),
+            (200, FISH_SPEECH_STRING_PENALTY_BODY,
+             "repetition_penalty en chaîne"),
+            (200, FISH_SPEECH_ENVELOPED_BODY,
+             "le dictionnaire dans une enveloppe"),
+            (200, FISH_SPEECH_LISTED_BODY, "le dictionnaire dans une liste"),
+            (200, FISH_SPEECH_QUOTED_IN_JSON_BODY,
+             "le document cité en chaîne"),
+            (200, FISH_SPEECH_QUOTED_IN_HTML_BODY,
+             "une page HTML qui le cite")):
+        assert not fish_speech_fires(status, body), (
+            f"le template conclut sur {why}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_fish_speech_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `fish_speech_fires` rejoue le matcher en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei lit les motifs pareil, et ce que
+    l'extracteur rend.
+    """
+    def scan(status, payload, content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == FISH_SPEECH_DEFAULTS_ROUTE:
+                    self.reply(status, payload, content_type)
+                else:
+                    self.reply(404, FISH_SPEECH_NOT_FOUND_BODY,
+                               "application/json")
+
+            def reply(self, code, body, ctype):
+                data = body.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", FISH_SPEECH_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "fish-speech-api-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       sorted(item.get("extracted-results") or []))
+                      for item in lines]
+
+    seen, hits = scan(200, FISH_SPEECH_DEFAULTS_BODY)
+    assert seen == [FISH_SPEECH_DEFAULTS_ROUTE], seen
+    assert hits == [("tts-defaults", ["s2"])], hits
+
+    _, hits = scan(200, FISH_SPEECH_DRAMA3_BODY)
+    assert hits == [("tts-defaults", ["drama3"])], hits
+
+    for payload in (FISH_SPEECH_REINDENTED_BODY,
+                    FISH_SPEECH_EXTRA_SETTING_BODY):
+        _, hits = scan(200, payload)
+        assert [name for name, _ in hits] == ["tts-defaults"], (payload, hits)
+
+    for status, payload, content_type in (
+            (401, FISH_SPEECH_UNAUTHORIZED_BODY, "application/json"),
+            (404, FISH_SPEECH_NOT_FOUND_BODY, "application/json"),
+            (200, FISH_SPEECH_HEALTH_BODY, "application/json"),
+            (200, FISH_SPEECH_OTHER_FAMILY_BODY, "application/json"),
+            (200, FISH_SPEECH_NO_PENALTY_BODY, "application/json"),
+            (200, FISH_SPEECH_STRING_PENALTY_BODY, "application/json"),
+            (200, FISH_SPEECH_QUOTED_IN_JSON_BODY, "application/json"),
+            (200, FISH_SPEECH_QUOTED_IN_HTML_BODY,
+             "text/html; charset=utf-8")):
+        _, hits = scan(status, payload, content_type)
+        assert hits == [], (status, payload[:120], hits)
