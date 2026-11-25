@@ -55201,3 +55201,518 @@ def test_fish_speech_matcher_compiles_and_fires_against_a_live_server():
              "text/html; charset=utf-8")):
         _, hits = scan(status, payload, content_type)
         assert hits == [], (status, payload[:120], hits)
+
+
+# --------------------------------------------------------------------------
+# Intel Gaudi Prometheus Metric Exporter (HabanaAI/gaudi-metric-exporter) :
+# l'exportateur officiel de télémétrie des accélérateurs Gaudi, pendant de
+# DCGM Exporter et d'AMD Device Metrics Exporter. Quatrième exportateur
+# d'accélérateurs du pack : ses séries s'appellent « habanalabs_… », et le
+# constat tient à deux d'entre elles — le taux d'occupation et la température
+# de la puce — sur des lignes ouvertes par Serial puis UUID.
+#
+# La documentation ne donne ni étiquette ni exemple de sortie. Les fixtures
+# viennent donc de deux relevés, et chacune dit lequel :
+#
+#   - 1.15.1, Gaudi 2 : lignes verbatim d'une sortie réelle publiée sur GitHub
+#     (leslieluyu/leslieluyu.github.io, genai_solution/observability/habana/
+#     metrics, commit 7c92cafb61e3 du 2024-07-17). Les valeurs y portent un
+#     « \n » échappé — pilote et micrologiciels n'étaient pas encore rognés —
+#     et les étiquettes de charge s'appellent pod et namespace ;
+#   - 1.24.2-481 : lignes rendues par une réplique locale construite sur les
+#     sources du tag (main.go, exporter.go, samples.go, device.go, helpers.go
+#     inchangés hors chemins sysfs ; « rhlml » et le client kubelet remplacés
+#     par des bouchons). Le jeu d'étiquettes, leur ordre et les lignes de
+#     métadonnées sont ceux du produit ; les valeurs sont celles du bouchon.
+#     Les étiquettes de charge y sont pod_name et pod_namespace, et l'aide de
+#     chaque famille est vide.
+#
+# Le début de ligne — « {Serial="…",UUID="…", » — est ce que les deux relevés
+# ont en commun, et c'est tout ce que le matcher lit du jeu d'étiquettes.
+
+GAUDI_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                              "gaudi-metric-exporter-exposed.yaml")
+
+GAUDI_ROUTE = "/metrics"
+
+# Verbatim, 1.15.1 : les trois valeurs que chaque série répète.
+GAUDI_115_DRIVER = r'1.15.1-62f612b\n'
+GAUDI_115_FIT = (r'U-Boot 2021.04-hl-gaudi2-1.15.1-fw-49.0.0-sec-9 '
+                 r'(Mar 20 2024 - 11:36:19 +0200) build#: 11006\n')
+GAUDI_115_SPI = (r'Linux gaudi2 5.10.18-hl-gaudi2-1.15.1-fw-49.0.0-sec-9 #1 SMP '
+                 r'PREEMPT Wed Mar 20 11:36:43 IST 2024 aarch64 GNU/Linux\n')
+
+# Les aides de la 1.15.1, verbatim ; la 1.24.2 les rend vides.
+GAUDI_115_HELP = {
+    "habanalabs_utilization": "Utilization of the device",
+    "habanalabs_temperature_onchip": "Chip temperature in celsius",
+    "habanalabs_device_config": "Gaudi device configuration",
+    "habanalabs_kube_info": "kubernetes info",
+}
+
+
+def gaudi_115_sample(name, value, serial="AN47046190",
+                     uuid="01P0-HL2080A0-15-TNBU47-01-08-04", index="2",
+                     namespace="", pod=""):
+    """Une ligne de la 1.15.1 : neuf étiquettes, triées par nom."""
+    return ('%s{Serial="%s",UUID="%s",device="%s",driver="%s",fit="%s",'
+            'id="%s",namespace="%s",pod="%s",spi="%s"} %s'
+            % (name, serial, uuid, serial, GAUDI_115_DRIVER, GAUDI_115_FIT,
+               index, namespace, pod, GAUDI_115_SPI, value))
+
+
+# Verbatim : la carte libre et la carte tenue par un pod, lignes 333-334 et
+# 383-384 de la sortie relevée.
+GAUDI_115_IDLE = [
+    gaudi_115_sample("habanalabs_temperature_onchip", "26"),
+    gaudi_115_sample("habanalabs_utilization", "0"),
+]
+GAUDI_115_HELD = [
+    gaudi_115_sample("habanalabs_temperature_onchip", "26",
+                     serial="AN47046297",
+                     uuid="01P0-HL2080A0-15-TNBU70-19-02-06", index="4",
+                     namespace="default", pod="busybox-7b998b4c4-869jx"),
+    gaudi_115_sample("habanalabs_utilization", "0", serial="AN47046297",
+                     uuid="01P0-HL2080A0-15-TNBU70-19-02-06", index="4",
+                     namespace="default", pod="busybox-7b998b4c4-869jx"),
+]
+
+# Verbatim, lignes 140 et 170 : sur la 1.15.1, habanalabs_device_config ne
+# porte que cinq étiquettes — ni Serial ni UUID.
+GAUDI_115_DEVICE_CONFIG = (
+    'habanalabs_device_config{device="AN47046190",driver="%s",fit="%s",'
+    'id="2",spi="%s"} 1' % (GAUDI_115_DRIVER, GAUDI_115_FIT, GAUDI_115_SPI))
+GAUDI_115_KUBE_INFO = (
+    'habanalabs_kube_info{hostname="metric-exporter-ds-fvxdd",namespace="",'
+    'node="",podIP="",podName=""} 1')
+
+# La ligne entière, recopiée telle quelle de la sortie relevée : elle amarre
+# le constructeur ci-dessus à ce que l'instance a réellement écrit.
+GAUDI_115_UTILIZATION_CAPTURED = (
+    r'habanalabs_utilization{Serial="AN47046190",'
+    r'UUID="01P0-HL2080A0-15-TNBU47-01-08-04",device="AN47046190",'
+    r'driver="1.15.1-62f612b\n",fit="U-Boot 2021.04-hl-gaudi2-1.15.1-fw-49.0.0'
+    r'-sec-9 (Mar 20 2024 - 11:36:19 +0200) build#: 11006\n",id="2",'
+    r'namespace="",pod="",spi="Linux gaudi2 5.10.18-hl-gaudi2-1.15.1-fw-49.0.0'
+    r'-sec-9 #1 SMP PREEMPT Wed Mar 20 11:36:43 IST 2024 aarch64 GNU/Linux\n"}'
+    r' 0')
+
+# 1.24.2-481, rendu de la réplique.
+GAUDI_124_DRIVER = "1.24.2-481"
+GAUDI_124_FIT = "U-Boot 2021.04-hl-gaudi2-1.24.2-fw-65.0.0-sec-9 build#: 481"
+GAUDI_124_SPI = ("Linux gaudi2 5.10.18-hl-gaudi2-1.24.2-fw-65.0.0-sec-9 #1 SMP "
+                 "PREEMPT aarch64 GNU/Linux")
+
+
+def gaudi_124_sample(name, value, serial="AN47046190",
+                     uuid="01P0-HL2080A0-15-TNBU47-01-08-04", index="0",
+                     pod_name="", pod_namespace="", extra=""):
+    """
+    Une ligne de la 1.24.2 : getMetricLabels() trié par nom. `extra` porte les
+    deux étiquettes propres à habanalabs_nic_port_status, qui se trient entre
+    pod_namespace et spi.
+    """
+    return ('%s{Serial="%s",UUID="%s",device="%s",driver="%s",fit="%s",'
+            'id="%s",pod_name="%s",pod_namespace="%s",%sspi="%s"} %s'
+            % (name, serial, uuid, serial, GAUDI_124_DRIVER, GAUDI_124_FIT,
+               index, pod_name, pod_namespace, extra, GAUDI_124_SPI, value))
+
+
+GAUDI_124_IDLE = [
+    gaudi_124_sample("habanalabs_temperature_onchip", "36"),
+    gaudi_124_sample("habanalabs_utilization", "0"),
+]
+GAUDI_124_HELD = [
+    gaudi_124_sample("habanalabs_temperature_onchip", "61",
+                     serial="AN47046297",
+                     uuid="01P0-HL2080A0-15-TNBU70-19-02-06", index="1",
+                     pod_name="vllm-llama3-7b998b4c4-869jx",
+                     pod_namespace="inference"),
+    gaudi_124_sample("habanalabs_utilization", "87", serial="AN47046297",
+                     uuid="01P0-HL2080A0-15-TNBU70-19-02-06", index="1",
+                     pod_name="vllm-llama3-7b998b4c4-869jx",
+                     pod_namespace="inference"),
+]
+GAUDI_124_NIC = gaudi_124_sample("habanalabs_nic_port_status", "1",
+                                 extra='port="1",port_type="external",')
+# Les alias que la 1.24.2 émet en double : mêmes étiquettes, nom générique.
+GAUDI_124_ALIASES = [
+    gaudi_124_sample("accelerator_gpu_utilization", "0"),
+    gaudi_124_sample("accelerator_temperature_celcius", "36"),
+]
+# Sous hostNetwork, HOSTNAME est le nom du nœud ; le manifeste 1.24.2 ne pose
+# aucune des variables KUBE_*, d'où les quatre autres étiquettes vides.
+GAUDI_124_KUBE_INFO = (
+    'habanalabs_kube_info{hostname="gaudi-node-03",namespace="",node="",'
+    'podIP="",podName=""} 1')
+
+
+def gaudi_body(samples, help_text=None, metadata=True):
+    """
+    Le corps de GET /metrics : pour chaque famille, « # HELP » puis « # TYPE »,
+    puis ses échantillons. `help_text` associe une famille à son aide ; sans
+    lui l'aide est vide, comme la 1.24.2 la rend — « # HELP <nom> » suivi
+    d'une espace, que promMetric() doit à sa description vide.
+    """
+    lines, declared = [], set()
+    for sample in samples:
+        family = sample.split("{", 1)[0]
+        if metadata and family not in declared:
+            declared.add(family)
+            lines.append("# HELP %s %s" % (family, (help_text or {}).get(family, "")))
+            lines.append("# TYPE %s gauge" % family)
+        lines.append(sample)
+    return "\n".join(lines) + "\n"
+
+
+# Les quatre formes d'instance : une 1.15.1 et une 1.24.2, hors Kubernetes
+# (aucune carte tenue) et en Kubernetes (habanalabs_kube_info, un pod).
+GAUDI_115_BODY = gaudi_body(
+    [GAUDI_115_DEVICE_CONFIG, GAUDI_115_KUBE_INFO]
+    + sorted(GAUDI_115_IDLE + GAUDI_115_HELD), help_text=GAUDI_115_HELP)
+GAUDI_124_BARE_BODY = gaudi_body(GAUDI_124_ALIASES + [GAUDI_124_NIC]
+                                 + GAUDI_124_IDLE)
+GAUDI_124_K8S_BODY = gaudi_body(
+    GAUDI_124_ALIASES + [GAUDI_124_KUBE_INFO, GAUDI_124_NIC]
+    + sorted(GAUDI_124_IDLE + GAUDI_124_HELD))
+GAUDI_BODY = GAUDI_124_K8S_BODY
+
+
+def gaudi_relabel(samples, added):
+    """
+    La même série passée par un relais : étiquettes ajoutées, puis tri par
+    nom — instance et job tombent entre id et pod_name.
+    """
+    return [sample.replace(',pod_name="', ',%spod_name="' % added, 1)
+            for sample in samples]
+
+
+# Une fédération Prometheus ou un collecteur OpenTelemetry : instance et job
+# ajoutés, triés entre id et pod_name. Serial et UUID restent en tête.
+GAUDI_FEDERATED_BODY = gaudi_body(gaudi_relabel(
+    GAUDI_124_IDLE, 'instance="10.0.0.4:41611",job="metric-exporter",'))
+
+# Un Pushgateway : job seul.
+GAUDI_PUSHED_BODY = gaudi_body(gaudi_relabel(GAUDI_124_IDLE, 'job="gaudi-batch",'))
+
+# Le refus du limiteur, verbatim (main.go, relevé sur la réplique en 429).
+GAUDI_RATE_LIMITED_BODY = "rate limiting exceeded\n"
+
+# Une règle d'alerte qui cite les deux séries avec leurs étiquettes de tête.
+GAUDI_PROMQL_BODY = (
+    "groups:\n  - name: gaudi\n    rules:\n      - alert: GaudiHot\n"
+    '        expr: habanalabs_temperature_onchip{Serial="AN47046190",'
+    'UUID="01P0-HL2080A0-15-TNBU47-01-08-04"} > 95\n'
+    "      - alert: GaudiIdle\n"
+    '        expr: habanalabs_utilization{Serial="AN47046190",'
+    'UUID="01P0-HL2080A0-15-TNBU47-01-08-04"} < 5\n'
+)
+
+# Le sélecteur des tableaux de bord Grafana publiés pour Gaudi, en début de
+# ligne : écrit à la main, il n'ouvre pas sur Serial.
+GAUDI_SELECTOR_BODY = (
+    "# TYPE habanalabs_utilization gauge\n"
+    'habanalabs_utilization{instance="$node", UUID="$hpu"}/100\n'
+    'habanalabs_temperature_onchip{instance="$node", UUID="$hpu"}\n'
+)
+
+# La table « Exposed Metrics » de la documentation : les noms, sans ligne
+# d'échantillon.
+GAUDI_DOC_TABLE_BODY = (
+    "habanalabs_temperature_onchip\nTemperature on the ASIC in Celsius.\n"
+    "habanalabs_utilization\nDevice utilization.\n"
+)
+
+# Une page qui recopie la sortie : les lignes sont dans des balises.
+GAUDI_DOC_PAGE_BODY = (
+    "<html><body><pre># TYPE habanalabs_utilization gauge\n<code>%s</code>\n"
+    "<code>%s</code></pre></body></html>"
+    % (GAUDI_124_IDLE[1], GAUDI_124_IDLE[0]))
+
+
+def gaudi_block():
+    doc = load(GAUDI_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % GAUDI_ROUTE in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /metrics"
+    return blocks[0]
+
+
+def gaudi_fires(body=None, status=200):
+    if body is None:
+        body = GAUDI_BODY
+    block = gaudi_block()
+    verdicts = [mcpo_dsl_hits(m, [(status, body)])
+                for m in (block.get("matchers") or []) if m.get("type") == "dsl"]
+    assert verdicts, "aucun matcher dsl"
+    if block.get("matchers-condition") == "or":
+        return any(verdicts)
+    return all(verdicts)
+
+
+def gaudi_extracted(body):
+    found = set()
+    for extractor in gaudi_block().get("extractors") or []:
+        group = extractor.get("group", 0)
+        for pattern in extractor.get("regex") or []:
+            for m in re.finditer(pattern, body):
+                found.add(m.group(group))
+    return sorted(found)
+
+
+def test_gaudi_fixtures_are_the_lines_the_exporter_writes():
+    """
+    Le constructeur de la 1.15.1 rend, caractère pour caractère, la ligne
+    recopiée de la sortie réelle — « \\n » échappés compris. Et les deux
+    générations n'ont en commun que ce que le matcher lit : le début.
+    """
+    assert GAUDI_115_IDLE[1] == GAUDI_115_UTILIZATION_CAPTURED
+    assert "\n" not in GAUDI_115_UTILIZATION_CAPTURED, (
+        "le « \\n » de la sortie relevée est un échappement, pas un saut de ligne")
+    opening = 'habanalabs_utilization{Serial="AN47046190",UUID="01P0-HL2080A0-15-TNBU47-01-08-04",device="AN47046190",driver="'
+    assert GAUDI_115_IDLE[1].startswith(opening)
+    assert GAUDI_124_IDLE[1].startswith(opening)
+    assert ',namespace="",pod="",spi="' in GAUDI_115_IDLE[1]
+    assert ',pod_name="",pod_namespace="",spi="' in GAUDI_124_IDLE[1]
+    assert "# HELP habanalabs_utilization \n# TYPE habanalabs_utilization gauge\n" \
+        in GAUDI_124_BARE_BODY, "la 1.24.2 rend une aide vide"
+    assert "# HELP habanalabs_utilization Utilization of the device\n" in GAUDI_115_BODY
+
+
+def test_gaudi_probe_reads_only_the_telemetry_route():
+    doc = load(GAUDI_TEMPLATE)
+    assert request_routes(doc) == {("GET", GAUDI_ROUTE)}, sorted(request_routes(doc))
+    assert doc["info"]["severity"] == "medium"
+    assert doc["info"]["metadata"]["max-request"] == 1, (
+        "le limiteur du produit n'admet qu'une requête toutes les cinq secondes")
+    assert doc["info"]["metadata"]["product"] == "gaudi-metric-exporter"
+    blocks = doc.get("http") or []
+    assert len(blocks) == 1 and len(blocks[0].get("path") or []) == 1, (
+        "une seconde requête dans les cinq secondes reçoit 429 et prive le "
+        "collecteur légitime de sa scrutation")
+    for block in blocks:
+        assert not block.get("body") and not block.get("raw")
+        for path in block.get("path") or []:
+            for route in ("/debug/", "pprof", "?"):
+                assert route not in path, (
+                    "le template interroge %s — /debug/pprof/ est ouvert sur "
+                    "le même port, et n'a rien à faire dans une détection" % route)
+
+
+def test_gaudi_matcher_rests_on_two_habanalabs_series_opened_by_serial_and_uuid():
+    for body, why in (
+        (GAUDI_115_BODY, "une 1.15.1 réelle, étiquettes pod et namespace"),
+        (GAUDI_124_BARE_BODY, "une 1.24.2 hors Kubernetes, aide vide"),
+        (GAUDI_124_K8S_BODY, "une 1.24.2 en Kubernetes, une carte tenue par un pod"),
+        (gaudi_body(GAUDI_124_IDLE), "les deux séries seules"),
+        (gaudi_body(list(reversed(GAUDI_124_IDLE))),
+         "les deux séries dans l'autre ordre"),
+        (gaudi_body(GAUDI_115_IDLE), "une 1.15.1 dont l'aide serait vide"),
+        (gaudi_body([s.replace('Serial="AN47046190"', 'Serial=""')
+                     .replace('UUID="01P0-HL2080A0-15-TNBU47-01-08-04"', 'UUID=""')
+                     for s in GAUDI_124_IDLE]),
+         "un pilote qui ne rend ni numéro de série ni UUID"),
+        (gaudi_body([GAUDI_124_IDLE[0],
+                     GAUDI_124_IDLE[1].replace("} 0", "} 1.0434386828776153e+19")]),
+         "une valeur en notation exponentielle"),
+        (GAUDI_124_K8S_BODY.replace("\n", "\r\n"),
+         "un relais qui sert le corps en CRLF"),
+    ):
+        assert gaudi_fires(body), "le template perd %s" % why
+    assert gaudi_fires(status=203), "le constat dépend du statut HTTP"
+
+    for body, why in (
+        (dcgm_body(), "DCGM Exporter, produit distinct déjà couvert"),
+        (nge_body(), "nvidia_gpu_exporter, produit distinct déjà couvert"),
+        (AMD_DME_BODY, "AMD Device Metrics Exporter, produit distinct déjà couvert"),
+        (HAMI_BODY, "HAMi, produit distinct déjà couvert"),
+        (DCGM_NODE_EXPORTER_BODY, "un exportateur Prometheus quelconque"),
+        (DCGM_VLLM_BODY, "un serveur d'inférence qui publie ses compteurs"),
+        (gaudi_body([GAUDI_124_IDLE[1]]),
+         "habanalabs_utilization seule : une série ne fait pas le produit"),
+        (gaudi_body([GAUDI_124_IDLE[0]]), "habanalabs_temperature_onchip seule"),
+        (gaudi_body(GAUDI_124_ALIASES + [GAUDI_124_KUBE_INFO, GAUDI_124_NIC]),
+         "une instance qui ne voit aucune carte"),
+        (gaudi_body(GAUDI_124_ALIASES), "les alias accelerator_ seuls"),
+        (gaudi_body([s.replace("habanalabs_", "xhabanalabs_")
+                     for s in GAUDI_124_IDLE]),
+         "des séries dont le nom finit seulement par celui du produit"),
+        (gaudi_body([s.replace("habanalabs_utilization{", "habanalabs_utilization_ratio{")
+                     for s in GAUDI_124_IDLE]),
+         "une série dont le nom commence seulement par habanalabs_utilization"),
+        (gaudi_body([s.replace('{Serial="AN47046190",', '{')
+                     for s in GAUDI_124_IDLE]),
+         "des séries sans Serial"),
+        (gaudi_body([s.replace(',UUID="01P0-HL2080A0-15-TNBU47-01-08-04"', "")
+                     for s in GAUDI_124_IDLE]),
+         "des séries sans UUID"),
+        (gaudi_body([s.replace('{Serial="AN47046190",', '{Rack="r4",Serial="AN47046190",')
+                     for s in GAUDI_124_IDLE]),
+         "des séries qui n'ouvrent pas sur Serial"),
+        (gaudi_body([s.replace("{Serial=", "{serial=").replace(",UUID=", ",uuid=")
+                     for s in GAUDI_124_IDLE]),
+         "des étiquettes en minuscules, que le produit n'écrit pas"),
+        (gaudi_body([GAUDI_115_DEVICE_CONFIG,
+                     GAUDI_115_DEVICE_CONFIG.replace("habanalabs_device_config{",
+                                                     "habanalabs_utilization{")]),
+         "le jeu à cinq étiquettes de habanalabs_device_config en 1.15.1"),
+        (gaudi_body(GAUDI_124_IDLE, metadata=False),
+         "les lignes sans # TYPE de famille"),
+        (gaudi_body(GAUDI_124_IDLE).replace(
+            "# TYPE habanalabs_utilization gauge", "# TYPE habanalabs_utilization counter"),
+         "un type que le produit ne déclare pas"),
+        (GAUDI_FEDERATED_BODY, "une copie republiée par une fédération"),
+        (GAUDI_PUSHED_BODY, "une copie poussée dans un Pushgateway"),
+        (GAUDI_PROMQL_BODY, "une règle d'alerte qui cite les deux séries"),
+        (GAUDI_SELECTOR_BODY, "les sélecteurs d'un tableau de bord Grafana"),
+        (GAUDI_DOC_TABLE_BODY, "la table de la documentation"),
+        (GAUDI_DOC_PAGE_BODY, "une page qui recopie la sortie"),
+        (GAUDI_RATE_LIMITED_BODY, "le refus du limiteur"),
+        ("Unauthorized\n", "le refus d'un proxy authentifiant"),
+        ("404 page not found\n", "un 404"),
+        ("", "une réponse vide"),
+    ):
+        assert not gaudi_fires(body), "le template conclut sur %s" % why
+    assert not gaudi_fires(GAUDI_RATE_LIMITED_BODY, status=429)
+
+
+def test_gaudi_workload_labels_are_not_read_as_a_republished_copy():
+    """
+    Le garde contre les copies republiées cherche « job= » et « instance= »
+    derrière une virgule. Aucune étiquette du produit ne s'appelle ainsi, et
+    aucune valeur réelle — nom de pod, namespace, version de micrologiciel à
+    virgules et parenthèses — ne doit être lue comme telle.
+    """
+    for sample in GAUDI_115_IDLE + GAUDI_115_HELD + GAUDI_124_HELD + [GAUDI_124_NIC]:
+        assert not re.search(r',(?:job|instance)="', sample), sample
+    held = [s.replace("vllm-llama3-7b998b4c4-869jx", "job-instance-0")
+            .replace('pod_namespace="inference"', 'pod_namespace="instance"')
+            for s in GAUDI_124_HELD]
+    assert held != GAUDI_124_HELD
+    assert gaudi_fires(gaudi_body(held)), (
+        "le template perd un nœud dont un pod s'appelle job ou instance")
+    assert 'job="' in GAUDI_FEDERATED_BODY and 'instance="' in GAUDI_FEDERATED_BODY
+    assert GAUDI_FEDERATED_BODY.count('{Serial="AN47046190",UUID="') == 2, (
+        "la copie fédérée garde Serial et UUID en tête : seul le jeu "
+        "d'étiquettes la sépare de l'instance")
+    assert not gaudi_fires(GAUDI_FEDERATED_BODY)
+    assert 'job="' in GAUDI_PUSHED_BODY and not gaudi_fires(GAUDI_PUSHED_BODY)
+
+
+def test_gaudi_and_the_other_accelerator_exporters_do_not_answer_each_other():
+    for body in (GAUDI_115_BODY, GAUDI_124_BARE_BODY, GAUDI_124_K8S_BODY):
+        assert not dcgm_fires(body), "le template DCGM conclut sur Gaudi"
+        assert not nge_fires(body), "le template nvidia_gpu_exporter conclut sur Gaudi"
+        assert not amd_dme_fires(body), (
+            "le template AMD Device Metrics Exporter conclut sur Gaudi")
+        assert not hami_fires(body), "le template HAMi conclut sur Gaudi"
+    for body in (DCGM_BODY, NGE_BODY, AMD_DME_BODY, HAMI_BODY):
+        assert not gaudi_fires(body)
+
+
+def test_gaudi_extraction_reports_driver_and_host_without_workload_labels():
+    extractors = gaudi_block().get("extractors") or []
+    assert len(extractors) == 1, "une ligne de résultat par instance"
+    assert gaudi_extracted(GAUDI_124_K8S_BODY) == sorted([
+        'driver="1.24.2-481"',
+        'hostname="gaudi-node-03"',
+    ]), gaudi_extracted(GAUDI_124_K8S_BODY)
+    assert gaudi_extracted(GAUDI_124_BARE_BODY) == ['driver="1.24.2-481"'], (
+        "hors Kubernetes, habanalabs_kube_info n'existe pas")
+    assert gaudi_extracted(GAUDI_115_BODY) == sorted([
+        r'driver="1.15.1-62f612b\n"',
+        'hostname="metric-exporter-ds-fvxdd"',
+    ]), gaudi_extracted(GAUDI_115_BODY)
+    assert gaudi_extracted(gaudi_body(
+        [s.replace('driver="1.24.2-481"', 'driver=""') for s in GAUDI_124_IDLE])) == [], (
+        "une version de pilote illisible est rapportée vide")
+    for body in (GAUDI_115_BODY, GAUDI_124_K8S_BODY):
+        extracted = gaudi_extracted(body)
+        for leaked in ("AN47046190", "AN47046297", "01P0-HL2080A0", "busybox",
+                       "vllm-llama3", "inference", "pod", "namespace", "Serial",
+                       "UUID", "U-Boot"):
+            assert not any(leaked in value for value in extracted), (
+                "l'extracteur recopie %s dans le rapport — %s" % (leaked, extracted))
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_gaudi_matcher_compiles_and_fires_against_a_live_server():
+    def scan(body, status=200):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == GAUDI_ROUTE:
+                    payload = body.encode()
+                    self.send_response(status)
+                    # L'en-tête que promhttp rend sur la réplique 1.24.2 ; le
+                    # refus du limiteur part, lui, par http.Error.
+                    self.send_header(
+                        "Content-Type",
+                        "text/plain; version=0.0.4; charset=utf-8; "
+                        "escaping=underscores" if status == 200
+                        else "text/plain; charset=utf-8")
+                else:
+                    payload = b"404 page not found\n"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", GAUDI_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "gaudi-metric-exporter-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    seen, hits, extracted = scan(GAUDI_124_K8S_BODY)
+    assert seen == [GAUDI_ROUTE], (
+        "le template n'envoie pas exactement une requête — %s" % seen)
+    assert hits == 1, hits
+    assert extracted == sorted(['driver="1.24.2-481"',
+                                'hostname="gaudi-node-03"']), extracted
+
+    seen, hits, extracted = scan(GAUDI_115_BODY)
+    assert seen == [GAUDI_ROUTE] and hits == 1, (seen, hits)
+    assert extracted == sorted([r'driver="1.15.1-62f612b\n"',
+                                'hostname="metric-exporter-ds-fvxdd"']), extracted
+
+    _, hits, extracted = scan(GAUDI_124_BARE_BODY)
+    assert hits == 1 and extracted == ['driver="1.24.2-481"'], (hits, extracted)
+
+    # Le limiteur a refusé : pas de constat, et surtout pas de seconde requête.
+    seen, hits, _ = scan(GAUDI_RATE_LIMITED_BODY, status=429)
+    assert seen == [GAUDI_ROUTE], (
+        "le template insiste après un 429 — %s" % seen)
+    assert hits == 0, hits
+
+    for body in (GAUDI_FEDERATED_BODY, GAUDI_PUSHED_BODY, GAUDI_PROMQL_BODY,
+                 GAUDI_SELECTOR_BODY, GAUDI_DOC_PAGE_BODY,
+                 gaudi_body([GAUDI_124_IDLE[1]]),
+                 gaudi_body(GAUDI_124_IDLE, metadata=False),
+                 dcgm_body(), nge_body(), AMD_DME_BODY, HAMI_BODY):
+        _, hits, _ = scan(body)
+        assert hits == 0, body

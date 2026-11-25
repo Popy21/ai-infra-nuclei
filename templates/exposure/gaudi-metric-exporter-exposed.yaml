@@ -1,0 +1,230 @@
+id: gaudi-metric-exporter-exposed
+
+info:
+  name: Intel Gaudi Prometheus Metric Exporter - Unauthenticated Accelerator Telemetry Exposure
+  author: popy21
+  severity: medium
+  description: |
+    Intel Gaudi Prometheus Metric Exporter (HabanaAI/gaudi-metric-exporter) est
+    l'exportateur officiel de télémétrie des accélérateurs Intel Gaudi — la
+    documentation Gaudi l'ouvre ainsi : « a Prometheus exporter implementation
+    that enables the collection of Intel® Gaudi® AI accelerator metrics in a
+    container cluster for compute workload ». C'est le pendant Gaudi de DCGM
+    Exporter et d'AMD Device Metrics Exporter, et un produit distinct d'eux :
+    ses séries s'appellent « habanalabs_… », jamais « DCGM_FI_DEV_… »,
+    « nvidia_smi_… » ni « gpu_… ».
+    GET /metrics est sa route d'exposition, et elle est montée sans garde :
+    main.go la câble en « handler.Handle("/metrics", rateLimit(promhttp.Handler())) »
+    sur un http.ServeMux dont le seul intergiciel est un limiteur de débit — il
+    ne vérifie aucun appelant. L'écoute est un http.Server nu lancé par
+    ListenAndServe, donc en clair, sur « fmt.Sprintf(":%d", port) », c'est-à-dire
+    toutes les interfaces, et le port vaut 41611 par défaut (« flag.Int("port",
+    41611, … ) », « default port number 41611 » dans la documentation).
+    L'absence d'authentification n'est pas ici un réglage oublié : le binaire
+    n'en porte aucun. « --port » est son seul drapeau — ni TLS, ni basic auth,
+    ni jeton, ni adresse d'écoute —, là où DCGM Exporter et nvidia_gpu_exporter
+    offrent au moins un fichier web-config.
+    Les deux déploiements documentés posent ce port sur l'adresse de la machine.
+    En Docker : « docker run -it --privileged --network=host -v /dev:/dev
+    vault.habana.ai/gaudi-metric-exporter/metric-exporter:1.24.2-481 ». En
+    Kubernetes : un DaemonSet « privileged: true » et « hostNetwork: true »
+    (« Prometheus metric exporter exposes metrics to Intel Gaudi network
+    interfaces using hostNetwork: true »), « containerPort: 41611 » ; le
+    Service est en « clusterIP: None » et le ServiceMonitor ne porte ni TLS ni
+    authentification. L'exportateur répond donc sur chaque nœud Gaudi, à
+    quiconque joint l'adresse du nœud.
+    Le constat repose sur le nom des séries joint aux deux étiquettes qui les
+    ouvrent. exporter.go fixe le jeu commun — Serial, UUID, device, id, fit,
+    spi, driver, pod_namespace, pod_name — et client_golang le rend trié par
+    nom, donc Serial puis UUID en tête de chaque ligne. Une ligne relevée sur
+    une instance réelle (publication 1.15.1, Gaudi 2) :
+    « habanalabs_utilization{Serial="AN47046190",UUID="01P0-HL2080A0-15-TNBU47-01-08-04",device="AN47046190",driver="1.15.1-62f612b\n",fit="U-Boot 2021.04-hl-gaudi2-1.15.1-fw-49.0.0-sec-9 (Mar 20 2024 - 11:36:19 +0200) build#: 11006\n",id="2",namespace="",pod="",spi="Linux gaudi2 5.10.18-hl-gaudi2-1.15.1-fw-49.0.0-sec-9 #1 SMP PREEMPT Wed Mar 20 11:36:43 IST 2024 aarch64 GNU/Linux\n"} 0 ».
+    Les publications 1.23.0 à 1.24.2 écrivent le même début de ligne et
+    renomment la fin, pod_name et pod_namespace à la place de pod et namespace
+    (étiquettes lues dans la source de chaque tag, rendu vérifié sur une
+    réplique locale de la 1.24.2-481). Les publications antérieures à la 1.15
+    n'ont pas été relevées.
+    Le même port porte aussi « /debug/pprof/ » : main.go enregistre Index,
+    Cmdline, Profile, Symbol et Trace de net/http/pprof sans condition et sans
+    plus de garde. Ce template ne les interroge pas.
+  impact: |
+    La lecture livre l'inventaire nominatif des accélérateurs du nœud, rafraîchi
+    à chaque scrutation : sur chaque série, le numéro de série de la carte
+    (Serial, repris dans device), son UUID, son indice (id), la version du
+    pilote habanalabs de l'hôte (driver, lue dans /sys/module/habanalabs/version)
+    et les versions de micrologiciel de la carte (fit pour U-Boot, spi pour le
+    noyau embarqué) — le niveau de correctif du parc, en une requête et sans
+    compte.
+    Le taux d'occupation ensuite : habanalabs_utilization,
+    habanalabs_memory_used_bytes contre habanalabs_memory_total_bytes,
+    habanalabs_power_mW, habanalabs_energy et les températures disent quelles
+    cartes travaillent, lesquelles sont libres et à quel rythme tournent les
+    campagnes d'entraînement et les services d'inférence.
+    habanalabs_nic_port_status donne l'état de chaque port réseau des cartes
+    (étiquettes port et port_type), donc le câblage de mise à l'échelle ; les
+    compteurs habanalabs_pending_rows_with_*_ecc_errors et
+    habanalabs_pcie_replay_count, les machines en défaut.
+    La carte des charges enfin, et c'est elle qui fait la sévérité. En
+    Kubernetes, kube.go interroge l'API pod-resources du kubelet et pose sur
+    chaque série le pod qui tient la carte : pod_name et pod_namespace (pod et
+    namespace sur la 1.15.1). La sortie réelle citée plus haut porte
+    « namespace="default",pod="busybox-7b998b4c4-869jx" » sur trois de ses huit
+    cartes. L'appelant anonyme lit donc quel travail occupe quel accélérateur,
+    dans quel namespace, et habanalabs_kube_info y joint le nom de la machine
+    (hostname).
+    La route sert aussi à aveugler la supervision. Le limiteur est unique pour
+    tous les appelants (« rate.NewLimiter(rate.Every(5*time.Second), 1) ») :
+    quiconque interroge /metrics toutes les cinq secondes consomme le seul
+    jeton, et le collecteur Prometheus légitime reçoit « 429 rate limiting
+    exceeded » — les séries des accélérateurs s'interrompent sans qu'aucune
+    identité n'ait été demandée.
+  remediation: |
+    Le binaire n'a ni TLS, ni authentification, ni adresse d'écoute à régler :
+    « --port » est son seul drapeau. La fermeture se fait par le réseau.
+    Filtrer le port 41611 sur chaque nœud Gaudi — pare-feu de l'hôte, groupe de
+    sécurité ou ACL du réseau des nœuds — et n'y admettre que le collecteur
+    Prometheus. Ne pas compter sur le Service pour cela : il est en
+    « clusterIP: None », et c'est « hostNetwork: true » dans le DaemonSet (ou
+    « --network=host » dans la commande Docker) qui place l'écoute sur
+    l'adresse du nœud. Une NetworkPolicy de pod ne suffit pas davantage tant
+    que le pod partage la pile réseau de l'hôte : vérifier ce que le CNI
+    applique réellement à un pod en hostNetwork avant de s'y fier.
+    Les nœuds d'accélérateurs n'ont pas à être joignables depuis Internet ni
+    depuis les réseaux des locataires : un nœud à adresse publique expose ce
+    port tel quel.
+    Si une authentification est exigée, placer devant le port un proxy
+    authentifiant (kube-rbac-proxy ou un proxy inverse en TLS) et fermer l'accès
+    direct au 41611 ; le ServiceMonitor fourni scrute en clair et doit alors
+    être réécrit en conséquence.
+    La même règle ferme /debug/pprof/, servi sur le même port.
+    Vérifier depuis l'extérieur du périmètre, sans en-tête : « curl -s
+    http://<noeud>:41611/metrics » ne doit plus rendre de série
+    « habanalabs_… ». Attendre cinq secondes entre deux essais : dans
+    l'intervalle, le limiteur répond 429 même à une instance ouverte.
+    Après une exposition, tenir l'inventaire pour lu, et il ne se reprend pas :
+    numéros de série et UUID des cartes, versions du pilote et des
+    micrologiciels, nom des machines, et les noms de pods et de namespaces qui
+    occupaient les accélérateurs pendant toute la fenêtre. Chercher la durée de
+    cette fenêtre dans les journaux du pare-feu : l'exportateur journalise
+    chaque collecte, sans l'adresse de l'appelant.
+  reference:
+    - https://docs.habana.ai/en/latest/Orchestration/Prometheus_Metric_Exporter.html
+    - https://github.com/HabanaAI/gaudi-metric-exporter
+    - https://github.com/HabanaAI/gaudi-metric-exporter/blob/1.24.2-481/main.go
+    - https://github.com/HabanaAI/gaudi-metric-exporter/blob/1.24.2-481/exporter.go
+    - https://github.com/HabanaAI/gaudi-metric-exporter/blob/1.24.2-481/kube.go
+    - https://vault.habana.ai/artifactory/gaudi-metric-exporter/yaml/1.24.2/metric-exporter-daemonset.yaml
+    - https://vault.habana.ai/artifactory/gaudi-metric-exporter/yaml/1.24.2/metric-exporter-service.yaml
+    - https://vault.habana.ai/artifactory/gaudi-metric-exporter/yaml/1.24.2/metric-exporter-serviceMonitor.yaml
+    - https://github.com/leslieluyu/leslieluyu.github.io/blob/main/genai_solution/observability/habana/metrics
+  metadata:
+    max-request: 1
+    vendor: intel
+    product: gaudi-metric-exporter
+  tags: ai,ml,gpu,accelerator,intel,gaudi,habana,gaudi-metric-exporter,telemetry,prometheus,exposure,unauth,misconfig
+
+http:
+  # Une lecture, et une seule : c'est le produit qui l'impose. Chaque
+  # scrutation lance le binaire « rhlml » qui interroge le pilote (Collect(),
+  # exporter.go) — « the call to the driver takes about 2-3 second », écrit
+  # main.go —, et rateLimit() n'admet donc qu'une requête toutes les cinq
+  # secondes, tous appelants confondus. Deux conséquences, assumées :
+  #
+  #   - une cible que son collecteur Prometheus vient de scruter répond
+  #     « 429 rate limiting exceeded » : pas de constat sur ce passage, alors
+  #     que l'instance est ouverte. Rejouer plus tard, sans insister ;
+  #   - la lecture de ce template consomme le jeton : une scrutation légitime
+  #     qui tomberait dans les cinq secondes suivantes échoue une fois.
+  #
+  # /debug/pprof/ n'est pas interrogé, bien qu'il soit ouvert sur le même
+  # port : il rend les entrailles du processus (et « profile » fait tourner un
+  # profilage CPU), ce qui n'a rien à faire dans une détection. « / » rend un
+  # 404 nu : le mux ne monte que /metrics et /debug/pprof/.
+  - method: GET
+    path:
+      - "{{BaseURL}}/metrics"
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # Deux séries du produit, chacune sur une ligne d'échantillon rendue :
+          # le taux d'occupation et la température de la puce. Collect() les
+          # émet toutes deux, sans condition, pour chaque carte — une instance
+          # qui voit au moins un accélérateur porte donc les deux, et une
+          # instance qui n'en voit aucun n'expose rien de ce que le constat
+          # reproche.
+          #
+          # Le nom d'abord, ancré en début de ligne — (?m) et ^ — parce qu'une
+          # ligne d'échantillon du format d'exposition commence par le nom de sa
+          # famille ; une citation dans une phrase, une requête PromQL ou un
+          # tableau de bord ne commence rien. Le préfixe « habanalabs_ » est
+          # celui du pilote, aucun autre exportateur ne le publie ; les alias
+          # « accelerator_… » que les publications 1.23.0 à 1.24.2 émettent en
+          # double ne sont pas lus, leur nom ne dit pas de qui ils viennent.
+          #
+          # « {Serial="…",UUID="…", » ensuite, en tête du jeu d'étiquettes. Ce
+          # début n'est pas deviné : getMetricLabels() fixe Serial, UUID, device,
+          # id, fit, spi, driver, pod_namespace, pod_name, client_golang trie par
+          # nom, et les majuscules se trient avant les minuscules — la sortie
+          # réelle d'une 1.15.1 et le rendu d'une 1.24.2 ouvrent toutes leurs
+          # lignes ainsi. Un sélecteur PromQL écrit à la main
+          # (« habanalabs_utilization{instance="$node", UUID="$hpu"} ») n'ouvre
+          # pas de cette façon.
+          #
+          # Aucune valeur n'est contrainte. Le format d'un numéro de série ou
+          # d'un UUID Gaudi n'a été relevé que sur une génération de cartes, et
+          # une instance dont le pilote rendrait une valeur vide est exactement
+          # aussi ouverte. La suite de la ligne est libre pour la même raison :
+          # c'est elle qui a changé entre publications (pod et namespace, puis
+          # pod_name et pod_namespace).
+          #
+          # « } » puis un chiffre, enfin : la ligne porte une valeur. Toutes les
+          # séries du produit sont des float64 tirés d'un uint64, donc jamais
+          # négatives ni NaN ; une règle d'alerte (« … } > 85 ») ne finit pas
+          # ainsi.
+          - 'regex("(?m)^habanalabs_utilization\\{Serial=\"[^\"\\n]*\",UUID=\"[^\"\\n]*\",[^\\n]*\\} [0-9]", body)'
+          - 'regex("(?m)^habanalabs_temperature_onchip\\{Serial=\"[^\"\\n]*\",UUID=\"[^\"\\n]*\",[^\\n]*\\} [0-9]", body)'
+
+          # Les métadonnées de famille que le format d'exposition impose : le
+          # corps est une scrutation rendue, pas une ligne recopiée dans un
+          # journal ou une page. « gauge » et rien d'autre — promMetric() ne
+          # construit que des prometheus.GaugeValue. La ligne « # HELP » n'est
+          # pas lue : la 1.15.1 y écrit une aide, la 1.24.2 la laisse vide.
+          - 'regex("(?m)^# TYPE habanalabs_utilization gauge", body)'
+
+          # Pas une copie republiée. Le tri par nom ne sépare pas l'instance de
+          # sa copie — Prometheus trie de la même façon, Serial et UUID restent
+          # en tête —, donc c'est le jeu d'étiquettes qui le fait : une
+          # fédération, un Pushgateway ou un collecteur OpenTelemetry ajoutent
+          # job et instance, que le produit ne pose pas. La série republiée
+          # porte les mêmes noms ; ce n'est pas l'exportateur qui répond.
+          #
+          # La virgule exigée devant le nom et « =" » derrière lui écartent une
+          # étiquette qui ne ferait que le contenir. Aucune étiquette du produit
+          # ne s'appelle ainsi, dans aucune des publications relevées.
+          - '!regex("(?m)^habanalabs_[A-Za-z0-9_]+\\{(?:[^\\n]*,)?(?:job|instance)=\"", body)'
+
+    extractors:
+      # L'inventaire, pas la version : l'exportateur ne publie pas son propre
+      # numéro de publication sur cette route. Un seul extracteur, donc une
+      # seule ligne de résultat par instance ; le groupe 1 garde la paire
+      # entière sans le séparateur qui la précède, et nuclei déduplique, de
+      # sorte qu'un nœud de huit cartes remonte une version de pilote.
+      #
+      #   driver    la version du pilote habanalabs de l'hôte, donc la
+      #             publication Gaudi installée et son niveau de correctif.
+      #   hostname  la machine, sur habanalabs_kube_info, en Kubernetes
+      #             seulement : c'est elle qui dit à l'exploitant quel nœud
+      #             fermer.
+      #
+      # Aucune ne conditionne le constat. Les numéros de série, les UUID et les
+      # étiquettes de charge — pod_name, pod_namespace, pod, namespace — ne sont
+      # pas extraits, alors que ce sont eux qui font la sévérité : les rapporter
+      # reviendrait à recopier dans le rapport de scrutation ce que le constat
+      # reproche à la cible de publier.
+      - type: regex
+        name: inventory
+        group: 1
+        regex:
+          - '[{,]((?:driver|hostname)="[^"]+")'
