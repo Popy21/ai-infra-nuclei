@@ -55716,3 +55716,605 @@ def test_gaudi_matcher_compiles_and_fires_against_a_live_server():
                  dcgm_body(), nge_body(), AMD_DME_BODY, HAMI_BODY):
         _, hits, _ = scan(body)
         assert hits == 0, body
+
+
+# --------------------------------------------------------------------------
+# llama-cpp-python (abetlen/llama-cpp-python) : la liaison Python de
+# llama.cpp. Son serveur compatible OpenAI, « python -m llama_cpp.server »,
+# est une application FastAPI ; authenticate, montée route par route, laisse
+# tout passer tant que api_key vaut None — son défaut.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux d'une réplique : llama_cpp/server/ et
+#     llama_types.py du commit 77fbb5d de main (tag v0.3.38-hip-radeon), puis
+#     du tag v0.2.37, fastapi 0.133.1, starlette 0.52.1, pydantic 2.12.5,
+#     pydantic-settings 2.16.3, uvicorn 0.41.0 ; le moteur natif remplacé par
+#     un bouchon — aucune inférence n'a été relevée ;
+#   - GET /v1/models sérialise compact, dans l'ordre de ModelList et de
+#     ModelData : object, data ; id, object, owned_by, permissions ; une
+#     entrée par modèle configuré, et l'alias vaut le chemin du fichier de
+#     modèle quand --model_alias n'est pas donné ;
+#   - avec --api_key (ou la variable API_KEY sous la fabrique uvicorn de
+#     l'image), les routes du routeur rendent 401 et {"detail":"Invalid API
+#     key"}, sans jeton comme sur un jeton faux ; GET /openapi.json et GET
+#     /docs restent servis, le schéma identique à l'octet près ;
+#   - GET /openapi.json s'ouvre sur openapi, info, title, version ;
+#     --root_path ajoute « servers » en fin de document, pas en tête ;
+#   - la v0.2.37 rend le même corps de /v1/models et le même titre, sans les
+#     routes /extras/* (v0.2.56) ni les tags ;
+#   - une route absente — /, /props, /health — rend 404 et {"detail":"Not
+#     Found"}.
+
+LLAMA_CPP_PYTHON_TEMPLATE = os.path.join(
+    TEMPLATES_DIR, "exposure", "llama-cpp-python-server-exposed.yaml")
+
+LLAMA_CPP_PYTHON_MODELS_ROUTE = "/v1/models"
+LLAMA_CPP_PYTHON_OPENAPI_ROUTE = "/openapi.json"
+
+LLAMA_CPP_PYTHON_TITLE = "🦙 llama.cpp Python API"
+
+# Verbatim, réplique : sans clé, sans alias. 127 octets.
+LLAMA_CPP_PYTHON_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"/models/qwen2.5-0.5b-instruct-q4_k_m.ggu'
+    'f","object":"model","owned_by":"me","permissions":[]}]}')
+# Verbatim, réplique : « --model_alias gpt-3.5-turbo ». 99 octets.
+LLAMA_CPP_PYTHON_ALIAS_BODY = (
+    '{"object":"list","data":[{"id":"gpt-3.5-turbo","object":"model","owned_b'
+    'y":"me","permissions":[]}]}')
+# Verbatim, réplique : un fichier de configuration à trois modèles. 252 octets.
+LLAMA_CPP_PYTHON_THREE_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"gpt-3.5-turbo","object":"model","owned_b'
+    'y":"me","permissions":[]},{"id":"gpt-4-vision-preview","object":"model",'
+    '"owned_by":"me","permissions":[]},{"id":"copilot-codex","object":"model"'
+    ',"owned_by":"me","permissions":[]}]}')
+LLAMA_CPP_PYTHON_ALIASES = ["gpt-3.5-turbo", "gpt-4-vision-preview",
+                            "copilot-codex"]
+# Verbatim, réplique du tag v0.2.37. 130 octets.
+LLAMA_CPP_PYTHON_LEGACY_MODELS_BODY = (
+    '{"object":"list","data":[{"id":"/models/mistral-7b-instruct-v0.2.Q4_K_M.'
+    'gguf","object":"model","owned_by":"me","permissions":[]}]}')
+
+# Verbatim, réplique : --api_key, sans jeton comme sur un jeton faux ; puis
+# une route absente.
+LLAMA_CPP_PYTHON_UNAUTHORIZED_BODY = '{"detail":"Invalid API key"}'
+LLAMA_CPP_PYTHON_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+
+# Verbatim, réplique : l'ouverture de GET /openapi.json, sans clé comme avec.
+LLAMA_CPP_PYTHON_OPENAPI_HEAD = (
+    '{"openapi":"3.1.0","info":{"title":"🦙 llama.cpp Python API","version":"'
+    '0.3.38"},"paths":{"/v1/completions":{"post":{"tags":["OpenAI V1"],"summa'
+    'ry":"Completion",')
+
+# Les opérations du schéma relevé, dans l'ordre du document : chemin,
+# méthode, tag, summary.
+LLAMA_CPP_PYTHON_OPERATIONS = (
+    ("/v1/completions", "post", "OpenAI V1", "Completion"),
+    ("/v1/embeddings", "post", "OpenAI V1", "Embedding"),
+    ("/v1/chat/completions", "post", "OpenAI V1", "Chat"),
+    ("/v1/models", "get", "OpenAI V1", "Models"),
+    ("/extras/tokenize", "post", "Extras", "Tokenize"),
+    ("/extras/tokenize/count", "post", "Extras", "Tokenize Count"),
+    ("/extras/detokenize", "post", "Extras", "Detokenize"),
+)
+
+
+def llama_cpp_python_openapi_body(version="0.3.38", info=None,
+                                  operations=LLAMA_CPP_PYTHON_OPERATIONS,
+                                  tags=True, openapi="3.1.0", servers=None):
+    """
+    Abrégé du document relevé — 34 162 octets sur la réplique : chaque
+    opération est réduite à tags, summary et security, components est omis.
+    L'ordre des clés est celui du relevé.
+    """
+    paths = {}
+    for route, method, tag, summary in operations:
+        operation = {"tags": [tag]} if tags else {}
+        operation["summary"] = summary
+        operation["security"] = [{"HTTPBearer": []}]
+        paths[route] = {method: operation}
+    doc = {"openapi": openapi,
+           "info": info or {"title": LLAMA_CPP_PYTHON_TITLE,
+                            "version": version},
+           "paths": paths}
+    if servers:
+        doc["servers"] = servers
+    return json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+
+
+LLAMA_CPP_PYTHON_OPENAPI_BODY = llama_cpp_python_openapi_body()
+# Abrégé, réplique du tag v0.2.37 : quatre routes, sans tags.
+LLAMA_CPP_PYTHON_LEGACY_OPENAPI_BODY = llama_cpp_python_openapi_body(
+    version="0.2.37", operations=LLAMA_CPP_PYTHON_OPERATIONS[:4], tags=False)
+# Abrégé, réplique : « --root_path /llama ».
+LLAMA_CPP_PYTHON_ROOT_PATH_OPENAPI_BODY = llama_cpp_python_openapi_body(
+    servers=[{"url": "/llama"}])
+# Écrit, pas relevé : un FastAPI antérieur à la 0.99, dont le schéma s'ouvre
+# sur 3.0.2.
+LLAMA_CPP_PYTHON_OLD_FASTAPI_OPENAPI_BODY = llama_cpp_python_openapi_body(
+    version="0.1.50", operations=LLAMA_CPP_PYTHON_OPERATIONS[:4], tags=False,
+    openapi="3.0.2")
+# Abrégé, réplique : la page Swagger de GET /docs, qui cite le titre.
+LLAMA_CPP_PYTHON_DOCS_BODY = (
+    '\n    <!DOCTYPE html>\n    <html>\n    <head>\n    <title>🦙 llama.cpp P'
+    'ython API - Swagger UI</title>\n    </head>\n    <body>\n    <div id="sw'
+    'agger-ui">\n    </div>\n    </body>\n    </html>\n    ')
+
+# Un intermédiaire qui réindente : en gardant l'UTF-8, puis en échappant
+# l'émoji du titre en \ud83e\udd99.
+LLAMA_CPP_PYTHON_MODELS_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(LLAMA_CPP_PYTHON_THREE_MODELS_BODY), indent=2)
+    + "\n")
+LLAMA_CPP_PYTHON_OPENAPI_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(LLAMA_CPP_PYTHON_OPENAPI_BODY), indent=2,
+                      ensure_ascii=False) + "\n")
+LLAMA_CPP_PYTHON_OPENAPI_ASCII_BODY = (
+    "\n" + json.dumps(json.loads(LLAMA_CPP_PYTHON_OPENAPI_BODY), indent=2)
+    + "\n")
+# Écrit, pas relevé : un chemin Windows et un alias à guillemet, que JSON
+# échappe.
+LLAMA_CPP_PYTHON_ESCAPED_IDS = ["C:\\models\\llama-2-7b-chat.Q4_K_M.gguf",
+                                'qwen "instruct"']
+LLAMA_CPP_PYTHON_ESCAPED_IDS_BODY = json.dumps(
+    {"object": "list",
+     "data": [{"id": model_id, "object": "model", "owned_by": "me",
+               "permissions": []}
+              for model_id in LLAMA_CPP_PYTHON_ESCAPED_IDS]},
+    separators=(",", ":"))
+
+# Un autre propriétaire, la clé au singulier, une permission accordée, une
+# carte qui porte created : pas le littéral de get_models.
+LLAMA_CPP_PYTHON_OTHER_OWNER_BODY = LLAMA_CPP_PYTHON_ALIAS_BODY.replace(
+    '"owned_by":"me"', '"owned_by":"user"')
+LLAMA_CPP_PYTHON_SINGULAR_PERMISSION_BODY = (
+    LLAMA_CPP_PYTHON_ALIAS_BODY.replace('"permissions":[]', '"permission":[]'))
+LLAMA_CPP_PYTHON_GRANTED_PERMISSION_BODY = (
+    LLAMA_CPP_PYTHON_ALIAS_BODY.replace('"permissions":[]',
+                                        '"permissions":["read"]'))
+LLAMA_CPP_PYTHON_CREATED_BODY = LLAMA_CPP_PYTHON_ALIAS_BODY.replace(
+    '"object":"model",', '"object":"model","created":1686935002,')
+# Trois cartes dont une seule n'est pas la sienne.
+LLAMA_CPP_PYTHON_MIXED_OWNERS_BODY = (
+    LLAMA_CPP_PYTHON_THREE_MODELS_BODY.replace(
+        '"gpt-4-vision-preview","object":"model","owned_by":"me"',
+        '"gpt-4-vision-preview","object":"model","owned_by":"openai"'))
+# "object":"list" seul, sans une carte ; puis l'enveloppe dans l'autre sens.
+LLAMA_CPP_PYTHON_EMPTY_LIST_BODY = '{"object":"list","data":[]}'
+LLAMA_CPP_PYTHON_REORDERED_BODY = (
+    '{"data":[{"id":"gpt-3.5-turbo","object":"model","owned_by":"me","permiss'
+    'ions":[]}],"object":"list"}')
+# Le document rangé sous la clé d'un autre, cité en chaîne, cité dans une page.
+LLAMA_CPP_PYTHON_WRAPPED_BODY = (
+    '{"upstream":%s}' % LLAMA_CPP_PYTHON_MODELS_BODY)
+LLAMA_CPP_PYTHON_QUOTED_IN_JSON_BODY = json.dumps(
+    {"object": "list", "example": LLAMA_CPP_PYTHON_MODELS_BODY},
+    separators=(",", ":"))
+LLAMA_CPP_PYTHON_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>" + LLAMA_CPP_PYTHON_MODELS_BODY
+    + "</pre></body></html>")
+
+# Le schéma d'une application qui n'a pas ce titre, qui le prolonge, ou qui
+# ne le porte que dans sa description.
+LLAMA_CPP_PYTHON_RETITLED_OPENAPI_BODY = llama_cpp_python_openapi_body(
+    info={"title": "FastAPI", "version": "0.1.0"})
+LLAMA_CPP_PYTHON_SUFFIXED_TITLE_OPENAPI_BODY = llama_cpp_python_openapi_body(
+    info={"title": LLAMA_CPP_PYTHON_TITLE + " Gateway", "version": "1.0.0"})
+LLAMA_CPP_PYTHON_TITLE_IN_DESCRIPTION_OPENAPI_BODY = (
+    llama_cpp_python_openapi_body(
+        info={"title": "Gateway",
+              "description": "Relays the %s" % LLAMA_CPP_PYTHON_TITLE,
+              "version": "1.0.0"}))
+# Le schéma sans la route d'inférence, puis avec son chemin cité dans un
+# summary plutôt que déclaré.
+LLAMA_CPP_PYTHON_NO_CHAT_OPENAPI_BODY = llama_cpp_python_openapi_body(
+    operations=[o for o in LLAMA_CPP_PYTHON_OPERATIONS
+                if o[0] != "/v1/chat/completions"])
+LLAMA_CPP_PYTHON_CHAT_AS_TEXT_OPENAPI_BODY = llama_cpp_python_openapi_body(
+    operations=[o if o[0] != "/v1/chat/completions"
+                else ("/chat", "post", "OpenAI V1",
+                      'Replaces "/v1/chat/completions": {"post": ...}')
+                for o in LLAMA_CPP_PYTHON_OPERATIONS])
+# Le schéma republié sous la clé d'une passerelle.
+LLAMA_CPP_PYTHON_WRAPPED_OPENAPI_BODY = (
+    '{"upstream":%s}' % LLAMA_CPP_PYTHON_OPENAPI_BODY)
+
+
+def llama_cpp_python_block():
+    doc = load(LLAMA_CPP_PYTHON_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % LLAMA_CPP_PYTHON_MODELS_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /v1/models"
+    return blocks[0]
+
+
+def llama_cpp_python_requests():
+    """(méthode, chemin) dans l'ordre déclaré : il numérote les body_N."""
+    block = llama_cpp_python_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def llama_cpp_python_matcher():
+    found = [m for m in llama_cpp_python_block().get("matchers") or []
+             if m.get("name") == "model-aliases"]
+    assert len(found) == 1, "matcher 'model-aliases' absent ou en double"
+    return found[0]
+
+
+def llama_cpp_python_fires(models=(200, LLAMA_CPP_PYTHON_MODELS_BODY),
+                           openapi=(200, LLAMA_CPP_PYTHON_OPENAPI_BODY)):
+    scenario = {
+        normalise_route("GET", LLAMA_CPP_PYTHON_MODELS_ROUTE): models,
+        normalise_route("GET", LLAMA_CPP_PYTHON_OPENAPI_ROUTE): openapi}
+    responses = []
+    for request in llama_cpp_python_requests():
+        assert request in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{request}")
+        responses.append(scenario[request])
+    return dsl_matcher_hits(llama_cpp_python_matcher(), responses)
+
+
+def test_llama_cpp_python_fixtures_hold_the_bodies_read_on_the_replica():
+    for body, size, digest in (
+            (LLAMA_CPP_PYTHON_MODELS_BODY, 127,
+             "67a4ecc5c466ae38f35ac1a5841de21ff0bcbc83cad817c83b176a345264f593"),
+            (LLAMA_CPP_PYTHON_ALIAS_BODY, 99,
+             "9adb40113f039c2f37460b733bf18cc6b0d24da38864ed8a71eb834f9b2e38c4"),
+            (LLAMA_CPP_PYTHON_THREE_MODELS_BODY, 252,
+             "71c67d2bf052239ecd59411956d4daa46a681658af1bdb8c93b2b96c548f7b8f")):
+        assert len(body.encode()) == size
+        assert hashlib.sha256(body.encode()).hexdigest() == digest, (
+            "le corps relevé, à l'octet près")
+    assert len(LLAMA_CPP_PYTHON_LEGACY_MODELS_BODY.encode()) == 130
+    for body in (LLAMA_CPP_PYTHON_MODELS_BODY, LLAMA_CPP_PYTHON_ALIAS_BODY,
+                 LLAMA_CPP_PYTHON_THREE_MODELS_BODY,
+                 LLAMA_CPP_PYTHON_LEGACY_MODELS_BODY,
+                 LLAMA_CPP_PYTHON_ESCAPED_IDS_BODY):
+        doc = json.loads(body)
+        assert list(doc) == ["object", "data"], "l'ordre de ModelList"
+        assert doc["object"] == "list" and doc["data"], (
+            "LlamaProxy refuse de démarrer sans modèle")
+        for card in doc["data"]:
+            assert list(card) == ["id", "object", "owned_by", "permissions"], (
+                "l'ordre de ModelData")
+            assert (card["object"], card["owned_by"], card["permissions"]) == (
+                "model", "me", [])
+    assert json.loads(LLAMA_CPP_PYTHON_MODELS_BODY)["data"][0]["id"] == (
+        "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"), (
+        "sans alias, l'identifiant est le chemin du fichier de modèle")
+    assert [card["id"] for card in json.loads(
+        LLAMA_CPP_PYTHON_THREE_MODELS_BODY)["data"]] == LLAMA_CPP_PYTHON_ALIASES
+    assert [card["id"] for card in json.loads(
+        LLAMA_CPP_PYTHON_ESCAPED_IDS_BODY)["data"]] == (
+        LLAMA_CPP_PYTHON_ESCAPED_IDS)
+    assert json.loads(LLAMA_CPP_PYTHON_UNAUTHORIZED_BODY) == {
+        "detail": "Invalid API key"}
+    assert json.loads(LLAMA_CPP_PYTHON_NOT_FOUND_BODY) == {
+        "detail": "Not Found"}
+
+    assert LLAMA_CPP_PYTHON_OPENAPI_BODY.startswith(
+        LLAMA_CPP_PYTHON_OPENAPI_HEAD), (
+        "l'abrégé s'ouvre comme le document relevé")
+    openapi = json.loads(LLAMA_CPP_PYTHON_OPENAPI_BODY)
+    assert list(openapi) == ["openapi", "info", "paths"]
+    assert openapi["info"] == {"title": LLAMA_CPP_PYTHON_TITLE,
+                               "version": "0.3.38"}
+    assert list(openapi["paths"]) == [o[0] for o in LLAMA_CPP_PYTHON_OPERATIONS]
+    assert "🦙" in LLAMA_CPP_PYTHON_OPENAPI_BODY, (
+        "FastAPI écrit l'émoji en UTF-8, sans l'échapper")
+    legacy = json.loads(LLAMA_CPP_PYTHON_LEGACY_OPENAPI_BODY)
+    assert legacy["info"] == {"title": LLAMA_CPP_PYTHON_TITLE,
+                              "version": "0.2.37"}
+    assert list(legacy["paths"]) == ["/v1/completions", "/v1/embeddings",
+                                     "/v1/chat/completions", "/v1/models"], (
+        "la v0.2.37 ne déclare pas les routes /extras/*")
+    assert "tags" not in legacy["paths"]["/v1/models"]["get"]
+    rooted = json.loads(LLAMA_CPP_PYTHON_ROOT_PATH_OPENAPI_BODY)
+    assert list(rooted)[:2] == ["openapi", "info"] and (
+        list(rooted)[-1] == "servers"), "servers ferme le document"
+    assert json.loads(LLAMA_CPP_PYTHON_OLD_FASTAPI_OPENAPI_BODY)[
+        "openapi"] == "3.0.2"
+    assert "\\ud83e\\udd99 llama.cpp Python API" in (
+        LLAMA_CPP_PYTHON_OPENAPI_ASCII_BODY)
+    assert "🦙" in LLAMA_CPP_PYTHON_OPENAPI_REINDENTED_BODY
+    assert json.loads(LLAMA_CPP_PYTHON_OPENAPI_ASCII_BODY) == openapi
+    assert LLAMA_CPP_PYTHON_TITLE in LLAMA_CPP_PYTHON_DOCS_BODY
+    assert "/v1/chat/completions" not in json.loads(
+        LLAMA_CPP_PYTHON_NO_CHAT_OPENAPI_BODY)["paths"]
+    assert "/v1/chat/completions" not in json.loads(
+        LLAMA_CPP_PYTHON_CHAT_AS_TEXT_OPENAPI_BODY)["paths"]
+    assert "/v1/chat/completions" in LLAMA_CPP_PYTHON_CHAT_AS_TEXT_OPENAPI_BODY
+    assert json.loads(LLAMA_CPP_PYTHON_TITLE_IN_DESCRIPTION_OPENAPI_BODY)[
+        "info"]["title"] == "Gateway"
+    assert json.loads(LLAMA_CPP_PYTHON_QUOTED_IN_JSON_BODY)["example"] == (
+        LLAMA_CPP_PYTHON_MODELS_BODY)
+    assert [card["owned_by"] for card in json.loads(
+        LLAMA_CPP_PYTHON_MIXED_OWNERS_BODY)["data"]] == ["me", "openai", "me"]
+
+
+def test_llama_cpp_python_probe_reads_two_documents_and_runs_no_inference():
+    doc = load(LLAMA_CPP_PYTHON_TEMPLATE)
+    expected = [("GET", LLAMA_CPP_PYTHON_MODELS_ROUTE),
+                ("GET", LLAMA_CPP_PYTHON_OPENAPI_ROUTE)]
+    assert request_routes(doc) == set(expected), (
+        "le template ne lit que la liste des modèles et le schéma : "
+        "/v1/completions, /v1/chat/completions, /v1/embeddings et /extras/* "
+        "calculent")
+    assert llama_cpp_python_requests() == expected, (
+        "l'ordre des chemins numérote body_1 et body_2 — %s"
+        % llama_cpp_python_requests())
+    block = llama_cpp_python_block()
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 et body_2 n'existent pas")
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête Authorization : c'est l'accès anonyme qui est constaté")
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 2
+    assert meta.get("product") == "llama-cpp-python"
+    assert doc["info"]["severity"] == "high"
+    description = re.sub(r"\s+", " ", doc["info"]["description"])
+    assert "if settings.api_key is None: return True" in description and (
+        "default=None" in description), (
+        "l'absence de clé par défaut est relevée dans le code, pas devinée")
+    assert 'default="localhost"' in description and (
+        "ENV HOST=0.0.0.0" in description), (
+        "l'écoute par défaut et celle de l'image du dépôt")
+    assert "v0.2.56" in description and "v0.2.25" in description, (
+        "les limites de versions — /extras/*, api_key — sont écrites dans "
+        "le template")
+    assert "llama-server" in description and "/props" in description, (
+        "le produit est distingué du serveur C++ de llama.cpp")
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1 and extractors[0].get("part") == "body_1", (
+        "un seul extracteur, borné à body_1 : sous req-condition un second "
+        "ferait remonter deux fois la même instance")
+
+
+def test_llama_cpp_python_matcher_rests_on_the_literal_and_the_title():
+    matchers = llama_cpp_python_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"]
+    expressions = llama_cpp_python_matcher().get("dsl") or []
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire peut rendre 200 sur tout")
+    assert llama_cpp_python_matcher().get("condition") == "and"
+    assert any("body_1" in e for e in expressions) and any(
+        "body_2" in e for e in expressions), "les deux réponses sont jugées"
+    models_expression = [e for e in expressions if "body_1" in e]
+    assert len(models_expression) == 1
+    for literal in ('\\"object\\"\\\\s*:\\\\s*\\"list\\"',
+                    '\\"owned_by\\"\\\\s*:\\\\s*\\"me\\"',
+                    '\\"permissions\\"\\\\s*:\\\\s*\\\\[\\\\s*\\\\]'):
+        assert literal in models_expression[0], (
+            "object list, owned_by me et permissions [] sont exigés "
+            f"ensemble — {literal}")
+    assert any(LLAMA_CPP_PYTHON_TITLE.replace(".", "\\\\.").replace(
+        "🦙", "(?:🦙|\\\\\\\\u[dD]83[eE]\\\\\\\\u[dD][dD]99)") in e
+        for e in expressions), "le titre écrit en dur nomme le produit"
+    assert not any("/extras/" in e for e in expressions), (
+        "les routes /extras/* ne datent que de la v0.2.56 : les exiger "
+        "ferait manquer les versions antérieures")
+
+    for models, openapi, why in (
+            (LLAMA_CPP_PYTHON_MODELS_BODY, LLAMA_CPP_PYTHON_OPENAPI_BODY,
+             "les corps relevés"),
+            (LLAMA_CPP_PYTHON_ALIAS_BODY, LLAMA_CPP_PYTHON_OPENAPI_BODY,
+             "un modèle servi sous un alias"),
+            (LLAMA_CPP_PYTHON_THREE_MODELS_BODY, LLAMA_CPP_PYTHON_OPENAPI_BODY,
+             "une instance à trois modèles"),
+            (LLAMA_CPP_PYTHON_MODELS_BODY,
+             LLAMA_CPP_PYTHON_ROOT_PATH_OPENAPI_BODY,
+             "une instance lancée avec --root_path"),
+            (LLAMA_CPP_PYTHON_LEGACY_MODELS_BODY,
+             LLAMA_CPP_PYTHON_LEGACY_OPENAPI_BODY,
+             "la v0.2.37, sans les routes /extras/*"),
+            (LLAMA_CPP_PYTHON_LEGACY_MODELS_BODY,
+             LLAMA_CPP_PYTHON_OLD_FASTAPI_OPENAPI_BODY,
+             "un FastAPI antérieur à la 0.99"),
+            (LLAMA_CPP_PYTHON_ESCAPED_IDS_BODY, LLAMA_CPP_PYTHON_OPENAPI_BODY,
+             "des identifiants que JSON échappe"),
+            (LLAMA_CPP_PYTHON_MODELS_REINDENTED_BODY,
+             LLAMA_CPP_PYTHON_OPENAPI_REINDENTED_BODY,
+             "les documents réindentés"),
+            (LLAMA_CPP_PYTHON_MODELS_REINDENTED_BODY,
+             LLAMA_CPP_PYTHON_OPENAPI_ASCII_BODY,
+             "un intermédiaire qui échappe l'émoji du titre")):
+        assert llama_cpp_python_fires(models=(200, models),
+                                      openapi=(200, openapi)), (
+            f"le template ne reconnaît pas {why}")
+
+    ours = (200, LLAMA_CPP_PYTHON_MODELS_BODY)
+    schema = (200, LLAMA_CPP_PYTHON_OPENAPI_BODY)
+    for models, openapi, why in (
+            ((401, LLAMA_CPP_PYTHON_UNAUTHORIZED_BODY), schema,
+             "une instance à clé, dont le schéma reste servi"),
+            (ours, (404, LLAMA_CPP_PYTHON_NOT_FOUND_BODY),
+             "la liste sans le schéma : rien ne nomme le produit"),
+            ((404, LLAMA_CPP_PYTHON_NOT_FOUND_BODY),
+             (404, LLAMA_CPP_PYTHON_NOT_FOUND_BODY),
+             "une application FastAPI qui ne sert ni l'un ni l'autre"),
+            (ours, ours, "la liste des modèles sur toutes les routes"),
+            (schema, schema, "le schéma sur toutes les routes"),
+            ((200, LLAMA_CPP_PYTHON_EMPTY_LIST_BODY), schema,
+             '"object":"list" seul, sans une carte'),
+            ((200, LLAMA_CPP_PYTHON_OTHER_OWNER_BODY), schema,
+             "un autre owned_by"),
+            ((200, LLAMA_CPP_PYTHON_SINGULAR_PERMISSION_BODY), schema,
+             "la clé permission au singulier"),
+            ((200, LLAMA_CPP_PYTHON_GRANTED_PERMISSION_BODY), schema,
+             "une liste de permissions non vide"),
+            ((200, LLAMA_CPP_PYTHON_CREATED_BODY), schema,
+             "une carte qui porte created"),
+            ((200, LLAMA_CPP_PYTHON_MIXED_OWNERS_BODY), schema,
+             "une carte d'un autre propriétaire parmi les siennes"),
+            ((200, LLAMA_CPP_PYTHON_REORDERED_BODY), schema,
+             "l'enveloppe dans l'autre sens"),
+            ((200, LLAMA_CPP_PYTHON_WRAPPED_BODY), schema,
+             "la liste rangée sous la clé d'une passerelle"),
+            ((200, LLAMA_CPP_PYTHON_QUOTED_IN_JSON_BODY), schema,
+             "la liste citée en chaîne"),
+            ((200, LLAMA_CPP_PYTHON_QUOTED_IN_HTML_BODY), schema,
+             "une page HTML qui cite la liste"),
+            (ours, (200, LLAMA_CPP_PYTHON_RETITLED_OPENAPI_BODY),
+             "un schéma au titre générique"),
+            (ours, (200, LLAMA_CPP_PYTHON_SUFFIXED_TITLE_OPENAPI_BODY),
+             "un titre qui prolonge celui du produit"),
+            (ours, (200, LLAMA_CPP_PYTHON_TITLE_IN_DESCRIPTION_OPENAPI_BODY),
+             "le titre repris dans une description"),
+            (ours, (200, LLAMA_CPP_PYTHON_NO_CHAT_OPENAPI_BODY),
+             "un schéma sans la route d'inférence"),
+            (ours, (200, LLAMA_CPP_PYTHON_CHAT_AS_TEXT_OPENAPI_BODY),
+             "la route d'inférence citée dans un summary"),
+            (ours, (200, LLAMA_CPP_PYTHON_WRAPPED_OPENAPI_BODY),
+             "le schéma republié sous la clé d'une passerelle"),
+            (ours, (200, LLAMA_CPP_PYTHON_DOCS_BODY),
+             "la page Swagger, qui cite le titre")):
+        assert not llama_cpp_python_fires(models=models, openapi=openapi), (
+            f"le template conclut sur {why}")
+
+
+def test_llama_cpp_python_and_the_other_models_readers_stay_apart():
+    """
+    Le pack lit /v1/models et /openapi.json sur d'autres serveurs compatibles
+    OpenAI : aucun de leurs corps ne porte le littéral de get_models ni le
+    titre de create_app, et LLaMA-Factory, qui lit les deux mêmes routes, se
+    tait devant ceux de llama-cpp-python.
+    """
+    schema = (200, LLAMA_CPP_PYTHON_OPENAPI_BODY)
+    for body, product in ((VLLM_MODELS_BODY, "vLLM"),
+                          (LMSTUDIO_MODELS_BODY, "LM Studio"),
+                          (LOCALAI_OPENAI_MODELS_BODY, "LocalAI"),
+                          (LITELLM_OPENAI_MODELS_BODY, "LiteLLM"),
+                          (KOKORO_MODELS_BODY, "Kokoro-FastAPI"),
+                          (LLAMA_FACTORY_MODELS_BODY, "LLaMA-Factory"),
+                          (APHRODITE_MODELS_BODY, "Aphrodite"),
+                          (FASTDEPLOY_MODELS_BODY, "FastDeploy")):
+        assert not llama_cpp_python_fires(models=(200, body), openapi=schema), (
+            f"le template conclut sur la liste des modèles de {product}")
+    for body, product in ((LLAMA_FACTORY_OPENAPI_BODY, "LLaMA-Factory"),
+                          (VLLM_OPENAPI_BODY, "vLLM"),
+                          (SPEACHES_OPENAPI_BODY, "Speaches"),
+                          (LANGSERVE_OPENAPI_BODY, "LangServe")):
+        assert not llama_cpp_python_fires(openapi=(200, body)), (
+            f"le template conclut sur le schéma de {product}")
+    assert llama_factory_fires(), "le cas de test ne dit pas ce qu'il croit"
+    for models in (LLAMA_CPP_PYTHON_MODELS_BODY, LLAMA_CPP_PYTHON_ALIAS_BODY,
+                   LLAMA_CPP_PYTHON_THREE_MODELS_BODY):
+        assert not llama_factory_fires(
+            models=(200, models),
+            openapi=(200, LLAMA_CPP_PYTHON_OPENAPI_BODY)), (
+            "le template LLaMA-Factory conclut sur llama-cpp-python")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_llama_cpp_python_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `llama_cpp_python_fires` rejoue le matcher en Python : seul un scan
+    contre un vrai serveur dit que le lexer de nuclei lit les motifs pareil —
+    l'émoji et son échappement compris —, et ce que l'extracteur rend sous
+    req-condition.
+    """
+    def scan(models=(200, LLAMA_CPP_PYTHON_MODELS_BODY),
+             openapi=(200, LLAMA_CPP_PYTHON_OPENAPI_BODY),
+             content_types=None):
+        seen = []
+        routes = {LLAMA_CPP_PYTHON_MODELS_ROUTE: models,
+                  LLAMA_CPP_PYTHON_OPENAPI_ROUTE: openapi}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path in routes:
+                    status, body = routes[self.path]
+                    ctype = (content_types or {}).get(self.path,
+                                                      "application/json")
+                    self.reply(status, body, ctype)
+                else:
+                    self.reply(404, LLAMA_CPP_PYTHON_NOT_FOUND_BODY,
+                               "application/json")
+
+            def reply(self, code, body, ctype):
+                data = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", LLAMA_CPP_PYTHON_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "llama-cpp-python-server-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       sorted(item.get("extracted-results") or []))
+                      for item in lines]
+
+    seen, hits = scan()
+    assert seen == [LLAMA_CPP_PYTHON_MODELS_ROUTE,
+                    LLAMA_CPP_PYTHON_OPENAPI_ROUTE], seen
+    assert hits == [("model-aliases",
+                     ["/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"])], hits
+
+    _, hits = scan(models=(200, LLAMA_CPP_PYTHON_THREE_MODELS_BODY))
+    assert hits == [("model-aliases", sorted(LLAMA_CPP_PYTHON_ALIASES))], hits
+
+    _, hits = scan(models=(200, LLAMA_CPP_PYTHON_LEGACY_MODELS_BODY),
+                   openapi=(200, LLAMA_CPP_PYTHON_LEGACY_OPENAPI_BODY))
+    assert hits == [("model-aliases",
+                     ["/models/mistral-7b-instruct-v0.2.Q4_K_M.gguf"])], hits
+
+    _, hits = scan(models=(200, LLAMA_CPP_PYTHON_ESCAPED_IDS_BODY))
+    assert hits == [("model-aliases",
+                     sorted(LLAMA_CPP_PYTHON_ESCAPED_IDS))], hits
+
+    for openapi in (LLAMA_CPP_PYTHON_OPENAPI_REINDENTED_BODY,
+                    LLAMA_CPP_PYTHON_OPENAPI_ASCII_BODY,
+                    LLAMA_CPP_PYTHON_ROOT_PATH_OPENAPI_BODY):
+        _, hits = scan(models=(200, LLAMA_CPP_PYTHON_MODELS_REINDENTED_BODY),
+                       openapi=(200, openapi))
+        assert [name for name, _ in hits] == ["model-aliases"], (
+            openapi[:120], hits)
+
+    ours = (200, LLAMA_CPP_PYTHON_MODELS_BODY)
+    schema = (200, LLAMA_CPP_PYTHON_OPENAPI_BODY)
+    html = {LLAMA_CPP_PYTHON_OPENAPI_ROUTE: "text/html; charset=utf-8"}
+    for models, openapi, content_types in (
+            ((401, LLAMA_CPP_PYTHON_UNAUTHORIZED_BODY), schema, None),
+            (ours, (404, LLAMA_CPP_PYTHON_NOT_FOUND_BODY), None),
+            (ours, ours, None),
+            (schema, schema, None),
+            ((200, LLAMA_CPP_PYTHON_OTHER_OWNER_BODY), schema, None),
+            ((200, LLAMA_CPP_PYTHON_SINGULAR_PERMISSION_BODY), schema, None),
+            ((200, LLAMA_CPP_PYTHON_EMPTY_LIST_BODY), schema, None),
+            ((200, LLAMA_FACTORY_MODELS_BODY),
+             (200, LLAMA_FACTORY_OPENAPI_BODY), None),
+            (ours, (200, LLAMA_CPP_PYTHON_RETITLED_OPENAPI_BODY), None),
+            (ours, (200, LLAMA_CPP_PYTHON_SUFFIXED_TITLE_OPENAPI_BODY), None),
+            (ours, (200, LLAMA_CPP_PYTHON_NO_CHAT_OPENAPI_BODY), None),
+            (ours, (200, LLAMA_CPP_PYTHON_DOCS_BODY), html)):
+        _, hits = scan(models=models, openapi=openapi,
+                       content_types=content_types)
+        assert hits == [], (models[1][:80], openapi[1][:80], hits)

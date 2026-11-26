@@ -1,0 +1,168 @@
+id: llama-cpp-python-server-exposed
+
+info:
+  name: llama-cpp-python - Unauthenticated OpenAI-Compatible API Server Exposed
+  author: popy21
+  severity: high
+  description: |
+    llama-cpp-python (abetlen/llama-cpp-python) est la liaison Python de
+    llama.cpp. Son serveur compatible OpenAI, lancé par « python -m
+    llama_cpp.server », est une application FastAPI servie par uvicorn — un
+    produit distinct du llama-server C++ de llama.cpp : il ne sert pas
+    GET /props, et son document OpenAPI est titré « 🦙 llama.cpp Python API ».
+    L'authentification est optionnelle et absente par défaut. Chaque route du
+    routeur porte « dependencies=[Depends(authenticate)] », et authenticate
+    (llama_cpp/server/app.py) commence par « if settings.api_key is None:
+    return True » ; ServerSettings (settings.py) déclare « api_key:
+    Optional[str] = Field(default=None, … ) ». Sans clé, toutes les routes
+    répondent sans jeton. Avant la v0.2.25 le réglage n'existe pas.
+    L'écoute par défaut est « host: str = Field(default="localhost", … ) »,
+    port 8000 ; l'instance est exposée par « --host 0.0.0.0 » ou par l'image
+    du dépôt : docker/simple/Dockerfile pose « ENV HOST=0.0.0.0 », « EXPOSE
+    8000 », et run.sh lance « uvicorn --factory
+    llama_cpp.server.app:create_app --host $HOST --port $PORT ».
+    GET /v1/models (get_models) rend {"object":"list","data":[{"id":"<alias>",
+    "object":"model","owned_by":"me","permissions":[]}]}, une entrée par
+    modèle configuré, sans rien charger ni calculer. Sans « --model_alias »,
+    l'alias vaut le chemin du fichier de modèle sur le disque du serveur
+    (model.py : « model.model_alias = model.model »).
+    GET /openapi.json est le chemin par défaut de FastAPI, que create_app ne
+    désactive pas ; le titre y est écrit en dur, la version est
+    llama_cpp.__version__. Le document est servi avec ou sans clé : seul, il
+    nomme le produit et ne dit rien de l'ouverture.
+    Avec « --api_key », GET /v1/models rend 401 et {"detail":"Invalid API
+    key"} : le template ne conclut pas.
+    Limites : une instance publiée derrière un intermédiaire qui ne relaie pas
+    /openapi.json n'est pas reconnue. Les routes /extras/tokenize,
+    /extras/tokenize/count et /extras/detokenize ne datent que de la v0.2.56 :
+    le constat ne les exige pas. Le titre et le littéral de get_models sont
+    lus identiques dans app.py aux tags v0.1.50, v0.1.78, v0.2.0, v0.2.27 et
+    v0.2.37.
+    Relevé sur une réplique : llama_cpp/server/ (app.py, settings.py,
+    model.py, types.py, errors.py, cli.py, __main__.py) et llama_types.py du
+    commit 77fbb5d de main (tag v0.3.38-hip-radeon), puis du tag v0.2.37, sous
+    fastapi 0.133.1, starlette 0.52.1, pydantic 2.12.5, pydantic-settings
+    2.16.3 et uvicorn 0.41.0 — sans clé, avec « --api_key », avec
+    « --model_alias », avec un fichier de configuration à trois modèles, avec
+    « --root_path », et par la fabrique uvicorn de l'image avec puis sans
+    variable API_KEY. Le moteur natif y est remplacé par un bouchon : aucune
+    inférence n'a été relevée.
+  impact: |
+    Un appelant anonyme lit les alias des modèles servis et, quand aucun
+    alias n'est donné, le chemin de leurs fichiers sur le serveur. Les routes
+    d'inférence du même routeur portent la même dépendance et s'ouvrent avec
+    elle : POST /v1/completions, POST /v1/chat/completions et POST
+    /v1/embeddings font tourner le modèle sur le matériel de l'opérateur,
+    sans compte ni limite ; depuis la v0.2.56, POST /extras/tokenize,
+    /extras/tokenize/count et /extras/detokenize exposent son tokeniseur.
+    Sur une instance à plusieurs modèles, nommer un autre alias dans une
+    requête fait fermer le modèle chargé et charger celui-là (LlamaProxy,
+    model.py). CORSMiddleware est monté avec « allow_origins=["*"] » : une
+    page web ouverte dans un navigateur qui joint l'instance peut l'appeler.
+    Relevé dans le code ; le template n'envoie que deux lectures GET.
+  remediation: |
+    Poser une clé : « --api_key <secret> » en ligne de commande, la variable
+    d'environnement API_KEY (image Docker, fabrique uvicorn) ou la clé
+    « api_key » du fichier de configuration. Toutes les routes du routeur
+    exigent alors « Authorization: Bearer <secret> ». Laisser « --host » à
+    localhost quand l'instance n'a pas à être jointe depuis une autre
+    machine ; sous Docker, publier le port sur l'interface locale seulement
+    (« -p 127.0.0.1:8000:8000 ») ou placer devant un intermédiaire qui
+    authentifie. Vérifier depuis l'extérieur que GET /v1/models rend 401 et
+    {"detail":"Invalid API key"}. /openapi.json et /docs restent servis sous
+    clé et donnent la version installée : les filtrer devant le port s'ils
+    n'ont pas à sortir. Après une exposition, relire le journal d'accès à la
+    recherche des POST /v1/chat/completions, /v1/completions et
+    /v1/embeddings qu'on ne s'explique pas.
+  reference:
+    - https://github.com/abetlen/llama-cpp-python
+    - https://github.com/abetlen/llama-cpp-python/blob/main/llama_cpp/server/app.py
+    - https://github.com/abetlen/llama-cpp-python/blob/main/llama_cpp/server/settings.py
+    - https://github.com/abetlen/llama-cpp-python/blob/main/llama_cpp/server/model.py
+    - https://github.com/abetlen/llama-cpp-python/blob/main/llama_cpp/server/__main__.py
+    - https://github.com/abetlen/llama-cpp-python/blob/main/docker/simple/Dockerfile
+    - https://github.com/abetlen/llama-cpp-python/blob/main/docker/simple/run.sh
+    - https://github.com/abetlen/llama-cpp-python/blob/main/CHANGELOG.md
+  metadata:
+    max-request: 2
+    vendor: abetlen
+    product: llama-cpp-python
+  tags: ai,llm,llama-cpp-python,llamacpp,inference,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, en GET, sans corps ni en-tête, et chacune porte une moitié
+  # du constat.
+  #
+  # GET /v1/models est la preuve d'ouverture : authenticate y est montée, donc
+  # son corps ne sort que d'une instance sans api_key. Le handler rend un
+  # littéral, un élément par alias configuré : ni le modèle ni le matériel ne
+  # sont sollicités.
+  #
+  # GET /openapi.json nomme le produit par son titre, écrit en dur dans
+  # create_app. Il répond sur une instance à clé comme sur une instance
+  # ouverte — seul, il dirait « c'est llama-cpp-python », jamais « il est
+  # ouvert ».
+  #
+  # POST /v1/completions, /v1/chat/completions, /v1/embeddings et /extras/*
+  # calculent : ce que le constat signale, pas ce qu'un scanner a besoin
+  # d'appeler pour l'établir.
+  #
+  # Aucun en-tête Authorization : c'est l'accès anonyme qui est constaté.
+  # Le port n'est pas forcé : 8000 par défaut, à donner dans la cible.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/models"
+      - "{{BaseURL}}/openapi.json"
+
+    # req-condition accumule body_N pour que la conclusion porte sur les deux
+    # réponses à la fois.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        name: model-aliases
+        condition: and
+        dsl:
+          # Le document entier de get_models, ancré aux deux bouts : ModelList
+          # déclare object puis data, ModelData id, object, owned_by puis
+          # permissions, et LlamaProxy refuse de démarrer sans modèle — la
+          # liste n'est jamais vide. Le couple "owned_by":"me" et
+          # "permissions":[] — clé au pluriel, liste vide — est le littéral du
+          # handler ; "object":"list" seul ne dit rien. Tenir le document
+          # entier écarte les serveurs qui ajoutent created, root ou
+          # permission à la carte, le 401 {"detail":"Invalid API key"} d'une
+          # instance à clé, la page ou le document qui citerait la réponse.
+          # FastAPI sérialise compact ; les \s* absorbent l'intermédiaire qui
+          # réindente.
+          - 'regex("^\\{\\s*\"object\"\\s*:\\s*\"list\"\\s*,\\s*\"data\"\\s*:\\s*\\[\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"owned_by\"\\s*:\\s*\"me\"\\s*,\\s*\"permissions\"\\s*:\\s*\\[\\s*\\]\\s*\\}(?:\\s*,\\s*\\{\\s*\"id\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"object\"\\s*:\\s*\"model\"\\s*,\\s*\"owned_by\"\\s*:\\s*\"me\"\\s*,\\s*\"permissions\"\\s*:\\s*\\[\\s*\\]\\s*\\})*\\s*\\]\\s*\\}$", trim_space(body_1))'
+
+          # Le schéma, ouvert sur openapi puis info puis title comme
+          # get_openapi() l'écrit : l'instance a servi le document elle-même,
+          # et son titre est celui que create_app écrit en dur — aucun réglage
+          # ne le change. Le littéral de get_models est court et peut être
+          # recopié par un serveur dérivé ; le titre, lui, nomme le produit.
+          # L'émoji est lu tel que FastAPI l'écrit, en UTF-8, ou échappé en
+          # 🦙 par l'intermédiaire qui resérialise en ASCII.
+          - 'regex("^\\{\\s*\"openapi\"\\s*:\\s*\"3\\.[0-9.]+\"\\s*,\\s*\"info\"\\s*:\\s*\\{\\s*\"title\"\\s*:\\s*\"(?:🦙|\\\\u[dD]83[eE]\\\\u[dD][dD]99) llama\\.cpp Python API\"\\s*[,}]", trim_space(body_2))'
+
+          # Et la route d'inférence que l'impact nomme, tenue pour une clé de
+          # paths suivie de son opération : ce schéma-là la déclare, sur le
+          # même routeur et sous la même dépendance, sans que le scanner ait à
+          # l'appeler. Les routes /extras/* ne sont pas exigées : elles ne
+          # datent que de la v0.2.56, le titre et /v1/chat/completions sont là
+          # depuis la v0.1.50 au moins.
+          - 'regex("\"/v1/chat/completions\"\\s*:\\s*\\{\\s*\"post\"\\s*:", body_2)'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout,
+    # seul le corps dit ce qui est servi.
+
+    extractors:
+      # Les alias des modèles servis — le chemin du fichier de modèle quand
+      # aucun alias n'est donné. Un seul extracteur, borné à body_1 : sous
+      # req-condition le moteur émet un résultat par extracteur qui rend
+      # quelque chose.
+      - type: json
+        part: body_1
+        name: models
+        json:
+          - '.data[].id'
