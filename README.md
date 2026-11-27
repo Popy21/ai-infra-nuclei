@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-162 templates, 159 produits.
+163 templates, 160 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -142,6 +142,7 @@ amont.
 | ollama | [`ollama-model-pull-abuse`](templates/exposure/ollama-model-pull-abuse.yaml) | high |
 | ollama | [`ollama-unauthenticated-api`](templates/exposure/ollama-unauthenticated-api.yaml) | high |
 | onyx | [`onyx-versions-exposed`](templates/exposure/onyx-versions-exposed.yaml) | low |
+| opea | [`opea-microservice-health-check-exposed`](templates/exposure/opea-microservice-health-check-exposed.yaml) | high |
 | open-notebook | [`open-notebook-auth-disabled`](templates/exposure/open-notebook-auth-disabled.yaml) | high |
 | open-webui | [`open-webui-signup-enabled`](templates/exposure/open-webui-signup-enabled.yaml) | medium |
 | opencode | [`opencode-server-exposed`](templates/exposure/opencode-server-exposed.yaml) | critical |

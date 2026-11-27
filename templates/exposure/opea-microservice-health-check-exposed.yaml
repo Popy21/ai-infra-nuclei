@@ -1,0 +1,147 @@
+id: opea-microservice-health-check-exposed
+
+info:
+  name: OPEA GenAIComps - Unauthenticated Microservice Health Check Exposed
+  author: popy21
+  severity: high
+  description: |
+    OPEA (Open Platform for Enterprise AI, opea-project) assemble des
+    pipelines d'IA générative — ChatQnA, CodeGen, DocSum — à partir de
+    microservices (GenAIComps) qu'un « mégaservice » orchestre
+    (GenAIExamples). Microservices et mégaservices sont tous des MicroService
+    (comps/cores/mega/micro_service.py), bâtis sur HTTPService
+    (http_service.py) : une application FastAPI servie par uvicorn.
+    L'authentification n'est pas un réglage oublié, c'est une fonctionnalité
+    absente : http_service.py ne contient aucun contrôle d'identifiant. Son
+    seul middleware est un CORSMiddleware à « allow_origins=["*"] » et
+    « allow_credentials=True », monté sous « if self.cors: » (vrai par
+    défaut), et register_microservice ajoute chaque route par
+    « add_api_route(endpoint, func, methods=methods) », sans dépendance.
+    L'authentification n'existe que comme surcouche optionnelle, documentée à
+    part dans GenAIInfra (authN-authZ/README.md : « Here we provide different
+    options for user to implement authentication and authorization according
+    to their needs: », options Istio et APISIX).
+    _create_app déclare GET /v1/health_check, qui rend {"Service Title":
+    self.title, "Version": __version__, "Service Description":
+    self.description} : le titre est le nom du service, la description vaut
+    « self.description or "OPEA Microservice Infrastructure" ». La clé Version
+    date de la v1.3 ; des tags v0.6 à v1.2 le document n'a que les deux
+    autres, et la description y est écrite en dur.
+    L'écoute par défaut de MicroService est « host: str = "localhost" »,
+    « port: int = 8080 », mais les services livrés l'ouvrent :
+    « @register_microservice(name="opea_service@llm",
+    endpoint="/v1/chat/completions", host="0.0.0.0", port=9000 » (LLM),
+    « opea_service@retrievers » sur 7000, « opea_service@dataprep » sur 5000,
+    et ChatQnA/chatqna.py lance son mégaservice sur « host="0.0.0.0" » et
+    MEGA_SERVICE_PORT (8888). ChatQnA/docker_compose/intel/cpu/xeon/
+    compose.yaml publie sans préfixe d'adresse « 8888:8888 », « 7000:7000 »
+    et « 6007:5000 » : toutes les interfaces de l'hôte.
+    Relevé sur une réplique — comps/ du commit 8130a3f de main
+    (comps/version.py : 1.5) sous fastapi 0.128.0, starlette 0.49.1, pydantic
+    2.12.5, uvicorn 0.40.0 et prometheus-fastapi-instrumentator 7.1.0, les
+    versions épinglées par requirements.txt, handlers remplacés par des
+    bouchons : le décorateur du microservice LLM rend {"Service
+    Title":"opea_service@llm","Version":"1.5","Service Description":"OPEA
+    Microservice Infrastructure"}, la construction du mégaservice de
+    chatqna.py rend le titre « ChatQnAService » et la même description, et
+    comps/cores/mega/ du tag v1.2 rend le document à deux clés. FastAPI
+    sérialise compact. Sur la même application : GET /health rend 200 et un
+    corps vide, GET /v1/statistics un objet JSON, GET /metrics les compteurs
+    Prometheus de l'Instrumentator, GET /openapi.json le schéma.
+    Limites : le template ne lit que /v1/health_check. Une réponse prouve que
+    le service est atteint sans passerelle d'authentification devant lui, pas
+    qu'une passerelle éventuelle n'exempte pas ce seul chemin. Un service qui
+    porte à la fois une description propre et un nom hors « opea_service@ »
+    n'est pas reconnu.
+  impact: |
+    Un appelant anonyme lit le nom du service, la version de GenAIComps et sa
+    description. Les routes métier de la même application ne portent aucun
+    contrôle : sur un mégaservice, POST /v1/chatqna (comme /v1/codegen et
+    /v1/docsum) interroge le corpus RAG et fait tourner le LLM aux frais de
+    l'opérateur ; sur le microservice LLM, POST /v1/chat/completions ; sur
+    dataprep, les routes /v1/dataprep/ingest, /get et /delete écrivent, lisent
+    et suppriment les documents indexés. Le CORS à origine « * » laisse une
+    page web ouverte dans un navigateur qui joint l'instance l'appeler. Le
+    même compose publie en outre redis-vector-db en « 6379:6379 » et
+    « 8001:8001 ». Relevé dans le code ; le template n'envoie qu'une lecture
+    GET.
+  remediation: |
+    Ne pas publier les ports des services sur toutes les interfaces : dans le
+    compose, préfixer l'adresse (« 127.0.0.1:8888:8888 ») ou retirer la
+    publication des microservices que seul le mégaservice appelle (retriever,
+    dataprep, redis-vector-db). Placer devant ce qui doit sortir une
+    passerelle qui authentifie — GenAIInfra documente Istio et APISIX sous
+    authN-authZ — sans exempter /v1/health_check, /v1/statistics, /metrics ni
+    /openapi.json. Vérifier depuis l'extérieur que GET /v1/health_check ne
+    rend plus le document, puis que POST /v1/chatqna est refusé sans
+    identifiant. Après une exposition, relire le journal d'accès à la
+    recherche des POST qu'on ne s'explique pas ; /v1/health_check, lui, est
+    filtré du journal d'accès uvicorn par http_service.py.
+  reference:
+    - https://github.com/opea-project/GenAIComps
+    - https://github.com/opea-project/GenAIComps/blob/main/comps/cores/mega/http_service.py
+    - https://github.com/opea-project/GenAIComps/blob/main/comps/cores/mega/micro_service.py
+    - https://github.com/opea-project/GenAIComps/blob/main/comps/llms/src/text-generation/opea_llm_microservice.py
+    - https://github.com/opea-project/GenAIExamples/blob/main/ChatQnA/chatqna.py
+    - https://github.com/opea-project/GenAIExamples/blob/main/ChatQnA/docker_compose/intel/cpu/xeon/compose.yaml
+    - https://github.com/opea-project/GenAIInfra/blob/main/authN-authZ/README.md
+  metadata:
+    max-request: 1
+    vendor: opea-project
+    product: opea
+  tags: ai,llm,rag,opea,genaicomps,exposure,unauth,misconfig
+
+http:
+  # Une seule lecture, en GET, sans corps ni en-tête. _health_check() relit
+  # trois attributs fixés au démarrage : ni le modèle, ni le corpus, ni un
+  # service aval ne sont sollicités.
+  #
+  # GET /health n'est pas lu : il rend 200 et un corps vide, ce que rend
+  # n'importe quelle sonde. POST /v1/chatqna, /v1/chat/completions et les
+  # routes de dataprep calculent ou écrivent : ce que le constat signale, pas
+  # ce qu'un scanner a besoin d'appeler pour l'établir.
+  #
+  # Aucun en-tête Authorization : c'est l'accès anonyme qui est constaté.
+  # Le port n'est pas forcé : 8888 (mégaservice ChatQnA), 9000 (LLM), 7000
+  # (retriever), 6007 (dataprep, tel que le compose le publie) ou 8080
+  # (défaut de MicroService), à donner dans la cible.
+  - method: GET
+    path:
+      - "{{BaseURL}}/v1/health_check"
+
+    matchers:
+      - type: dsl
+        name: service-identity
+        condition: and
+        dsl:
+          # Le document entier de _health_check(), ancré aux deux bouts, dans
+          # l'ordre où le handler écrit son dict : Service Title, Version,
+          # Service Description. Les clés à espace et à capitales sont propres
+          # au produit. Version est facultative — elle ne date que de la v1.3
+          # — et rien d'autre ne l'est : tenir le document entier écarte la
+          # supervision qui le range sous une clé à elle, la page ou le
+          # document qui le cite, le service qui reprend une clé parmi les
+          # siennes. FastAPI sérialise compact ; les \s* absorbent
+          # l'intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"Service Title\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*(?:\"Version\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*)?\"Service Description\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*\\}$", trim_space(body))'
+
+          # Et ce qui nomme OPEA, à sa place dans le document : la description
+          # par défaut de MicroService, valeur entière de la dernière clé —
+          # celle des services livrés et des mégaservices des exemples, écrite
+          # en dur jusqu'à la v1.3 —, ou un titre en « opea_service@ », le
+          # préfixe des microservices de GenAIComps, pour celui qui porte une
+          # description à lui. La forme seule ne conclut pas.
+          - 'regex("\"Service Description\"\\s*:\\s*\"OPEA Microservice Infrastructure\"\\s*\\}$", trim_space(body)) || regex("^\\{\\s*\"Service Title\"\\s*:\\s*\"opea_service@", trim_space(body))'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout,
+    # seul le corps dit ce qui est servi.
+
+    extractors:
+      # Le nom du service : « opea_service@llm », « ChatQnAService »… Il dit
+      # quel maillon du pipeline est atteint, donc quelles routes métier sont
+      # derrière.
+      - type: json
+        part: body
+        name: service
+        json:
+          - '.["Service Title"]'

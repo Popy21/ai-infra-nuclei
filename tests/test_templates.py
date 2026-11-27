@@ -56318,3 +56318,426 @@ def test_llama_cpp_python_matcher_compiles_and_fires_against_a_live_server():
         _, hits = scan(models=models, openapi=openapi,
                        content_types=content_types)
         assert hits == [], (models[1][:80], openapi[1][:80], hits)
+
+
+# --------------------------------------------------------------------------
+# OPEA (opea-project/GenAIComps, GenAIExamples) : chaque microservice et
+# chaque mégaservice est un MicroService, une application FastAPI dont
+# http_service.py ne garde aucune route — son seul middleware est un CORS à
+# origine « * ». GET /v1/health_check y rend le nom du service, la version de
+# comps et sa description, sous des clés à espace et à capitales.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux d'une réplique : comps/ du commit 8130a3f
+#     de main (comps/version.py : 1.5), fastapi 0.128.0, starlette 0.49.1,
+#     pydantic 2.12.5, uvicorn 0.40.0, prometheus-fastapi-instrumentator
+#     7.1.0 — les versions épinglées par requirements.txt ; les handlers
+#     remplacés par des bouchons, aucune inférence relevée ;
+#   - le document est compact, dans l'ordre du dict du handler : Service
+#     Title, Version, Service Description ; un mégaservice construit comme
+#     ChatQnAService.start() porte le nom de sa classe et la description par
+#     défaut ; une description propre sort en UTF-8, guillemets échappés ;
+#   - comps/cores/mega/ du tag v1.2 (commit 5af7578) rend le document sans
+#     la clé Version, qui ne date que de la v1.3 ;
+#   - GET /health rend 200 et un corps vide, GET /v1/statistics « {} » sur un
+#     service sans statistique, GET /metrics le texte Prometheus de
+#     l'Instrumentator ; une route absente rend 404 et {"detail":"Not
+#     Found"}.
+
+OPEA_TEMPLATE = os.path.join(
+    TEMPLATES_DIR, "exposure", "opea-microservice-health-check-exposed.yaml")
+
+OPEA_HEALTH_CHECK_ROUTE = "/v1/health_check"
+
+OPEA_DEFAULT_DESCRIPTION = "OPEA Microservice Infrastructure"
+
+# Verbatim, réplique : le décorateur du microservice LLM. 109 octets.
+OPEA_LLM_BODY = (
+    '{"Service Title":"opea_service@llm","Version":"1.5","Service Description'
+    '":"OPEA Microservice Infrastructure"}')
+# Verbatim, réplique : le mégaservice de ChatQnA/chatqna.py. 107 octets.
+OPEA_MEGA_BODY = (
+    '{"Service Title":"ChatQnAService","Version":"1.5","Service Description":'
+    '"OPEA Microservice Infrastructure"}')
+# Verbatim, réplique : un microservice enregistré avec description=. 125
+# octets.
+OPEA_DESCRIBED_BODY = (
+    '{"Service Title":"opea_service@custom","Version":"1.5","Service Descript'
+    'ion":"Internal \\"RAG\\" gateway — équipe données"}')
+# Verbatim, réplique du tag v1.2 : deux clés. 97 octets.
+OPEA_LEGACY_BODY = (
+    '{"Service Title":"opea_service@llm_tgi","Service Description":"OPEA Micr'
+    'oservice Infrastructure"}')
+
+# Verbatim, réplique : une route absente, GET /health, GET /v1/statistics.
+OPEA_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+OPEA_HEALTH_BODY = ""
+OPEA_STATISTICS_BODY = "{}"
+# Verbatim, réplique : l'ouverture de GET /openapi.json du microservice LLM,
+# qui reprend le titre et la description.
+OPEA_OPENAPI_HEAD = (
+    '{"openapi":"3.1.0","info":{"title":"opea_service@llm","description":"OPE'
+    'A Microservice Infrastructure","version":"0.1.0"},"paths":{"/v1/health_c'
+    'heck":{"get":{"tags":["Debug"],"summary":"Get the status of GenAI micros'
+    'ervice",')
+# Abrégé, réplique : GET /metrics, qui nomme la route dans ses compteurs.
+OPEA_METRICS_BODY = (
+    '# HELP http_requests_total Total number of requests by method, status an'
+    'd handler.\n# TYPE http_requests_total counter\nhttp_requests_total{hand'
+    'ler="/v1/health_check",method="GET",status="2xx"} 3.0\n')
+
+
+def opea_health_body(title="opea_service@llm", version="1.5",
+                     description=OPEA_DEFAULT_DESCRIPTION, **dumps):
+    """Le document de _health_check(), dans l'ordre du dict du handler."""
+    doc = {"Service Title": title}
+    if version is not None:
+        doc["Version"] = version
+    doc["Service Description"] = description
+    dumps.setdefault("separators", (",", ":"))
+    dumps.setdefault("ensure_ascii", False)
+    return json.dumps(doc, **dumps)
+
+
+# Écrit d'après les décorateurs de GenAIComps, pas relevé : le retriever et
+# dataprep, sans description ; puis un MicroService sans nom.
+OPEA_RETRIEVER_BODY = opea_health_body(title="opea_service@retrievers")
+OPEA_DATAPREP_BODY = opea_health_body(title="opea_service@dataprep")
+OPEA_UNNAMED_BODY = opea_health_body(title="")
+# Un intermédiaire qui réindente : en gardant l'UTF-8, puis en l'échappant.
+OPEA_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(OPEA_MEGA_BODY), indent=2) + "\n")
+OPEA_DESCRIBED_REINDENTED_BODY = (
+    "\n" + json.dumps(json.loads(OPEA_DESCRIBED_BODY), indent=2,
+                      ensure_ascii=False) + "\n")
+OPEA_DESCRIBED_ASCII_BODY = json.dumps(json.loads(OPEA_DESCRIBED_BODY),
+                                       indent=2)
+
+# La forme seule : les trois clés, ni la description par défaut ni un titre
+# en « opea_service@ ».
+OPEA_SHAPE_ONLY_BODY = opea_health_body(title="gateway", version="2.0",
+                                        description="Internal gateway")
+# Le préfixe ailleurs qu'en tête du titre ; la description par défaut
+# prolongée ; le littéral rangé dans le titre.
+OPEA_PREFIX_INSIDE_TITLE_BODY = opea_health_body(
+    title="proxy for opea_service@llm", description="Relay")
+OPEA_PROLONGED_DESCRIPTION_BODY = opea_health_body(
+    title="gateway", description=OPEA_DEFAULT_DESCRIPTION + " (mirror)")
+OPEA_LITERAL_IN_TITLE_BODY = opea_health_body(
+    title=OPEA_DEFAULT_DESCRIPTION, description="Relay")
+# Une clé sur deux, une description nulle, les clés en minuscules.
+OPEA_TITLE_ONLY_BODY = '{"Service Title":"opea_service@llm"}'
+OPEA_DESCRIPTION_ONLY_BODY = (
+    '{"Service Description":"OPEA Microservice Infrastructure"}')
+OPEA_NULL_DESCRIPTION_BODY = (
+    '{"Service Title":"opea_service@llm","Version":"1.5","Service Description'
+    '":null}')
+OPEA_LOWERCASE_KEYS_BODY = (
+    '{"service title":"opea_service@llm","version":"1.5","service description'
+    '":"OPEA Microservice Infrastructure"}')
+# Le document dans l'autre sens, puis avec une clé de plus.
+OPEA_REORDERED_BODY = (
+    '{"Service Description":"OPEA Microservice Infrastructure","Version":"1.5'
+    '","Service Title":"opea_service@llm"}')
+OPEA_EXTRA_KEY_BODY = OPEA_LLM_BODY[:-1] + ',"status":"ok"}'
+# Le document rangé sous la clé d'un autre, dans une liste, cité en chaîne,
+# cité dans une page.
+OPEA_WRAPPED_BODY = '{"upstream":%s}' % OPEA_LLM_BODY
+OPEA_LISTED_BODY = "[%s]" % OPEA_LLM_BODY
+OPEA_QUOTED_IN_JSON_BODY = json.dumps(
+    {"Service Title": "opea_service@llm", "example": OPEA_LLM_BODY},
+    separators=(",", ":"))
+OPEA_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>" + OPEA_LLM_BODY + "</pre></body></html>")
+
+
+def opea_block():
+    doc = load(OPEA_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % OPEA_HEALTH_CHECK_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /v1/health_check"
+    return blocks[0]
+
+
+def opea_matcher():
+    found = [m for m in opea_block().get("matchers") or []
+             if m.get("name") == "service-identity"]
+    assert len(found) == 1, "matcher 'service-identity' absent ou en double"
+    return found[0]
+
+
+def opea_fires(body=OPEA_LLM_BODY, status=200):
+    return dsl_matcher_hits(opea_matcher(), [(status, body)])
+
+
+def test_opea_fixtures_hold_the_bodies_read_on_the_replica():
+    for body, size, digest in (
+            (OPEA_LLM_BODY, 109,
+             "0437b0f4e665944bb448d847abbe848d0612226aaadd7d34dce1d063e5588478"),
+            (OPEA_MEGA_BODY, 107,
+             "b5d138005f31c144f6407937d6436464375c15b19d48f61f4bff18e64233b66a"),
+            (OPEA_DESCRIBED_BODY, 125,
+             "9c01b8652d5e379473ab4f03a0c5bbe78112fe2a5a850c83e92ad688b6177e35"),
+            (OPEA_LEGACY_BODY, 97,
+             "1d5377d10f56e41b7e04608bdf0df02b117c70ca049d1b5011bae6354333aec8")):
+        assert len(body.encode()) == size
+        assert hashlib.sha256(body.encode()).hexdigest() == digest, (
+            "le corps relevé, à l'octet près")
+    for body, title in ((OPEA_LLM_BODY, "opea_service@llm"),
+                        (OPEA_MEGA_BODY, "ChatQnAService"),
+                        (OPEA_DESCRIBED_BODY, "opea_service@custom")):
+        doc = json.loads(body)
+        assert list(doc) == ["Service Title", "Version",
+                             "Service Description"], "l'ordre du handler"
+        assert (doc["Service Title"], doc["Version"]) == (title, "1.5")
+    assert json.loads(OPEA_LLM_BODY)["Service Description"] == (
+        OPEA_DEFAULT_DESCRIPTION)
+    assert json.loads(OPEA_MEGA_BODY)["Service Description"] == (
+        OPEA_DEFAULT_DESCRIPTION), (
+        "le mégaservice de chatqna.py ne donne pas de description")
+    assert json.loads(OPEA_DESCRIBED_BODY)["Service Description"] == (
+        'Internal "RAG" gateway — équipe données')
+    assert "—" in OPEA_DESCRIBED_BODY and '\\"RAG\\"' in OPEA_DESCRIBED_BODY, (
+        "FastAPI écrit l'UTF-8 sans l'échapper, et échappe les guillemets")
+    assert json.loads(OPEA_LEGACY_BODY) == {
+        "Service Title": "opea_service@llm_tgi",
+        "Service Description": OPEA_DEFAULT_DESCRIPTION}, (
+        "la v1.2 ne rend pas la clé Version")
+    assert list(json.loads(OPEA_LEGACY_BODY)) == ["Service Title",
+                                                  "Service Description"]
+    assert opea_health_body() == OPEA_LLM_BODY, (
+        "le constructeur de corps écrit ce que la réplique rend")
+    assert opea_health_body(title="ChatQnAService") == OPEA_MEGA_BODY
+    assert opea_health_body(title="opea_service@llm_tgi",
+                            version=None) == OPEA_LEGACY_BODY
+    assert opea_health_body(
+        title="opea_service@custom",
+        description='Internal "RAG" gateway — équipe données') == (
+        OPEA_DESCRIBED_BODY)
+    assert json.loads(OPEA_NOT_FOUND_BODY) == {"detail": "Not Found"}
+    assert OPEA_HEALTH_BODY == "" and json.loads(OPEA_STATISTICS_BODY) == {}
+    assert json.loads(OPEA_REINDENTED_BODY) == json.loads(OPEA_MEGA_BODY)
+    assert "\\u2014" in OPEA_DESCRIBED_ASCII_BODY
+    assert json.loads(OPEA_DESCRIBED_ASCII_BODY) == json.loads(
+        OPEA_DESCRIBED_REINDENTED_BODY) == json.loads(OPEA_DESCRIBED_BODY)
+    assert json.loads(OPEA_UNNAMED_BODY)["Service Title"] == ""
+    assert json.loads(OPEA_QUOTED_IN_JSON_BODY)["example"] == OPEA_LLM_BODY
+    assert json.loads(OPEA_WRAPPED_BODY)["upstream"] == json.loads(
+        OPEA_LLM_BODY)
+    assert json.loads(OPEA_REORDERED_BODY) == json.loads(OPEA_LLM_BODY)
+    assert list(json.loads(OPEA_EXTRA_KEY_BODY))[-1] == "status"
+    assert OPEA_DEFAULT_DESCRIPTION in OPEA_OPENAPI_HEAD and (
+        "opea_service@llm" in OPEA_OPENAPI_HEAD)
+    assert OPEA_HEALTH_CHECK_ROUTE in OPEA_METRICS_BODY
+
+
+def test_opea_probe_reads_one_document_and_runs_no_inference():
+    doc = load(OPEA_TEMPLATE)
+    assert request_routes(doc) == {("GET", OPEA_HEALTH_CHECK_ROUTE)}, (
+        "le template ne lit que /v1/health_check : /health rend un corps "
+        "vide, /v1/chatqna et /v1/chat/completions calculent")
+    block = opea_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête Authorization : c'est l'accès anonyme qui est constaté")
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 1
+    assert meta.get("product") == "opea"
+    assert doc["info"]["severity"] == "high"
+    description = re.sub(r"\s+", " ", doc["info"]["description"])
+    assert 'allow_origins=["*"]' in description and (
+        "allow_credentials=True" in description), (
+        "le seul middleware de http_service.py est relevé dans le code")
+    assert "authN-authZ" in description, (
+        "l'authentification n'existe que comme surcouche de GenAIInfra")
+    assert 'host: str = "localhost"' in description and (
+        "port: int = 8080" in description), "l'écoute par défaut"
+    assert 'host="0.0.0.0"' in description and "8888:8888" in description, (
+        "l'écoute des services livrés et la publication du compose")
+    assert OPEA_LLM_BODY in description, (
+        "le corps relevé sur la réplique est écrit dans le template")
+    assert "8130a3f" in description and "v1.3" in description, (
+        "le commit relevé et la version qui introduit la clé Version")
+    assert "n'exempte pas ce seul chemin" in description, (
+        "la limite du constat — un chemin de santé joignable ne dit rien "
+        "d'une passerelle qui n'exempterait que lui — est écrite")
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1 and extractors[0].get("part") == "body", (
+        "un seul extracteur : le nom du service")
+
+
+def test_opea_matcher_rests_on_both_keys_and_what_names_opea():
+    matchers = opea_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"], (
+        "aucun matcher de statut : un intermédiaire peut rendre 200 sur tout")
+    expressions = opea_matcher().get("dsl") or []
+    assert opea_matcher().get("condition") == "and"
+    assert len(expressions) == 2
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu")
+    shape, names = expressions
+    for key in ('\\"Service Title\\"', '\\"Service Description\\"'):
+        assert key in shape, f"les deux clés sont exigées ensemble — {key}"
+    assert '(?:\\"Version\\"' in shape and ")?" in shape, (
+        "la clé Version est facultative : elle ne date que de la v1.3")
+    assert shape.startswith('regex("^') and '$", trim_space(body))' in shape, (
+        "le document est tenu aux deux bouts")
+    assert OPEA_DEFAULT_DESCRIPTION in names and "opea_service@" in names, (
+        "la description par défaut ou le préfixe des microservices")
+    assert "||" in names, "l'un ou l'autre nomme OPEA"
+
+    for body, why in (
+            (OPEA_LLM_BODY, "le microservice LLM relevé"),
+            (OPEA_MEGA_BODY, "le mégaservice ChatQnA relevé"),
+            (OPEA_DESCRIBED_BODY,
+             "un microservice à description propre, nommé opea_service@"),
+            (OPEA_LEGACY_BODY, "la v1.2, sans la clé Version"),
+            (OPEA_RETRIEVER_BODY, "le retriever"),
+            (OPEA_DATAPREP_BODY, "dataprep"),
+            (OPEA_UNNAMED_BODY, "un MicroService sans nom"),
+            (OPEA_REINDENTED_BODY, "le document réindenté"),
+            (OPEA_DESCRIBED_REINDENTED_BODY,
+             "le document à description propre réindenté"),
+            (OPEA_DESCRIBED_ASCII_BODY,
+             "un intermédiaire qui échappe l'UTF-8 de la description")):
+        assert opea_fires(body), f"le template ne reconnaît pas {why}"
+    assert opea_fires(OPEA_LLM_BODY, status=503), (
+        "le statut ne décide de rien : seul le corps est lu")
+
+    for status, body, why in (
+            (404, OPEA_NOT_FOUND_BODY, "une route absente"),
+            (200, OPEA_HEALTH_BODY, "le 200 à corps vide de GET /health"),
+            (200, OPEA_STATISTICS_BODY, "le « {} » de /v1/statistics"),
+            (200, OPEA_OPENAPI_HEAD + "}}}}",
+             "le schéma, qui reprend titre et description"),
+            (200, OPEA_METRICS_BODY, "les compteurs Prometheus"),
+            (200, OPEA_SHAPE_ONLY_BODY,
+             "la forme seule, sans rien qui nomme OPEA"),
+            (200, OPEA_PREFIX_INSIDE_TITLE_BODY,
+             "le préfixe ailleurs qu'en tête du titre"),
+            (200, OPEA_PROLONGED_DESCRIPTION_BODY,
+             "une description qui prolonge celle du produit"),
+            (200, OPEA_LITERAL_IN_TITLE_BODY,
+             "le littéral rangé dans le titre"),
+            (200, OPEA_TITLE_ONLY_BODY, "le titre sans la description"),
+            (200, OPEA_DESCRIPTION_ONLY_BODY, "la description sans le titre"),
+            (200, OPEA_NULL_DESCRIPTION_BODY, "une description nulle"),
+            (200, OPEA_LOWERCASE_KEYS_BODY, "les clés en minuscules"),
+            (200, OPEA_REORDERED_BODY, "le document dans l'autre sens"),
+            (200, OPEA_EXTRA_KEY_BODY, "une clé de plus"),
+            (200, OPEA_WRAPPED_BODY,
+             "le document rangé sous la clé d'une supervision"),
+            (200, OPEA_LISTED_BODY, "le document dans une liste"),
+            (200, OPEA_QUOTED_IN_JSON_BODY, "le document cité en chaîne"),
+            (200, OPEA_QUOTED_IN_HTML_BODY, "une page qui cite le document")):
+        assert not opea_fires(body, status=status), (
+            f"le template conclut sur {why}")
+
+
+def test_opea_and_the_other_health_readers_stay_apart():
+    """
+    Le pack lit d'autres documents de santé et d'information : aucun ne porte
+    les clés à espace de _health_check().
+    """
+    for body, product in ((VERBA_HEALTH_BODY, "Verba"),
+                          (TABBY_HEALTH_BODY, "Tabby"),
+                          (MINERU_HEALTH_BODY, "MinerU"),
+                          (MINERU_OTHER_HEALTH_BODY, "une sonde générique"),
+                          (LITSERVE_INFO_BODY, "LitServe"),
+                          (TEI_INFO_BODY, "text-embeddings-inference"),
+                          (LLAMA_CPP_PYTHON_OPENAPI_BODY, "llama-cpp-python")):
+        assert not opea_fires(body), (
+            f"le template conclut sur le document de {product}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_opea_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `opea_fires` rejoue le matcher en Python : seul un scan contre un vrai
+    serveur dit que le lexer de nuclei lit les motifs pareil — le groupe
+    facultatif et le « || » compris —, et ce que l'extracteur rend d'une clé
+    à espace.
+    """
+    def scan(body=OPEA_LLM_BODY, status=200,
+             content_type="application/json"):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append(self.path)
+                if self.path == OPEA_HEALTH_CHECK_ROUTE:
+                    self.reply(status, body, content_type)
+                else:
+                    self.reply(404, OPEA_NOT_FOUND_BODY, "application/json")
+
+            def reply(self, code, payload, ctype):
+                data = payload.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", OPEA_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "opea-microservice-health-check-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       sorted(item.get("extracted-results") or []))
+                      for item in lines]
+
+    seen, hits = scan()
+    assert seen == [OPEA_HEALTH_CHECK_ROUTE], seen
+    assert hits == [("service-identity", ["opea_service@llm"])], hits
+
+    for body, title in ((OPEA_MEGA_BODY, "ChatQnAService"),
+                        (OPEA_DESCRIBED_BODY, "opea_service@custom"),
+                        (OPEA_LEGACY_BODY, "opea_service@llm_tgi"),
+                        (OPEA_REINDENTED_BODY, "ChatQnAService"),
+                        (OPEA_DESCRIBED_ASCII_BODY, "opea_service@custom")):
+        _, hits = scan(body=body)
+        assert hits == [("service-identity", [title])], (body[:80], hits)
+
+    _, hits = scan(status=503)
+    assert hits == [("service-identity", ["opea_service@llm"])], hits
+
+    html = "text/html; charset=utf-8"
+    for status, body, content_type in (
+            (404, OPEA_NOT_FOUND_BODY, "application/json"),
+            (200, OPEA_HEALTH_BODY, "application/json"),
+            (200, OPEA_STATISTICS_BODY, "application/json"),
+            (200, OPEA_SHAPE_ONLY_BODY, "application/json"),
+            (200, OPEA_PREFIX_INSIDE_TITLE_BODY, "application/json"),
+            (200, OPEA_PROLONGED_DESCRIPTION_BODY, "application/json"),
+            (200, OPEA_TITLE_ONLY_BODY, "application/json"),
+            (200, OPEA_DESCRIPTION_ONLY_BODY, "application/json"),
+            (200, OPEA_REORDERED_BODY, "application/json"),
+            (200, OPEA_EXTRA_KEY_BODY, "application/json"),
+            (200, OPEA_WRAPPED_BODY, "application/json"),
+            (200, OPEA_QUOTED_IN_JSON_BODY, "application/json"),
+            (200, OPEA_QUOTED_IN_HTML_BODY, html)):
+        _, hits = scan(body=body, status=status, content_type=content_type)
+        assert hits == [], (body[:80], hits)
