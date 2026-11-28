@@ -1,0 +1,167 @@
+id: gravitino-metalakes-exposed
+
+info:
+  name: Apache Gravitino - Unauthenticated REST API (Metalake Listing)
+  author: popy21
+  severity: high
+  description: |
+    Apache Gravitino (apache/gravitino) est un catalogue de métadonnées
+    fédéré — tables, filesets, topics et modèles : docs/model-catalog.md
+    décrit son catalogue de modèles comme « a registry for machine learning
+    models ». Son serveur (Jetty, Jersey) monte toute l'API REST sous /api/*
+    (GravitinoServer.java, API_ANY_PATH = "/api/*") ; l'objet racine en est
+    le metalake, qui porte catalogues, schémas et objets.
+    L'absence d'authentification est le défaut livré.
+    conf/gravitino.conf.template ne pose pas gravitino.authenticators, dont
+    la valeur par défaut est « simple »
+    (docs/security/how-to-authenticate.md : « If you don't enable
+    authentication for your client and server explicitly, the user
+    `anonymous` will be used to access the server. ») ; il pose
+    gravitino.authorization.enable = false (docs/security/access-control.md
+    : « Authorization is off by default. ») et
+    gravitino.server.webserver.host = 0.0.0.0 avec httpPort = 8090 : le
+    serveur écoute sur toutes les interfaces sans qu'aucun réglage soit
+    touché.
+    AuthenticationFilter n'exempte que les routes de health check et rend 401
+    quand aucun authentificateur ne fournit de principal.
+    SimpleAuthenticator.supportsToken accepte l'en-tête Authorization absent
+    et authenticateToken rend alors ANONYMOUS_PRINCIPAL ; un en-tête Basic y
+    est décodé sans être vérifié, le nom d'utilisateur pris tel quel. Les
+    trois autres authentificateurs livrés (oauth, kerberos, basic) rendent
+    false à supportsToken sans en-tête : une requête nue n'y obtient aucun
+    principal. Un document rendu sans en-tête Authorization dit donc que
+    « simple » figure parmi gravitino.authenticators — à un authentificateur
+    maison près, AuthenticatorFactory acceptant un nom de classe.
+    Deux lectures, exigées ensemble : GET /api/metalakes
+    (MetalakeOperations.listMetalakes, MetalakeListResponse) et GET
+    /api/version (VersionOperations.getVersion, VersionResponse).
+    Relevé sur une réplique — gravitino-server 1.3.1 de Maven Central sous
+    JDK 21, conf/gravitino.conf.template et scripts/h2 du tag v1.3.1, base H2
+    embarquée ; seuls l'adresse d'écoute (127.0.0.1), le port et
+    gravitino.auxService.names (vidé : ni iceberg-rest ni lance-rest) y sont
+    changés. Sans aucun en-tête, une instance neuve rend
+    {"code":0,"metalakes":[]} et
+    {"code":0,"version":{"version":"1.3.1","compileDate":"24/09/2026
+    08:37:39","gitCommit":"ab5d0a4d655e6a81d0b86f7d2733d1874ed3f41a"}} ;
+    après création, chaque entrée de la liste s'ouvre sur
+    {"name":"lake_raw","properties":{"in-use":"true"}, et se ferme sur
+    "audit":{"creator":"anonymous","createTime":"2026-11-28T13:21:38.373410Z"}}
+    — comment, entre name et properties, n'est écrit que s'il existe, le
+    mapper du serveur étant en NON_NULL. Les deux
+    réponses portent « Content-Type: application/json », pas le
+    application/vnd.gravitino.v1+json de l'annotation @Produces : Utils.ok
+    pose .type(MediaType.APPLICATION_JSON), et l'en-tête n'est pas lu. Sur
+    main, MetalakeDTO porte en plus owner (@JsonInclude ALWAYS), que la 1.3.1
+    n'écrit pas : le matcher ne lit pas la fin d'une entrée.
+    Contrôles négatifs sur la même réplique. Sous gravitino.authenticators =
+    oauth, les deux routes rendent 401
+    {"code":1011,"type":"UnauthorizedException","message":"The provided
+    credentials did not support",…} ; kerberos et basic sont lus dans le
+    code, non exercés. Sous gravitino.authorization.enable = true avec
+    « simple », l'anonyme reçoit {"code":0,"metalakes":[]} : la liste passe
+    par MetadataAuthzHelper.filterMetalakes, qui la rend entière quand
+    l'autorisation est désactivée. Le template conclut encore dans ce cas —
+    ce qu'il constate est l'authentificateur, pas le contenu de la liste.
+    /configs et /api/health répondent sans authentification sous oauth
+    aussi, et ne sont pas lus. nuclei-templates porte apache-gravitino-detect
+    (le titre de /ui/metalakes) et CVE-2026-41042, qui crée un metalake par
+    POST ; ce template-ci ne fait que lire.
+  impact: |
+    Un appelant anonyme énumère les metalakes — noms, commentaires,
+    propriétés, auteur et date de création —, porte d'entrée des catalogues,
+    schémas, tables, filesets et modèles enregistrés. Sous la configuration
+    livrée il écrit aussi : sur la réplique 1.3.1, POST /api/metalakes
+    {"name":"lake_raw"} sans en-tête a rendu le metalake créé, creator
+    « anonymous », et le même POST sous un en-tête Basic ne portant que le
+    nom alice, sans mot de passe, l'a créé au nom d'alice. Avec
+    l'autorisation activée et « simple » conservé, l'anonyme reçoit une liste
+    vide et un ForbiddenException, code 1008, à la création, mais un en-tête
+    Basic au nom d'un serviceAdmins, toujours sans mot de passe, a créé un
+    metalake : sous « simple », l'identité est déclarée, jamais vérifiée. Les
+    routes filles
+    n'ont pas été exercées au-delà de GET /api/metalakes/{name} et GET
+    /api/metalakes/{name}/catalogs, lus sans en-tête sur la réplique ;
+    l'écriture de catalogues, de tables et de modèles n'a pas été relevée.
+  remediation: |
+    Remplacer « simple » par un authentificateur qui vérifie l'identité —
+    gravitino.authenticators = oauth, kerberos ou basic dans
+    conf/gravitino.conf, sans laisser « simple » dans la liste —, puis poser
+    gravitino.authorization.enable = true avec des serviceAdmins nommés (la
+    valeur livrée est « anonymous »), et redémarrer. Ne publier le port 8090
+    que derrière un reverse proxy authentifiant ou sur un réseau de
+    confiance. Une instance restée ouverte a pu être modifiée par un
+    anonyme : relire les metalakes, leurs catalogues et l'auteur que porte
+    leur audit. Vérifier depuis l'extérieur du périmètre que GET
+    /api/metalakes rend 401 sans en-tête Authorization.
+  reference:
+    - https://github.com/apache/gravitino
+    - https://github.com/apache/gravitino/blob/main/server/src/main/java/org/apache/gravitino/server/web/rest/MetalakeOperations.java
+    - https://github.com/apache/gravitino/blob/main/server/src/main/java/org/apache/gravitino/server/web/rest/VersionOperations.java
+    - https://github.com/apache/gravitino/blob/main/server-common/src/main/java/org/apache/gravitino/server/authentication/AuthenticationFilter.java
+    - https://github.com/apache/gravitino/blob/main/server-common/src/main/java/org/apache/gravitino/server/authentication/SimpleAuthenticator.java
+    - https://github.com/apache/gravitino/blob/main/server-common/src/main/java/org/apache/gravitino/server/authorization/MetadataAuthzHelper.java
+    - https://github.com/apache/gravitino/blob/main/conf/gravitino.conf.template
+    - https://github.com/apache/gravitino/blob/main/docs/security/how-to-authenticate.md
+    - https://github.com/apache/gravitino/blob/main/docs/security/access-control.md
+    - https://github.com/apache/gravitino/blob/main/docs/manage-metalake-using-gravitino.md
+  metadata:
+    max-request: 2
+    vendor: apache
+    product: gravitino
+  tags: ai,ml,data-catalog,model-registry,gravitino,apache,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, toutes deux en GET sous le préfixe que GravitinoServer.java
+  # monte (API_ANY_PATH = "/api/*"). listMetalakes() ne fait que lire le magasin
+  # d'entités ; getVersion() rend les trois valeurs de
+  # gravitino-build-info.properties, figées à la compilation.
+  #
+  # Rien d'autre n'est touché : POST /api/metalakes crée, PUT et DELETE
+  # /api/metalakes/{name} modifient et suppriment, et
+  # /api/metalakes/{name}/catalogs/testConnection ouvre une connexion sortante.
+  # Ne sont pas lus non plus /configs et /api/health, que le serveur sert sans
+  # authentification quel que soit l'authentificateur : ils ne disent rien de
+  # l'accès.
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/metalakes"
+      - "{{BaseURL}}/api/version"
+
+    # req-condition range les deux réponses dans body_1 et body_2 : c'est leur
+    # conjonction qui fait le constat, la liste vide d'une instance neuve ne
+    # nommant aucun produit à elle seule.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          # MetalakeListResponse : le "code" de BaseResponse, à 0, puis
+          # "metalakes", un tableau — Jackson écrit les champs de la classe
+          # mère avant ceux de la classe fille. "code":0 seul ne dit rien : la
+          # route de health check et chaque réponse heureuse du serveur le
+          # portent. L'ancrage écarte le document recopié sous une clé par une
+          # supervision.
+          - 'regex("^\\{\\s*\"code\"\\s*:\\s*0\\s*,\\s*\"metalakes\"\\s*:\\s*\\[", trim_space(body_1))'
+
+          # Une instance neuve, ou un anonyme sous autorisation, reçoit la
+          # liste vide, qui ferme alors le document ; sinon la première entrée
+          # est un MetalakeDTO, qui s'ouvre sur "name" et porte son "audit".
+          # La fin d'une entrée n'est pas lue : main y ajoute "owner".
+          - 'regex("^\\{\\s*\"code\"\\s*:\\s*0\\s*,\\s*\"metalakes\"\\s*:\\s*\\[\\s*\\]\\s*\\}$", trim_space(body_1)) || (regex("^\\{\\s*\"code\"\\s*:\\s*0\\s*,\\s*\"metalakes\"\\s*:\\s*\\[\\s*\\{\\s*\"name\"\\s*:\\s*\"", trim_space(body_1)) && regex("\"audit\"\\s*:\\s*\\{\\s*\"(?:creator|createTime)\"\\s*:\\s*\"", body_1))'
+
+          # VersionResponse : "code" à 0, puis "version", un VersionDTO dont
+          # les trois champs s'écrivent dans l'ordre de la classe — version,
+          # compileDate, gitCommit. Version.java n'admet qu'une version qui
+          # s'ouvre sur trois nombres. La route passe par le même
+          # AuthenticationFilter que la liste : sous oauth, elle rend 401.
+          - 'regex("^\\{\\s*\"code\"\\s*:\\s*0\\s*,\\s*\"version\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"[0-9]+\\.[0-9]+\\.[0-9]+[^\"]*\"\\s*,\\s*\"compileDate\"\\s*:\\s*\"[^\"]*\"\\s*,\\s*\"gitCommit\"\\s*:\\s*\"[^\"]*\"", trim_space(body_2))'
+
+    extractors:
+      # Les noms des metalakes. Un seul extracteur, borné à body_1 : sous
+      # req-condition le moteur évalue les extracteurs contre chaque réponse.
+      - type: json
+        part: body_1
+        name: metalakes
+        json:
+          - '.metalakes[].name'

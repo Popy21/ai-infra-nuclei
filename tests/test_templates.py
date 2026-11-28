@@ -57477,3 +57477,597 @@ def test_gpt_researcher_matcher_compiles_and_fires_against_a_live_server():
         _, hits = scan(discovery=discovery, reports=reports,
                        content_types=content_types)
         assert hits == [], (discovery[1][:80], reports[1][:80], hits)
+
+
+# --------------------------------------------------------------------------
+# Apache Gravitino (apache/gravitino) : catalogue de métadonnées fédéré, dont
+# le catalogue de modèles est « a registry for machine learning models ».
+# L'API REST est montée sous /api/*, et gravitino.authenticators vaut
+# « simple » par défaut : sans en-tête Authorization, SimpleAuthenticator rend
+# le principal anonymous.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux de gravitino-server 1.3.1 (Maven Central)
+#     lancé sous JDK 21 avec conf/gravitino.conf.template et scripts/h2 du tag
+#     v1.3.1, base H2 embarquée — adresse d'écoute, port et services
+#     auxiliaires seuls changés ;
+#   - Jackson écrit "code" (BaseResponse) avant le champ de la réponse, compact,
+#     en NON_NULL : une entrée sans commentaire n'a pas de clé comment, et la
+#     1.3.1 n'écrit pas la clé owner que main ajoute en fin d'entrée ;
+#   - une instance neuve rend {"code":0,"metalakes":[]} : la liste seule ne
+#     nomme aucun produit, d'où la seconde lecture de /api/version ;
+#   - "code":0 ouvre aussi le health check, GET /api/metalakes/{name} et la
+#     liste des catalogues : il ne prouve rien seul ;
+#   - sous gravitino.authenticators = oauth, les deux routes rendent le même
+#     401, code 1011 ; sous gravitino.authorization.enable = true avec
+#     « simple », l'anonyme reçoit la liste vide.
+
+GRAVITINO_TEMPLATE = os.path.join(TEMPLATES_DIR, "exposure",
+                                  "gravitino-metalakes-exposed.yaml")
+
+GRAVITINO_METALAKES_ROUTE = "/api/metalakes"
+GRAVITINO_VERSION_ROUTE = "/api/version"
+
+# Verbatim, réplique : une instance neuve, sans aucun en-tête.
+GRAVITINO_EMPTY_BODY = '{"code":0,"metalakes":[]}'
+
+# Verbatim, réplique : trois metalakes créés par POST /api/metalakes — deux
+# sans en-tête (creator anonymous), un sous « Authorization: Basic » portant le
+# seul nom alice. 466 octets.
+GRAVITINO_THREE_BODY = (
+    '{"code":0,"metalakes":[{"name":"lake_raw","properties":{"in-use":"true"}'
+    ',"audit":{"creator":"anonymous","createTime":"2026-11-28T13:21:38.373410'
+    'Z"}},{"name":"by_alice","comment":"x","properties":{"in-use":"true"},"au'
+    'dit":{"creator":"alice","createTime":"2026-11-28T13:21:39.155084Z"}},{"n'
+    'ame":"ml_prod","comment":"Modèles \\"prod\\" de l\'équipe","properties":{"i'
+    'n-use":"true","team":"ml"},"audit":{"creator":"anonymous","createTime":"'
+    '2026-11-28T13:21:37.858862Z"}}]}')
+
+# Verbatim, réplique : GET /api/version.
+GRAVITINO_VERSION_BODY = (
+    '{"code":0,"version":{"version":"1.3.1","compileDate":"24/09/2026 08:37:3'
+    '9","gitCommit":"ab5d0a4d655e6a81d0b86f7d2733d1874ed3f41a"}}')
+
+# Verbatim, réplique : gravitino.authorization.enable = true, serviceAdmins =
+# admin, la liste lue sous un en-tête Basic au nom d'admin — le metalake que
+# ce même en-tête venait de créer. L'anonyme, lui, y reçoit
+# GRAVITINO_EMPTY_BODY.
+GRAVITINO_OWNED_BODY = (
+    '{"code":0,"metalakes":[{"name":"by_admin","comment":"created by asserted'
+    ' admin","properties":{"in-use":"true"},"audit":{"creator":"admin","creat'
+    'eTime":"2026-11-28T13:24:54.494526Z"}}]}')
+
+# Verbatim, réplique : les deux routes sous gravitino.authenticators = oauth,
+# sans en-tête — le début du corps de 3650 octets, dont la pile compte 41
+# cadres ; elle est fermée ici après le deuxième.
+GRAVITINO_UNAUTHORIZED_HEAD = (
+    '{"code":1011,"type":"UnauthorizedException","message":"The provided cred'
+    'entials did not support","stack":["org.apache.gravitino.exceptions.Unaut'
+    'horizedException: The provided credentials did not support","\\tat org.ap'
+    'ache.gravitino.server.authentication.AuthenticationFilter.doFilter(Authe'
+    'nticationFilter.java:115)"')
+GRAVITINO_UNAUTHORIZED_BODY = GRAVITINO_UNAUTHORIZED_HEAD + "]}"
+
+# Verbatim, réplique : une route que Jersey ne monte pas, le health check,
+# /configs, GET /api/metalakes/ml_prod et GET /api/metalakes/ml_prod/catalogs.
+GRAVITINO_NOT_FOUND_BODY = (
+    '{"code":1003,"type":"NotFoundException","message":"HTTP 404 Not Found"}')
+GRAVITINO_HEALTH_BODY = (
+    '{"code":0,"status":"up","checks":[{"name":"httpServer","status":"up","de'
+    'tails":{}},{"name":"entityStore","status":"up","details":{}}]}')
+GRAVITINO_CONFIGS_BODY = (
+    '{"gravitino.schema.separator":":","gravitino.authorization.enable":false'
+    ',"gravitino.authenticators":["simple"]}')
+GRAVITINO_ONE_METALAKE_BODY = (
+    '{"code":0,"metalake":{"name":"ml_prod","comment":"Modèles \\"prod\\" de l'
+    '\'équipe","properties":{"in-use":"true","team":"ml"},"audit":{"creator":"'
+    'anonymous","createTime":"2026-11-28T13:21:37.858862Z"}}}')
+GRAVITINO_CATALOGS_BODY = '{"code":0,"identifiers":[]}'
+
+
+def gravitino_metalake(name, creator, create_time, comment=None,
+                       properties=None, **extra):
+    """
+    Un MetalakeDTO tel que la 1.3.1 le rend : name, comment s'il existe,
+    properties — où le serveur pose in-use —, audit. Le test des fixtures
+    vérifie que cette aide rend, octet pour octet, les corps relevés — c'est
+    ce qui autorise à composer avec elle ceux que la réplique n'a pas rendus.
+    """
+    entry = {"name": name}
+    if comment is not None:
+        entry["comment"] = comment
+    entry["properties"] = dict({"in-use": "true"}, **(properties or {}))
+    entry["audit"] = {"creator": creator, "createTime": create_time}
+    entry.update(extra)
+    return entry
+
+
+def gravitino_list(metalakes):
+    return json.dumps({"code": 0, "metalakes": metalakes},
+                      separators=(",", ":"), ensure_ascii=False)
+
+
+def gravitino_version(version="1.3.1", compile_date="24/09/2026 08:37:39",
+                      commit="ab5d0a4d655e6a81d0b86f7d2733d1874ed3f41a",
+                      **extra):
+    return json.dumps({"code": 0, "version": dict(
+        {"version": version, "compileDate": compile_date, "gitCommit": commit},
+        **extra)}, separators=(",", ":"), ensure_ascii=False)
+
+
+GRAVITINO_LAKE_RAW = gravitino_metalake(
+    "lake_raw", "anonymous", "2026-11-28T13:21:38.373410Z")
+GRAVITINO_BY_ALICE = gravitino_metalake(
+    "by_alice", "alice", "2026-11-28T13:21:39.155084Z", comment="x")
+GRAVITINO_ML_PROD = gravitino_metalake(
+    "ml_prod", "anonymous", "2026-11-28T13:21:37.858862Z",
+    comment='Modèles "prod" de l\'équipe', properties={"team": "ml"})
+
+# Composé : main ajoute owner en fin d'entrée (MetalakeDTO, @JsonInclude
+# ALWAYS) — null sans propriétaire, sinon un OwnerDTO name/type. Sa
+# sérialisation n'est pas relevée ici : le matcher ne doit pas dépendre de la
+# dernière clé d'une entrée.
+GRAVITINO_MAIN_BODY = gravitino_list([
+    dict(GRAVITINO_LAKE_RAW, owner=None),
+    dict(GRAVITINO_ML_PROD, owner={"name": "admin", "type": "user"})])
+
+# Composé : un audit sans creator — en NON_NULL, il s'ouvrirait sur createTime.
+GRAVITINO_NO_CREATOR_BODY = gravitino_list([{
+    "name": "legacy", "properties": {"in-use": "true"},
+    "audit": {"createTime": "2026-11-28T13:21:38.373410Z"}}])
+
+# Composé : une version de développement, une version d'incubation, et un
+# VersionDTO qu'une version future prolongerait d'une clé.
+GRAVITINO_SNAPSHOT_VERSION_BODY = gravitino_version("1.4.0-SNAPSHOT")
+GRAVITINO_INCUBATING_VERSION_BODY = gravitino_version("0.9.0-incubating")
+GRAVITINO_NEXT_VERSION_BODY = gravitino_version(javaVersion="17")
+
+# Les corps relevés réindentés par un intermédiaire.
+GRAVITINO_REINDENTED_BODY = json.dumps(
+    json.loads(GRAVITINO_THREE_BODY), indent=2, ensure_ascii=False)
+GRAVITINO_REINDENTED_EMPTY_BODY = json.dumps(
+    json.loads(GRAVITINO_EMPTY_BODY), indent=2)
+GRAVITINO_REINDENTED_VERSION_BODY = json.dumps(
+    json.loads(GRAVITINO_VERSION_BODY), indent=2)
+
+# La liste et la version recopiées sous une clé par une supervision : ce n'est
+# pas Gravitino qui répond.
+GRAVITINO_QUOTED_BODY = (
+    '{"gravitino":%s,"checked_at":0}' % GRAVITINO_THREE_BODY)
+GRAVITINO_QUOTED_VERSION_BODY = (
+    '{"gravitino":%s,"checked_at":0}' % GRAVITINO_VERSION_BODY)
+
+# Une liste « metalakes » sans audit : c'est le MetalakeDTO qui est exigé.
+GRAVITINO_BARE_NAMES_BODY = '{"code":0,"metalakes":[{"name":"main"}]}'
+# Des chaînes, null, un objet : listMetalakes rend un tableau de MetalakeDTO.
+GRAVITINO_STRINGS_BODY = '{"code":0,"metalakes":["main"]}'
+GRAVITINO_NULL_LIST_BODY = '{"code":0,"metalakes":null}'
+GRAVITINO_OBJECT_LIST_BODY = '{"code":0,"metalakes":{}}'
+# Un code d'erreur, un code qui commence par 0 sans l'être, les clés dans
+# l'autre ordre, la liste vide suivie d'une clé que MetalakeListResponse n'a
+# pas.
+GRAVITINO_ERROR_CODE_BODY = '{"code":1002,"metalakes":[]}'
+GRAVITINO_DECIMAL_CODE_BODY = '{"code":0.5,"metalakes":[]}'
+GRAVITINO_REORDERED_BODY = '{"metalakes":[],"code":0}'
+GRAVITINO_EMPTY_THEN_KEY_BODY = '{"code":0,"metalakes":[],"total":0}'
+
+# La version amputée de gitCommit, réduite à une chaîne, sans numéro, ou ses
+# trois clés dans un autre ordre.
+GRAVITINO_NO_COMMIT_VERSION_BODY = (
+    '{"code":0,"version":{"version":"1.3.1","compileDate":"24/09/2026 08:37:3'
+    '9"}}')
+GRAVITINO_STRING_VERSION_BODY = '{"code":0,"version":"1.3.1"}'
+GRAVITINO_UNNUMBERED_VERSION_BODY = gravitino_version("dev")
+GRAVITINO_REORDERED_VERSION_BODY = (
+    '{"code":0,"version":{"gitCommit":"ab5d0a4d655e6a81d0b86f7d2733d1874ed3f4'
+    '1a","compileDate":"24/09/2026 08:37:39","version":"1.3.1"}}')
+
+# Une page qui cite la liste, et celle d'un proxy qui garde /api/.
+GRAVITINO_QUOTED_IN_HTML_BODY = (
+    "<html><body><pre>%s</pre></body></html>" % GRAVITINO_EMPTY_BODY)
+GRAVITINO_LOGIN_PAGE_BODY = (
+    "<html><head><title>Sign in</title></head><body></body></html>")
+
+
+def gravitino_block():
+    doc = load(GRAVITINO_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % GRAVITINO_METALAKES_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/metalakes"
+    return blocks[0]
+
+
+def gravitino_fires(metalakes=(200, GRAVITINO_THREE_BODY),
+                    version=(200, GRAVITINO_VERSION_BODY)):
+    scenario = {GRAVITINO_METALAKES_ROUTE: metalakes,
+                GRAVITINO_VERSION_ROUTE: version}
+    block = gravitino_block()
+    matchers = block.get("matchers") or []
+    assert matchers, "bloc sans matcher"
+    responses = []
+    for target in block.get("path") or []:
+        route = target.replace("{{BaseURL}}", "")
+        assert route in scenario, (
+            f"le template interroge un chemin non prévu : {route}")
+        responses.append(scenario[route])
+    return all(dsl_matcher_hits(m, responses) for m in matchers
+               if m.get("type") == "dsl")
+
+
+def test_gravitino_fixtures_hold_the_bodies_read_on_the_replica():
+    assert gravitino_list([]) == GRAVITINO_EMPTY_BODY
+    assert gravitino_list([GRAVITINO_LAKE_RAW, GRAVITINO_BY_ALICE,
+                           GRAVITINO_ML_PROD]) == GRAVITINO_THREE_BODY, (
+        "l'aide ne rend plus le corps relevé sur la réplique : les corps "
+        "composés ne diraient plus rien du serveur réel"
+    )
+    assert len(GRAVITINO_THREE_BODY.encode("utf-8")) == 466, (
+        "le Content-Length relevé")
+    assert gravitino_list([gravitino_metalake(
+        "by_admin", "admin", "2026-11-28T13:24:54.494526Z",
+        comment="created by asserted admin")]) == GRAVITINO_OWNED_BODY
+    assert gravitino_version() == GRAVITINO_VERSION_BODY
+    assert len(GRAVITINO_VERSION_BODY) == 131
+    assert json.dumps({"code": 0, "metalake": GRAVITINO_ML_PROD},
+                      separators=(",", ":"), ensure_ascii=False) \
+        == GRAVITINO_ONE_METALAKE_BODY
+
+    assert list(json.loads(GRAVITINO_THREE_BODY)) == ["code", "metalakes"], (
+        "le code de BaseResponse ouvre le document")
+    assert list(json.loads(GRAVITINO_VERSION_BODY)["version"]) == [
+        "version", "compileDate", "gitCommit"], "l'ordre de VersionDTO"
+    for entry in json.loads(GRAVITINO_THREE_BODY)["metalakes"]:
+        assert list(entry)[0] == "name" and list(entry)[-1] == "audit", (
+            "la 1.3.1 n'écrit pas owner : une entrée se ferme sur audit")
+        assert list(entry["audit"]) == ["creator", "createTime"]
+    assert "comment" not in json.loads(GRAVITINO_THREE_BODY)["metalakes"][0], (
+        "NON_NULL : un metalake sans commentaire n'a pas la clé")
+
+    unauthorized = json.loads(GRAVITINO_UNAUTHORIZED_BODY)
+    assert list(unauthorized) == ["code", "type", "message", "stack"]
+    assert unauthorized["code"] == 1011
+    assert unauthorized["message"] == (
+        "The provided credentials did not support")
+    assert json.loads(GRAVITINO_HEALTH_BODY)["code"] == 0, (
+        "le health check porte lui aussi code 0")
+    assert json.loads(GRAVITINO_CONFIGS_BODY)[
+        "gravitino.authenticators"] == ["simple"]
+
+
+def test_gravitino_probe_only_reads_the_two_routes():
+    doc = load(GRAVITINO_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", GRAVITINO_METALAKES_ROUTE),
+        ("GET", GRAVITINO_VERSION_ROUTE),
+    }, (
+        "le template ne lit que /api/metalakes et /api/version : POST "
+        "/api/metalakes crée, PUT et DELETE modifient et suppriment, "
+        "testConnection ouvre une connexion sortante"
+    )
+    assert len(doc["http"]) == 1
+    block = gravitino_block()
+    assert [p.replace("{{BaseURL}}", "") for p in block.get("path") or []] == [
+        GRAVITINO_METALAKES_ROUTE, GRAVITINO_VERSION_ROUTE], (
+        "l'ordre des chemins donne son numéro à chaque body_N"
+    )
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps"
+    )
+    assert not block.get("headers"), (
+        "aucun en-tête : le constat est l'accès sans Authorization, et un "
+        "en-tête Basic ferait endosser une identité à la sonde"
+    )
+    for target in block.get("path") or []:
+        assert "?" not in target, "aucun paramètre de requête"
+    assert block.get("req-condition") is True, (
+        "sans req-condition, body_1 et body_2 n'existent pas : la liste vide "
+        "d'une instance neuve conclurait sans la version"
+    )
+    info = doc["info"]
+    meta = info.get("metadata") or {}
+    assert meta.get("max-request") == 2
+    assert meta.get("vendor") == "apache"
+    assert meta.get("product") == "gravitino"
+    assert info["severity"] == "high"
+
+    description = re.sub(r"\s+", " ", info["description"])
+    for quote in (
+            "a registry for machine learning models",
+            'API_ANY_PATH = "/api/*"',
+            "the user `anonymous` will be used to access the server.",
+            "Authorization is off by default.",
+            "gravitino.server.webserver.host = 0.0.0.0",
+            "httpPort = 8090",
+            "The provided credentials did not support"):
+        assert quote in description, (
+            f"ce qui fonde le défaut est relevé à la source — {quote}")
+    for body in (GRAVITINO_EMPTY_BODY, GRAVITINO_VERSION_BODY):
+        assert body in description, (
+            f"le corps relevé sur la réplique est écrit dans le template — "
+            f"{body[:40]}")
+    first = GRAVITINO_THREE_BODY[len('{"code":0,"metalakes":['):].split(
+        "},{")[0]
+    for fragment in (first[:first.index('"audit"')], first[first.index(
+            '"audit"'):] + "}"):
+        assert fragment in description, (
+            f"l'entrée relevée est écrite dans le template — {fragment[:40]}")
+    for marker in ("gravitino-server 1.3.1", "v1.3.1", "JDK 21",
+                   "non exercés", "à un authentificateur maison près"):
+        assert marker in description, (
+            f"ce qui a été relevé, et ce qui ne l'a pas été — {marker}")
+    assert "application/vnd.gravitino.v1+json" in description and (
+        "l'en-tête n'est pas lu" in description), (
+        "le Content-Type émis n'est pas celui de @Produces, et il n'est pas lu")
+    impact = re.sub(r"\s+", " ", info["impact"])
+    assert "POST /api/metalakes" in impact and "sans mot de passe" in impact
+    assert "n'a pas été relevée" in impact, (
+        "l'impact dit où s'arrête ce qui a été exercé")
+
+
+def test_gravitino_matcher_rests_on_both_documents_not_on_status():
+    matchers = gravitino_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"], (
+        "aucun matcher de statut ni de mot : sous req-condition, seul le DSL "
+        "lie les deux réponses"
+    )
+    assert matchers[0].get("condition") == "and"
+    expressions = matchers[0].get("dsl") or []
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu : un intermédiaire le réécrit sans rien "
+        "changer au fait"
+    )
+    assert not any("content_type" in e or "header" in e for e in expressions), (
+        "le Content-Type n'est pas lu : Utils.ok pose application/json, pas "
+        "le type de @Produces"
+    )
+    for key in ('\\"metalakes\\"', '\\"audit\\"', '\\"compileDate\\"',
+                '\\"gitCommit\\"', '\\"version\\"'):
+        assert any(key in e for e in expressions), f"le matcher perd {key}"
+    assert all('\\"code\\"\\\\s*:\\\\s*0' in e for e in expressions), (
+        "chaque document est tenu par le code 0 de BaseResponse")
+    assert all('\\"metalakes\\"' in e or '\\"compileDate\\"' in e
+               for e in expressions), (
+        "aucune expression ne conclut sur le code seul")
+    assert any("body_1" in e for e in expressions)
+    assert any("body_2" in e for e in expressions)
+
+    version = (200, GRAVITINO_VERSION_BODY)
+    for metalakes, version_body, why in (
+        (GRAVITINO_THREE_BODY, GRAVITINO_VERSION_BODY,
+         "trois metalakes, commentaire échappé"),
+        (GRAVITINO_EMPTY_BODY, GRAVITINO_VERSION_BODY,
+         "l'instance neuve, liste vide"),
+        (GRAVITINO_OWNED_BODY, GRAVITINO_VERSION_BODY,
+         "la liste rendue sous autorisation à qui se dit admin"),
+        (GRAVITINO_MAIN_BODY, GRAVITINO_VERSION_BODY,
+         "les entrées de main, owner en fin d'objet"),
+        (GRAVITINO_NO_CREATOR_BODY, GRAVITINO_VERSION_BODY,
+         "un audit sans creator"),
+        (GRAVITINO_REINDENTED_BODY, GRAVITINO_REINDENTED_VERSION_BODY,
+         "les corps réindentés"),
+        (GRAVITINO_REINDENTED_EMPTY_BODY, GRAVITINO_VERSION_BODY,
+         "la liste vide réindentée"),
+        (GRAVITINO_THREE_BODY, GRAVITINO_SNAPSHOT_VERSION_BODY,
+         "une version -SNAPSHOT"),
+        (GRAVITINO_THREE_BODY, GRAVITINO_INCUBATING_VERSION_BODY,
+         "une version -incubating"),
+        (GRAVITINO_EMPTY_BODY, GRAVITINO_NEXT_VERSION_BODY,
+         "un VersionDTO prolongé d'une clé"),
+    ):
+        assert gravitino_fires((200, metalakes), (200, version_body)), (
+            f"le template ne reconnaît pas {why}")
+    assert gravitino_fires((503, GRAVITINO_THREE_BODY),
+                           (503, GRAVITINO_VERSION_BODY)), (
+        "le statut ne décide de rien : seuls les corps sont lus")
+
+    for metalakes, version_response, why in (
+        ((401, GRAVITINO_UNAUTHORIZED_BODY),
+         (401, GRAVITINO_UNAUTHORIZED_BODY),
+         "l'instance sous gravitino.authenticators = oauth"),
+        ((200, GRAVITINO_THREE_BODY), (401, GRAVITINO_UNAUTHORIZED_BODY),
+         "une liste servie sans la version"),
+        ((200, GRAVITINO_EMPTY_BODY), (404, GRAVITINO_NOT_FOUND_BODY),
+         "la liste vide sans /api/version"),
+        ((401, GRAVITINO_UNAUTHORIZED_BODY), version,
+         "la version sans la liste"),
+        ((200, GRAVITINO_HEALTH_BODY), version,
+         "le health check, qui porte code 0 sans la liste"),
+        ((200, GRAVITINO_ONE_METALAKE_BODY), version,
+         "la clé au singulier de GET /api/metalakes/{name}"),
+        ((200, GRAVITINO_CATALOGS_BODY), version,
+         "la liste des catalogues, code 0 et identifiers"),
+        ((200, GRAVITINO_CONFIGS_BODY), version,
+         "/configs, ouvert sous tous les authentificateurs"),
+        ((200, GRAVITINO_QUOTED_BODY), version,
+         "la liste recopiée sous une clé"),
+        ((200, GRAVITINO_BARE_NAMES_BODY), version,
+         "une liste sans audit"),
+        ((200, GRAVITINO_STRINGS_BODY), version, "une liste de chaînes"),
+        ((200, GRAVITINO_NULL_LIST_BODY), version, "une clé metalakes nulle"),
+        ((200, GRAVITINO_OBJECT_LIST_BODY), version,
+         "une clé metalakes qui ouvre un objet"),
+        ((200, GRAVITINO_ERROR_CODE_BODY), version, "un code d'erreur"),
+        ((200, GRAVITINO_DECIMAL_CODE_BODY), version,
+         "un code qui commence par 0 sans l'être"),
+        ((200, GRAVITINO_REORDERED_BODY), version,
+         "les clés dans un autre ordre"),
+        ((200, GRAVITINO_EMPTY_THEN_KEY_BODY), version,
+         "la liste vide suivie d'une autre clé"),
+        ((200, GRAVITINO_QUOTED_IN_HTML_BODY), version,
+         "une page qui cite la liste"),
+        ((200, GRAVITINO_VERSION_BODY), version,
+         "la version servie sur les deux routes"),
+        ((200, GRAVITINO_THREE_BODY), (200, GRAVITINO_THREE_BODY),
+         "la liste servie sur les deux routes"),
+        ((200, GRAVITINO_THREE_BODY), (200, GRAVITINO_NO_COMMIT_VERSION_BODY),
+         "une version sans gitCommit"),
+        ((200, GRAVITINO_THREE_BODY), (200, GRAVITINO_STRING_VERSION_BODY),
+         "une version réduite à une chaîne"),
+        ((200, GRAVITINO_THREE_BODY),
+         (200, GRAVITINO_UNNUMBERED_VERSION_BODY),
+         "une version sans numéro"),
+        ((200, GRAVITINO_THREE_BODY), (200, GRAVITINO_REORDERED_VERSION_BODY),
+         "le trio dans un autre ordre"),
+        ((200, GRAVITINO_THREE_BODY), (200, GRAVITINO_QUOTED_VERSION_BODY),
+         "la version recopiée sous une clé"),
+        ((200, GRAVITINO_THREE_BODY), (200, GRAVITINO_HEALTH_BODY),
+         "le health check à la place de la version"),
+        ((200, GRAVITINO_THREE_BODY), (200, GRAVITINO_LOGIN_PAGE_BODY),
+         "la page de connexion d'un proxy qui garde /api/version"),
+        ((200, GRAVITINO_LOGIN_PAGE_BODY), (200, GRAVITINO_LOGIN_PAGE_BODY),
+         "une page de connexion sur les deux routes"),
+        ((200, GRAVITINO_THREE_BODY), (200, ""), "un corps vide"),
+        ((404, ""), (404, ""), "deux routes absentes"),
+    ):
+        assert not gravitino_fires(metalakes, version_response), (
+            f"le template conclut sur {why}")
+
+
+def test_gravitino_and_the_other_documents_of_the_pack_stay_apart():
+    """
+    Le pack lit d'autres catalogues et d'autres documents de version, dont
+    plusieurs s'ouvrent eux aussi sur "code":0 : aucun ne porte la clé
+    metalakes, aucun ne range compileDate et gitCommit sous version.
+    """
+    for body, product in (
+            (UNITY_CATALOG_SEED_BODY, "Unity Catalog"),
+            (UNITY_CATALOG_EMPTY_BODY, "Unity Catalog (base vide)"),
+            (UNITY_CATALOG_METASTORE_BODY, "Unity Catalog (metastore)"),
+            (MILVUS_DATABASES_BODY, "Milvus"),
+            (MILVUS_EMPTY_COLLECTIONS_BODY, "Milvus (aucune collection)"),
+            (RAGFLOW_VERSION_BODY, "RAGFlow"),
+            (LANGFLOW_VERSION_BODY, "Langflow"),
+            (GENERIC_VERSION_BODY, "un document de version quelconque")):
+        assert not gravitino_fires(
+            (200, body), (200, GRAVITINO_VERSION_BODY)), (
+            f"le template lit le document de {product} comme une liste")
+        assert not gravitino_fires(
+            (200, GRAVITINO_THREE_BODY), (200, body)), (
+            f"le template lit le document de {product} comme une version")
+        assert not gravitino_fires((200, body), (200, body)), (
+            f"le template conclut sur le document de {product}")
+
+
+def test_gravitino_extractor_names_the_metalakes():
+    extractors = gravitino_block().get("extractors") or []
+    assert len(extractors) == 1, (
+        "sous req-condition, chaque extracteur est évalué contre chaque "
+        "réponse : un second signalerait l'instance deux fois"
+    )
+    assert extractors[0].get("type") == "json"
+    assert extractors[0].get("part") == "body_1", (
+        "les noms ne sont que dans la liste, pas dans la version"
+    )
+    assert extractors[0].get("json") == [".metalakes[].name"]
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_gravitino_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `dsl_matcher_hits` réévalue les motifs en Python : seul un scan contre un
+    vrai serveur dit que le lexer de nuclei les lit pareil, que req-condition
+    numérote les réponses dans l'ordre des chemins, que le moteur n'émet que
+    deux GET sans en-tête Authorization et que l'extracteur rend les noms.
+    """
+    def scan(metalakes, version):
+        seen = []
+        routes = {GRAVITINO_METALAKES_ROUTE: metalakes,
+                  GRAVITINO_VERSION_ROUTE: version}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path,
+                             self.headers.get("Authorization")))
+                if self.command == "GET" and self.path in routes:
+                    self.reply(*routes[self.path])
+                else:
+                    self.reply(404, GRAVITINO_NOT_FOUND_BODY)
+
+            # Toute autre méthode est consignée : le template n'en émet pas.
+            do_POST = do_PUT = do_DELETE = do_HEAD = do_OPTIONS = do_GET
+
+            def reply(self, code, payload):
+                data = payload.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Server", "Jetty(9.4.58.v20250814)")
+                if payload.startswith("<"):
+                    self.send_header("Content-Type", "text/html")
+                elif code == 401:
+                    self.send_header("Content-Type",
+                                     "application/json;charset=utf-8")
+                else:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", GRAVITINO_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        results = [json.loads(line) for line in r.stdout.splitlines()
+                   if line.strip()]
+        assert {item.get("template-id") for item in results} <= {
+            "gravitino-metalakes-exposed"}, r.stdout + r.stderr
+        return (seen, len(results),
+                sorted({value for item in results
+                        for value in (item.get("extracted-results") or [])}))
+
+    version = (200, GRAVITINO_VERSION_BODY)
+    seen, hits, extracted = scan((200, GRAVITINO_THREE_BODY), version)
+    assert seen == [("GET", GRAVITINO_METALAKES_ROUTE, None),
+                    ("GET", GRAVITINO_VERSION_ROUTE, None)], (
+        f"deux GET, dans l'ordre, sans en-tête Authorization — {seen}"
+    )
+    assert hits == 1, f"une ligne de résultat par instance — {hits}"
+    assert extracted == ["by_alice", "lake_raw", "ml_prod"], extracted
+
+    _, hits, extracted = scan((200, GRAVITINO_EMPTY_BODY), version)
+    assert hits == 1, "le moteur perd l'instance neuve"
+    assert extracted == [], extracted
+
+    _, hits, extracted = scan((200, GRAVITINO_MAIN_BODY),
+                              (200, GRAVITINO_SNAPSHOT_VERSION_BODY))
+    assert hits == 1, "le moteur perd les entrées de main"
+    assert extracted == ["lake_raw", "ml_prod"], extracted
+
+    _, hits, _ = scan((200, GRAVITINO_REINDENTED_BODY),
+                      (200, GRAVITINO_REINDENTED_VERSION_BODY))
+    assert hits == 1, "le moteur perd les corps réindentés"
+
+    _, hits, _ = scan((503, GRAVITINO_THREE_BODY),
+                      (503, GRAVITINO_VERSION_BODY))
+    assert hits == 1, "le moteur lit le statut"
+
+    for metalakes, version_response in (
+            ((401, GRAVITINO_UNAUTHORIZED_BODY),
+             (401, GRAVITINO_UNAUTHORIZED_BODY)),
+            ((200, GRAVITINO_EMPTY_BODY), (404, GRAVITINO_NOT_FOUND_BODY)),
+            ((200, GRAVITINO_HEALTH_BODY), version),
+            ((200, GRAVITINO_BARE_NAMES_BODY), version),
+            ((200, GRAVITINO_QUOTED_BODY), version),
+            ((200, GRAVITINO_EMPTY_THEN_KEY_BODY), version),
+            ((200, GRAVITINO_THREE_BODY),
+             (200, GRAVITINO_NO_COMMIT_VERSION_BODY)),
+            ((200, GRAVITINO_THREE_BODY),
+             (200, GRAVITINO_LOGIN_PAGE_BODY))):
+        _, hits, _ = scan(metalakes, version_response)
+        assert hits == 0, (metalakes[1][:120], version_response[1][:120])

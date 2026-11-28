@@ -29,7 +29,7 @@ est ouvert.
 amont.
 
 <!-- couverture -->
-164 templates, 161 produits.
+165 templates, 162 produits.
 
 | Produit | Template | Sévérité |
 | --- | --- | --- |
@@ -78,6 +78,7 @@ amont.
 | gpt-researcher | [`gpt-researcher-server-exposed`](templates/exposure/gpt-researcher-server-exposed.yaml) | high |
 | gpt-sovits | [`gpt-sovits-api-exposed`](templates/exposure/gpt-sovits-api-exposed.yaml) | high |
 | gradio | [`gradio-app-exposed`](templates/exposure/gradio-app-exposed.yaml) | medium |
+| gravitino | [`gravitino-metalakes-exposed`](templates/exposure/gravitino-metalakes-exposed.yaml) | high |
 | h2o-3 | [`h2o-cluster-status-exposed`](templates/exposure/h2o-cluster-status-exposed.yaml) | high |
 | hami | [`hami-metrics-exposed`](templates/exposure/hami-metrics-exposed.yaml) | medium |
 | hayhooks | [`hayhooks-status-exposed`](templates/exposure/hayhooks-status-exposed.yaml) | high |
