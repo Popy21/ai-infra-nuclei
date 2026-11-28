@@ -1,0 +1,179 @@
+id: gpt-researcher-server-exposed
+
+info:
+  name: GPT Researcher - Unauthenticated Research Server and Report Store Exposed
+  author: popy21
+  severity: high
+  description: |
+    GPT Researcher (assafelovic/gpt-researcher) est un agent autonome qui mène
+    une recherche web ou documentaire et en rédige un rapport. Son serveur,
+    backend/server/app.py, est une application FastAPI — « app =
+    FastAPI(lifespan=lifespan) » — servie par uvicorn sur le port 8000.
+    L'authentification n'est pas un réglage oublié, c'est une fonctionnalité
+    absente : app.py ne contient ni dépendance, ni clé, ni jeton. Son seul
+    middleware est un CORSMiddleware (ALLOWED_ORIGINS : http://localhost:3000,
+    http://127.0.0.1:3000 et https://app.gptr.dev par défaut, surchargés par
+    CORS_ALLOW_ORIGINS, sous « allow_credentials=True »), qui ne filtre pas un
+    client non navigateur. SECURITY.md l'écrit : « The backend server (FastAPI
+    + WebSocket, `/ws` and the REST endpoints) ships **without built-in
+    authentication or network access controls, by design.** »
+    Le serveur l'annonce lui-même. « @app.get("/.well-known/
+    agent-discovery.json") » — docstring « Advertise GPT Researcher services
+    via the Agent Discovery Protocol. » — rend le document de
+    build_agent_discovery_document (agent_discovery.py) : les clés
+    agent_discovery_version ("0.1"), domain et services, plus contact si
+    AGENT_DISCOVERY_CONTACT est défini, et quatre services — research,
+    reports, chat, research_stream — portant chacun « "auth": "none" »,
+    « "governance": "none" » et « "free_tier": True ». « @app.get(
+    "/api/reports") » rend {"reports": reports}, où
+    report_store.list_reports rend « list(data.values()) » sans filtre quand
+    aucun identifiant n'est passé : tous les rapports du magasin
+    (data/reports.json, REPORT_STORE_PATH).
+    Écoute : main.py prend « host = os.getenv("HOST", "127.0.0.1") »
+    (« Defaults to localhost; set HOST=0.0.0.0 to expose on the network
+    (Docker does this). »), mais le Dockerfile pose « ARG HOST=0.0.0.0 »,
+    « ENV HOST=${HOST} », « ARG PORT=8000 » et « CMD uvicorn main:app --host
+    ${HOST} --port ${PORT} --workers ${WORKERS} », et docker-compose.yml
+    publie « 8000:8000 » sans préfixe d'adresse : le déploiement conteneur
+    livré écoute sur toutes les interfaces de l'hôte.
+    Relevé sur une réplique — main.py, backend/server/app.py,
+    agent_discovery.py et report_store.py du commit 9d39a2f de main, sous
+    fastapi 0.165.0, starlette 1.10.0, pydantic 2.14.4 et uvicorn 0.54.0
+    (requirements.txt ne pose que des planchers), websocket_manager,
+    server_utils, utils, chat et gpt_researcher remplacés par des bouchons,
+    aucune recherche lancée. GET /.well-known/agent-discovery.json rend, en
+    JSON compact et dans l'ordre des dicts, un document de 875 octets qui
+    s'ouvre sur
+    {"agent_discovery_version":"0.1","domain":"127.0.0.1","services":[
+    puis sur son premier service,
+    {"name":"research","description":"Submit a research job and generate a
+    report.","endpoint":"http://127.0.0.1:18000/report/",
+    "protocol":"http","auth":"none","governance":"none","free_tier":true}
+    — les trois autres suivent —, avec l'en-tête
+    « access-control-allow-origin: * ». domain et les endpoint suivent
+    l'en-tête Host et, derrière un proxy de confiance, X-Forwarded-Proto ;
+    contact, quand il existe, ferme le document. GET /api/reports rend
+    {"reports":[]} sur un magasin vide, puis les rapports dans l'ordre id,
+    question, answer, orderedData, chatMessages, timestamp.
+    Le document de découverte date de la v3.5.0 (commit 524520f ; le tag
+    v3.4.4 ne porte pas agent_discovery.py) et le fichier n'a pas changé
+    depuis ; le magasin de rapports date de la v3.3.9.
+    Limites : une instance antérieure à la v3.5.0 ne sert que /api/reports et
+    n'est pas reconnue — {"reports":[]} seul ne nomme aucun produit. Le
+    template ne lit que ces deux documents : il constate que les rapports se
+    lisent sans identifiant, pas que les routes d'écriture répondent.
+  impact: |
+    Un appelant anonyme lit tous les rapports de recherche stockés : la
+    question posée (question), le rapport rédigé (answer) et la conversation
+    de suivi (chatMessages). La même application sert sans identifiant POST
+    /report/ — une recherche lancée aux frais des clés LLM et de recherche web
+    de l'opérateur —, POST /api/chat, le WebSocket /ws, POST /upload/ et
+    DELETE /files/{filename} sur le dossier de documents, et DELETE
+    /api/reports/{research_id}, qui efface un rapport. SECURITY.md range hors
+    périmètre, à la charge de l'opérateur, ce qu'un client non authentifié
+    atteint ainsi — source_urls et document_urls fournis par l'appelant,
+    commandes de serveurs MCP. Relevé dans le code ; le template n'envoie que
+    deux lectures GET.
+  remediation: |
+    Ne pas publier le port 8000 sur toutes les interfaces : dans
+    docker-compose.yml, préfixer l'adresse (« 127.0.0.1:8000:8000 ») ou
+    construire l'image avec HOST=127.0.0.1. Placer devant ce qui doit sortir
+    un reverse proxy qui authentifie — SECURITY.md : « add an
+    authentication/authorization layer in front of it » — sans exempter
+    /.well-known/, /api/, /report/, /files/, /upload/, /outputs/ ni /ws.
+    Restreindre CORS_ALLOW_ORIGINS ne protège pas : le CORS ne filtre que les
+    navigateurs. Vérifier depuis l'extérieur que GET /api/reports ne rend plus
+    {"reports":[...]}. Après une exposition, relire data/reports.json et le
+    journal d'accès à la recherche des POST /report/ et des DELETE qu'on ne
+    s'explique pas, et renouveler les clés LLM et de recherche web si des
+    recherches inconnues ont tourné.
+  reference:
+    - https://github.com/assafelovic/gpt-researcher
+    - https://github.com/assafelovic/gpt-researcher/blob/main/backend/server/app.py
+    - https://github.com/assafelovic/gpt-researcher/blob/main/backend/server/agent_discovery.py
+    - https://github.com/assafelovic/gpt-researcher/blob/main/backend/server/report_store.py
+    - https://github.com/assafelovic/gpt-researcher/blob/main/SECURITY.md
+    - https://github.com/assafelovic/gpt-researcher/blob/main/Dockerfile
+    - https://github.com/assafelovic/gpt-researcher/blob/main/docker-compose.yml
+  metadata:
+    max-request: 2
+    vendor: assafelovic
+    product: gpt-researcher
+  tags: ai,llm,agent,gpt-researcher,exposure,unauth,misconfig
+
+http:
+  # Deux lectures, en GET, sans corps ni en-tête.
+  #
+  # GET /.well-known/agent-discovery.json nomme le produit : le handler
+  # compose un littéral à partir de l'URL de la requête, rien n'est lu ni
+  # écrit. Il répond aussi derrière un proxy qui n'exempterait que
+  # /.well-known/ — seul, il dirait « c'est GPT Researcher, et il s'annonce
+  # sans authentification », jamais « les rapports se lisent ».
+  #
+  # GET /api/reports est la preuve d'ouverture : list_reports relit le
+  # magasin et le rend entier. C'est une lecture, sans appel au LLM.
+  #
+  # GET /files/ n'est pas lu : son handler crée le dossier DOC_PATH s'il
+  # manque — ce n'est plus une lecture seule. GET / ne rend qu'une page au
+  # titre « GPT Researcher », et GET /report/<identifiant inconnu> répond 200
+  # avec {"message":"Report not found."} : ni l'un ni l'autre ne conclut.
+  # POST /report/, POST /api/chat, POST /upload/ et les DELETE calculent,
+  # écrivent ou effacent : ce que le constat signale, pas ce qu'un scanner a
+  # besoin d'appeler pour l'établir.
+  #
+  # Aucun en-tête Authorization : c'est l'accès anonyme qui est constaté.
+  # Le port n'est pas forcé : 8000 par défaut, à donner dans la cible.
+  - method: GET
+    path:
+      - "{{BaseURL}}/.well-known/agent-discovery.json"
+      - "{{BaseURL}}/api/reports"
+
+    # req-condition accumule body_N pour que la conclusion porte sur les deux
+    # réponses à la fois.
+    req-condition: true
+
+    matchers:
+      - type: dsl
+        name: open-report-store
+        condition: and
+        dsl:
+          # L'ouverture du document de découverte, ancrée en tête, dans
+          # l'ordre où build_agent_discovery_document écrit ses dicts :
+          # agent_discovery_version, domain, services, puis le premier
+          # service — name, description, endpoint, protocol, auth. Trois
+          # choses y sont tenues ensemble : la clé agent_discovery_version,
+          # la description littérale du service research, propre au produit,
+          # et « "auth":"none" » sur ce service-là. domain et endpoint
+          # suivent l'hôte demandé, leur valeur est libre ; celle de la
+          # version aussi, qu'une révision du protocole changerait. La fin
+          # n'est pas tenue : contact s'y ajoute. Ancrer en tête écarte la
+          # page ou le document qui cite celui-ci, la supervision qui le
+          # range sous une clé à elle. JSONResponse sérialise compact ; les
+          # \s* absorbent l'intermédiaire qui réindente.
+          - 'regex("^\\{\\s*\"agent_discovery_version\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"domain\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"services\"\\s*:\\s*\\[\\s*\\{\\s*\"name\"\\s*:\\s*\"research\"\\s*,\\s*\"description\"\\s*:\\s*\"Submit a research job and generate a report\\.\"\\s*,\\s*\"endpoint\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"\\s*,\\s*\"protocol\"\\s*:\\s*\"http\"\\s*,\\s*\"auth\"\\s*:\\s*\"none\"\\s*[,}]", trim_space(body_1))'
+
+          # Et le magasin, tel que get_all_reports le rend : un objet ouvert
+          # sur la clé reports, dont la valeur est une liste — vide sur une
+          # instance qui n'a encore rien stocké. Seul, ce corps est celui de
+          # n'importe quelle API ; joint au document ci-dessus, il dit que la
+          # route que ce document annonce sans authentification répond bien à
+          # un appelant anonyme, et non la page de connexion ou le 401 d'un
+          # proxy qui la garderait. La fin n'est pas tenue : le moteur borne
+          # ce qu'il lit d'un corps, et un magasin plein — celui qui compte —
+          # peut la dépasser.
+          - 'regex("^\\{\\s*\"reports\"\\s*:\\s*\\[", trim_space(body_2))'
+
+    # Aucun matcher de statut : un intermédiaire peut rendre 200 sur tout,
+    # seul le corps dit ce qui est servi.
+
+    extractors:
+      # Le nombre de rapports lisibles — pas leur contenu : questions et
+      # réponses sont les données de l'opérateur, elles n'ont rien à faire
+      # dans un rapport de scan. Un seul extracteur, borné à body_2 : sous
+      # req-condition le moteur émet un résultat par extracteur qui rend
+      # quelque chose.
+      - type: json
+        part: body_2
+        name: reports
+        json:
+          - '.reports | length'

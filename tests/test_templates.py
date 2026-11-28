@@ -56741,3 +56741,739 @@ def test_opea_matcher_compiles_and_fires_against_a_live_server():
             (200, OPEA_QUOTED_IN_HTML_BODY, html)):
         _, hits = scan(body=body, status=status, content_type=content_type)
         assert hits == [], (body[:80], hits)
+
+
+# --------------------------------------------------------------------------
+# GPT Researcher (assafelovic/gpt-researcher) : un agent de recherche dont le
+# serveur FastAPI, backend/server/app.py, ne porte ni dépendance, ni clé, ni
+# jeton — SECURITY.md : « ships without built-in authentication or network
+# access controls, by design ». GET /.well-known/agent-discovery.json annonce
+# ses quatre services sous « "auth":"none" », GET /api/reports rend tout le
+# magasin de rapports.
+#
+# Ce que cette section amarre, et qui ne se devine pas :
+#
+#   - les corps relevés sont ceux d'une réplique : main.py,
+#     backend/server/app.py, agent_discovery.py et report_store.py du commit
+#     9d39a2f de main, fastapi 0.165.0, starlette 1.10.0, pydantic 2.14.4,
+#     uvicorn 0.54.0 ; websocket_manager, server_utils, utils, chat et
+#     gpt_researcher remplacés par des bouchons — aucune recherche lancée ;
+#   - le document de découverte est compact, dans l'ordre des dicts de
+#     build_agent_discovery_document : agent_discovery_version, domain,
+#     services ; name, description, endpoint, protocol, auth, governance,
+#     free_tier ; domain et les endpoint suivent l'en-tête Host, et
+#     X-Forwarded-Proto venu d'un proxy de confiance ; contact, sous
+#     AGENT_DISCOVERY_CONTACT, ferme le document ;
+#   - GET /api/reports rend {"reports":[]} sur un magasin vide, puis les
+#     rapports dans l'ordre id, question, answer, orderedData, chatMessages,
+#     timestamp — answer vaut null quand le client ne l'a pas donné ;
+#     « ?report_ids=<inconnu> » rend aussi {"reports":[]} ;
+#   - agent_discovery.py date de la v3.5.0 (commit 524520f, absent du tag
+#     v3.4.4) et n'a pas changé depuis ; report_store.py date de la v3.3.9 ;
+#   - GET /report/<inconnu> rend 200 et {"message":"Report not found."}, GET
+#     /api/reports/<inconnu> 404 et {"detail":"Report not found"}, une route
+#     absente 404 et {"detail":"Not Found"} ; GET / rend la page au titre
+#     « GPT Researcher », GET /openapi.json un schéma au titre « FastAPI ».
+
+GPT_RESEARCHER_TEMPLATE = os.path.join(
+    TEMPLATES_DIR, "exposure", "gpt-researcher-server-exposed.yaml")
+
+GPT_RESEARCHER_DISCOVERY_ROUTE = "/.well-known/agent-discovery.json"
+GPT_RESEARCHER_REPORTS_ROUTE = "/api/reports"
+
+GPT_RESEARCHER_RESEARCH_DESCRIPTION = (
+    "Submit a research job and generate a report.")
+
+# Les quatre services de build_agent_discovery_document, dans l'ordre du
+# fichier : nom, description, chemin, protocole.
+GPT_RESEARCHER_SERVICES = (
+    ("research", GPT_RESEARCHER_RESEARCH_DESCRIPTION, "/report/", "http"),
+    ("reports", "Create, list, and manage generated research reports.",
+     "/api/reports", "http"),
+    ("chat", "Ask follow-up questions against a generated report.",
+     "/api/chat", "http"),
+    ("research_stream",
+     "Realtime WebSocket stream for interactive research runs.",
+     "/ws", "websocket"),
+)
+
+# Verbatim, réplique : GET /.well-known/agent-discovery.json sur
+# 127.0.0.1:18000, sans AGENT_DISCOVERY_CONTACT. 875 octets.
+GPT_RESEARCHER_DISCOVERY_BODY = (
+    '{"agent_discovery_version":"0.1","domain":"127.0.0.1","services":[{"name'
+    '":"research","description":"Submit a research job and generate a report.'
+    '","endpoint":"http://127.0.0.1:18000/report/","protocol":"http","auth":"'
+    'none","governance":"none","free_tier":true},{"name":"reports","descripti'
+    'on":"Create, list, and manage generated research reports.","endpoint":"h'
+    'ttp://127.0.0.1:18000/api/reports","protocol":"http","auth":"none","gove'
+    'rnance":"none","free_tier":true},{"name":"chat","description":"Ask follo'
+    'w-up questions against a generated report.","endpoint":"http://127.0.0.1'
+    ':18000/api/chat","protocol":"http","auth":"none","governance":"none","fr'
+    'ee_tier":true},{"name":"research_stream","description":"Realtime WebSock'
+    'et stream for interactive research runs.","endpoint":"ws://127.0.0.1:180'
+    '00/ws","protocol":"websocket","auth":"none","governance":"none","free_ti'
+    'er":true}]}')
+
+# Les trois fragments du document que la description du template cite, bout
+# à bout : l'ouverture, puis le premier service en deux morceaux.
+GPT_RESEARCHER_DISCOVERY_QUOTES = (
+    '{"agent_discovery_version":"0.1","domain":"127.0.0.1","services":[',
+    '{"name":"research","description":"Submit a research job and generate a '
+    'report.","endpoint":"http://127.0.0.1:18000/report/",',
+    '"protocol":"http","auth":"none","governance":"none","free_tier":true}')
+
+
+def gpt_researcher_discovery_body(origin="http://127.0.0.1:18000",
+                                  domain="127.0.0.1", contact=None,
+                                  version="0.1",
+                                  services=GPT_RESEARCHER_SERVICES,
+                                  auth="none", **dumps):
+    """
+    Le document de build_agent_discovery_document, dans l'ordre de ses dicts :
+    l'origine WebSocket se déduit de l'origine HTTP, contact ferme le
+    document quand il existe.
+    """
+    if origin.startswith("https://"):
+        websocket_origin = "wss://" + origin[len("https://"):]
+    else:
+        websocket_origin = "ws://" + origin[len("http://"):]
+    doc = {"agent_discovery_version": version, "domain": domain,
+           "services": []}
+    for name, description, path, protocol in services:
+        entry = {"name": name, "description": description,
+                 "endpoint": (websocket_origin if protocol == "websocket"
+                              else origin) + path,
+                 "protocol": protocol}
+        if auth is not None:
+            entry["auth"] = auth
+        entry["governance"] = "none"
+        entry["free_tier"] = True
+        doc["services"].append(entry)
+    if contact:
+        doc["contact"] = contact
+    dumps.setdefault("separators", (",", ":"))
+    dumps.setdefault("ensure_ascii", False)
+    return json.dumps(doc, **dumps)
+
+
+# Relevés sur la réplique et rendus à l'octet près par le constructeur : un
+# en-tête « Host: research.internal:8000 » (911 octets), le même hôte
+# derrière « X-Forwarded-Proto: https » (895 octets), puis une instance
+# lancée sur le port 18001 avec AGENT_DISCOVERY_CONTACT (913 octets).
+GPT_RESEARCHER_HOST_DISCOVERY_BODY = gpt_researcher_discovery_body(
+    origin="http://research.internal:8000", domain="research.internal")
+GPT_RESEARCHER_HTTPS_DISCOVERY_BODY = gpt_researcher_discovery_body(
+    origin="https://research.internal", domain="research.internal")
+GPT_RESEARCHER_CONTACT_DISCOVERY_BODY = gpt_researcher_discovery_body(
+    origin="http://127.0.0.1:18001", contact="research-ops@lab.internal")
+
+# Verbatim, réplique : GET /api/reports sur un magasin vide — et sous
+# « ?report_ids=<inconnu> ». 14 octets.
+GPT_RESEARCHER_REPORTS_EMPTY_BODY = '{"reports":[]}'
+# Verbatim, réplique : après deux POST /api/reports sur la réplique, le
+# second sans answer ni timestamp. 501 octets.
+GPT_RESEARCHER_REPORTS_BODY = (
+    '{"reports":[{"id":"task_1764330000_market","question":"What moved the li'
+    'thium market in Q3?","answer":"# Lithium, Q3\\n\\nPrices fell 12 % — see ['
+    '1].","orderedData":[{"type":"question","content":"What moved the lithium'
+    ' market in Q3?"}],"chatMessages":[{"role":"user","content":"And cobalt?"'
+    ',"timestamp":1764330100000}],"timestamp":1764330000000},{"id":"task_1764'
+    '333600_minimal","question":"Résumé de l’état de l’art","answer":null,"or'
+    'deredData":[],"chatMessages":[],"timestamp":1795869652395}]}')
+GPT_RESEARCHER_REPORT_KEYS = ["id", "question", "answer", "orderedData",
+                              "chatMessages", "timestamp"]
+
+# Verbatim, réplique : GET /report/<inconnu> (200), GET
+# /api/reports/<inconnu> (404), une route absente (404).
+GPT_RESEARCHER_REPORT_MISSING_BODY = '{"message":"Report not found."}'
+GPT_RESEARCHER_API_REPORT_MISSING_BODY = '{"detail":"Report not found"}'
+GPT_RESEARCHER_NOT_FOUND_BODY = '{"detail":"Not Found"}'
+# Verbatim, réplique : l'ouverture de GET / et celle de GET /openapi.json.
+GPT_RESEARCHER_INDEX_HEAD = (
+    '<!DOCTYPE html>\n<html lang="en">\n\n<head>\n    <title>GPT Researcher</ti'
+    'tle>\n    <meta name="description" content="A research assistant powered'
+    ' by GPT-4">\n')
+GPT_RESEARCHER_OPENAPI_HEAD = (
+    '{"openapi":"3.1.0","info":{"title":"FastAPI","version":"0.1.0"},"paths":'
+    '{"/":{"get":{"summary":"Serve Frontend","description":"Serve the main fr'
+    'ontend HTML page.",')
+
+
+def gpt_researcher_reports_body(reports=(), **dumps):
+    """Le document de get_all_reports : la clé reports, une liste."""
+    dumps.setdefault("separators", (",", ":"))
+    dumps.setdefault("ensure_ascii", False)
+    return json.dumps({"reports": list(reports)}, **dumps)
+
+
+GPT_RESEARCHER_REPORTS = json.loads(GPT_RESEARCHER_REPORTS_BODY)["reports"]
+
+# Un intermédiaire qui réindente, qui échappe l'UTF-8, qui échappe les
+# barres obliques.
+GPT_RESEARCHER_DISCOVERY_REINDENTED_BODY = (
+    "\n" + gpt_researcher_discovery_body(indent=2, separators=None) + "\n")
+GPT_RESEARCHER_DISCOVERY_ESCAPED_SLASHES_BODY = (
+    GPT_RESEARCHER_DISCOVERY_BODY.replace("/", "\\/"))
+GPT_RESEARCHER_REPORTS_REINDENTED_BODY = (
+    "\n" + gpt_researcher_reports_body(GPT_RESEARCHER_REPORTS, indent=2,
+                                       separators=None) + "\n")
+GPT_RESEARCHER_REPORTS_ASCII_BODY = gpt_researcher_reports_body(
+    GPT_RESEARCHER_REPORTS, ensure_ascii=True)
+# Écrit d'après le code, pas relevé : une révision du protocole, puis un
+# rapport qui porte la clé facultative brief de create_or_update_report.
+GPT_RESEARCHER_NEXT_VERSION_DISCOVERY_BODY = gpt_researcher_discovery_body(
+    version="0.2")
+GPT_RESEARCHER_BRIEF_REPORTS_BODY = gpt_researcher_reports_body(
+    [dict(GPT_RESEARCHER_REPORTS[0], brief={"audience": "board"})])
+# Un magasin plein dont le moteur n'a lu que le début.
+GPT_RESEARCHER_TRUNCATED_REPORTS_BODY = GPT_RESEARCHER_REPORTS_BODY[:230]
+
+# Un dérivé qui annonce une authentification, puis qui n'en annonce aucune.
+GPT_RESEARCHER_BEARER_DISCOVERY_BODY = gpt_researcher_discovery_body(
+    auth="bearer")
+GPT_RESEARCHER_NO_AUTH_KEY_DISCOVERY_BODY = gpt_researcher_discovery_body(
+    auth=None)
+# Le document de découverte d'un autre produit ; la description prolongée ;
+# le service research ailleurs qu'en tête.
+GPT_RESEARCHER_OTHER_PRODUCT_DISCOVERY_BODY = gpt_researcher_discovery_body(
+    services=(("search", "Search the product catalogue.", "/search",
+               "http"),))
+GPT_RESEARCHER_PROLONGED_DESCRIPTION_DISCOVERY_BODY = (
+    gpt_researcher_discovery_body(services=(
+        ("research", GPT_RESEARCHER_RESEARCH_DESCRIPTION + " (mirror)",
+         "/report/", "http"),) + GPT_RESEARCHER_SERVICES[1:]))
+GPT_RESEARCHER_RESEARCH_NOT_FIRST_DISCOVERY_BODY = (
+    gpt_researcher_discovery_body(
+        services=GPT_RESEARCHER_SERVICES[1:] + GPT_RESEARCHER_SERVICES[:1]))
+# Sans la clé de version, puis les clés dans un autre ordre.
+GPT_RESEARCHER_NO_VERSION_DISCOVERY_BODY = (
+    '{"domain":"127.0.0.1",' + GPT_RESEARCHER_DISCOVERY_BODY[
+        len('{"agent_discovery_version":"0.1","domain":"127.0.0.1",'):])
+GPT_RESEARCHER_REORDERED_DISCOVERY_BODY = (
+    '{"domain":"127.0.0.1","agent_discovery_version":"0.1",'
+    + GPT_RESEARCHER_DISCOVERY_BODY[
+        len('{"agent_discovery_version":"0.1","domain":"127.0.0.1",'):])
+# Le document rangé sous la clé d'un autre, dans une liste, cité en chaîne,
+# cité dans une page.
+GPT_RESEARCHER_WRAPPED_DISCOVERY_BODY = (
+    '{"upstream":%s}' % GPT_RESEARCHER_DISCOVERY_BODY)
+GPT_RESEARCHER_LISTED_DISCOVERY_BODY = "[%s]" % GPT_RESEARCHER_DISCOVERY_BODY
+GPT_RESEARCHER_QUOTED_IN_JSON_DISCOVERY_BODY = json.dumps(
+    {"agent_discovery_version": "0.1",
+     "example": GPT_RESEARCHER_DISCOVERY_BODY}, separators=(",", ":"))
+GPT_RESEARCHER_QUOTED_IN_HTML_DISCOVERY_BODY = (
+    "<html><body><pre>" + GPT_RESEARCHER_DISCOVERY_BODY
+    + "</pre></body></html>")
+
+# Ce qu'un proxy qui garde /api/ rend à la place du magasin.
+GPT_RESEARCHER_UNAUTHORIZED_BODY = '{"detail":"Not authenticated"}'
+GPT_RESEARCHER_LOGIN_PAGE_BODY = (
+    "<html><head><title>Sign in</title></head><body><form method=\"post\">"
+    "</form></body></html>")
+# La clé reports qui n'ouvre pas une liste, la clé au singulier de GET
+# /api/reports/<id>, la clé ailleurs qu'en tête, sous une autre, dans une
+# liste, citée dans une page.
+GPT_RESEARCHER_REPORTS_OBJECT_BODY = '{"reports":{}}'
+GPT_RESEARCHER_REPORTS_NULL_BODY = '{"reports":null}'
+GPT_RESEARCHER_SINGLE_REPORT_BODY = json.dumps(
+    {"report": GPT_RESEARCHER_REPORTS[0]}, separators=(",", ":"),
+    ensure_ascii=False)
+GPT_RESEARCHER_REPORTS_NOT_FIRST_BODY = '{"count":0,"reports":[]}'
+GPT_RESEARCHER_WRAPPED_REPORTS_BODY = '{"data":{"reports":[]}}'
+GPT_RESEARCHER_LISTED_REPORTS_BODY = '[{"reports":[]}]'
+GPT_RESEARCHER_QUOTED_IN_HTML_REPORTS_BODY = (
+    "<html><body><pre>" + GPT_RESEARCHER_REPORTS_BODY + "</pre></body></html>")
+
+
+def gpt_researcher_block():
+    doc = load(GPT_RESEARCHER_TEMPLATE)
+    blocks = [b for b in (doc.get("http") or [])
+              if "{{BaseURL}}%s" % GPT_RESEARCHER_REPORTS_ROUTE
+              in (b.get("path") or [])]
+    assert blocks, "le template n'interroge pas GET /api/reports"
+    return blocks[0]
+
+
+def gpt_researcher_requests():
+    """(méthode, chemin) dans l'ordre déclaré : il numérote les body_N."""
+    block = gpt_researcher_block()
+    return [normalise_route(block.get("method"), target)
+            for target in (block.get("path") or [])]
+
+
+def gpt_researcher_matcher():
+    found = [m for m in gpt_researcher_block().get("matchers") or []
+             if m.get("name") == "open-report-store"]
+    assert len(found) == 1, "matcher 'open-report-store' absent ou en double"
+    return found[0]
+
+
+def gpt_researcher_fires(discovery=(200, GPT_RESEARCHER_DISCOVERY_BODY),
+                         reports=(200, GPT_RESEARCHER_REPORTS_BODY)):
+    scenario = {
+        normalise_route("GET", GPT_RESEARCHER_DISCOVERY_ROUTE): discovery,
+        normalise_route("GET", GPT_RESEARCHER_REPORTS_ROUTE): reports}
+    responses = []
+    for request in gpt_researcher_requests():
+        assert request in scenario, (
+            f"le template interroge un chemin que le serveur ne sert pas : "
+            f"{request}")
+        responses.append(scenario[request])
+    return dsl_matcher_hits(gpt_researcher_matcher(), responses)
+
+
+def test_gpt_researcher_fixtures_hold_the_bodies_read_on_the_replica():
+    for body, size, digest in (
+            (GPT_RESEARCHER_DISCOVERY_BODY, 875,
+             "61ab9dfaba5357028a03589ef56590b92f2381e0f98db4e4b29506a1cae37e68"),
+            (GPT_RESEARCHER_HOST_DISCOVERY_BODY, 911,
+             "b7f213a8a6e3973416afba4a31ae63fb0223c7c836a78963283ed168f19b5675"),
+            (GPT_RESEARCHER_HTTPS_DISCOVERY_BODY, 895,
+             "08105cd5301efd443db2e1423302d063cf412a7c3e177af1d8d93393596f204f"),
+            (GPT_RESEARCHER_CONTACT_DISCOVERY_BODY, 913,
+             "0a212ed6637c5e2edd2798dfebbe300c38876fa880f67b17fdbcc3a2a463674f"),
+            (GPT_RESEARCHER_REPORTS_EMPTY_BODY, 14,
+             "486a8f07711a55700e1ed31c536217c17f3135cc6340b4830bcb4f87bbc7072a"),
+            (GPT_RESEARCHER_REPORTS_BODY, 501,
+             "3a9c33863758933323112679805ef9733870102e453486a83b10ad371d4194ac"),
+            (GPT_RESEARCHER_REPORT_MISSING_BODY, 31,
+             "07903f2f395c978570ef29c5b907555b734bdaeda7bfaca6864598bab5084cad"),
+            (GPT_RESEARCHER_API_REPORT_MISSING_BODY, 29,
+             "dc2c6b1e8e46d8dab0aa8f7166b36e8ac08aa1644e89f50c9ccd0641df19298e"),
+            (GPT_RESEARCHER_NOT_FOUND_BODY, 22,
+             "37ec4665a8102d115ffd1ac20dae94c98b4dac64b0c1a68228aa2a531caeb35d")):
+        assert len(body.encode()) == size, body[:60]
+        assert hashlib.sha256(body.encode()).hexdigest() == digest, (
+            "le corps relevé, à l'octet près")
+    assert gpt_researcher_discovery_body() == GPT_RESEARCHER_DISCOVERY_BODY, (
+        "le constructeur de corps écrit ce que la réplique rend")
+    assert "".join(GPT_RESEARCHER_DISCOVERY_QUOTES) == (
+        GPT_RESEARCHER_DISCOVERY_BODY[:259]), (
+        "les fragments cités ouvrent le document, bout à bout")
+
+    doc = json.loads(GPT_RESEARCHER_DISCOVERY_BODY)
+    assert list(doc) == ["agent_discovery_version", "domain", "services"], (
+        "l'ordre du dict de build_agent_discovery_document")
+    assert doc["agent_discovery_version"] == "0.1"
+    assert [s["name"] for s in doc["services"]] == [
+        "research", "reports", "chat", "research_stream"]
+    for service, (name, description, path, protocol) in zip(
+            doc["services"], GPT_RESEARCHER_SERVICES):
+        assert list(service) == ["name", "description", "endpoint",
+                                 "protocol", "auth", "governance",
+                                 "free_tier"], "l'ordre de chaque service"
+        assert (service["name"], service["description"],
+                service["protocol"]) == (name, description, protocol)
+        assert service["endpoint"].endswith(":18000" + path)
+        assert (service["auth"], service["governance"],
+                service["free_tier"]) == ("none", "none", True), (
+            "les quatre services s'annoncent sans authentification")
+    assert doc["services"][0]["description"] == (
+        GPT_RESEARCHER_RESEARCH_DESCRIPTION)
+    assert doc["services"][3]["endpoint"] == "ws://127.0.0.1:18000/ws"
+
+    hosted = json.loads(GPT_RESEARCHER_HOST_DISCOVERY_BODY)
+    assert hosted["domain"] == "research.internal", (
+        "domain suit l'en-tête Host, sans le port")
+    assert hosted["services"][0]["endpoint"] == (
+        "http://research.internal:8000/report/")
+    secured = json.loads(GPT_RESEARCHER_HTTPS_DISCOVERY_BODY)
+    assert secured["services"][0]["endpoint"] == (
+        "https://research.internal/report/")
+    assert secured["services"][3]["endpoint"] == "wss://research.internal/ws"
+    contact = json.loads(GPT_RESEARCHER_CONTACT_DISCOVERY_BODY)
+    assert list(contact)[-1] == "contact", "contact ferme le document"
+    assert contact["contact"] == "research-ops@lab.internal"
+
+    assert json.loads(GPT_RESEARCHER_REPORTS_EMPTY_BODY) == {"reports": []}
+    assert gpt_researcher_reports_body() == GPT_RESEARCHER_REPORTS_EMPTY_BODY
+    assert gpt_researcher_reports_body(GPT_RESEARCHER_REPORTS) == (
+        GPT_RESEARCHER_REPORTS_BODY), (
+        "le constructeur de corps écrit ce que la réplique rend")
+    assert list(json.loads(GPT_RESEARCHER_REPORTS_BODY)) == ["reports"]
+    assert len(GPT_RESEARCHER_REPORTS) == 2
+    for report in GPT_RESEARCHER_REPORTS:
+        assert list(report) == GPT_RESEARCHER_REPORT_KEYS, (
+            "l'ordre de create_or_update_report")
+    assert GPT_RESEARCHER_REPORTS[1]["answer"] is None
+    assert "—" in GPT_RESEARCHER_REPORTS_BODY and (
+        "\\n\\n" in GPT_RESEARCHER_REPORTS_BODY), (
+        "FastAPI écrit l'UTF-8 sans l'échapper, et échappe les sauts de ligne")
+
+    assert json.loads(GPT_RESEARCHER_REPORT_MISSING_BODY) == {
+        "message": "Report not found."}
+    assert json.loads(GPT_RESEARCHER_API_REPORT_MISSING_BODY) == {
+        "detail": "Report not found"}
+    assert "<title>GPT Researcher</title>" in GPT_RESEARCHER_INDEX_HEAD
+    assert '"title":"FastAPI"' in GPT_RESEARCHER_OPENAPI_HEAD, (
+        "le schéma ne nomme pas le produit")
+
+    assert json.loads(GPT_RESEARCHER_DISCOVERY_REINDENTED_BODY) == doc
+    assert json.loads(GPT_RESEARCHER_DISCOVERY_ESCAPED_SLASHES_BODY) == doc
+    assert "http:\\/\\/" in GPT_RESEARCHER_DISCOVERY_ESCAPED_SLASHES_BODY
+    assert json.loads(GPT_RESEARCHER_REPORTS_REINDENTED_BODY) == json.loads(
+        GPT_RESEARCHER_REPORTS_ASCII_BODY) == json.loads(
+        GPT_RESEARCHER_REPORTS_BODY)
+    assert "\\u2014" in GPT_RESEARCHER_REPORTS_ASCII_BODY
+    assert json.loads(GPT_RESEARCHER_NEXT_VERSION_DISCOVERY_BODY)[
+        "agent_discovery_version"] == "0.2"
+    assert list(json.loads(GPT_RESEARCHER_BRIEF_REPORTS_BODY)["reports"][0]) == (
+        GPT_RESEARCHER_REPORT_KEYS + ["brief"])
+    with pytest.raises(ValueError):
+        json.loads(GPT_RESEARCHER_TRUNCATED_REPORTS_BODY)
+    assert {s["auth"] for s in json.loads(
+        GPT_RESEARCHER_BEARER_DISCOVERY_BODY)["services"]} == {"bearer"}
+    assert not any("auth" in s for s in json.loads(
+        GPT_RESEARCHER_NO_AUTH_KEY_DISCOVERY_BODY)["services"])
+    assert [s["name"] for s in json.loads(
+        GPT_RESEARCHER_RESEARCH_NOT_FIRST_DISCOVERY_BODY)["services"]] == [
+        "reports", "chat", "research_stream", "research"]
+    assert list(json.loads(GPT_RESEARCHER_NO_VERSION_DISCOVERY_BODY)) == [
+        "domain", "services"]
+    assert json.loads(GPT_RESEARCHER_REORDERED_DISCOVERY_BODY) == doc
+    assert list(json.loads(GPT_RESEARCHER_REORDERED_DISCOVERY_BODY))[0] == (
+        "domain")
+    assert json.loads(GPT_RESEARCHER_WRAPPED_DISCOVERY_BODY)["upstream"] == doc
+    assert json.loads(GPT_RESEARCHER_QUOTED_IN_JSON_DISCOVERY_BODY)[
+        "example"] == GPT_RESEARCHER_DISCOVERY_BODY
+    assert json.loads(GPT_RESEARCHER_SINGLE_REPORT_BODY)["report"] == (
+        GPT_RESEARCHER_REPORTS[0])
+
+
+def test_gpt_researcher_probe_reads_two_documents_and_never_writes():
+    doc = load(GPT_RESEARCHER_TEMPLATE)
+    assert request_routes(doc) == {
+        ("GET", GPT_RESEARCHER_DISCOVERY_ROUTE),
+        ("GET", GPT_RESEARCHER_REPORTS_ROUTE)}, (
+        "le template ne lit que le document de découverte et le magasin : "
+        "GET /files/ crée DOC_PATH s'il manque, POST /report/ lance une "
+        "recherche, les DELETE effacent")
+    assert gpt_researcher_requests() == [
+        ("GET", GPT_RESEARCHER_DISCOVERY_ROUTE),
+        ("GET", GPT_RESEARCHER_REPORTS_ROUTE)], (
+        "body_1 est le document de découverte, body_2 le magasin")
+    assert len(doc["http"]) == 1
+    block = gpt_researcher_block()
+    assert str(block.get("method", "GET")).upper() == "GET"
+    assert block.get("req-condition") is True
+    assert not block.get("body") and not block.get("raw"), (
+        "aucune requête ne porte de corps")
+    assert not block.get("headers"), (
+        "aucun en-tête Authorization : c'est l'accès anonyme qui est constaté")
+    for target in block.get("path") or []:
+        assert "?" not in target, "aucun paramètre de requête"
+    meta = doc["info"].get("metadata") or {}
+    assert meta.get("max-request") == 2
+    assert meta.get("product") == "gpt-researcher"
+    assert doc["info"]["severity"] == "high"
+
+    description = re.sub(r"\s+", " ", doc["info"]["description"])
+    assert "app = FastAPI(lifespan=lifespan)" in description
+    assert "CORSMiddleware" in description and (
+        "allow_credentials=True" in description), (
+        "le seul middleware d'app.py est relevé dans le code")
+    assert ("without built-in authentication or network access controls, by "
+            "design.") in description, (
+        "SECURITY.md dit que l'authentification est absente par conception")
+    assert 'host = os.getenv("HOST", "127.0.0.1")' in description and (
+        "ARG HOST=0.0.0.0" in description) and "8000:8000" in description, (
+        "l'écoute par défaut, celle de l'image et la publication du compose")
+    for quote in GPT_RESEARCHER_DISCOVERY_QUOTES:
+        assert quote in description, (
+            f"le corps relevé sur la réplique est écrit dans le template — "
+            f"{quote[:40]}")
+    assert GPT_RESEARCHER_REPORTS_EMPTY_BODY in description
+    assert "9d39a2f" in description, "le commit relevé"
+    for marker in ("v3.5.0", "524520f", "v3.4.4", "v3.3.9"):
+        assert marker in description, (
+            f"la version qui introduit le document est écrite — {marker}")
+    assert "n'est pas reconnue" in description, (
+        "la limite — une instance antérieure à la v3.5.0 ne sert que "
+        "/api/reports — est écrite")
+    impact = re.sub(r"\s+", " ", doc["info"]["impact"])
+    for route in ("POST /report/", "POST /api/chat", "POST /upload/",
+                  "DELETE /files/{filename}",
+                  "DELETE /api/reports/{research_id}"):
+        assert route in impact, f"l'impact nomme {route}"
+
+    extractors = block.get("extractors") or []
+    assert len(extractors) == 1, (
+        "un seul extracteur : sous req-condition le moteur émet un résultat "
+        "par extracteur qui rend quelque chose")
+    assert extractors[0].get("part") == "body_2"
+    assert extractors[0].get("json") == [".reports | length"], (
+        "le nombre de rapports, pas leur contenu : questions et réponses "
+        "n'ont rien à faire dans un rapport de scan")
+
+
+def test_gpt_researcher_matcher_rests_on_the_discovery_document_and_the_store():
+    matchers = gpt_researcher_block().get("matchers") or []
+    assert [m.get("type") for m in matchers] == ["dsl"], (
+        "aucun matcher de statut : un intermédiaire peut rendre 200 sur tout")
+    expressions = gpt_researcher_matcher().get("dsl") or []
+    assert gpt_researcher_matcher().get("condition") == "and"
+    assert len(expressions) == 2
+    assert not any("status_code" in e for e in expressions), (
+        "le statut n'est pas lu")
+    discovery, store = expressions
+    assert discovery.startswith('regex("^') and discovery.endswith(
+        ', trim_space(body_1))'), "le document de découverte est tenu en tête"
+    for token in ('\\"agent_discovery_version\\"',
+                  "Submit a research job and generate a report\\\\.",
+                  '\\"auth\\"\\\\s*:\\\\s*\\"none\\"'):
+        assert token in discovery, (
+            f"la clé de version, la description littérale et l'annonce sans "
+            f"authentification sont exigées ensemble — {token}")
+    assert discovery.index("agent_discovery_version") < discovery.index(
+        "Submit a research job") < discovery.index('\\"auth\\"'), (
+        "dans l'ordre où le handler les écrit")
+    assert store.startswith('regex("^') and store.endswith(
+        ', trim_space(body_2))'), "le magasin est tenu en tête"
+    assert '\\"reports\\"' in store and "\\\\[" in store, (
+        "la clé reports ouvre une liste")
+    assert "$" not in store, (
+        "la fin n'est pas tenue : le moteur borne ce qu'il lit d'un corps")
+
+    empty = (200, GPT_RESEARCHER_REPORTS_EMPTY_BODY)
+    full = (200, GPT_RESEARCHER_REPORTS_BODY)
+    for discovery_body, reports, why in (
+            (GPT_RESEARCHER_DISCOVERY_BODY, full,
+             "l'instance relevée, deux rapports stockés"),
+            (GPT_RESEARCHER_DISCOVERY_BODY, empty,
+             "l'instance relevée, magasin vide"),
+            (GPT_RESEARCHER_HOST_DISCOVERY_BODY, full,
+             "une instance jointe par son nom"),
+            (GPT_RESEARCHER_HTTPS_DISCOVERY_BODY, full,
+             "une instance derrière un proxy TLS"),
+            (GPT_RESEARCHER_CONTACT_DISCOVERY_BODY, empty,
+             "une instance qui publie un contact"),
+            (GPT_RESEARCHER_DISCOVERY_REINDENTED_BODY,
+             (200, GPT_RESEARCHER_REPORTS_REINDENTED_BODY),
+             "les deux documents réindentés"),
+            (GPT_RESEARCHER_DISCOVERY_ESCAPED_SLASHES_BODY,
+             (200, GPT_RESEARCHER_REPORTS_ASCII_BODY),
+             "un intermédiaire qui échappe les barres et l'UTF-8"),
+            (GPT_RESEARCHER_NEXT_VERSION_DISCOVERY_BODY, full,
+             "une révision du protocole de découverte"),
+            (GPT_RESEARCHER_DISCOVERY_BODY,
+             (200, GPT_RESEARCHER_BRIEF_REPORTS_BODY),
+             "un rapport qui porte la clé brief"),
+            (GPT_RESEARCHER_DISCOVERY_BODY,
+             (200, GPT_RESEARCHER_TRUNCATED_REPORTS_BODY),
+             "un magasin plein dont le moteur n'a lu que le début")):
+        assert gpt_researcher_fires((200, discovery_body), reports), (
+            f"le template ne reconnaît pas {why}")
+    assert gpt_researcher_fires((503, GPT_RESEARCHER_DISCOVERY_BODY),
+                                (503, GPT_RESEARCHER_REPORTS_BODY)), (
+        "le statut ne décide de rien : seuls les corps sont lus")
+
+    ours = (200, GPT_RESEARCHER_DISCOVERY_BODY)
+    for discovery_response, reports, why in (
+            ((404, GPT_RESEARCHER_NOT_FOUND_BODY), empty,
+             "{\"reports\":[]} seul : une instance d'avant la v3.5.0, ou "
+             "n'importe quelle API"),
+            ((404, GPT_RESEARCHER_NOT_FOUND_BODY), full,
+             "des rapports sans le document qui nomme le produit"),
+            ((200, GPT_RESEARCHER_BEARER_DISCOVERY_BODY), full,
+             "un dérivé qui annonce une authentification"),
+            ((200, GPT_RESEARCHER_NO_AUTH_KEY_DISCOVERY_BODY), full,
+             "un document sans la clé auth"),
+            ((200, GPT_RESEARCHER_OTHER_PRODUCT_DISCOVERY_BODY), full,
+             "le document de découverte d'un autre produit"),
+            ((200, GPT_RESEARCHER_PROLONGED_DESCRIPTION_DISCOVERY_BODY), full,
+             "une description qui prolonge celle du produit"),
+            ((200, GPT_RESEARCHER_RESEARCH_NOT_FIRST_DISCOVERY_BODY), full,
+             "le service research ailleurs qu'en tête"),
+            ((200, GPT_RESEARCHER_NO_VERSION_DISCOVERY_BODY), full,
+             "le document sans agent_discovery_version"),
+            ((200, GPT_RESEARCHER_REORDERED_DISCOVERY_BODY), full,
+             "les clés dans un autre ordre"),
+            ((200, GPT_RESEARCHER_WRAPPED_DISCOVERY_BODY), full,
+             "le document rangé sous la clé d'une supervision"),
+            ((200, GPT_RESEARCHER_LISTED_DISCOVERY_BODY), full,
+             "le document dans une liste"),
+            ((200, GPT_RESEARCHER_QUOTED_IN_JSON_DISCOVERY_BODY), full,
+             "le document cité en chaîne"),
+            ((200, GPT_RESEARCHER_QUOTED_IN_HTML_DISCOVERY_BODY), full,
+             "une page qui cite le document"),
+            ((200, GPT_RESEARCHER_INDEX_HEAD + "</head></html>"), full,
+             "la page au titre « GPT Researcher »"),
+            ((200, GPT_RESEARCHER_REPORT_MISSING_BODY), full,
+             "le 200 de GET /report/<inconnu>"),
+            ((200, GPT_RESEARCHER_OPENAPI_HEAD + '"responses":{}}}}}'), full,
+             "le schéma, au titre « FastAPI »"),
+            ((200, GPT_RESEARCHER_REPORTS_BODY), full,
+             "le magasin servi sur les deux routes"),
+            (ours, (401, GPT_RESEARCHER_UNAUTHORIZED_BODY),
+             "le 401 d'un proxy qui garde /api/"),
+            (ours, (200, GPT_RESEARCHER_LOGIN_PAGE_BODY),
+             "la page de connexion d'un proxy qui garde /api/"),
+            (ours, (404, GPT_RESEARCHER_NOT_FOUND_BODY),
+             "une instance sans la route du magasin"),
+            (ours, ours, "le document de découverte servi sur les deux routes"),
+            (ours, (200, GPT_RESEARCHER_REPORTS_OBJECT_BODY),
+             "une clé reports qui ouvre un objet"),
+            (ours, (200, GPT_RESEARCHER_REPORTS_NULL_BODY),
+             "une clé reports nulle"),
+            (ours, (200, GPT_RESEARCHER_SINGLE_REPORT_BODY),
+             "la clé au singulier de GET /api/reports/<id>"),
+            (ours, (404, GPT_RESEARCHER_API_REPORT_MISSING_BODY),
+             "le 404 de GET /api/reports/<inconnu>"),
+            (ours, (200, GPT_RESEARCHER_REPORT_MISSING_BODY),
+             "le 200 de GET /report/<inconnu>"),
+            (ours, (200, GPT_RESEARCHER_REPORTS_NOT_FIRST_BODY),
+             "la clé reports ailleurs qu'en tête"),
+            (ours, (200, GPT_RESEARCHER_WRAPPED_REPORTS_BODY),
+             "la clé reports sous une autre"),
+            (ours, (200, GPT_RESEARCHER_LISTED_REPORTS_BODY),
+             "le magasin dans une liste"),
+            (ours, (200, GPT_RESEARCHER_QUOTED_IN_HTML_REPORTS_BODY),
+             "une page qui cite le magasin"),
+            (ours, (200, ""), "un corps vide")):
+        assert not gpt_researcher_fires(discovery_response, reports), (
+            f"le template conclut sur {why}")
+
+
+def test_gpt_researcher_and_the_other_documents_of_the_pack_stay_apart():
+    """
+    Le pack lit d'autres documents d'identité et d'information : aucun ne
+    porte agent_discovery_version, aucun ne s'ouvre sur la clé reports.
+    """
+    for body, product in ((OPEA_LLM_BODY, "OPEA"),
+                          (VERBA_HEALTH_BODY, "Verba"),
+                          (LITSERVE_INFO_BODY, "LitServe"),
+                          (TEI_INFO_BODY, "text-embeddings-inference"),
+                          (LLAMA_CPP_PYTHON_MODELS_BODY, "llama-cpp-python"),
+                          (LLAMA_CPP_PYTHON_OPENAPI_BODY,
+                           "llama-cpp-python (schéma)")):
+        assert not gpt_researcher_fires(
+            (200, body), (200, GPT_RESEARCHER_REPORTS_BODY)), (
+            f"le template lit le document de {product} comme une découverte")
+        assert not gpt_researcher_fires(
+            (200, GPT_RESEARCHER_DISCOVERY_BODY), (200, body)), (
+            f"le template lit le document de {product} comme un magasin")
+        assert not gpt_researcher_fires((200, body), (200, body)), (
+            f"le template conclut sur le document de {product}")
+
+
+@pytest.mark.skipif(shutil.which("nuclei") is None, reason="nuclei absent")
+def test_gpt_researcher_matcher_compiles_and_fires_against_a_live_server():
+    """
+    `gpt_researcher_fires` rejoue le matcher en Python : seul un scan contre
+    un vrai serveur dit que le lexer de nuclei lit les motifs pareil, que le
+    moteur n'émet que deux GET, et ce que l'extracteur rend sous
+    req-condition — le nombre de rapports, zéro compris.
+    """
+    def scan(discovery=(200, GPT_RESEARCHER_DISCOVERY_BODY),
+             reports=(200, GPT_RESEARCHER_REPORTS_BODY),
+             content_types=None):
+        seen = []
+        routes = {GPT_RESEARCHER_DISCOVERY_ROUTE: discovery,
+                  GPT_RESEARCHER_REPORTS_ROUTE: reports}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                seen.append((self.command, self.path))
+                if self.command == "GET" and self.path in routes:
+                    status, body = routes[self.path]
+                    ctype = (content_types or {}).get(self.path,
+                                                      "application/json")
+                    self.reply(status, body, ctype)
+                else:
+                    self.reply(404, GPT_RESEARCHER_NOT_FOUND_BODY,
+                               "application/json")
+
+            # Toute autre méthode est consignée : le template n'en émet pas.
+            do_POST = do_PUT = do_DELETE = do_HEAD = do_OPTIONS = do_GET
+
+            def reply(self, code, body, ctype):
+                data = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = subprocess.run(
+                ["nuclei", "-t", GPT_RESEARCHER_TEMPLATE,
+                 "-u", "http://127.0.0.1:%d" % server.server_port,
+                 "-duc", "-auth=false", "-jsonl", "-silent"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            server.shutdown()
+        assert r.returncode == 0, r.stdout + r.stderr
+        lines = [json.loads(line) for line in r.stdout.splitlines()
+                 if line.strip()]
+        assert {item.get("template-id") for item in lines} <= {
+            "gpt-researcher-server-exposed"}, r.stdout + r.stderr
+        return seen, [(item.get("matcher-name"),
+                       sorted(item.get("extracted-results") or []))
+                      for item in lines]
+
+    seen, hits = scan()
+    assert seen == [("GET", GPT_RESEARCHER_DISCOVERY_ROUTE),
+                    ("GET", GPT_RESEARCHER_REPORTS_ROUTE)], seen
+    assert hits == [("open-report-store", ["2"])], hits
+
+    _, hits = scan(reports=(200, GPT_RESEARCHER_REPORTS_EMPTY_BODY))
+    assert hits == [("open-report-store", ["0"])], hits
+
+    for discovery, reports, count in (
+            (GPT_RESEARCHER_HTTPS_DISCOVERY_BODY,
+             GPT_RESEARCHER_BRIEF_REPORTS_BODY, "1"),
+            (GPT_RESEARCHER_CONTACT_DISCOVERY_BODY,
+             GPT_RESEARCHER_REPORTS_ASCII_BODY, "2"),
+            (GPT_RESEARCHER_DISCOVERY_REINDENTED_BODY,
+             GPT_RESEARCHER_REPORTS_REINDENTED_BODY, "2"),
+            (GPT_RESEARCHER_DISCOVERY_ESCAPED_SLASHES_BODY,
+             GPT_RESEARCHER_REPORTS_BODY, "2")):
+        _, hits = scan(discovery=(200, discovery), reports=(200, reports))
+        assert hits == [("open-report-store", [count])], (
+            discovery[:80], reports[:80], hits)
+
+    _, hits = scan(discovery=(503, GPT_RESEARCHER_DISCOVERY_BODY),
+                   reports=(503, GPT_RESEARCHER_REPORTS_BODY))
+    assert hits == [("open-report-store", ["2"])], hits
+
+    # Le magasin tronqué n'est plus du JSON : le constat tient, le compte
+    # manque.
+    _, hits = scan(reports=(200, GPT_RESEARCHER_TRUNCATED_REPORTS_BODY))
+    assert hits == [("open-report-store", [])], hits
+
+    ours = (200, GPT_RESEARCHER_DISCOVERY_BODY)
+    full = (200, GPT_RESEARCHER_REPORTS_BODY)
+    html = "text/html; charset=utf-8"
+    for discovery, reports, content_types in (
+            ((404, GPT_RESEARCHER_NOT_FOUND_BODY),
+             (200, GPT_RESEARCHER_REPORTS_EMPTY_BODY), None),
+            ((200, GPT_RESEARCHER_BEARER_DISCOVERY_BODY), full, None),
+            ((200, GPT_RESEARCHER_OTHER_PRODUCT_DISCOVERY_BODY), full, None),
+            ((200, GPT_RESEARCHER_PROLONGED_DESCRIPTION_DISCOVERY_BODY), full,
+             None),
+            ((200, GPT_RESEARCHER_WRAPPED_DISCOVERY_BODY), full, None),
+            ((200, GPT_RESEARCHER_QUOTED_IN_HTML_DISCOVERY_BODY), full,
+             {GPT_RESEARCHER_DISCOVERY_ROUTE: html}),
+            ((200, GPT_RESEARCHER_INDEX_HEAD + "</head></html>"),
+             (200, GPT_RESEARCHER_INDEX_HEAD + "</head></html>"),
+             {GPT_RESEARCHER_DISCOVERY_ROUTE: html,
+              GPT_RESEARCHER_REPORTS_ROUTE: html}),
+            (ours, (401, GPT_RESEARCHER_UNAUTHORIZED_BODY), None),
+            (ours, (200, GPT_RESEARCHER_LOGIN_PAGE_BODY),
+             {GPT_RESEARCHER_REPORTS_ROUTE: html}),
+            (ours, ours, None),
+            (ours, (200, GPT_RESEARCHER_REPORTS_OBJECT_BODY), None),
+            (ours, (200, GPT_RESEARCHER_REPORTS_NOT_FIRST_BODY), None)):
+        _, hits = scan(discovery=discovery, reports=reports,
+                       content_types=content_types)
+        assert hits == [], (discovery[1][:80], reports[1][:80], hits)
